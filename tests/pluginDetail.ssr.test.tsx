@@ -6,7 +6,10 @@
 // screens tall inside a grid card. The contents moved to a page of its own.
 //
 // What SSR can prove is the page's SHELL — the dialog is modal and labelled,
-// each of the three lists has its own tab, and every room has an empty state
+// every room has an empty state, so a bare bundle is never a blank panel.
+// The page now has seven rooms — Skills, Commands, Sub-agents, Connectors,
+// Scripts, Hooks, Bundle — because a Claude Code bundle can be made of any of
+// them. Bundle is the manifest view, so it carries no count badge (6 of 7).
 // instead of a blank panel. The part rows themselves arrive from the backend
 // `/plugins/skills|mcp|scripts` calls inside an effect, so they are not in this
 // render; the live click-through is what covers those.
@@ -77,7 +80,16 @@ console.log('1) The page renders as a dialog on a tab of its own:')
   check('it is a modal dialog', html.includes('aria-modal="true"'))
   check('it is labelled with the plugin', html.includes('aria-label="Demo bundle details"'))
   check('the slug is shown next to the name', html.includes('demo-bundle'))
-  check('all four rooms are offered', html.includes('>Skills<') && html.includes('>Connectors<') && html.includes('>Scripts<') && html.includes('>Bundle<'))
+  check(
+    'every room is offered',
+    html.includes('>Skills<') &&
+      html.includes('>Commands<') &&
+      html.includes('>Sub-agents<') &&
+      html.includes('>Connectors<') &&
+      html.includes('>Scripts<') &&
+      html.includes('>Hooks<') &&
+      html.includes('>Bundle<'),
+  )
 }
 
 console.log('2) An empty bundle says so instead of rendering a blank room:')
@@ -105,7 +117,7 @@ console.log('3) The way out is on the page, not only via Escape:')
   // user is never stuck on a page with no way back).
   check('the close button is labelled', html.includes('aria-label="Close"'))
   check('the tab strip is a tablist', html.includes('role="tablist"'))
-  check('each tab is selectable', (html.match(/role="tab"/g) ?? []).length === 4)
+  check('each tab is selectable', (html.match(/role="tab"/g) ?? []).length === 7)
 }
 
 console.log('4) Every room has an empty state, so a bare bundle is never a blank panel:')
@@ -115,7 +127,7 @@ console.log('4) Every room has an empty state, so a bare bundle is never a blank
   )
   // SSR has no backend, so every room renders its empty state — which is
   // exactly the state a brand-new plugin is in, and the one users hit first.
-  check('each tab carries its count', (html.match(/pd-count/g) ?? []).length === 3)
+  check('each tab carries its count', (html.match(/pd-count/g) ?? []).length === 6)
   check('the skills room explains the emptiness', html.includes('No skills in this bundle'))
 }
 

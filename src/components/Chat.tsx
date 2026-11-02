@@ -254,7 +254,6 @@ const CHAT_ERROR_MAX_RETRIES = 10;
 const CHAT_ERROR_RETRY_DELAY_MS = 10_000;
 const chatStopped = new Map<string, boolean>();
 const chatAutoRetry = new Map<string, AutoRetryScheduler>();
-const chatAutoRetryCount = new Map<string, number>();
 const autoRetryFor = (chatId: string): AutoRetryScheduler => {
   let sched = chatAutoRetry.get(chatId);
   if (!sched) {
@@ -1113,6 +1112,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   //   fires past it even if a marker is stale, and the judge's reason after
   //   the marker rides into the next prompt as guidance.
   const goalAutoRef = useRef<Map<string, string>>(new Map());
+  // The chat error-retry ladder's attempt count, per chat id. It lives in a REF
+  // rather than on the message because the resend clears `retry` on the
+  // continuation bubble (and the give-up banner written just before it reports
+  // attempt 1), so a message-derived count always re-read 1 and the ladder
+  // re-armed at "2/10" every cycle — restarting the turn every 10s forever
+  // without ever reaching its cap. A module-level map was equivalent per chat,
+  // but leaked one entry per chat id for the life of the process and could not be
+  // seen by the panel's own remount (a fresh mount shared the old count); a ref
+  // is scoped to the panel that owns the ladder and dies with it.
+  const autoRetryCountRef = useRef<Map<string, number>>(new Map());
   const goalInitRef = useRef<Set<string>>(new Set());
   const goalSendingRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -2230,7 +2239,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     prune(abortMapRef.current);
     prune(chatStopped);
     prune(chatAutoRetry);
-    prune(chatAutoRetryCount);
     prune(goalAutoRef.current);
     prune(lastSeenFpRef.current);
     for (const k of Array.from(goalInitRef.current)) if (!live.has(k)) goalInitRef.current.delete(k);
@@ -4246,7 +4254,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     autoRetryFor(chatId).beginTurn();
     // A genuine new turn — not a continuation of a failed one — starts the
     // automatic error-retry ladder over from its first attempt.
-    if (!continueAssistantId) chatAutoRetryCount.set(chatId, 0);
+    if (!continueAssistantId) autoRetryCountRef.current.set(chatId, 0);
     // Per-turn local state (was shared refs — now locals so concurrent chats
     // don't race). stop() coordinates via chatStopped + chatAborts store.
     let mcpChanged = false;
@@ -5248,6 +5256,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             : `${chat.root || useStore.getState().root}/${event.path.replace(/^\/+/, "")}`;
           store.bumpDocRev(abs);
         }
+      } else if (event.kind === "turn_diff") {
+        // Net change of a file since the turn's FIRST edit of it. The backend
+        // sends it right before the per-call `diff`, while the edit card is still
+        // running; it rides on the same card (matched by path) so the Review
+        // panel's "Last Turn" view can show what `git diff` would, not the sum of
+        // every intermediate edit.
+        const current = findMsg()?.toolActivity ?? [];
+        const turnPath = typeof event.path === "string" ? event.path : "";
+        const turnTool = (a: ToolActivity) => a.tool === "edit_file" || a.tool === "write_file";
+        const next = current.map((a) =>
+          turnTool(a) && a.status === "running" && editTargetOf(a.args) === turnPath
+            ? { ...a, turnDiff: event.diff ?? "" }
+            : a,
+        );
+        store.updateMessage(assistantMsg.id, { toolActivity: next });
       } else if (event.kind === "tool_output") {
         // Live output tail of a running run_terminal call (downloads, builds).
         // Folded into the running card by its call id; a resolved or unknown
@@ -5541,9 +5564,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // written just above reports `attempt: 1`, so a message-derived count
         // always re-read 1 and the ladder re-armed at "2/10" on every cycle —
         // the turn restarted every 10s forever and never reached its cap.
-        const spent = chatAutoRetryCount.get(chat.id) ?? 1;
+    const spent = autoRetryCountRef.current.get(chat.id) ?? 1;
         if (lastUserMsg && spent < CHAT_ERROR_MAX_RETRIES) {
-          chatAutoRetryCount.set(chat.id, spent + 1);
+          autoRetryCountRef.current.set(chat.id, spent + 1);
           useStore.getState().updateMessage(assistantMsg.id, {
             retry: {
               attempt: spent + 1,

@@ -3282,6 +3282,7 @@ mod tests {
         fs::create_dir_all(bundle.join("hooks")).unwrap();
         fs::create_dir_all(bundle.join("hooks-handlers")).unwrap();
         fs::create_dir_all(bundle.join("commands")).unwrap();
+        fs::create_dir_all(bundle.join("agents")).unwrap();
         fs::write(
             bundle.join(MANIFEST),
             json!({"name": "Advisor", "version": "1.0.1"}).to_string(),
@@ -3290,6 +3291,13 @@ mod tests {
         fs::write(
             bundle.join(COMMANDS).join("model-check.md"),
             "Reassess the session.\n",
+        )
+        .unwrap();
+        // A sub-agent ships alongside the command: all three parts travel in
+        // ONE install, so the reply must report each of them.
+        fs::write(
+            bundle.join("agents").join("judge.md"),
+            "---\nname: judge\ndescription: Reviews a diff\ntools: read\n---\nYou review diffs.\n",
         )
         .unwrap();
         fs::write(
@@ -3319,6 +3327,13 @@ mod tests {
         assert_eq!(out["hooks"][0]["event"], "SessionStart");
         assert_eq!(out["plugin"][crate::hooks::ENABLED_KEY], json!(false));
         assert!(out["summary"].as_str().unwrap().contains("1 hook"));
+        // The command and the sub-agent landed too — not just the hook.
+        assert_eq!(out[COMMANDS], json!(["model-check"]));
+        assert_eq!(out[crate::subagents::AGENTS], json!(["judge"]), "the agent must travel with the install");
+        assert!(plugin_dir(&root, "advisor")
+            .join(crate::subagents::AGENTS)
+            .join("judge.md")
+            .is_file());
         // ...and so did the script it points at, EXECUTABLE: a handler that
         // cannot start is the one failure a hook must not have.
         let handler = plugin_dir(&root, "advisor").join("hooks-handlers/start.sh");

@@ -53,7 +53,7 @@ let aliveUrl: string | null = null
   return new Response('', { status: 200 })
 }
 
-const { ensureSidecar } = await import('../src/lib/api.ts')
+const { ensureSidecar, noteSidecarFailure } = await import('../src/lib/api.ts')
 
 function reset() {
   aliveUrl = null
@@ -86,6 +86,12 @@ console.log('۳) کش مرده → health-check شکست، کش پاک شده و
   aliveUrl = 'http://127.0.0.1:8899'
   const first = await ensureSidecar()
   aliveUrl = null // server crashes (e.g. segfault while loading Whisper)
+  // A crash inside the 2s trust window is NOT re-probed on the very next call —
+  // that window is what keeps a burst of Browser keystrokes off /health. What
+  // guarantees detection is the caller: BrowserPanel's failed request calls
+  // noteSidecarFailure(), which drops the window so the next call probes. This
+  // models that real sequence rather than a same-tick probe the window forbids.
+  noteSidecarFailure()
   const second = await ensureSidecar()
   check('فراخوانی دوم آدرس معتبر برمیگرداند', second === 'http://127.0.0.1:8899', second)
   check('getSidecarUrl دوباره صدا زده شد (restart)', sidecarUrlCalls === 2, sidecarUrlCalls)

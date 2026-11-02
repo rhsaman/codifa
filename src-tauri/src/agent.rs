@@ -2780,6 +2780,13 @@ pub enum AgentEvent {
     /// "No changes in this turn." (the Python sidecar used to emit this; the
     /// native agent must too).
     Diff { tool: String, path: String, diff: String },
+    /// Net change of one file since the turn's FIRST edit of it: a unified diff
+    /// against the turn's first snapshot (empty = a later edit undid the earlier
+    /// ones). `Diff` above is only THAT call's change; the Review panel's
+    /// "Last Turn" view needs this one so its +N/-M match `git diff` instead of
+    /// summing every intermediate edit. A variant of its own (not a field on
+    /// `Diff`) so no existing `Diff { .. }` pattern changes shape.
+    TurnDiff { path: String, diff: String },
     Warn { content: String },
     /// Carries the model + provider_id that actually served this request so
     /// the frontend attributes sub-agent tokens to the SUB model, not the
@@ -3001,6 +3008,9 @@ impl AgentEvent {
             }),
             AgentEvent::Diff { tool, path, diff } => json!({
                 "kind": "diff", "tool": tool, "path": path, "diff": diff,
+            }),
+            AgentEvent::TurnDiff { path, diff } => json!({
+                "kind": "turn_diff", "path": path, "diff": diff,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
             AgentEvent::McpLoaded { servers } => json!({"kind": "mcp_loaded", "servers": servers}),
@@ -4880,6 +4890,12 @@ already approved with \"Always allow\".",
     // round 4 — and so a whole round is never spent discovering that the
     // workspace, /tmp and ~/.codifa are already open.
     let mut permit = outside_permit(req);
+    // First snapshot of every file this turn edited (path -> content BEFORE the
+    // turn's first edit of it). Every later edit of the same file is diffed
+    // against it too, so the Review panel can show the NET change of the turn
+    // (what `git diff` would show) rather than the sum of each intermediate edit.
+    let mut turn_base: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     // Mid-turn auto-compaction state. `compact_rounds` bounds how many times a
     // single turn may fold its history (a turn can run MAX_STEPS tool calls, so
     // folding must be possible while the agent works — but the summarizer must
@@ -7441,6 +7457,17 @@ call fetch_url again with offset={next} for the rest]",
                         let newc = std::fs::read_to_string(target).unwrap_or_default();
                         let diff = crate::tools::unified_diff(&p, &old, &newc);
                         if !diff.is_empty() {
+                            // Net change since the turn's first snapshot of this
+                            // file; sent BEFORE `Diff`, while the card is still
+                            // "running", so the frontend attaches it to the same card.
+                            let base = turn_base
+                                .entry(p.to_string())
+                                .or_insert_with(|| old.clone());
+                            let net = crate::tools::unified_diff(&p, &*base, &newc);
+                            emit(&AgentEvent::TurnDiff {
+                                path: p.to_string(),
+                                diff: net,
+                            });
                             emit(&AgentEvent::Diff {
                                 tool: name.clone(),
                                 path: p.to_string(),

@@ -2207,10 +2207,102 @@ pub fn read_pre_edit(root: &str, path: &str, permit: Option<&Value>) -> Option<S
     fs::read_to_string(target).ok()
 }
 
-/// Minimal unified diff (`--- a/…` / `+++ b/…` + one hunk with 3 context
-/// lines). Not a minimal-edit LCS diff: the common prefix/suffix is trimmed
-/// and the changed middle is emitted as -old/+new — exact, cheap, and enough
-/// for the Review panel and the frontend's hunk parser.
+/// One line of the merged edit script: ` ` kept, `-` deleted, `+` added.
+/// `a` / `b` are how many OLD / NEW lines precede this op (for hunk headers).
+struct DiffOp<'a> {
+    tag: char,
+    text: &'a str,
+    a: usize,
+    b: usize,
+}
+
+/// Myers O(ND) shortest edit script between two line slices: marks which lines
+/// of `a` are deleted and which of `b` are added. Returns false (marks
+/// untouched) when the edit distance passes the cap, so a pathological pair of
+/// huge, unrelated files costs bounded time/memory and the caller falls back.
+fn myers_marks(a: &[&str], b: &[&str], del: &mut [bool], add: &mut [bool]) -> bool {
+    const MAX_D: isize = 1500;
+    let n = a.len() as isize;
+    let m = b.len() as isize;
+    let limit = (n + m).min(MAX_D);
+    let off = limit + 1;
+    let mut v = vec![0isize; (2 * limit + 3) as usize];
+    // trace[d] = the V frontier BEFORE round d, only diagonals -d..=d.
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut found: Option<isize> = None;
+    'search: for d in 0..=limit {
+        trace.push(v[(off - d) as usize..=(off + d) as usize].to_vec());
+        let mut k = -d;
+        while k <= d {
+            let idx = (off + k) as usize;
+            let mut x = if k == -d || (k != d && v[idx - 1] < v[idx + 1]) {
+                v[idx + 1]
+            } else {
+                v[idx - 1] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[idx] = x;
+            if x >= n && y >= m {
+                found = Some(d);
+                break 'search;
+            }
+            k += 2;
+        }
+    }
+    let Some(dd) = found else {
+        return false;
+    };
+    let (mut x, mut y) = (n, m);
+    for d in (1..=dd).rev() {
+        let vd = &trace[d as usize];
+        let get = |kk: isize| vd[(kk + d) as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && get(k - 1) < get(k + 1)) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = get(prev_k);
+        let prev_y = prev_x - prev_k;
+        // Walk back along the diagonal (kept lines) to just after the edit.
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+        }
+        if x == prev_x {
+            add[prev_y as usize] = true; // moved down: an insertion
+        } else {
+            del[prev_x as usize] = true; // moved right: a deletion
+        }
+        x = prev_x;
+        y = prev_y;
+    }
+    true
+}
+
+/// Deleted-flags for `a` and added-flags for `b`. A pure insert/delete needs no
+/// search; when the search is capped, everything in the span counts as changed
+/// (the old behaviour) rather than hanging on a giant rewrite.
+fn line_marks(a: &[&str], b: &[&str]) -> (Vec<bool>, Vec<bool>) {
+    let mut del = vec![false; a.len()];
+    let mut add = vec![false; b.len()];
+    if a.is_empty() || b.is_empty() || !myers_marks(a, b, &mut del, &mut add) {
+        del.iter_mut().for_each(|f| *f = true);
+        add.iter_mut().for_each(|f| *f = true);
+    }
+    (del, add)
+}
+
+/// Unified diff (`--- a/…` / `+++ b/…`) shaped like `git diff`: a real
+/// line-level diff (Myers), split into hunks with 3 context lines. Only lines
+/// that truly changed are `-`/`+`, so the +N/-M counters the UI derives from it
+/// match `git diff --numstat` instead of counting the whole span between the
+/// first and last edit (a 5-line change in a 130-line file used to read
+/// +122/-110).
 pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -2229,37 +2321,74 @@ pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
         return String::new(); // identical content
     }
     const CTX: usize = 3;
-    let head_start = pre.saturating_sub(CTX);
-    let del = &a[pre..a.len() - suf];
-    let add = &b[pre..b.len() - suf];
-    let tail_end = (a.len() - suf + CTX).min(a.len());
+
+    // Merged edit script: kept prefix, the diffed middle, kept suffix.
+    let (del, add) = line_marks(&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
+    let mut ops: Vec<DiffOp> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    for _ in 0..pre {
+        ops.push(DiffOp { tag: ' ', text: a[i], a: i, b: j });
+        i += 1;
+        j += 1;
+    }
+    let (mut p, mut q) = (0usize, 0usize);
+    while p < del.len() || q < add.len() {
+        if p < del.len() && del[p] {
+            ops.push(DiffOp { tag: '-', text: a[i], a: i, b: j });
+            i += 1;
+            p += 1;
+        } else if q < add.len() && add[q] {
+            ops.push(DiffOp { tag: '+', text: b[j], a: i, b: j });
+            j += 1;
+            q += 1;
+        } else if p < del.len() && q < add.len() {
+            ops.push(DiffOp { tag: ' ', text: a[i], a: i, b: j });
+            i += 1;
+            j += 1;
+            p += 1;
+            q += 1;
+        } else {
+            break;
+        }
+    }
+    for _ in 0..suf {
+        ops.push(DiffOp { tag: ' ', text: a[i], a: i, b: j });
+        i += 1;
+        j += 1;
+    }
+
+    // Group changes into hunks: two changes share a hunk when the unchanged gap
+    // between them fits inside both their context windows.
+    let changed: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.tag != ' ')
+        .map(|(n, _)| n)
+        .collect();
     let mut out = format!("--- a/{path}\n+++ b/{path}\n");
-    out.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        head_start + 1,
-        (pre - head_start) + del.len() + suf,
-        head_start + 1,
-        (pre - head_start) + add.len() + suf
-    ));
-    for l in &a[head_start..pre] {
-        out.push(' ');
-        out.push_str(l);
-        out.push('\n');
-    }
-    for l in del {
-        out.push('-');
-        out.push_str(l);
-        out.push('\n');
-    }
-    for l in add {
-        out.push('+');
-        out.push_str(l);
-        out.push('\n');
-    }
-    for l in &a[a.len() - suf..tail_end] {
-        out.push(' ');
-        out.push_str(l);
-        out.push('\n');
+    let mut s = 0usize;
+    while s < changed.len() {
+        let mut e = s;
+        while e + 1 < changed.len() && changed[e + 1] - changed[e] <= 2 * CTX + 1 {
+            e += 1;
+        }
+        let lo = changed[s].saturating_sub(CTX);
+        let hi = (changed[e] + CTX).min(ops.len() - 1);
+        let hunk = &ops[lo..=hi];
+        let old_len = hunk.iter().filter(|o| o.tag != '+').count();
+        let new_len = hunk.iter().filter(|o| o.tag != '-').count();
+        // git convention: an empty side points at the line BEFORE the hunk.
+        let old_start = if old_len == 0 { hunk[0].a } else { hunk[0].a + 1 };
+        let new_start = if new_len == 0 { hunk[0].b } else { hunk[0].b + 1 };
+        out.push_str(&format!(
+            "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
+        ));
+        for o in hunk {
+            out.push(o.tag);
+            out.push_str(o.text);
+            out.push('\n');
+        }
+        s = e + 1;
     }
     out
 }
@@ -2288,6 +2417,64 @@ mod diff_tests {
     #[test]
     fn unified_diff_identical_is_empty() {
         assert_eq!(unified_diff("x.txt", "same\n", "same\n"), "");
+    }
+
+    fn count_changes(d: &str) -> (usize, usize) {
+        let adds = d.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+        let dels = d.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+        (adds, dels)
+    }
+
+    /// The reported bug: two small edits far apart used to be diffed as one
+    /// block spanning everything between them (+122/-110 for a ~5 line change).
+    #[test]
+    fn unified_diff_counts_only_the_lines_that_really_changed() {
+        let old: Vec<String> = (1..=130).map(|n| format!("line {n}")).collect();
+        let mut new = old.clone();
+        new[8] = "line 9 changed".to_string();
+        new[120] = "line 121 changed".to_string();
+        new.insert(60, "brand new line".to_string());
+        let old_s = old.join("\n") + "\n";
+        let new_s = new.join("\n") + "\n";
+        let d = unified_diff("big.txt", &old_s, &new_s);
+        assert_eq!(count_changes(&d), (3, 2), "diff was:\n{d}");
+        // Three distant edits => three separate hunks, not one giant one.
+        assert_eq!(d.matches("\n@@ -").count(), 3, "diff was:\n{d}");
+    }
+
+    #[test]
+    fn unified_diff_close_edits_share_one_hunk() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let new = "a\nB\nc\nd\ne\nf\nG\nh\n";
+        let d = unified_diff("f.txt", old, new);
+        assert_eq!(count_changes(&d), (2, 2));
+        assert_eq!(d.matches("\n@@ -").count(), 1, "diff was:\n{d}");
+    }
+
+    #[test]
+    fn unified_diff_pure_insert_and_delete_in_the_middle() {
+        let d = unified_diff("f.txt", "a\nb\nc\n", "a\nb\nX\nY\nc\n");
+        assert_eq!(count_changes(&d), (2, 0));
+        let d = unified_diff("f.txt", "a\nb\nX\nY\nc\n", "a\nb\nc\n");
+        assert_eq!(count_changes(&d), (0, 2));
+    }
+
+    /// Applying the diff's own +/- lines to the old text must give the new text:
+    /// the hunks are not just well counted, they are exact.
+    #[test]
+    fn unified_diff_hunks_reconstruct_the_new_text() {
+        // Short enough that both edits land in ONE hunk (a hunk only carries
+        // context around its changes, so a multi-hunk diff is not the full text).
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n";
+        let new = "one\n2\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";
+        let d = unified_diff("f.txt", old, new);
+        let rebuilt: Vec<&str> = d
+            .lines()
+            .skip(2)
+            .filter(|l| !l.starts_with("@@") && !l.starts_with('-'))
+            .map(|l| &l[1..])
+            .collect();
+        assert_eq!(rebuilt, new.lines().collect::<Vec<_>>());
     }
 
     #[test]

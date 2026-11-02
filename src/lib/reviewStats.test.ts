@@ -114,6 +114,36 @@ console.log('۶) ویرایش بیرون ورک‌اسپیس از پنل Review 
   check('without a root, relative still lists', noRoot?.files.length === 1, noRoot?.files)
 }
 
+console.log('۷) buildReviewTurn: net diff of the turn replaces the sum of every edit:')
+{
+  const mkN = (path: string, diff: string, turnDiff?: string): ToolActivity =>
+    ({ tool: "edit_file", args: { path }, diff, turnDiff, status: "done" }) as any
+  const ab = ["--- a/x.ts", "+++ b/x.ts", "@@ -1,1 +1,1 @@", "-a", "+b"].join("\n")
+  const bc = ["--- a/x.ts", "+++ b/x.ts", "@@ -1,1 +1,1 @@", "-b", "+c"].join("\n")
+  const ac = ["--- a/x.ts", "+++ b/x.ts", "@@ -1,1 +1,1 @@", "-a", "+c"].join("\n")
+  const ba = ["--- a/x.ts", "+++ b/x.ts", "@@ -1,1 +1,1 @@", "-b", "+a"].join("\n")
+
+  // a -> b, then b -> c: summed that is +2 -2, but git sees one line a -> c.
+  const two = buildReviewTurn('m', [mkN('x.ts', ab, ab), mkN('x.ts', bc, ac)], '/p')
+  check('one row for the file', two?.files.length === 1, two?.files)
+  check('net is +1 -1, not +2 -2', two?.adds === 1 && two?.dels === 1, two)
+  check('row shows the net diff', two?.files[0]?.diff === ac, two?.files[0])
+  check('row counts match the header', two?.files[0]?.adds === 1 && two?.files[0]?.dels === 1, two?.files[0])
+
+  // a -> b, then b -> a: nothing changed overall, so nothing to review.
+  const undone = buildReviewTurn('m', [mkN('y.ts', ab, ab), mkN('y.ts', ba, "")], '/p')
+  check('edits that cancel out leave no review', undone === null, undone)
+
+  // An undone file must not hide another file that really changed.
+  const mixed = buildReviewTurn('m', [mkN('y.ts', ab, ab), mkN('y.ts', ba, ""), mkN('z.ts', ab, ab)], '/p')
+  check('only the really-changed file is listed', mixed?.files.length === 1 && mixed.files[0].path === 'z.ts', mixed?.files)
+  check('totals follow the listed files', mixed?.adds === 1 && mixed?.dels === 1, mixed)
+
+  // Older transcripts carry no turnDiff: keep the old per-edit sum.
+  const legacy = buildReviewTurn('m', [mkN('x.ts', ab), mkN('x.ts', bc)], '/p')
+  check('without a net diff the edits are summed', legacy?.adds === 2 && legacy?.dels === 2, legacy)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد`)
   process.exit(1)

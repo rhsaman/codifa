@@ -401,6 +401,12 @@ export interface ToolActivity {
   summary?: string
   status: 'running' | 'done' | 'error' | 'denied'
   diff?: string
+  /** Net unified diff of this card's file since the turn's FIRST edit of it
+   *  (sent by the backend as a `turn_diff` event). `diff` is only THIS call's
+   *  change; the Review panel's "Last Turn" view reads this so its +N/-M match
+   *  `git diff`. `""` = later edits undid the earlier ones; `undefined` = the
+   *  backend sent none (older transcripts) and Review falls back to summing. */
+  turnDiff?: string
   /** شمارش +N -M استخراج‌شده از diff (برای هدر Review). */
   diffStats?: DiffStats
   elapsedMs?: number
@@ -847,7 +853,7 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'tool_output' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'edit_target' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'tool_output' | 'diff' | 'turn_diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'edit_target' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
   /** edit_target: what an update session pins on the composer badge (the

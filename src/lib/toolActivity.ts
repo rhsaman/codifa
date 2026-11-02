@@ -156,6 +156,7 @@ function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivi
     summary: incoming.summary ?? existing.summary,
     diff: incoming.diff ?? existing.diff,
     diffStats: incoming.diffStats ?? existing.diffStats,
+    turnDiff: incoming.turnDiff ?? existing.turnDiff,
     checkpoint: incoming.checkpoint ?? existing.checkpoint,
     // A re-emitted start event must not wipe the rows a previous result event
     // already produced — the model still needs the links on screen.

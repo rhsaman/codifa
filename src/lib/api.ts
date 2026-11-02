@@ -28,6 +28,8 @@ api.onSidecarChanged(() => {
   sidecarUrl = null
   noteSidecarUrl(null)
   sidecarInFlight = null
+  // The stamp outlived the URL it described.
+  sidecarProbedAt = 0
 })
 
 // The Electron sidecar process crashed (e.g. segfault while loading the Whisper
@@ -37,6 +39,10 @@ api.onSidecarDead(() => {
   sidecarUrl = null
   noteSidecarUrl(null)
   sidecarInFlight = null
+  // A crash is proof the last probe's verdict is worthless: leaving the stamp
+  // armed let the next call trust a TTL that described a process now gone and
+  // hand out the dead port WITHOUT probing.
+  sidecarProbedAt = 0
 })
 
 /**
@@ -90,11 +96,20 @@ export async function ensureSidecar(): Promise<string | null> {
       // invalidates it (noteSidecarFailure), so a crash is still detected on
       // the next call instead of being paid as a round trip on every one.
       const probeFresh = Date.now() - sidecarProbedAt < SIDECAR_PROBE_TTL_MS
+      // A probe that has JUST succeeded is real evidence, and BrowserPanel
+      // re-probes on every failure (noteSidecarFailure), so the TTL stays armed
+      // here: the next keystroke/hover reuses this result instead of paying a
+      // second round trip. This is the hot path the TTL exists for.
       if (probeFresh || (await isSidecarAlive(sidecarUrl))) {
         sidecarProbedAt = Date.now()
         noteSidecarUrl(sidecarUrl)
         return sidecarUrl
       }
+      // The cached URL is dead. Forget the probe stamp too, or the TTL would
+      // still look fresh to the NEXT caller if this call re-resolved within the
+      // window (the resolve path below stamps it), and a dead port would be
+      // handed out a second time instead of re-probed.
+      sidecarProbedAt = 0
       sidecarUrl = null
     }
     // Bound the IPC: if the sidecar never comes up, every caller must still
@@ -117,6 +132,17 @@ export async function ensureSidecar(): Promise<string | null> {
         }),
       ])
       if (url) sidecarUrl = url
+      // `getSidecarUrl` hands back a PORT, not proof the process is running. A
+      // resolve triggered by a crash/restart must not hand that port straight
+      // to the caller: one request against a dead socket is exactly the
+      // "Failed to fetch" the restart was supposed to prevent. So verify it
+      // once, here, and let the TTL carry that verdict for the burst of
+      // keystrokes that follows (one probe per resolved URL, never per call).
+      if (sidecarUrl && (await isSidecarAlive(sidecarUrl))) {
+        sidecarProbedAt = Date.now()
+      } else {
+        sidecarProbedAt = 0
+      }
       noteSidecarUrl(sidecarUrl)
       return sidecarUrl
     } finally {
@@ -153,6 +179,9 @@ export async function ensureSidecar(): Promise<string | null> {
 export function invalidateSidecarCache(): void {
   sidecarUrl = null
   sidecarInFlight = null
+  // Same reason as onSidecarDead: the next caller must probe before trusting
+  // whatever URL it resolves, because the one the stamp described is gone.
+  sidecarProbedAt = 0
 }
 
 export interface ModelPricing {
@@ -878,6 +907,19 @@ export interface StreamParams {
   signal?: AbortSignal
 }
 
+/**
+ * A non-2xx answer from the backend. Distinguished from a transport failure so
+ * the reconnect loop can tell "the server replied" from "the socket died":
+ * only the latter is retried. Carries `status` for callers that want it.
+ */
+export class HttpError extends Error {
+  readonly status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'HttpError'
+    this.status = status
+  }
+}
 
 export async function streamChat(
   params: StreamParams,
@@ -1084,7 +1126,15 @@ export async function streamChat(
 
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
-      throw new Error((body as { detail?: string }).detail || `chat request failed (${res.status})`)
+      // A non-2xx is the backend ANSWERING, not a dropped socket. `streamChat`
+      // throws this error itself, so it must escape un-retried: thrown from
+      // inside the loop's try/read scope it would fall into the reconnect
+      // catch below and re-send the whole turn on every 10s cycle — a
+      // deliberate "boom" (bad key, 500) became 11 identical requests.
+      throw new HttpError(
+        (body as { detail?: string }).detail || `chat request failed (${res.status})`,
+        res.status,
+      )
     }
     if (!res.body) throw new Error('no response body')
 
@@ -1126,6 +1176,11 @@ export async function streamChat(
     } catch (err) {
       // A manual abort must propagate immediately, not trigger a reconnect.
       if (params.signal?.aborted || (err as Error).name === 'AbortError') throw err
+      // An HTTP error from the backend is a deliberate response (bad key,
+      // 429, 5xx) and the backend runs its own retry loop. Re-sending it here
+      // would multiply one failure into MAX_RECONNECT_ATTEMPTS requests, so it
+      // is NEVER a reconnect trigger — only a transport drop is.
+      if (err instanceof HttpError) throw err
       // Only auto-reconnect on a genuine sidecar crash BEFORE any output (no
       // event was delivered). If events were already flowing and the stream then
       // dropped, it's an interruption (client disconnect / user navigated away),

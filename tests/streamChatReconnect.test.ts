@@ -93,30 +93,38 @@ const baseParams = {
 async function run() {
   // 1) Clean stream → no reconnect, events delivered.
   {
-    let calls = 0
+    let streamCalls = 0
     const received: any[] = []
     ;(globalThis as any).fetch = async (url: string) => {
-      calls++
+      // Count `/chat/stream` only. `ensureSidecar` legitimately adds ONE
+      // `/health` probe per resolved URL (that is what keeps a Browser-panel
+      // burst from probing per call), so a global fetch counter would measure
+      // the health check instead of the no-reconnect property this case pins.
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
+      streamCalls++
       return makeStreamResponse([{ kind: 'text', content: 'hi' }, { kind: 'done' }])
     }
     await streamChat(baseParams, (e) => received.push(e))
-    check('۱) استریم سالم فقط یک‌بار fetch می‌زند', calls === 1, calls)
+    check('۱) استریم سالم فقط یک‌بار fetch می‌زند', streamCalls === 1, streamCalls)
     check('۱) هر دو event رسید', received.length === 2, received)
   }
 
   // 2) Connect failure → retry with backoff, then succeed.
   {
-    let calls = 0
+    let streamCalls = 0
     const received: any[] = []
     ;(globalThis as any).fetch = async (url: string) => {
-      calls++
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
-      if (calls === 2) throw new Error('connection refused') // first /chat/stream attempt fails
+      streamCalls++
+      // The FIRST stream attempt fails at the transport level; the second works.
+      // Count stream calls only: `ensureSidecar` legitimately probes /health as
+      // its own fetch, so a global fetch counter made this assertion depend on
+      // when that probe happened.
+      if (streamCalls === 1) throw new Error('connection refused')
       return makeStreamResponse([{ kind: 'text', content: 'ok' }, { kind: 'done' }])
     }
     await streamChat(baseParams, (e) => received.push(e))
-    check('۲) روی خطای اتصال دوباره تلاش می‌کند', calls >= 3, calls)
+    check('۲) روی خطای اتصال دوباره تلاش می‌کند', streamCalls === 2, streamCalls)
     // The self-healing layer surfaces a `reconnecting` retry event to the UI
     // (so the "Connection lost — reconnecting…" pill shows), then resumes and
     // delivers the two data events.
@@ -182,10 +190,10 @@ async function run() {
 
   // 5) HTTP error (non-2xx) → NOT retried.
   {
-    let calls = 0
+    let streamCalls = 0
     ;(globalThis as any).fetch = async (url: string) => {
-      calls++
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
+      if (url.endsWith('/chat/stream')) streamCalls++
       return makeErrorResponse(500)
     }
     let msg = ''
@@ -194,7 +202,11 @@ async function run() {
     } catch (err) {
       msg = (err as Error).message
     }
-    check('۵) خطای HTTP باعث retry نمی‌شود', calls === 2, calls)
+    // Count the STREAM requests only: whether ensureSidecar spends a /health
+    // probe on this call depends on the probe TTL and on which case ran before
+    // it, so folding it into the count made the assertion depend on test order
+    // rather than on the behaviour under test (exactly one request, no retry).
+    check('۵) خطای HTTP باعث retry نمی‌شود', streamCalls === 1, streamCalls)
     check('۵) پیام خطای سرور برگشت', msg.includes('boom'), msg)
   }
 

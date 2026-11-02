@@ -1,5 +1,5 @@
 import type { ReviewTurn, ToolActivity } from "../types";
-import { aggregateTurnStats, diffStatsFromUnified, editTargetOf } from "./toolActivity";
+import { diffStatsFromUnified, editTargetOf } from "./toolActivity";
 
 /** مسیر فایلِ یک فعالیت ویرایش (`path` یا `filePath`) — خالی یعنی غیر-ویرایشی. */
 export function reviewPathOf(a: ToolActivity): string {
@@ -34,7 +34,15 @@ export function buildReviewTurn(
   root?: string,
 ): ReviewTurn | null {
   const inReview = (path: string) => isReviewablePath(root, path);
-  const byPath = new Map<string, { adds: number; dels: number; diffs: string[] }>();
+  // `diffs`/`adds`/`dels` sum every edit of the file (the fallback for
+  // transcripts the backend never sent a net diff for); `net` is the NET diff
+  // of the file since the turn's first edit of it, taken from the LAST edit that
+  // carries one — what `git diff` would show: an edit that a later edit undid
+  // nets to nothing instead of counting twice.
+  const byPath = new Map<
+    string,
+    { adds: number; dels: number; diffs: string[]; net?: string }
+  >();
   const walk = (list: ToolActivity[]) => {
     for (const a of list) {
       if (
@@ -49,8 +57,9 @@ export function buildReviewTurn(
             cur.adds += s.adds;
             cur.dels += s.dels;
             cur.diffs.push(a.diff);
+            cur.net = a.turnDiff;
           } else {
-            byPath.set(path, { adds: s.adds, dels: s.dels, diffs: [a.diff] });
+            byPath.set(path, { adds: s.adds, dels: s.dels, diffs: [a.diff], net: a.turnDiff });
           }
         }
       }
@@ -59,14 +68,21 @@ export function buildReviewTurn(
   };
   walk(activities);
   if (byPath.size === 0) return null;
-  const files = [...byPath.entries()].map(([path, v]) => ({
-    path,
-    adds: v.adds,
-    dels: v.dels,
-    diff: v.diffs.join("\n"),
-  }));
-  // Totals come from the SAME filtered walk, so the header can never count a
+  const files: ReviewTurn["files"] = [];
+  for (const [path, v] of byPath) {
+    if (v.net === undefined) {
+      // No net diff for this file (older transcript): sum the edits as before.
+      files.push({ path, adds: v.adds, dels: v.dels, diff: v.diffs.join("\n") });
+    } else if (v.net !== "") {
+      const s = diffStatsFromUnified(v.net);
+      files.push({ path, adds: s.adds, dels: s.dels, diff: v.net });
+    }
+    // v.net === "": the turn's edits cancelled out — no net change, no row.
+  }
+  if (files.length === 0) return null;
+  // Totals are summed from the listed files, so the header can never count a
   // file the list below does not show.
-  const totals = aggregateTurnStats(activities, inReview);
-  return { id: messageId, files, adds: totals.adds, dels: totals.dels };
+  const adds = files.reduce((n, f) => n + f.adds, 0);
+  const dels = files.reduce((n, f) => n + f.dels, 0);
+  return { id: messageId, files, adds, dels };
 }

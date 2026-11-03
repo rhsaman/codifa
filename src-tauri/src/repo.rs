@@ -22,6 +22,52 @@ const GITHUB_API: &str = "https://api.github.com";
 const GITHUB_RAW: &str = "https://raw.githubusercontent.com";
 /// Timeout for one request.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How many times one download is attempted before it is called failed.
+///
+/// An install reads ~120 bundle files one request each, and a SINGLE dropped
+/// request ("error sending request") used to fail the whole install — the
+/// reported trading-bundle install died on one SKILL.md among 82. Transient
+/// failures are retried; a 404 (a real miss) and a 403 (rate limit, whose
+/// message drives the clone fallback) are not.
+const ATTEMPTS: usize = 3;
+/// Wait between download attempts, one entry per retry.
+const RETRY_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(600),
+    std::time::Duration::from_millis(1800),
+];
+
+/// Live progress of the bundle install running in THIS process, polled by the
+/// renderer (`GET /plugins/install-progress`) to feed the chat's progress
+/// bubble: the install is one blocking request, and a silent one read exactly
+/// as "nothing happened" — the user could not tell working from hung. One
+/// slot, last install wins: installs are user-paced and the frontend refuses
+/// a second concurrent install of the same address, so a race is not a real
+/// flow.
+fn install_slot() -> &'static std::sync::Mutex<Option<(&'static str, usize, usize)>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<(&'static str, usize, usize)>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Report the install phase: `listing` (the repo tree), `reading` (the bundle
+/// files, done/total), `writing` (the bundle hitting disk).
+pub fn install_progress_set(phase: &'static str, done: usize, total: usize) {
+    if let Ok(mut slot) = install_slot().lock() {
+        *slot = Some((phase, done, total));
+    }
+}
+
+/// Where the install stands right now, for the progress route.
+pub fn install_progress_now() -> Option<(&'static str, usize, usize)> {
+    install_slot().lock().ok().and_then(|slot| *slot)
+}
+
+/// The install settled (either way); the poll reads `idle` and stops.
+pub fn install_progress_clear() {
+    if let Ok(mut slot) = install_slot().lock() {
+        *slot = None;
+    }
+}
 /// Folders that are never part of a plugin or a skill.
 const SKIP_DIRS: [&str; 7] = [
     ".git",
@@ -429,29 +475,61 @@ fn http_get_text(url: &str) -> Result<String, String> {
         .map_err(|_| "the repo download thread panicked".to_string())?
 }
 
+/// One client for every download: reqwest's pool reuses TLS connections, and
+/// a fresh client per request paid a full handshake each time — on a network
+/// that resets connections intermittently (the reported install died on one
+/// dropped request among ~120), every extra handshake is one more chance to
+/// lose a request.
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(TIMEOUT)
+            .user_agent("codifa")
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 fn http_get_blocking(url: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(TIMEOUT)
-        .user_agent("codifa")
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let res = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .map_err(|e| format!("download failed: {e}"))?;
-    let status = res.status();
-    let text = res
-        .text()
-        .map_err(|e| format!("cannot read the download: {e}"))?;
-    if !status.is_success() {
-        return Err(match status.as_u16() {
-            404 => format!("not found: {url} (is the repo public?)"),
-            403 => format!("GitHub refused the request (rate limit?): {url}"),
-            code => format!("download failed ({code}): {url}"),
-        });
+    let client = http_client();
+    for attempt in 0..ATTEMPTS {
+        let res = match client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+        {
+            Ok(res) => res,
+            // A dropped connection or a timed-out read — the request never got
+            // a complete answer, so the wait-and-retry is the whole fix.
+            Err(_) if attempt + 1 < ATTEMPTS => {
+                std::thread::sleep(RETRY_BACKOFF[attempt]);
+                continue;
+            }
+            Err(e) => return Err(format!("download failed: {e}")),
+        };
+        let status = res.status();
+        let code = status.as_u16();
+        if code == 429 || code >= 500 {
+            // Server-side pressure and gateway blips clear within seconds;
+            // the retry is what turns a flaky hour into a working install.
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(RETRY_BACKOFF[attempt]);
+                continue;
+            }
+        }
+        if !status.is_success() {
+            return Err(match code {
+                404 => format!("not found: {url} (is the repo public?)"),
+                403 => format!("GitHub refused the request (rate limit?): {url}"),
+                code => format!("download failed ({code}): {url}"),
+            });
+        }
+        return res
+            .text()
+            .map_err(|e| format!("cannot read the download: {e}"));
     }
-    Ok(text)
+    unreachable!("the retry loop returns on its last attempt")
 }
 
 fn is_manifest(path: &str) -> bool {
@@ -617,9 +695,55 @@ fn locate(repo: &Repo) -> Result<(String, Option<String>), String> {
     Ok((root_of(&path), Some(path)))
 }
 
+/// Read a batch of bundle files at once.
+///
+/// The per-file reads used to run SEQUENTIALLY, so an install's wall time was
+/// the SUM of its ~120 requests (the trading bundle measured ~2.5 minutes) and
+/// the install sat exposed to the network for every one of them. Workers split
+/// the paths and read concurrently; results keep the caller's path order, and
+/// the first failure is the error — exactly what the loop this replaced
+/// reported, just reached far sooner.
+fn read_many<T, F>(paths: &[String], f: F) -> Result<Vec<T>, String>
+where
+    F: Fn(&str) -> Result<T, String> + Sync,
+    T: Send,
+{
+    const WORKERS: usize = 12;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Contiguous chunks keep each worker's results in path order, so joining
+    // the chunks in order flattens to the sequential order.
+    let chunk_len = (paths.len() + WORKERS - 1) / WORKERS;
+    let mut out = Vec::with_capacity(paths.len());
+    std::thread::scope(|s| -> Result<(), String> {
+        let handles: Vec<_> = paths
+            .chunks(chunk_len)
+            .map(|group| {
+                // The reader travels as a SHARED reference: one `&F` per worker
+                // (Send because `F: Sync`), so the same closure body serves every
+                // chunk without cloning the reader itself.
+                let f = &f;
+                s.spawn(move || group.iter().map(|p| f(p)).collect::<Vec<_>>())
+            })
+            .collect();
+        for handle in handles {
+            for item in handle
+                .join()
+                .map_err(|_| "the repo download thread panicked".to_string())?
+            {
+                out.push(item?);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// Read a whole plugin bundle: manifest, skills and connectors, in the exact
 /// shape `plugins::create_plugin` already accepts.
 pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String> {
+    install_progress_set("listing", 0, 0);
     let repo = Repo::open(spec, sub, git_ref)?;
     let (root, manifest_path) = locate(&repo)?;
     let manifest = match &manifest_path {
@@ -635,14 +759,12 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
     } else {
         format!("{root}/")
     };
-    let mut skills: Vec<Value> = Vec::new();
-    for path in repo
+    let skill_paths: Vec<String> = repo
         .files()
         .iter()
         .filter(|p| p.starts_with(prefix.as_str()) && is_skill_file(p))
-    {
-        skills.push(read_skill_at(&repo, path)?);
-    }
+        .cloned()
+        .collect();
     // Scripts travel with the bundle too: a plugin whose commands are code would
     // otherwise install as an empty shell. Read from `<root>/scripts/<name>/`
     // with the same manifest the writer produces, so a reinstall updates them.
@@ -694,36 +816,66 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
     // Commands (Claude) and prompts (Codex) are prompt templates, so they land
     // in the bundle's SKILL store flagged as `kind: command`: one container for
     // everything the renderer and the router already read.
-    let mut commands: Vec<Value> = Vec::new();
-    for path in repo.files().iter().filter(|p| {
-        p.starts_with(prefix.as_str()) && (is_command_file(p) || is_prompt_file(p))
-    }) {
-        if commands.len() >= crate::plugins::MAX_COMMANDS {
-            break;
-        }
-        commands.push(read_command_at(&repo, path)?);
-    }
+    let command_paths: Vec<String> = repo
+        .files()
+        .iter()
+        .filter(|p| {
+            p.starts_with(prefix.as_str()) && (is_command_file(p) || is_prompt_file(p))
+        })
+        .take(crate::plugins::MAX_COMMANDS)
+        .cloned()
+        .collect();
     // Sub-agent profiles travel verbatim: their frontmatter is the contract, so
     // the file is stored as read and parsed by `subagents` on every listing.
-    let mut agents: Vec<Value> = Vec::new();
-    for path in repo
+    let agent_paths: Vec<String> = repo
         .files()
         .iter()
         .filter(|p| p.starts_with(prefix.as_str()) && is_agent_file(p))
-    {
-        if agents.len() >= crate::subagents::MAX_AGENTS {
-            break;
-        }
-        let Ok(raw) = repo.read(path) else { continue };
-        let stem = leaf(path).trim_end_matches(".md").trim_end_matches(".MD");
-        let mut profile = crate::subagents::parse_profile(&raw, stem);
-        if !profile["prompt"].as_str().is_some_and(|p| !p.trim().is_empty()) {
-            continue;
-        }
-        profile["content"] = json!(raw);
-        profile["file"] = json!(leaf(path));
-        agents.push(profile);
-    }
+        .cloned()
+        .collect();
+    // Every file read reports one tick: the progress bubble in the chat is fed
+    // by this counter, so the install visibly moves instead of hanging silent.
+    let total = skill_paths.len() + command_paths.len() + agent_paths.len();
+    install_progress_set("reading", 0, total);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let tick = || {
+        let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        install_progress_set("reading", finished, total);
+    };
+    let skills = read_many(&skill_paths, |p| {
+        let r = read_skill_at(&repo, p);
+        tick();
+        r
+    })?;
+    let commands = read_many(&command_paths, |p| {
+        let r = read_command_at(&repo, p);
+        tick();
+        r
+    })?;
+    // An agent file that cannot be read, or whose frontmatter carries no
+    // prompt, is SKIPPED rather than fatal — the sequential loop this replaces
+    // `continue`d past one; the cap lands on the COLLECTED agents.
+    let agents: Vec<Value> = read_many(&agent_paths, |p| {
+        let r = (|| {
+            let Ok(raw) = repo.read(p) else {
+                return Ok(None);
+            };
+            let stem = leaf(p).trim_end_matches(".md").trim_end_matches(".MD");
+            let mut profile = crate::subagents::parse_profile(&raw, stem);
+            if !profile["prompt"].as_str().is_some_and(|p| !p.trim().is_empty()) {
+                return Ok(None);
+            }
+            profile["content"] = json!(raw);
+            profile["file"] = json!(leaf(p));
+            Ok(Some(profile))
+        })();
+        tick();
+        r
+    })?
+    .into_iter()
+    .flatten()
+    .take(crate::subagents::MAX_AGENTS)
+    .collect();
     // Hook declarations are VALIDATED here, not executed: a command that leaves
     // the bundle folder, or an event Codifa does not dispatch, is dropped before
     // it can reach disk. Execution is a separate, explicitly-approved decision.

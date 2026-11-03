@@ -1781,10 +1781,14 @@ export function persistSplitWidth(w: number) {
   }
 }
 
+/** Smallest strip the chat group keeps while the viewer pane takes the rest. */
+export const CHAT_MIN_WIDTH = 320
+
 export function clampSplitWidth(w: number, vw?: number): number {
   const width = typeof vw === 'number' && Number.isFinite(vw) ? vw : typeof window !== 'undefined' ? window.innerWidth : 1024
-  // Drag caps at half the viewport so chats keep at least half; fullscreen bypasses this via CSS.
-  const max = Math.min(width / 2, width - 320)
+  // Drag may take the pane nearly full-width — the chat keeps a small usable
+  // strip (CHAT_MIN_WIDTH); fullscreen hides the chat entirely via CSS.
+  const max = width - CHAT_MIN_WIDTH
   return Math.max(320, Math.min(max, w))
 }
 

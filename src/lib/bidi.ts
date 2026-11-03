@@ -390,6 +390,23 @@ export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   return fixed.join('```')
 }
 
+// A bare ``` fence whose content is mostly Persian/Arabic is not code: models
+// write prose or column-aligned data (price levels, small tables) inside fences
+// to preserve spacing, and rendering that as an LTR highlighted code block
+// scrambles the bidi order and stretches the script in monospace. The ratio is
+// taken over NON-WHITESPACE characters so indentation and column padding do not
+// dilute the signal; the small absolute floor keeps a lone «سلام» inside an
+// English dump from flipping the whole block.
+const RTL_PROSE_RATIO = 0.3
+const RTL_PROSE_MIN_CHARS = 8
+const RTL_CHAR_ALL_RE = new RegExp(`[${PERSIAN_RANGE}]`, 'g')
+export function isMostlyRtlText(text: string): boolean {
+  const nonWs = text.replace(/\s+/g, '')
+  if (nonWs.length < RTL_PROSE_MIN_CHARS) return false
+  const rtl = nonWs.length - nonWs.replace(RTL_CHAR_ALL_RE, '').length
+  return rtl / nonWs.length >= RTL_PROSE_RATIO
+}
+
 // fixZwsp را روی بلوک کد به‌طور مستقیم نزن: hljs و escapeHtml ساختار کد
 // (operatorها، پرانتزها، تورفتگی) را می‌بینند و اگر ZWNJ/ZWNJ-like را در
 // میانه‌ی خط به فاصله تبدیل کنیم، توکنایز کد می‌شکند و highlight از کار

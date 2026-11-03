@@ -370,7 +370,9 @@ export function ScheduleInbox() {
   return (
     <div className="schedule-inbox-overlay" dir={dir}>
       <InboxVimScroll inboxRef={inboxRef} chatRef={chatScrollRef} />
-      <div className="schedule-inbox-backdrop" onClick={() => setOpen(false)} />
+      {/* Backdrop only blocks clicks behind the inbox — it never closes it.
+          Closing is via the ✕ button. */}
+      <div className="schedule-inbox-backdrop" />
       <div
         ref={inboxRef}
         className="schedule-inbox"

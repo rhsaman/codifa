@@ -3,10 +3,6 @@ import { createPortal } from 'react-dom'
 import type { McpServerConfig, McpTransport, PluginInfo } from '../types'
 import { syncSkill } from '../lib/api'
 import type { SkillSyncResult } from '../lib/api'
-import { useStore } from '../lib/store'
-import { modelReasoning } from '../lib/context'
-import { supportsReasoning } from '../lib/thinking'
-import { toolFallbackEntries } from '../lib/toolSlots'
 import {
   deletePluginConnector,
   deletePluginScript,
@@ -16,10 +12,6 @@ import {
   listPluginScripts,
   listPluginSkills,
   savePluginConnector,
-  savePluginScript,
-  translateKeywords,
-  fillMissingKeywords,
-  updatePlugin,
 } from '../lib/plugins'
 import type {
   PluginAgentRow,
@@ -30,7 +22,7 @@ import type {
 } from '../lib/plugins'
 
 /** Which part of the bundle the page is showing. */
-type Tab = 'skills' | 'commands' | 'agents' | 'mcp' | 'scripts' | 'hooks' | 'bundle'
+type Tab = 'skills' | 'commands' | 'agents' | 'mcp' | 'scripts' | 'hooks'
 
 function kvToText(kv: Record<string, string>): string {
   return Object.entries(kv)
@@ -66,88 +58,18 @@ function skillOutcome(out: SkillSyncResult): { ok: true } | { error: string } {
   return out.ok ? { ok: true } : { error: out.note ?? 'the skill write failed' }
 }
 
-/** What a part of a bundle is FOR, and — when it has any — the Persian phrases
- *  that reach it.
- *
- *  Skills are matched by these phrases, so they carry the field. A connector or a
- *  script is invoked by name (`plugin` tool action `run`, the MCP tool list) and its
- *  metadata is never read by the keyword matcher, so `keywords` is passed as
- *  `null` for those: a field that changes nothing is worse than no field. */
-function MetaFields({
-  description,
-  keywords,
-  onDescription,
-  onKeywords,
-  onTranslate,
-  translating = false,
-}: {
-  description: string
-  keywords: string | null
-  onDescription: (value: string) => void
-  onKeywords: (value: string) => void
-  /** Present on the parts the keyword matcher actually reads. */
-  onTranslate?: () => void
-  translating?: boolean
-}) {
-  return (
-    <>
-      <label className="pd-field">
-        Description
-        <input
-          value={description}
-          onChange={(e) => onDescription(e.target.value)}
-          placeholder="What this part is for"
-          dir="auto"
-          spellCheck={false}
-        />
-      </label>
-      {keywords === null ? null : (
-        <label className="pd-field">
-          Persian keywords (fa_keywords)
-          <input
-            value={keywords}
-            onChange={(e) => onKeywords(e.target.value)}
-            placeholder="ترجمه کن, ترجمه"
-            dir="auto"
-            spellCheck={false}
-          />
-        </label>
-      )}
-      {onTranslate ? (
-        <div className="pd-field-actions">
-          <button
-            type="button"
-            className="btn tiny secondary"
-            disabled={translating}
-            onClick={onTranslate}
-          >
-            {translating ? 'Translating…' : 'Translate description'}
-          </button>
-          <span className="hint">
-            Fills the keywords from the description above. Review, then Save.
-          </span>
-        </div>
-      ) : null}
-    </>
-  )
-}
-
 /** A connector's own config form: transport plus the address it runs at. */
 function ConnectorForm({
   name,
   cfg,
-  description,
-  keywords,
   busy,
   onSave,
   onDelete,
 }: {
   name: string
   cfg: McpServerConfig
-  description: string
-  keywords: string
   busy: boolean
-  onSave: (cfg: McpServerConfig, meta: { description: string; faKeywords: string }) => void
+  onSave: (cfg: McpServerConfig) => void
   onDelete?: () => void
 }) {
   const [type, setType] = useState<McpTransport>(
@@ -252,7 +174,7 @@ function ConnectorForm({
           disabled={busy}
           onClick={() => {
             const next = build()
-            if (next) onSave(next, { description, faKeywords: keywords })
+            if (next) onSave(next)
           }}
         >
           Save
@@ -311,8 +233,10 @@ function Part({
  * Everything one plugin holds, on a page of its own.
  *
  * The bundle card in Settings answers "is this on, and what does it carry"; this
- * page answers "what exactly is inside it, and what are those things FOR" — the
- * description and the Persian keywords of every skill, connector and script.
+ * page answers "what exactly is inside it" — each skill's body, every
+ * connector's address, and one Delete for the whole bundle. The agent picks
+ * skills from the catalog by itself, so nothing here tunes routing: the
+ * description shown per row is the one the catalog matches requests against.
  * It is a full-screen overlay (not an inline expander) because editing three
  * lists with their own forms does not fit inside a grid card without turning it
  * into a page anyway.
@@ -321,10 +245,13 @@ export function PluginDetail({
   plugin,
   onClose,
   onChanged,
+  onDelete,
 }: {
   plugin: PluginInfo
   onClose: () => void
   onChanged: () => void
+  /** Delete the WHOLE bundle — its skills and connectors go with it. */
+  onDelete: () => void
 }) {
   const [tab, setTab] = useState<Tab>('skills')
   const [skills, setSkills] = useState<PluginSkillRow[]>([])
@@ -336,36 +263,11 @@ export function PluginDetail({
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
   const [open, setOpen] = useState('')
-  // One draft object per part, keyed by the part's name, so switching between
-  // rows never loses what was typed and never writes a half-finished edit.
-  const [skillDrafts, setSkillDrafts] = useState<
-    Record<string, { content: string; description: string; keywords: string }>
-  >({})
-  const [scriptDrafts, setScriptDrafts] = useState<
-    Record<string, { description: string; keywords: string }>
-  >({})
-  const [connDrafts, setConnDrafts] = useState<
-    Record<string, { description: string; keywords: string }>
-  >({})
-  const [meta, setMeta] = useState({
-    description: plugin.description ?? '',
-    keywords: (plugin.fa_keywords ?? []).join(', '),
-  })
-  // Which part is mid-translation (its own name), and whether the bulk pass is
-  // running. Two flags so one slow row cannot make the whole page look stuck.
-  const [translating, setTranslating] = useState('')
-  const [bulk, setBulk] = useState(false)
-  // Same provider the chat turn runs on: the translation is a model call, so it
-  // must use the ACTIVE provider, not whichever happens to sit first.
-  const provider = useStore(
-    (s) =>
-      s.settings.providers.find((x) => x.id === s.settings.activeProviderId) ??
-      s.settings.providers[0],
-  )
-  const subagentModels = useStore((s) => s.subagentModels)
-  const subagentThinking = useStore((s) => s.subagentThinking)
-  const toolFallbacks = useStore((s) => s.toolFallbacks)
-  const providers = useStore((s) => s.settings.providers)
+  // One draft body per skill, keyed by the skill's name, so switching between
+  // rows never loses what was typed and never writes a half-finished edit. The
+  // description and keywords are NOT editable here: the save carries the body
+  // only, and the backend keeps what is already on disk.
+  const [skillBodies, setSkillBodies] = useState<Record<string, string>>({})
 
   const load = useCallback(async () => {
     const [sk, cn, sc, cq, ag] = await Promise.all([
@@ -407,107 +309,6 @@ export function PluginDetail({
     }
   }
 
-  const skillState = (row: PluginSkillRow) =>
-    skillDrafts[row.name] ?? {
-      content: row.content ?? '',
-      description: row.description ?? '',
-      keywords: (row.fa_keywords ?? []).join(', '),
-    }
-  const scriptState = (row: PluginScriptRow) =>
-    scriptDrafts[row.name] ?? {
-      description: row.description ?? '',
-      keywords: (row.fa_keywords ?? []).join(', '),
-    }
-  const connState = (row: PluginConnectorRow) =>
-    connDrafts[row.name] ?? {
-      description: row.description ?? '',
-      keywords: (row.fa_keywords ?? []).join(', '),
-    }
-
-  /** Ask the model to turn descriptions into Persian trigger phrases.
-   *
-   *  Batched on purpose: the whole list is one cheap call, so translating 26
-   *  skills costs one round trip instead of 26. The reply only fills the DRAFTS
-   *  — nothing is written until the row (or the bulk button) saves, so a bad
-   *  translation is reviewable before it reaches the catalog. */
-  const requestKeywords = useCallback(
-    async (items: Array<{ name: string; description: string }>) => {
-      const usable = items.filter((i) => i.name.trim() && i.description.trim())
-      if (usable.length === 0 || !provider) return {}
-      const res = await translateKeywords({
-        provider,
-        subagentModels,
-        subagentThinking,
-        toolFallbacks: toolFallbackEntries(toolFallbacks),
-        providers: Object.fromEntries(providers.map((p) => [p.id, p])),
-        modelReasoning:
-          modelReasoning(provider, provider.model) ?? supportsReasoning(provider.model, provider.kind),
-        items: usable,
-      })
-      if (res.error) setMsg(`Translation: ${res.error}`)
-      return res.keywords
-    },
-    [provider, subagentModels, subagentThinking, toolFallbacks, providers],
-  )
-
-  /** Fill one part's keyword field from its own description. */
-  const translateOne = async (name: string, description: string, apply: (phrases: string) => void) => {
-    setTranslating(name)
-    setMsg('')
-    const map = await requestKeywords([{ name, description }])
-    setTranslating('')
-    const phrases = map[name]
-    if (!phrases || phrases.length === 0) {
-      // `requestKeywords` already reported WHY (a rate-limited or unreachable
-      // model); overwriting that with a generic line hid the real cause.
-      setMsg((cur) => cur || 'The model returned no phrases for this part.')
-      return
-    }
-    apply(phrases.join(', '))
-  }
-
-  /** Every skill of this bundle that still has no keywords of its own.
-   *
-   *  This is the reported gap: a bundle installed from a marketplace carries
-   *  English descriptions, so its skills reached the catalog keyword-free and no
-   *  Persian request could find them. One click fills them all. */
-  const untranslatedSkills = () =>
-    skills.filter((row) => (row.fa_keywords ?? []).length === 0 && (row.description ?? '').trim())
-
-  const translateAllSkills = async () => {
-    const pending = untranslatedSkills()
-    if (pending.length === 0) {
-      setMsg('Every skill in this bundle already has keywords.')
-      return
-    }
-    setBulk(true)
-    setMsg('')
-    // The SAME pass the install paths run, so a bundle filled here and one
-    // filled by an install can never end up with different keywords.
-    const fill = await fillMissingKeywords(plugin.slug, {
-      provider,
-      subagentModels,
-      subagentThinking,
-      toolFallbacks,
-      providers,
-      modelReasoning:
-        provider != null
-          ? modelReasoning(provider, provider.model) ??
-            supportsReasoning(provider.model, provider.kind)
-          : false,
-    })
-    setBulk(false)
-    setMsg(
-      fill.error && fill.filled === 0
-        ? `Translation: ${fill.error}`
-        : `Filled keywords for ${fill.filled} of ${pending.length} skill(s).`,
-    )
-    if (fill.filled > 0) {
-      await load()
-      onChanged()
-    }
-  }
-
   const counts: Record<Tab, number> = {
     skills: skills.length,
     commands: cmds.length,
@@ -515,7 +316,6 @@ export function PluginDetail({
     mcp: conns.length,
     scripts: scripts.length,
     hooks: plugin.hooks?.length ?? 0,
-    bundle: 0,
   }
   const tabLabels: Record<Tab, string> = {
     skills: 'Skills',
@@ -524,18 +324,16 @@ export function PluginDetail({
     mcp: 'Connectors',
     scripts: 'Scripts',
     hooks: 'Hooks',
-    bundle: 'Bundle',
   }
-  const tabs: Tab[] = ['skills', 'commands', 'agents', 'mcp', 'scripts', 'hooks', 'bundle']
+  const tabs: Tab[] = ['skills', 'commands', 'agents', 'mcp', 'scripts', 'hooks']
 
   const body = (
-    <div className="pd-overlay" onMouseDown={onClose}>
+    <div className="pd-overlay">
       <div
         className="pd-panel"
         role="dialog"
         aria-modal="true"
         aria-label={`${plugin.name} details`}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <header className="pd-head">
           <div className="pd-head-title">
@@ -545,9 +343,14 @@ export function PluginDetail({
           </div>
           {/* The census lives in the tab badges below (Skills 24 · Connectors 0
               · Scripts 0); repeating it here was noise. */}
-          <button className="pd-close" onClick={onClose} aria-label="Close">
-            ✕
-          </button>
+          <div className="pd-head-actions">
+            <button className="btn tiny secondary pm-danger" onClick={onDelete}>
+              Delete plugin
+            </button>
+            <button className="pd-close" onClick={onClose} aria-label="Close">
+              ✕
+            </button>
+          </div>
         </header>
 
         <nav className="pd-tabs" role="tablist">
@@ -563,7 +366,7 @@ export function PluginDetail({
               }}
             >
               {tabLabels[t]}
-              {t === 'bundle' ? null : <span className="pd-count">{counts[t]}</span>}
+              <span className="pd-count">{counts[t]}</span>
             </button>
           ))}
         </nav>
@@ -583,62 +386,23 @@ export function PluginDetail({
                 No skills in this bundle — add one with <code>/skill &lt;description&gt;</code>.
               </div>
             ) : (
-              <>
-                {untranslatedSkills().length > 0 ? (
-                  <div className="pd-bulk">
-                    <span className="hint">
-                      {untranslatedSkills().length} skill(s) here have no Persian keywords, so a
-                      Persian request cannot find them.
-                    </span>
-                    <button
-                      type="button"
-                      className="btn tiny"
-                      disabled={bulk || !provider}
-                      onClick={() => void translateAllSkills()}
-                    >
-                      {bulk ? 'Translating…' : `Translate ${untranslatedSkills().length} description(s)`}
-                    </button>
-                  </div>
-                ) : null}
-                {skills.map((row) => {
-                const d = skillState(row)
+              skills.map((row) => {
+                const content = skillBodies[row.name] ?? row.content ?? ''
                 return (
                   <Part
                     key={row.name}
                     name={row.name}
-                    sub={d.description}
+                    sub={row.description}
                     open={open === `skill:${row.name}`}
                     onToggle={() => setOpen(open === `skill:${row.name}` ? '' : `skill:${row.name}`)}
                   >
-                    <MetaFields
-                      description={d.description}
-                      keywords={d.keywords}
-                      onDescription={(v) =>
-                        setSkillDrafts((prev) => ({ ...prev, [row.name]: { ...d, description: v } }))
-                      }
-                      onKeywords={(v) =>
-                        setSkillDrafts((prev) => ({ ...prev, [row.name]: { ...d, keywords: v } }))
-                      }
-                      onTranslate={() =>
-                        void translateOne(row.name, d.description, (phrases) =>
-                          setSkillDrafts((prev) => ({
-                            ...prev,
-                            [row.name]: { ...d, keywords: phrases },
-                          })),
-                        )
-                      }
-                      translating={translating === row.name}
-                    />
                     <label className="pd-field">
                       Skill body
                       <textarea
                         className="system-prompt skill-raw"
-                        value={d.content}
+                        value={content}
                         onChange={(e) =>
-                          setSkillDrafts((prev) => ({
-                            ...prev,
-                            [row.name]: { ...d, content: e.target.value },
-                          }))
+                          setSkillBodies((prev) => ({ ...prev, [row.name]: e.target.value }))
                         }
                         rows={10}
                         dir="auto"
@@ -651,16 +415,14 @@ export function PluginDetail({
                         disabled={busy}
                         onClick={() =>
                           void run(
-                            // `plugin` names the bundle this skill belongs to; the
-                            // body arrives without frontmatter, so description and
-                            // keywords must travel separately or the save would
-                            // rewrite them as empty.
+                            // `plugin` names the bundle this skill belongs to. The
+                            // body arrives without frontmatter and the call names
+                            // NO description or keywords, so the save keeps the
+                            // ones already on disk.
                             () =>
                               syncSkill({
                                 name: row.name,
-                                content: d.content,
-                                description: d.description,
-                                faKeywords: d.keywords,
+                                content,
                                 plugin: plugin.slug,
                               }).then(skillOutcome),
                             'Saved.',
@@ -688,8 +450,7 @@ export function PluginDetail({
                     </div>
                   </Part>
                 )
-              })}
-              </>
+              })
             )
           ) : null}
 
@@ -701,7 +462,6 @@ export function PluginDetail({
               </div>
             ) : (
               conns.map((row) => {
-                const d = connState(row)
                 const cfg = row.cfg ?? {}
                 const where = cfg.command
                   ? [cfg.command, ...(cfg.args ?? [])].join(' ')
@@ -711,31 +471,19 @@ export function PluginDetail({
                     key={row.name}
                     name={row.name}
                     badge={cfg.command ? 'stdio' : cfg.headers ? 'HTTP' : 'SSE'}
-                    sub={d.description || where}
+                    sub={row.description || where}
                     open={open === `mcp:${row.name}`}
                     onToggle={() => setOpen(open === `mcp:${row.name}` ? '' : `mcp:${row.name}`)}
                   >
-                    <MetaFields
-                      description={d.description}
-                      keywords={null}
-                      onDescription={(v) =>
-                        setConnDrafts((prev) => ({ ...prev, [row.name]: { ...d, description: v } }))
-                      }
-                      onKeywords={() => {}}
-                    />
                     <ConnectorForm
                       name={row.name}
                       cfg={cfg}
-                      description={d.description}
-                      keywords={d.keywords}
                       busy={busy}
-                      onSave={(next, nextMeta) =>
+                      onSave={(next) =>
                         void run(
-                          () =>
-                            savePluginConnector(plugin.slug, row.name, next, undefined, {
-                              description: nextMeta.description,
-                              faKeywords: nextMeta.faKeywords,
-                            }),
+                          // No metadata is sent: the bundle manifest keeps the
+                          // description it already has.
+                          () => savePluginConnector(plugin.slug, row.name, next),
                           'Saved.',
                         )
                       }
@@ -830,14 +578,12 @@ export function PluginDetail({
                 No hooks in this bundle. A hook is a shell command under{' '}
                 <code>hooks/hooks.json</code> that runs at a point of a turn (SessionStart,
                 UserPromptSubmit, PreToolUse, PostToolUse, Stop) and may refuse a tool call.
-                Hooks run CODE, so they stay off until you approve them in the Bundle tab.
               </div>
             ) : (
               <>
-                <div className={`pd-hook-state${plugin.hooks_enabled ? ' on' : ''}`}>
-                  {plugin.hooks_enabled
-                    ? 'Hooks are ON for this bundle: every handler below runs during a turn.'
-                    : 'Hooks are OFF. Writing hooks.json is not approval to run it — turn them on in the Bundle tab when you trust this bundle.'}
+                <div className="pd-hook-state on">
+                  These handlers run during a turn while this bundle is enabled — the bundle's own
+                  switch on the Plugins page is what turns them on or off.
                 </div>
                 {plugin.hooks.map((h) => (
                   <div key={`${h.event}:${h.command}`} className="pd-part">
@@ -866,129 +612,34 @@ export function PluginDetail({
                 during a turn when the bundle's skill calls for it.
               </div>
             ) : (
-              scripts.map((row) => {
-                const d = scriptState(row)
-                return (
-                  <Part
-                    key={row.name}
-                    name={row.name}
-                    badge={row.language}
-                    sub={d.description}
-                    open={open === `script:${row.name}`}
-                    onToggle={() => setOpen(open === `script:${row.name}` ? '' : `script:${row.name}`)}
-                  >
-                    <MetaFields
-                      description={d.description}
-                      keywords={null}
-                      onDescription={(v) =>
-                        setScriptDrafts((prev) => ({ ...prev, [row.name]: { ...d, description: v } }))
-                      }
-                      onKeywords={() => {}}
-                    />
-                    <div className="pd-form-actions">
-                      <button
-                        className="btn tiny"
-                        disabled={busy}
-                        onClick={() =>
-                          void run(
-                            // Patching the script's manifest only: the body and
-                            // the language are left exactly as they are on disk.
-                            () =>
-                              savePluginScript(plugin.slug, row.name, {
-                                description: d.description,
-                                faKeywords: d.keywords,
-                              }),
-                            'Saved.',
-                          )
-                        }
-                      >
-                        Save
-                      </button>
-                      <button
-                        className="btn tiny secondary pm-danger"
-                        disabled={busy}
-                        onClick={() => {
-                          if (!window.confirm(`Delete script "${row.name}" from this plugin?`)) return
-                          void run(() => deletePluginScript(plugin.slug, row.name), 'Deleted.')
-                        }}
-                      >
-                        Delete
-                      </button>
-                      <span className="hint">
-                        Code lives in <code>{row.file ?? 'main.rs'}</code> — the assistant runs it
-                        during a turn when the bundle's skill calls for it.
-                      </span>
-                    </div>
-                  </Part>
-                )
-              })
-            )
-          ) : null}
-
-          {tab === 'bundle' ? (
-            <div className="pd-bundle">
-              <MetaFields
-                description={meta.description}
-                keywords={meta.keywords}
-                onDescription={(v) => setMeta((m) => ({ ...m, description: v }))}
-                onKeywords={(v) => setMeta((m) => ({ ...m, keywords: v }))}
-              />
-              <span className="hint">
-                These belong to the WHOLE bundle: the description is what the agent reads when it
-                lists your plugins, and the keywords are the Persian phrases that route an ask to
-                this bundle. A skill that carries none of its own falls back to them, so a library
-                of bare skills is still found.
-              </span>
-              {plugin.hooks?.length ? (
-                <div className={`pd-hook-state${plugin.hooks_enabled ? ' on' : ''}`}>
-                  <span>
-                    This bundle ships {plugin.hooks.length} hook
-                    {plugin.hooks.length === 1 ? '' : 's'} — shell commands that run during a turn
-                    and may refuse a tool call.{' '}
-                    {plugin.hooks_enabled
-                      ? 'They are ON.'
-                      : 'They are OFF: installing a bundle is not permission to run its code.'}
-                  </span>
-                  <button
-                    className="btn tiny"
-                    disabled={busy}
-                    onClick={() =>
-                      void run(
-                        () =>
-                          updatePlugin({
-                            slug: plugin.slug,
-                            hooks_enabled: !plugin.hooks_enabled,
-                          }).then((out) =>
-                            'error' in out ? { error: out.error } : { ok: true as const },
-                          ),
-                        plugin.hooks_enabled ? 'Hooks turned off.' : 'Hooks turned on.',
-                      )
-                    }
-                  >
-                    {plugin.hooks_enabled ? 'Turn hooks off' : 'Turn hooks on'}
-                  </button>
-                </div>
-              ) : null}
-              <div className="pd-form-actions">
-                <button
-                  className="btn tiny"
-                  disabled={busy}
-                  onClick={() =>
-                    void run(
-                      () =>
-                        updatePlugin({
-                          slug: plugin.slug,
-                          description: meta.description,
-                          fa_keywords: meta.keywords,
-                        }).then((out) => ('error' in out ? { error: out.error } : { ok: true as const })),
-                      'Saved.',
-                    )
-                  }
+              scripts.map((row) => (
+                <Part
+                  key={row.name}
+                  name={row.name}
+                  badge={row.language}
+                  sub={row.description}
+                  open={open === `script:${row.name}`}
+                  onToggle={() => setOpen(open === `script:${row.name}` ? '' : `script:${row.name}`)}
                 >
-                  Save
-                </button>
-              </div>
-            </div>
+                  <div className="pd-form-actions">
+                    <button
+                      className="btn tiny secondary pm-danger"
+                      disabled={busy}
+                      onClick={() => {
+                        if (!window.confirm(`Delete script "${row.name}" from this plugin?`)) return
+                        void run(() => deletePluginScript(plugin.slug, row.name), 'Deleted.')
+                      }}
+                    >
+                      Delete
+                    </button>
+                    <span className="hint">
+                      Code lives in <code>{row.file ?? 'main.rs'}</code> — the assistant runs it
+                      during a turn when the bundle's skill calls for it.
+                    </span>
+                  </div>
+                </Part>
+              ))
+            )
           ) : null}
 
           {msg ? <div className="pd-msg">{msg}</div> : null}

@@ -117,9 +117,8 @@ import {
   type CompactUsage,
   type StreamParams,
 } from "../lib/api";
-import { installPlugin, listPlugins, deletePlugin, togglePlugin, listPluginSkills, listPluginCommands } from "../lib/plugins";
+import { installPlugin, installProgress, listPlugins, deletePlugin, togglePlugin, listPluginSkills, listPluginCommands } from "../lib/plugins";
 import type { PluginCommandRow } from "../lib/plugins";
-import { fillKeywordsAfterInstall, fillKeywordsFromToolResult } from "../lib/keywordFill";
 import type { PluginInfo } from "../types";
 import { looksLikeRepoAddress } from "../lib/repoAddress";
 import { forgetPluginCommands } from "../lib/skills";
@@ -299,7 +298,7 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
 ];
 
 /** The argument a sub-command's token expects, and where it lives in the line. */
-type CmdArg = "name" | "repo" | "free";
+type CmdArg = "name" | "repo" | "url" | "free";
 
 /**
  * Permissions the Computer Use card has to report, plus the signing identity
@@ -1503,7 +1502,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const sub = (SUBCOMMANDS[verb] ?? []).find((s) => s.name === (caret.prev[1] ?? ""));
     if (!sub) return [];
     const kind: CmdArg | undefined = caret.index === 2 ? sub.arg : sub.rest;
-    if (!kind || kind === "free") return [];
+    // `url` is an install address typed WHOLE — the value list cannot hold the
+    // address the user is about to paste, so its level opens no menu and Enter
+    // submits the line instead of being swallowed by a row pick.
+    if (!kind || kind === "free" || kind === "url") return [];
     // Schedule tasks list their REAL rows here: the label is the human name
     // (paused marked), the inserted token is the id the update/run/remove
     // executors and the tool call resolve — a name would not survive them.
@@ -5205,20 +5207,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           void ensureSkills();
           void refreshPluginCmds();
         }
-        // A bundle the AGENT wrote (action=create/update/install) is filled from
-        // here, because `/plugin create` hands the job to the model: that write is
-        // only a tool result in the stream, so no other path ever sees it. The
-        // call is fire-and-forget — the write already succeeded, and the model was
-        // told about any bare skills by the tool's own WARNING line.
-        if (event.tool === "plugin") {
-          const action = String((event.args as { action?: unknown } | undefined)?.action ?? "");
-          void fillKeywordsFromToolResult(action, event.result).then((fill) => {
-            if (fill && fill.filled > 0) {
-              invalidateSkillsList();
-              window.dispatchEvent(new CustomEvent("coder:plugins-changed"));
-            }
-          }).catch(() => { });
-        }
       } else if (event.kind === "diff") {
         clearTransientRetry();
         const current = findMsg()?.toolActivity ?? [];
@@ -6429,11 +6417,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           void send(
             `Create a plugin named "${arg}"${rest ? ` from this description: "${rest}"` : ""}. ` +
               `Call the plugin tool with action=create and pass: "name": "${arg}", a one-line ` +
-              `"description", "fa_keywords" (the user's own Persian phrases, comma-separated), ` +
-              `its "skills" (each with name, content and its OWN fa_keywords), and any ` +
-              `"scripts" the description calls for. Scripts are Rust by default — omit ` +
-              `"language" unless the user asked for python, node or bash — and the content ` +
-              `must be a complete, compiling program that prints its result to stdout.`,
+              `"description" saying WHEN the bundle applies (that is what the agent matches ` +
+              `requests against), its "skills" (each with name, content and a short English ` +
+              `"description"), and any "scripts" the description calls for. Scripts are Rust ` +
+              `by default — omit "language" unless the user asked for python, node or bash — ` +
+              `and the content must be a complete, compiling program that prints its result ` +
+              `to stdout.`,
             [],
             [],
             true,
@@ -6448,45 +6437,67 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // The words after the repo are the sub-folder and the ref — exactly the
         // `repo`/`repo_path`/`repo_ref` trio the backend reads.
         const [path, ref] = rest.split(/\s+/).filter(Boolean);
-        const out = await installPlugin({
-          repo: arg,
-          ...(path ? { repo_path: path } : {}),
-          ...(ref ? { repo_ref: ref } : {}),
-        });
-        if ("error" in out) return say(`Plugin install failed: ${out.error}`);
-        invalidateAvailableSkills();
-        cmdArgFetchedAt.current = 0;
-        await ensureCmdArgValues();
-        // A bundle whose skills ship keyword-free is unreachable from a Persian
-        // request, so the phrases are written now. It costs one model call and
-        // only happens when the repo (or its index) carried none — the install
-        // itself already stands, so a failure just amends what is reported.
-        const fill = await fillKeywordsAfterInstall(out.slug);
-        if (fill.filled > 0) {
+        // NOTHING here may die silently: the caller `void`s this function, so a
+        // rejection renders as "nothing happened" — the reported bug.
+        //
+        // The feedback is ONE bubble that MORPHS: it lands the moment Enter does
+        // (⏳), a poll of the sidecar's install-progress turns it into a live
+        // bar while the files download, and it ends as ✓ (or ✗ + the error). A
+        // silent two-minute request read as "nothing happened", and dumping the
+        // whole part-name lists afterwards was noise nobody reads.
+        const status = ch
+          ? s.addMessage(ch.id, { role: "assistant", content: "⏳ Installing…" })
+          : null;
+        const update = (content: string) => {
+          if (status) useStore.getState().updateMessage(status.id, { content });
+        };
+        try {
+          const poll = setInterval(async () => {
+            const p = await installProgress();
+            if (!p || p.phase === "idle") return;
+            const label =
+              p.phase === "listing"
+                ? "Reading the repo…"
+                : p.phase === "writing"
+                  ? "Writing the bundle…"
+                  : "Downloading files";
+            if (p.phase !== "reading" || p.total === 0) {
+              update(`⏳ ${label}`);
+              return;
+            }
+            const pct = Math.round((p.done / p.total) * 100);
+            const filled = Math.round((pct / 100) * 20);
+            const bar = "▮".repeat(filled) + "▯".repeat(20 - filled);
+            update(`⏳ ${label}\n${bar} ${p.done}/${p.total} (${pct}%)`);
+          }, 400);
+          const out = await installPlugin({
+            repo: arg,
+            ...(path ? { repo_path: path } : {}),
+            ...(ref ? { repo_ref: ref } : {}),
+          }).finally(() => clearInterval(poll));
+          if ("error" in out) {
+            update(`✗ Plugin install failed: ${out.error}`);
+            return true;
+          }
           invalidateAvailableSkills();
           cmdArgFetchedAt.current = 0;
           await ensureCmdArgValues();
+          // The ✓ line is the receipt, not a report: counts only, and hooks are
+          // flagged as running with the bundle so nobody is surprised by them.
+          update(
+            `✓ Plugin **${out.plugin?.name ?? out.slug}** ${out.installed} — ` +
+              `${(out.skills ?? []).length} skills · ${(out.commands ?? []).length} commands · ` +
+              `${(out.agents ?? []).length} sub-agents · ${(out.hooks ?? []).length} hooks · ` +
+              `${(out.mcp ?? []).length} connectors · ${(out.scripts ?? []).length} scripts` +
+              ((out.hooks ?? []).length ? " (hooks run while the bundle is enabled)" : ""),
+          );
+          return true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (status) update(`✗ Plugin install failed: ${msg}`);
+          else return say(`✗ Plugin install failed: ${msg}`);
+          return true;
         }
-        return say(
-          `Plugin **${out.plugin?.name ?? out.slug}** ${out.installed}.\n` +
-            `Skills: ${(out.skills ?? []).join(", ") || "none"}\n` +
-            `Connectors: ${(out.mcp ?? []).join(", ") || "none"}\n` +
-            `Commands: ${(out.commands ?? []).join(", ") || "none"}\n` +
-            `Sub-agents: ${(out.agents ?? []).join(", ") || "none"}\n` +
-            // Hooks are the one part that lands INERT: saying so here is what
-            // stops a user from thinking a bundle's guards are already running.
-            `Hooks: ${
-              (out.hooks ?? []).length
-                ? `${(out.hooks ?? []).length} (OFF until you approve them in Settings → Plugins)`
-                : "none"
-            }\n` +
-            `Scripts: ${(out.scripts ?? []).join(", ") || "none"}` +
-            (fill.filled > 0
-              ? `\nPersian keywords filled for ${fill.filled} skill(s).`
-              : fill.error
-                ? `\nPersian keywords not filled: ${fill.error}`
-                : ""),
-        );
       }
       if (sub === "update" && arg) {
         if (!ch) return say(`Open a chat to edit plugin \`${arg}\`.`);
@@ -6525,7 +6536,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         void send(
           `Edit the existing plugin "${arg}": ${rest}. Call the plugin tool with ` +
             `action=list first to read that bundle's CURRENT manifest (description, ` +
-            `version, fa_keywords, skills, scripts, mcp), then action=update with the ` +
+            `version, skills, scripts, mcp), then action=update with the ` +
             `SAME slug and send ONLY the fields that change — an omitted field keeps ` +
             `its stored value, so never resend what you did not touch. To edit one ` +
             `skill send that skill's name with its new content; to rename a skill or ` +
@@ -6841,7 +6852,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     subs
                       .map(
                         (x) =>
-                          `  - \`/${c.name} ${x.name}${x.arg === "free" ? "" : x.arg === "repo" ? " <repo> [path] [ref]" : " <name>"}\` — ${x.hint}`,
+                          `  - \`/${c.name} ${x.name}${x.arg === "free" ? "" : x.arg === "repo" || x.arg === "url" ? " <repo> [path] [ref]" : " <name>"}\` — ${x.hint}`,
                       )
                       .join("\n")
                   : "";
@@ -6893,7 +6904,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 ? `Install a skill from this repo: "${first}"${path ? `, sub-folder "${path}"` : ""}${ref ? `, ref "${ref}"` : ""}. Call create_skill with "repo"${path ? `, "repo_path": "${path}"` : ""}${ref ? `, "repo_ref": "${ref}"` : ""} and let it read the SKILL.md itself instead of writing the instructions from memory.`
                 : `Install an MCP connector bundle from this repo: "${first}"${path ? `, sub-folder "${path}"` : ""}${ref ? `, ref "${ref}"` : ""}. Read its manifest and call create_mcp with the connector's own name plus its command/args (or url) so it is saved like any other connector.`
               : target === "skill"
-                ? `Create a skill named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_skill with "name": "${first}", one short ENGLISH "description" saying WHEN to use it, "fa_keywords" (the user's own Persian phrases, comma-separated), and the instructions themselves as "content". Do not pass "repo" — there is no repository here, the skill is written from scratch.`
+                ? `Create a skill named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_skill with "name": "${first}", one short ENGLISH "description" saying WHEN to use it (that is what the agent matches requests against), and the instructions themselves as "content". Do not pass "repo" — there is no repository here, the skill is written from scratch.`
                 : `Create an MCP connector named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_mcp with that same "name" plus EITHER "command" (+ "args"/"env") for a stdio server OR "url" for an HTTP one, so it is saved like any other connector.`;
             void send(
               prompt,
@@ -6929,7 +6940,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             });
             void send(
               target === "skill"
-                ? `Edit the existing skill "${name}": ${change}.${current} Write it back with create_skill using the SAME name so it is overwritten instead of duplicated, keeping BOTH frontmatter fields ("description" in English and "fa_keywords" as comma-separated Persian phrases).`
+                ? `Edit the existing skill "${name}": ${change}.${current} Write it back with create_skill using the SAME name so it is overwritten instead of duplicated, keeping its frontmatter ("description" in English — it is what the agent matches requests against).`
                 : `Edit the existing MCP connector "${name}": ${change}.${current} Call create_mcp with the SAME name to overwrite it in place (or previous_name when it must be renamed).`,
               [],
               [],
@@ -7004,7 +7015,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         void send(
           target === "skill"
-            ? `Create a new skill or edit an existing one from this description: "${body}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass BOTH frontmatter fields, in ENGLISH and PERSIAN: "description" — ONE short line of English saying WHEN to use this skill — and "fa_keywords" — the user's own Persian phrases for when it applies (comma-separated, e.g. "ترجمه کن, translate this"). Without them the skill shows up with no description and cannot be found by a Persian request. When EDITING an existing skill, always send BOTH fields again (read them from the current skill with load_skill first) — omitting one keeps the old value but never leave them out on purpose. If the user gives a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), pass it as "repo" (with "repo_path" for a sub-folder and "repo_ref" for a branch) and let create_skill read the SKILL.md itself instead of writing the instructions from memory. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
+            ? `Create a new skill or edit an existing one from this description: "${body}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass "description" — ONE short line of English saying WHEN to use this skill; the agent picks skills by matching the request against that description, so an English description serves Persian requests too. When EDITING an existing skill, send the description again (read it from the current skill with load_skill first) — omitting it keeps the old value. If the user gives a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), pass it as "repo" (with "repo_path" for a sub-folder and "repo_ref" for a branch) and let create_skill read the SKILL.md itself instead of writing the instructions from memory. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
             : `Create a new MCP connector or edit an existing one from this description: "${body}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
           [],
           [],
@@ -7065,7 +7076,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           ...(ch.mode ? { mode: ch.mode } : {}),
         });
         const prompts: Record<string, string> = {
-          "/plugin": `Create or edit a plugin from this description: "${desc}". A plugin is a folder bundling skills, MCP connectors AND runnable scripts so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. If instead they NAMED a plugin they want made (a bare word, not a repo address), use action=create with that name. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug and pass "fa_keywords" (the Persian phrases the WHOLE bundle answers to, comma-separated) plus the skills (name + content + description + fa_keywords in English AND Persian), the mcp map, and any "scripts" the description calls for. SCRIPTS ARE RUST BY DEFAULT: leave "language" out unless the user explicitly asked for python, node or bash, and write a complete, compiling program that prints its result to stdout (arguments arrive in std::env::args()). Run one later with action=run. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
+          "/plugin": `Create or edit a plugin from this description: "${desc}". A plugin is a folder bundling skills, MCP connectors AND runnable scripts so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. If instead they NAMED a plugin they want made (a bare word, not a repo address), use action=create with that name. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug, a one-line English "description" saying WHEN the bundle applies (the agent matches requests against it), the skills (name + content + a short English description each), the mcp map, and any "scripts" the description calls for. SCRIPTS ARE RUST BY DEFAULT: leave "language" out unless the user explicitly asked for python, node or bash, and write a complete, compiling program that prints its result to stdout (arguments arrive in std::env::args()). Run one later with action=run. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
           "/artifact": `Build an artifact from this description: "${desc}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
           "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field cron in the machine's LOCAL time (empty = run once), the workspace root, mode,${flagLine ? " and pass these exact arrays: " + flagLine + "." : " and the skills/mcp_servers/plugins the run needs."} To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
         };
@@ -9490,8 +9501,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // to its declared `rest` — none for `update`, so after the NAME is picked
     // the palette must CLOSE instead of sitting on an empty
     // "No matching commands" box (the change text is typed freely there).
+    // `url` closes too: an install address is typed or pasted WHOLE — a list of
+    // known repos has nothing to offer over it, and an open palette would eat
+    // the Enter that submits the line (the reported "nothing happens").
     const argLevel =
-      (caret.index === 2 && !!subDecl && subDecl.arg !== "free") ||
+      (caret.index === 2 &&
+        !!subDecl &&
+        (subDecl.arg === "name" || subDecl.arg === "repo")) ||
       (caret.index >= 3 && !!subDecl && !!subDecl.rest && subDecl.rest !== "free");
     const known =
       caret.index === 0 || hasSubCommands || flagLevel || argLevel;

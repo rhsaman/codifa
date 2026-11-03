@@ -7,10 +7,9 @@
 //
 // What SSR can prove is the page's SHELL — the dialog is modal and labelled,
 // every room has an empty state, so a bare bundle is never a blank panel.
-// The page now has seven rooms — Skills, Commands, Sub-agents, Connectors,
-// Scripts, Hooks, Bundle — because a Claude Code bundle can be made of any of
-// them. Bundle is the manifest view, so it carries no count badge (6 of 7).
-// instead of a blank panel. The part rows themselves arrive from the backend
+// The page has six rooms — Skills, Commands, Sub-agents, Connectors,
+// Scripts, Hooks — because a Claude Code bundle can be made of any of
+// them. instead of a blank panel. The part rows themselves arrive from the backend
 // `/plugins/skills|mcp|scripts` calls inside an effect, so they are not in this
 // render; the live click-through is what covers those.
 //
@@ -75,7 +74,7 @@ const plugin = {
 console.log('1) The page renders as a dialog on a tab of its own:')
 {
   const html = renderToStaticMarkup(
-    h(PluginDetail, { plugin, onClose: () => {}, onChanged: () => {} }),
+    h(PluginDetail, { plugin, onClose: () => {}, onChanged: () => {}, onDelete: () => {} }),
   )
   check('it is a modal dialog', html.includes('aria-modal="true"'))
   check('it is labelled with the plugin', html.includes('aria-label="Demo bundle details"'))
@@ -88,8 +87,9 @@ console.log('1) The page renders as a dialog on a tab of its own:')
       html.includes('>Connectors<') &&
       html.includes('>Scripts<') &&
       html.includes('>Hooks<') &&
-      html.includes('>Bundle<'),
+      !html.includes('>Bundle<'),
   )
+  check('the whole-bundle delete is on the page', html.includes('Delete plugin'))
 }
 
 console.log('2) An empty bundle says so instead of rendering a blank room:')
@@ -99,6 +99,7 @@ console.log('2) An empty bundle says so instead of rendering a blank room:')
       plugin: { name: 'Empty', slug: 'empty', enabled: false },
       onClose: () => {},
       onChanged: () => {},
+      onDelete: () => {},
     }),
   )
   check('the off state is badged', html.includes('pd-badge--off'))
@@ -108,7 +109,7 @@ console.log('2) An empty bundle says so instead of rendering a blank room:')
 console.log('3) The way out is on the page, not only via Escape:')
 {
   const html = renderToStaticMarkup(
-    h(PluginDetail, { plugin, onClose: () => {}, onChanged: () => {} }),
+    h(PluginDetail, { plugin, onClose: () => {}, onChanged: () => {}, onDelete: () => {} }),
   )
   // The rows themselves come from the backend lists, so they only exist after
   // the effect runs — an SSR render cannot show them. What it CAN show is the
@@ -117,13 +118,13 @@ console.log('3) The way out is on the page, not only via Escape:')
   // user is never stuck on a page with no way back).
   check('the close button is labelled', html.includes('aria-label="Close"'))
   check('the tab strip is a tablist', html.includes('role="tablist"'))
-  check('each tab is selectable', (html.match(/role="tab"/g) ?? []).length === 7)
+  check('each tab is selectable', (html.match(/role="tab"/g) ?? []).length === 6)
 }
 
 console.log('4) Every room has an empty state, so a bare bundle is never a blank panel:')
 {
   const html = renderToStaticMarkup(
-    h(PluginDetail, { plugin, onClose: () => {}, onChanged: () => {} }),
+    h(PluginDetail, { plugin, onClose: () => {}, onChanged: () => {}, onDelete: () => {} }),
   )
   // SSR has no backend, so every room renders its empty state — which is
   // exactly the state a brand-new plugin is in, and the one users hit first.

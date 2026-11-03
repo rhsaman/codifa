@@ -754,8 +754,9 @@ export function ReviewPanel(props?: {
       style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* اسکریم نرم — کلیک بیرون پنل می‌بندد (مثل حالت مطالعه). */}
-      {!docked && <div className="review-scrim" aria-hidden="true" onClick={close} />}
+      {/* اسکریم نرم — فقط کلیک‌های پشت پنل را می‌گیرد؛ بستن با دکمه ✕ (کلیک
+          بیرون پنل عمداً نمی‌بندد). */}
+      {!docked && <div className="review-scrim" aria-hidden="true" />}
       {/* دستگیره‌ی درگ لبه — تغییرعرض مثل مطالعه (در فول‌اسکرین مخفی). */}
       {!docked && !fullscreen && (
         <div

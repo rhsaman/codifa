@@ -23,8 +23,11 @@ export const MAX_COMMAND_USAGE = 20
  *           making the user recall a slug.
  *  `repo` — a git repo reference (`owner/repo`, a URL, or a local path), with the
  *           tokens after it being the sub-folder and the branch.
+ *  `url`  — the same reference, typed FREE: the address is one the value list
+ *           cannot know (a GitHub URL pasted whole), so no menu opens over it
+ *           and Enter submits the line instead of offering rows.
  *  `free` — prose the model reads; nothing to complete. */
-export type ArgKind = 'name' | 'repo' | 'free'
+export type ArgKind = 'name' | 'repo' | 'url' | 'free'
 
 /** One sub-command of a slash command. */
 export interface SubCommand {
@@ -44,7 +47,7 @@ export interface SubCommand {
 export const SUBCOMMANDS: Record<string, SubCommand[]> = {
   plugin: [
     { name: 'list', hint: 'List installed bundles', arg: 'free' },
-    { name: 'install', hint: 'Install a bundle from a repo', arg: 'repo', rest: 'free' },
+    { name: 'install', hint: 'Install a bundle from a repo', arg: 'url', rest: 'free' },
     { name: 'create', hint: 'Create a bundle from a description', arg: 'free' },
     { name: 'update', hint: 'Edit a bundle (skills, commands, agents, hooks, scripts)', arg: 'name' },
     { name: 'on', hint: 'Switch a bundle on', arg: 'name' },
@@ -53,7 +56,7 @@ export const SUBCOMMANDS: Record<string, SubCommand[]> = {
   ],
   skill: [
     { name: 'list', hint: 'List every installed skill', arg: 'free' },
-    { name: 'install', hint: 'Install a skill from a repo', arg: 'repo', rest: 'free' },
+    { name: 'install', hint: 'Install a skill from a repo', arg: 'url', rest: 'free' },
     { name: 'create', hint: 'Create a skill from a description', arg: 'free' },
     { name: 'update', hint: 'Edit an existing skill', arg: 'name' },
     { name: 'remove', hint: 'Delete a skill', arg: 'name' },
@@ -63,7 +66,7 @@ export const SUBCOMMANDS: Record<string, SubCommand[]> = {
     // `install` was already implemented in the dispatcher but missing from this
     // table, so the menu could not offer it and `/help` hid it — a path only a
     // user who already knew the word could reach.
-    { name: 'install', hint: 'Install a connector bundle from a repo', arg: 'repo', rest: 'free' },
+    { name: 'install', hint: 'Install a connector bundle from a repo', arg: 'url', rest: 'free' },
     { name: 'create', hint: 'Create a connector from a description', arg: 'free' },
     { name: 'update', hint: 'Edit an existing connector', arg: 'name' },
     { name: 'remove', hint: 'Delete a connector', arg: 'name' },

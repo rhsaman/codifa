@@ -171,8 +171,8 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="search-overlay" onMouseDown={onClose}>
-      <div className="search-pop" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="search-overlay">
+      <div className="search-pop">
         <div className="search-input-row">
           <span className="search-glyph">
             {query.mode === 'grep' ? '⌕' : '⌘'}
@@ -190,6 +190,14 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
             onKeyDown={onKeyDown}
           />
           <span className="search-mode-badge">{query.mode === 'grep' ? 'content' : 'files'}</span>
+          <button
+            className="search-close"
+            onClick={onClose}
+            title="Close (Esc)"
+            aria-label="Close search"
+          >
+            ✕
+          </button>
         </div>
         <div className="search-results" ref={resultsRef}>
           {!root && <div className="search-empty">No workspace open (⌘O)</div>}

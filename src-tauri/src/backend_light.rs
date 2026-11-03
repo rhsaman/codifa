@@ -823,6 +823,18 @@ async fn plugins_install(State(st): State<AppState>, Json(body): Json<Value>) ->
     }
 }
 
+/// Live install progress for the chat's progress bubble. One slot the install
+/// writes as it moves (`listing` → `reading done/total` → `writing`), read as
+/// often as the renderer likes — a poll, because the install itself is one
+/// blocking POST with no stream to attach to.
+async fn plugins_install_progress() -> Response<Body> {
+    Json(match crate::repo::install_progress_now() {
+        Some((phase, done, total)) => json!({ "phase": phase, "done": done, "total": total }),
+        None => json!({ "phase": "idle" }),
+    })
+    .into_response()
+}
+
 /// Latest saved body of one artifact — the preview tab reads it after a restart
 /// (the transcript only carries the card's id/title/kind/content).
 async fn artifact_get(State(st): State<AppState>, Query(q): Query<ArtifactQuery>) -> Response<Body> {
@@ -2580,6 +2592,17 @@ async fn browser_devtools_url(Query(q): Query<HashMap<String, String>>) -> Respo
     off(move || crate::browser::devtools_url(&chat)).await
 }
 
+/// Import pasted session cookies into the shared browser profile ("log in
+/// once in the user's real browser, keep the session inside the app") — the
+/// path for sites whose server-side bot defense rejects every login form the
+/// automation browser submits, Instagram above all.
+async fn browser_cookies_import(Json(body): Json<Value>) -> Response<Body> {
+    let chat = chat_id_of(&body, &HashMap::new());
+    let domain = body["domain"].as_str().unwrap_or_default().to_string();
+    let text = body["text"].as_str().unwrap_or_default().to_string();
+    off(move || crate::browser::import_cookies(&chat, &domain, &text)).await
+}
+
 async fn browser_close(Json(body): Json<Value>) -> Response<Body> {
     let chat = chat_id_of(&body, &HashMap::new());
     off(move || crate::browser::close(&chat)).await
@@ -2638,6 +2661,10 @@ pub fn router(state: AppState) -> Router {
         // the `plugin` tool, which goes through the same module.
         .route("/plugins", get(plugins_list))
         .route("/plugins/marketplace", get(plugins_marketplace))
+        // Live progress of the install in flight: the chat's progress bubble
+        // polls this while the blocking `POST /plugins/install` runs, so the
+        // user sees the install move instead of a silent request.
+        .route("/plugins/install-progress", get(plugins_install_progress))
         .route("/plugins/create", post(plugins_create))
         .route("/plugins/install", post(plugins_install))
         .route("/plugins/update", post(plugins_update))
@@ -2714,13 +2741,6 @@ pub fn router(state: AppState) -> Router {
         // polls the list for the active chat and posts a Stop here.
         .route("/agent-terminals", get(agent_terminals_list))
         .route("/agent-terminals/stop", post(agent_terminals_stop))
-        // Persian trigger phrases for a part's English description. The catalog
-        // matches on keywords, so a skill whose description is English-only is
-        // unreachable from a Persian request until someone writes them down.
-        .route(
-            "/plugins/keywords",
-            post(crate::appstate::persian_keywords),
-        )
         // In-app browser (migrated from the Python sidecar's browser_session):
         // the right-side panel polls frames and posts input here, while the
         // agent drives the same Chromium through the native `browser_driver`.
@@ -2741,6 +2761,7 @@ pub fn router(state: AppState) -> Router {
         .route("/browser/history", post(browser_history))
         .route("/browser/search", post(browser_search))
         .route("/browser/devtools-url", get(browser_devtools_url))
+        .route("/browser/cookies/import", post(browser_cookies_import))
         .route("/browser/close", post(browser_close))
         // Native /doc/read (port of backend/doc_tools.py): text extraction and
         // styled-HTML rendering for the file viewer. Registered natively so the

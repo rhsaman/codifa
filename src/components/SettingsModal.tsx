@@ -15,9 +15,7 @@ import {
   marketKey,
   subscribeInstallChanges,
   togglePlugin,
-  updatePlugin,
 } from '../lib/plugins'
-import { fillKeywordsAfterInstall } from '../lib/keywordFill'
 import { paginate, PAGE_SIZE } from '../lib/paging'
 import { useInfiniteGrid } from '../lib/useInfiniteGrid'
 import type { MarketplaceEntry, MarketplaceIndex, PluginConnectorRow } from '../lib/plugins'
@@ -509,9 +507,8 @@ function MarketplaceEditor() {
       // manifest becomes a single-skill bundle, a connector-only row a
       // single-connector one, and a real bundle stays a bundle — so every row
       // lands somewhere a user can switch it on and off.
-      // Passed through so an English-only bundle still lands with Persian
-      // trigger phrases: the backend seeds fa_keywords from the category when
-      // neither the repo nor a previous install carries any.
+      // Recorded in the manifest, so an update re-installs from the same
+      // category the row advertised.
       ...(entry.category ? { category: entry.category } : {}),
       ...(entry.description ? { description: entry.description } : {}),
     })
@@ -519,13 +516,9 @@ function MarketplaceEditor() {
       setError(`${entry.name}: ${out.error}`)
       return
     }
-    const keywords = (out.plugin?.fa_keywords ?? []).length
     setNote(
       `${out.installed === 'updated' ? 'Updated' : 'Installed'} ${out.plugin?.name ?? entry.name} — ` +
-        `${(out.skills ?? []).length} skills, ${(out.mcp ?? []).length} connectors` +
-        (keywords === 0
-          ? '. The Persian phrases for its skills are being written from their descriptions.'
-          : `, ${keywords} Persian keywords.`),
+        `${(out.skills ?? []).length} skills, ${(out.mcp ?? []).length} connectors.`,
     )
     void refreshInstalled()
     invalidateSkillsList()
@@ -540,23 +533,6 @@ function MarketplaceEditor() {
     if ((out.mcp ?? []).length > 0) void listMcp().then((db) => {
       useStore.getState().setMcpServers(db.mcpServers ?? {})
     }).catch(() => { })
-    // A bundle whose skills shipped keyword-free is unreachable from a Persian
-    // request, so the phrases are written now instead of waiting for its owner
-    // to find the detail page. Fire-and-forget: the install already succeeded,
-    // and a failed translation only amends the note.
-    void fillKeywordsAfterInstall(out.slug).then((fill) => {
-      if (fill.total === 0) return
-      if (fill.error) {
-        setNote((prev) => `${prev} Keywords were not filled: ${fill.error}`)
-        return
-      }
-      if (fill.filled > 0) {
-        invalidateSkillsList()
-        invalidateAvailableSkills()
-        window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
-        setNote((prev) => `${prev} Filled Persian keywords for ${fill.filled} skill(s).`)
-      }
-    })
   }
 
   const installedKeys = new Set(
@@ -824,9 +800,6 @@ function PluginBundleEditor() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('')
   const [pluginFilter, setPluginFilter] = useState('')
-  /** Outcome of the last update's keyword fill — the update itself already
-   *  stands, so this is a note and never an error. */
-  const [note, setNote] = useState('')
   // The one skill knob that is NOT per bundle: how much of the whole catalog
   // rides in every prompt. It sits ABOVE the grid because it scales the whole
   // page's content, not any one bundle.
@@ -847,8 +820,6 @@ function PluginBundleEditor() {
   const grid = useInfiniteGrid(filteredPlugins.length, `plugins:${pluginFilter}`)
   const visiblePlugins = filteredPlugins.slice(0, grid.visible)
 
-  const [draftDesc, setDraftDesc] = useState<Record<string, string>>({})
-  const [draftKeywords, setDraftKeywords] = useState<Record<string, string>>({})
   /** The bundle whose detail page is open — `null` keeps the grid on screen. */
   const [detail, setDetail] = useState<PluginInfo | null>(null)
 
@@ -900,25 +871,6 @@ function PluginBundleEditor() {
     }
   }
 
-  /** Save the two editable manifest fields of one plugin. An empty keyword field
-   *  clears them (the backend drops an empty list), which is how a user removes
-   *  an inherited trigger they do not want. */
-  const saveMeta = async (p: PluginInfo, name: string, description: string) => {
-    setBusy(p.slug)
-    const out = await updatePlugin({
-      slug: p.slug,
-      name: name.trim() || p.name,
-      description,
-      fa_keywords: draftKeywords[p.slug] ?? p.fa_keywords ?? [],
-    })
-    setBusy('')
-    if ('error' in out) setError(out.error)
-    else {
-      setError('')
-      setPlugins((cur) => (cur ?? []).map((x) => (x.slug === out.slug ? out : x)))
-    }
-  }
-
   /** Re-read the bundle from the repo it was installed from.
    *
    *  The address is the one recorded at install time — the same three arguments
@@ -938,31 +890,12 @@ function PluginBundleEditor() {
       return
     }
     setError('')
-    setNote('')
     await refresh()
     // A refresh can add, rename or drop skills, so the composer's command list
     // and every skill cache have to be rebuilt — same as a fresh install.
     invalidateSkillsList()
     invalidateAvailableSkills()
     window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
-    // Skills an update added (or that the source still ships keyword-free) get
-    // their Persian phrases here, exactly like a fresh install.
-    void fillKeywordsAfterInstall(out.slug).then((fill) => {
-      if (fill.filled > 0) {
-        invalidateSkillsList()
-        invalidateAvailableSkills()
-        window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
-      }
-      // Never swallowed: the update itself stands, but a silent failure would
-      // leave the bundle unreachable from a Persian request with no clue why.
-      setNote(
-        fill.filled > 0
-          ? `Persian keywords filled for ${fill.filled} skill(s).`
-          : fill.error
-            ? `Persian keywords not filled: ${fill.error}`
-            : '',
-      )
-    })
   }
 
   return (
@@ -1006,14 +939,13 @@ function PluginBundleEditor() {
         </div>
       </div>
       {error ? <div className="hint error-text">{error}</div> : null}
-      {note ? <div className="hint">{note}</div> : null}
       {plugins !== null && plugins.length > 12 ? (
         <div className="settings-search">
           <input
             type="search"
             value={pluginFilter}
             onChange={(e) => setPluginFilter(e.target.value)}
-            placeholder="Search plugins, skills, keywords…"
+            placeholder="Search plugins…"
             dir="ltr"
           />
         </div>
@@ -1064,13 +996,22 @@ function PluginBundleEditor() {
                 </div>
               </div>
               {p.description ? <div className="pm-card-desc">{p.description}</div> : null}
-              {/* The one-glance census of this bundle: how much of each part it
-                  carries. A zero is information too — it says this bundle has
-                  no connectors, so the model gets no MCP tools from it. */}
+              {/* The one-glance census of this bundle: how much of EACH part it
+                  carries — the same six the detail page tabs break down. A zero
+                  is information too: it says this bundle brings no connectors,
+                  so the model gets no MCP tools from it. */}
               <div className="pm-meta">
                 <span className="pm-meta-item">
                   <b>{(p.skills ?? []).length}</b>
                   {(p.skills ?? []).length === 1 ? 'skill' : 'skills'}
+                </span>
+                <span className="pm-meta-item">
+                  <b>{(p.commands ?? []).length}</b>
+                  cmd
+                </span>
+                <span className="pm-meta-item">
+                  <b>{(p.agents ?? []).length}</b>
+                  {(p.agents ?? []).length === 1 ? 'agent' : 'agents'}
                 </span>
                 <span className="pm-meta-item">
                   <b>{(p.mcp ?? []).length}</b>
@@ -1080,13 +1021,15 @@ function PluginBundleEditor() {
                   <b>{(p.scripts ?? []).length}</b>
                   {(p.scripts ?? []).length === 1 ? 'script' : 'scripts'}
                 </span>
+                <span className="pm-meta-item">
+                  <b>{(p.hooks ?? []).length}</b>
+                  {(p.hooks ?? []).length === 1 ? 'hook' : 'hooks'}
+                </span>
               </div>
-              {/* One way in, not an expander: what a bundle CONTAINS — its
-                  skills, connectors and scripts with their descriptions and
-                  Persian keywords — is a page of its own. An inline `<details>`
-                  turned the grid card into a column three screens tall. The
-                  census row above already carries the counts, so this row is
-                  only the action. */}
+              {/* One way in, not an expander: what a bundle CONTAINS is a page
+                  of its own — an inline `<details>` turned the grid card into a
+                  column three screens tall. The census row above already carries
+                  the counts, so this row is only the action. */}
               <button
                 type="button"
                 className="pm-card-open"
@@ -1094,9 +1037,16 @@ function PluginBundleEditor() {
               >
                 <span>View details</span>
                 <span className="pm-card-open-hint">
-                  {(p.skills ?? []).length + (p.mcp ?? []).length + (p.scripts ?? []).length === 1
-                    ? '1 item'
-                    : `${(p.skills ?? []).length + (p.mcp ?? []).length + (p.scripts ?? []).length} items`}
+                  {(() => {
+                    const n =
+                      (p.skills ?? []).length +
+                      (p.commands ?? []).length +
+                      (p.agents ?? []).length +
+                      (p.mcp ?? []).length +
+                      (p.scripts ?? []).length +
+                      (p.hooks ?? []).length
+                    return n === 1 ? '1 item' : `${n} items`
+                  })()}
                 </span>
                 <span className="pd-chevron" aria-hidden="true">
                   ▶
@@ -1118,6 +1068,11 @@ function PluginBundleEditor() {
           plugin={detail}
           onClose={() => setDetail(null)}
           onChanged={refresh}
+          onDelete={() => {
+            const target = detail
+            setDetail(null)
+            if (target) void remove(target)
+          }}
         />
       ) : null}
     </div>
@@ -2728,8 +2683,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   }
 
   return (
-    <div className="modal-overlay" onMouseDown={onClose}>
-      <div className="modal modal-wide settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="modal-overlay">
+      <div className="modal modal-wide settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
         <div className="settings-header">
           <div className="settings-header-title">
             <h2>Settings</h2>

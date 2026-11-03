@@ -88,7 +88,7 @@ import { supportsReasoning } from './thinking'
 import { TOOL_FALLBACK_SLOTS as TOOL_SLOT_KEYS, toolFallbackEntries, withOtherSlotsFilled } from './toolSlots'
 import { normalizeToolActivity } from './toolActivity'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
-import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
+import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, loadSavedChatTree, normalizeTree, openBeside, persistChatTree, persistSavedChatTree, removeChat, resizePair, restoreMultiTree, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -1628,6 +1628,11 @@ interface State {
   moveChatTab: (fromId: string, toId: string, after?: boolean) => void
   /** Show a chat as a stacked window (adds to visibleChatIds + focuses). */
   openInWindow: (id: string) => void
+  /** Single/multi window toggle (tab-bar button next to +): multi collapses
+   *  to one window showing the focused chat (the split layout is stashed for
+   *  restore, tabs stay open); single expands every open tab back into
+   *  windows (stashed layout first). */
+  toggleChatWindows: () => void
   /** Hide a window without deleting the chat (focus moves to neighbor). */
   closeWindow: (id: string) => void
   /** Focus a visible window (sets activeChatId, keeps other windows). */
@@ -4033,6 +4038,42 @@ export const useStore = create<State>((set, get) => ({
         chatLayout: mirrors.chatLayout,
         chatTree,
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
+      }
+    })
+    persistSoon()
+  },
+
+  toggleChatWindows: () => {
+    set((s) => {
+      const treeIds = s.chatTree ? collectChatIds(s.chatTree) : []
+      const visibleIds = treeIds.length > 0 ? treeIds : s.visibleChatIds
+      if (visibleIds.length > 1) {
+        // Collapse: stash the split layout (nested dirs + per-window sizes, so
+        // expand restores every pane in place at the same size) and keep only
+        // the focused window. Tabs stay open.
+        const activeChatId =
+          s.activeChatId && visibleIds.includes(s.activeChatId)
+            ? s.activeChatId
+            : visibleIds[visibleIds.length - 1] ?? ''
+        if (!activeChatId) return {}
+        persistSavedChatTree(s.chatTree ?? buildFromList(visibleIds, treeDirFromLayout(s.chatLayout)))
+        persistVisibleChats([activeChatId])
+        persistChatTree(null)
+        persistWindowSizes({})
+        return { chatTree: null, visibleChatIds: [activeChatId], chatWindowSizes: {}, activeChatId }
+      }
+      // Expand: bring back the previously open windows exactly as they were
+      // (saved tree keeps positions and sizes), then add any tab opened while
+      // single beside the focused one.
+      const validIds = new Set(s.chats.map((c) => c.id))
+      const chatTree = restoreMultiTree(loadSavedChatTree(), s.openChatIds, validIds, s.activeChatId, treeDirFromLayout(s.chatLayout))
+      if (!chatTree) return {}
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      return {
+        chatTree,
+        visibleChatIds: mirrors.visibleChatIds,
+        chatWindowSizes: mirrors.chatWindowSizes,
+        chatLayout: mirrors.chatLayout,
       }
     })
     persistSoon()

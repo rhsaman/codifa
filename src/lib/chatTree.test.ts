@@ -20,6 +20,7 @@ import {
   removeChat,
   replaceChat,
   resizePair,
+  restoreMultiTree,
   setNodeSize,
   resolveLeafPos,
   shouldShowNestedGhost,
@@ -277,6 +278,42 @@ console.log("17) flex weights — a split always covers its whole track:");
   check("relative sizes kept when scaled", Math.abs(uneven[0] / uneven[1] - 0.3 / 0.4) < 1e-9 && Math.abs(sum(uneven) - 1) < 1e-9);
   check("lone child claims the track", JSON.stringify(flexWeights([0.25])) === JSON.stringify([1]));
   check("degenerate sizes fall back to equal", JSON.stringify(flexWeights([0, 0])) === JSON.stringify([1, 1]));
+}
+
+console.log("18) restoreMultiTree — single/multi window toggle expand path:");
+{
+  // A saved nested layout: row [a (size 2), col [b, c (size 0.5)]]
+  const saved = makeSplit("row", [makeLeaf("a", 2), makeSplit("col", [makeLeaf("b"), makeLeaf("c", 0.5)])]);
+  const all = new Set(["a", "b", "c", "d"]);
+  const restored = restoreMultiTree(saved, ["a", "b", "c"], all, "a", "row")!;
+  check("saved tree restored as-is", restored === saved);
+  check("nested structure kept", restored.kind === "split" && (restored as any).dir === "row");
+  const sizes = sizesByChat(restored);
+  check("per-window sizes kept", sizes["a"] === 2 && sizes["c"] === 0.5);
+
+  // Tabs opened while single are appended beside the focused window.
+  const withNew = restoreMultiTree(saved, ["a", "b", "c", "d"], all, "a", "row")!;
+  check("tab opened while single is added", containsChat(withNew, "d") && collectChatIds(withNew).length === 4);
+  const sizesAfter = sizesByChat(withNew);
+  check("old windows keep their sizes after append", sizesAfter["a"] === 2 && sizesAfter["c"] === 0.5);
+
+  // Chats deleted while single are dropped from the restored layout.
+  const pruned = restoreMultiTree(saved, ["a", "c"], new Set(["a", "c", "d"]), "a", "row")!;
+  check("deleted chat dropped from saved layout", !containsChat(pruned, "b") && collectChatIds(pruned).join(",") === "a,c");
+  check("kept sibling size survives prune", sizesByChat(pruned)["a"] === 2);
+
+  // No saved layout: fall back to a flat split of the open tabs.
+  const fallback = restoreMultiTree(null, ["a", "b", "c"], all, "a", "col")!;
+  check("no saved tree builds from open tabs", JSON.stringify(collectChatIds(fallback)) === JSON.stringify(["a", "b", "c"]));
+  check("fallback uses the given direction", fallback.kind === "split" && (fallback as any).dir === "col");
+
+  // The active chat always gets a window, even when stale mirrors leave it
+  // out of both the saved layout and the open-tab list.
+  const activeOnly = restoreMultiTree(buildFromList(["a", "b"], "row"), [], all, "c", "row")!;
+  check("active chat keeps a window", collectChatIds(activeOnly).includes("c"));
+
+  // Nothing to show at all.
+  check("no chats, no tree", restoreMultiTree(null, [], new Set(), "", "row") === null);
 }
 
 if (failed > 0) {

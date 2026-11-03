@@ -306,11 +306,12 @@ console.log('11) viewer multi-window tree — split, focus, close:')
   check('closed tab stays in tab list', vt().tabs.some((t) => t.id === traceId))
 }
 
-console.log('12) split width — drag caps at half viewport:')
+console.log('12) split width — drag may take the pane nearly full-width:')
 {
-  const { clampSplitWidth } = await import('./viewerTabs')
-  check('drag beyond half clamps to half', clampSplitWidth(900, 1280) === 640, clampSplitWidth(900, 1280))
-  check('small drag kept', clampSplitWidth(400, 1280) === 400, clampSplitWidth(400, 1280))
+  const { clampSplitWidth, CHAT_MIN_WIDTH } = await import('./viewerTabs')
+  check('drag to the end leaves the chat strip', clampSplitWidth(1280, 1280) === 1280 - CHAT_MIN_WIDTH, clampSplitWidth(1280, 1280))
+  check('beyond the strip clamps to it', clampSplitWidth(1500, 1280) === 1280 - CHAT_MIN_WIDTH, clampSplitWidth(1500, 1280))
+  check('mid drag kept', clampSplitWidth(400, 1280) === 400, clampSplitWidth(400, 1280))
   check('min width kept', clampSplitWidth(100, 1280) === 320, clampSplitWidth(100, 1280))
 }
 

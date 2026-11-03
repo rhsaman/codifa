@@ -647,7 +647,8 @@ pub fn gemini_native_api(base: &str) -> String {
 }
 
 /// Resolve the chat-completions endpoint + auth header style for a kind.
-/// Returns (url, header_name, header_value_prefix).
+/// Returns (url, header_name, header_value_prefix). An empty header_name
+/// means "send no auth header" — the keyless local-endpoint case.
 fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, String) {
     let base = normalize_base(&cfg.provider, &cfg.base_url);
     // Use the key of THIS attempt, not always the first one: the caller's
@@ -658,11 +659,11 @@ fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, Strin
     } else {
         key.to_string()
     };
-    match cfg.provider.as_str() {
+    let (url, header_name, header_value) = match cfg.provider.as_str() {
         "anthropic" => (
             format!("{base}/v1/messages"),
             "x-api-key",
-            key,
+            key.clone(),
         ),
         // Native shape: the saved base may carry the OpenAI-compat suffix
         // (`…/v1beta/openai`), and appending `/v1beta` to THAT produced
@@ -675,11 +676,19 @@ fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, Strin
                 model = cfg.model
             ),
             "x-goog-api-key",
-            key,
+            key.clone(),
         ),
         // OpenAI-compatible kinds (openrouter/ollama/custom/nvidia/...)
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
+    };
+    // An EMPTY key is "no credential" (a keyless local endpoint): send no auth
+    // header at all — a bare `Bearer ` is a malformed credential some servers
+    // reject, and the model-list path (models.rs `auth_headers`) omits the
+    // header for the same reason. The caller skips a header with an empty NAME.
+    if key.is_empty() {
+        return (url, "", String::new());
     }
+    (url, header_name, header_value)
 }
 
 /// The provider telling us the MODEL's upstream endpoint is gone.
@@ -983,6 +992,18 @@ pub fn should_fall_back(err: &str) -> bool {
     names_a_model && says_missing
 }
 
+/// Kinds that may be called with NO api key at all: the `ollama` kind (the
+/// local OpenAI-compatible servers — Ollama, llama.cpp, LM Studio) and any
+/// `custom` base_url, which is how every localhost gateway (vLLM, a proxy) is
+/// wired. For these a keyless attempt is the RULE, not an error: the model
+/// list (models.rs `auth_headers`) and the sidecar probe (backend_light.rs)
+/// already send an empty key to exactly such endpoints. Cloud kinds keep the
+/// up-front refusal — spending a network round trip to learn a key is missing
+/// tells the user far less than "no api key configured".
+fn kind_allows_keyless(kind: &str) -> bool {
+    matches!(kind, "ollama" | "custom")
+}
+
 /// One-shot completion. Tries each API key in order on key errors
 /// (llm.py's resolve_keys + _is_key_error fallback chain).
 pub async fn complete(client: &Client, cfg: &LlmConfig, system: &str, user: &str) -> Result<LlmResult, String> {
@@ -998,14 +1019,18 @@ pub async fn complete_with_images(
     user: &str,
     images: &[String],
 ) -> Result<LlmResult, String> {
-    if cfg.api_keys.is_empty() {
+    if cfg.api_keys.is_empty() && !kind_allows_keyless(&cfg.provider) {
         return Err("no api key configured".into());
     }
+    // A keyless local endpoint runs ONE attempt with an empty key (no auth
+    // header); cloud kinds never reach this with an empty list.
+    let empty_key = [String::new()];
+    let attempts: &[String] = if cfg.api_keys.is_empty() { &empty_key } else { &cfg.api_keys };
     // Build the payload ONCE: it does not depend on the key, and a vision call
     // is megabytes of base64 that used to be re-serialized for every attempt.
     let body = one_shot_body(cfg, system, user, images);
     let mut last_err = String::new();
-    for key in key_attempt_order(&cfg.api_keys) {
+    for key in key_attempt_order(attempts) {
         match complete_with_key(client, cfg, &key, &body).await {
             Ok(res) => {
                 mark_key_ok(&key);
@@ -1092,10 +1117,10 @@ async fn complete_with_key(
     body: &Value,
 ) -> Result<LlmResult, (u16, String)> {
     let (url, header_name, header_value) = endpoint_and_auth(cfg, key);
-    let mut req = client
-        .post(&url)
-        .header(header_name, header_value)
-        .json(body);
+    let mut req = client.post(&url).json(body);
+    if !header_name.is_empty() {
+        req = req.header(header_name, header_value);
+    }
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
@@ -1530,15 +1555,19 @@ pub async fn stream_chat(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     steer_interrupt: Option<&InterruptSignal>,
 ) -> Result<StreamAcc, (u16, String)> {
-    if cfg.api_keys.is_empty() {
+    if cfg.api_keys.is_empty() && !kind_allows_keyless(&cfg.provider) {
         return Err((0, "no api key configured".into()));
     }
+    // A keyless local endpoint runs ONE attempt with an empty key (no auth
+    // header); cloud kinds never reach this with an empty list.
+    let empty_key = [String::new()];
+    let attempts: &[String] = if cfg.api_keys.is_empty() { &empty_key } else { &cfg.api_keys };
     // Build the payload ONCE (it is key-independent): the previous code rebuilt
     // and re-cloned the whole message array — base64 images included — for every
     // API-key attempt.
     let body = build_request_body(cfg, messages, tools);
     let mut last_err = String::new();
-    for key in key_attempt_order(&cfg.api_keys) {
+    for key in key_attempt_order(attempts) {
         match stream_with_key(client, cfg, &key, &body, on_event, cancel, steer_interrupt)
             .await
         {
@@ -1584,6 +1613,14 @@ async fn stream_with_key(
         ),
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
     };
+    // An EMPTY key is "no credential" (a keyless local endpoint): send no auth
+    // header at all — the same rule `endpoint_and_auth` applies for one-shot
+    // calls. The caller skips a header with an empty NAME.
+    let (header_name, header_value): (&'static str, String) = if key.is_empty() {
+        ("", String::new())
+    } else {
+        (header_name, header_value)
+    };
 
     // Set only after a gateway refused a field, and each strip is applied to
     // what was ACTUALLY sent last. Two independent `Option`s picked with `or`
@@ -1603,10 +1640,10 @@ async fn stream_with_key(
     let header_wait = std::time::Duration::from_secs(header_wait_secs());
     let resp = loop {
         let send_body = retry_body.as_ref().unwrap_or(body);
-        let mut req = client
-            .post(&url)
-            .header(header_name, header_value.as_str())
-            .json(send_body);
+        let mut req = client.post(&url).json(send_body);
+        if !header_name.is_empty() {
+            req = req.header(header_name, header_value.as_str());
+        }
         if cfg.provider == "anthropic" {
             req = req.header("anthropic-version", "2023-06-01");
         }
@@ -2034,10 +2071,83 @@ mod tests {
     }
 
     #[test]
-    fn complete_requires_a_key() {
+    fn a_cloud_kind_without_a_key_is_refused_before_any_network_call() {
         let c = http_client();
-        let c0 = cfg("custom", "http://127.0.0.1:1", &[]);
+        // openrouter needs a credential by definition; the URL is unreachable
+        // on purpose — reaching it would mean the refusal fired too late.
+        let c0 = cfg("openrouter", "http://127.0.0.1:1", &[]);
         assert!(tokio_test_block(&c, &c0).contains("no api key"));
+    }
+
+    /// Serves ONE response and hands the captured request bytes back.
+    /// `Connection: close` + no Content-Length: reqwest reads to EOF.
+    fn serve_one(response: String) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 16384];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+            let _ = tx.send(buf[..n].to_vec());
+            use std::io::Write as _;
+            sock.write_all(response.as_bytes()).ok();
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn a_keyless_local_one_shot_reaches_the_server_without_an_auth_header() {
+        let body = r#"{"choices":[{"message":{"content":"local hi"}}]}"#;
+        let (port, rx) = serve_one(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        ));
+        let c = cfg("ollama", &format!("http://127.0.0.1:{port}"), &[]);
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { complete(&http_client(), &c, "s", "u").await })
+            .expect("a keyless local call must succeed");
+        assert_eq!(out.text, "local hi");
+        let req = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the request must reach the local server");
+        let head = String::from_utf8_lossy(&req).to_lowercase();
+        assert!(head.contains("post /v1/chat/completions"), "ollama /v1 path: {head}");
+        assert!(!head.contains("authorization"), "no auth header on a keyless call: {head}");
+    }
+
+    #[test]
+    fn a_keyless_custom_endpoint_attempts_the_call() {
+        // The `custom` kind is how every localhost gateway is wired: no keys
+        // must still ATTEMPT the request (it did not before — the call died
+        // with "no api key configured" before any I/O). A refused connection
+        // proves the attempt happened: the error is transport, not keys.
+        let c = cfg("custom", "http://127.0.0.1:1", &[]);
+        let err = tokio_test_block(&http_client(), &c);
+        assert!(!err.contains("no api key"), "{err}");
+    }
+
+    #[test]
+    fn a_keyless_local_stream_reaches_the_server() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let (port, _rx) = serve_one(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+        ));
+        let c = cfg("ollama", &format!("http://127.0.0.1:{port}"), &[]);
+        let msgs = vec![json!({"role": "user", "content": "u"})];
+        let mut silent = |_sig: StreamSignal<'_>| {};
+        let mut sink: SignalSink<'_> = &mut silent;
+        let acc = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                stream_chat(&http_client(), &c, &msgs, None, &mut sink, None, None).await
+            })
+            .expect("a keyless local stream must run");
+        assert_eq!(acc.text, "hi");
     }
 
     #[test]

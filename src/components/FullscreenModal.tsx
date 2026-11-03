@@ -14,7 +14,7 @@ function clampZoom(z: number) {
 }
 
 /** A reusable full-window overlay used to enlarge read-only content (mermaid
- *  diagrams, file diffs) without leaving the app. Closes on Esc or scrim click.
+ *  diagrams, file diffs) without leaving the app. Closes on Esc or the ✕ button.
  *
  *  Zoom: drag a marquee box over the region you want — it zooms so that region
  *  fills the viewport and centers. Ctrl/⌘ + wheel also zooms. The ⟳ button
@@ -266,13 +266,12 @@ export function FullscreenModal({
   }
 
   return createPortal(
-    <div className="fullscreen-modal-scrim" onClick={onClose} role="presentation">
+    <div className="fullscreen-modal-scrim" role="presentation">
       <div
         className="fullscreen-modal-panel"
         role="dialog"
         aria-modal="true"
         aria-label={title ?? 'Full screen'}
-        onClick={(e) => e.stopPropagation()}
       >
         <div className="fullscreen-modal-head">
           <span className="fullscreen-modal-title">{title}</span>

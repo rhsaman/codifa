@@ -95,7 +95,6 @@ thinking|tests/thinking.test.ts|--packages=external --external:electron
 ensureSidecar|tests/ensureSidecar.test.ts|--packages=external --external:electron
 marketplaceBrowse|tests/marketplaceBrowse.test.ts|--packages=external --external:electron
 marketplaceDefaults|tests/marketplaceDefaults.test.ts|-
-keywordFill|tests/keywordFill.test.ts|--packages=external --external:electron
 installTracker|tests/installTracker.test.ts|--packages=external --external:electron
 repoAddress|tests/repoAddress.test.ts|-
 cmdContext|tests/cmdContext.test.ts|-

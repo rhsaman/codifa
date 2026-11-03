@@ -7416,6 +7416,26 @@ body.coder-dragging .chat-split-child {
   overflow-x: auto;
 }
 
+/* A fence that carried Persian prose instead of code (see CodeBlock in
+   ChatMessage): plain message text, no chrome, no monospace, no LTR clamp.
+   white-space: pre-wrap keeps the model's column alignment; dir="auto" +
+   unicode-bidi: plaintext let each line resolve its own direction (a
+   Persian-first levels chart lays out RTL, an `Entry:` table stays LTR). */
+.markdown-body pre.plain-fence {
+  background: none !important;
+  border: none;
+  padding: 0;
+  margin: 0.2em 0 1.15em;
+  overflow-x: visible;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  unicode-bidi: plaintext;
+}
+
 .markdown-body code {
   /* Theme-tinted chip: a whisper of the theme accent over --bg-alt, a
      hairline accent border and text pulled slightly toward the accent so
@@ -8591,6 +8611,9 @@ body.coder-dragging .chat-split-child {
 
 .settings-search {
   margin-top: 8px;
+  /* The card grid below must not sit against the input: without this the
+     first row of cards touches the search box. */
+  margin-bottom: 12px;
 }
 
 .settings-search input[type="search"]:focus {
@@ -15526,6 +15549,23 @@ body.coder-dragging .chat-split-child {
   letter-spacing: 0.4px;
 }
 
+.search-close {
+  flex: none;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.search-close:hover {
+  color: var(--text);
+  background: var(--hover, rgba(128, 128, 128, 0.15));
+}
+
 .search-results {
   max-height: 46vh;
   overflow-y: auto;
@@ -20831,6 +20871,14 @@ mark.diff-hit-active {
   flex: 0 0 auto;
 }
 
+/* Per-task browser-access toggle ON: accent-tinted so "this schedule may
+   browse" is visible at a glance among the other row actions. */
+.schedule-icon-btn.active {
+  color: var(--accent, #4c8dff);
+  background: color-mix(in srgb, var(--accent, #4c8dff) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent, #4c8dff) 45%, transparent);
+}
+
 .schedule-error {
   font-size: 11px;
   color: var(--danger, #e5484d);
@@ -22518,7 +22566,9 @@ mark.trace-hit-active {
   display: flex;
   flex-direction: column;
   min-width: 320px;
-  max-width: min(50%, calc(100% - 320px));
+  /* May take nearly the whole window — the drag clamp (clampSplitWidth) and
+     the chat group's own min-width keep a usable chat strip beside it. */
+  max-width: calc(100% - 320px);
   overflow: hidden;
   position: relative;
   isolation: isolate;
@@ -23515,6 +23565,12 @@ mark.trace-hit-active {
   padding: 0 2px 6px 8px;
 }
 
+/* Chat tab row: the chevron must sit level with the tabs (the wrap's default
+   6px bottom padding leaves its glyph ~3px below the tab label's center). */
+.chat-tabs-row .tab-list-wrap {
+  padding-bottom: 9px;
+}
+
 .viewer-pane-head .tab-list-wrap {
   padding: 0 0 0 8px;
   align-self: center;
@@ -23705,6 +23761,57 @@ mark.trace-hit-active {
 
 .tab-list-footer:disabled {
   opacity: 0.5;
+  cursor: default;
+}
+
+/* Toolbar row at the menu top: search + tool icons (window-mode toggle,
+   bulk tab close) share one line so neither costs the tab bar any space. */
+.tab-list-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.tab-list-toolbar .tab-list-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.tab-list-tool-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.tab-list-tool-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* Window-mode toggle while multi-window is ON: accent, like the other
+   pressed toggles in the app. */
+.tab-list-tool-btn[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.tab-list-tool-btn:disabled {
+  opacity: 0.45;
   cursor: default;
 }
 
@@ -24347,6 +24454,118 @@ mark.trace-hit-active {
 .browser-menu-item:disabled {
   color: var(--text-dim, #9aa0a6);
   opacity: 0.7;
+  cursor: default;
+}
+
+/* Session-cookie import dialog (Browser panel ⋮ → Import session cookies).
+   The "log in outside, keep the session inside" path for sites whose bot
+   defense rejects every login form the virtual browser submits. */
+.browser-cookie-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.browser-cookie-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(460px, calc(100% - 48px));
+  padding: 16px;
+  border-radius: 14px;
+  background: var(--bg-panel, #1a1a1a);
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  box-shadow: var(--shadow-pop, 0 12px 36px rgba(0, 0, 0, 0.55));
+}
+
+.browser-cookie-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text, #e8eaed);
+}
+
+.browser-cookie-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim, #9aa0a6);
+}
+
+.browser-cookie-hint code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-inset, rgba(255, 255, 255, 0.06));
+  font-size: 11.5px;
+}
+
+.browser-cookie-domain,
+.browser-cookie-text {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  background: var(--bg-inset, rgba(255, 255, 255, 0.05));
+  color: var(--text, #e8eaed);
+  font-size: 12.5px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.browser-cookie-text {
+  resize: vertical;
+  min-height: 84px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.browser-cookie-domain:focus,
+.browser-cookie-text:focus {
+  outline: none;
+  border-color: var(--accent, #6ea8fe);
+}
+
+.browser-cookie-msg {
+  font-size: 12px;
+  color: var(--danger, #ff7b72);
+  white-space: pre-wrap;
+}
+
+.browser-cookie-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.browser-cookie-btn {
+  padding: 7px 14px;
+  border-radius: 9px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  background: transparent;
+  color: var(--text, #e8eaed);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.browser-cookie-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text, #ffffff) 9%, transparent);
+}
+
+.browser-cookie-btn--primary {
+  background: var(--accent, #4c8dff);
+  border-color: transparent;
+  color: #fff;
+}
+
+.browser-cookie-btn--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent, #4c8dff) 86%, #fff);
+}
+
+.browser-cookie-btn:disabled {
+  opacity: 0.55;
   cursor: default;
 }
 
@@ -28086,6 +28305,14 @@ tr[data-search-current] .fv-mark,
   font-size: 11px;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
+}
+
+/* The header's right side: the whole-bundle Delete next to the close button. */
+.pd-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .pd-close {

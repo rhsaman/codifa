@@ -5,9 +5,9 @@
 //! a tool call (`PreToolUse` only) by exiting with code 2, or by printing
 //! `{"decision":"block","reason":"…"}` on stdout.
 //!
-//! SECURITY: this is the one part of a bundle that runs arbitrary code, so it
-//! is off unless the user turned it on for THAT bundle (`hooks_enabled` in the
-//! manifest), it runs inside the plugin's own folder, with a bounded wall-clock
+//! SECURITY: this is the one part of a bundle that runs arbitrary code, so a
+//! bundle's hooks only run while the bundle itself is ENABLED (the switch on
+//! its card); it runs inside the plugin's own folder, with a bounded wall-clock
 //! budget and output, in a scrubbed environment (no provider keys), and every
 //! run is reported back so the trace can name what happened.
 
@@ -21,8 +21,6 @@ use serde_json::{json, Value};
 pub(crate) const HOOKS: &str = "hooks";
 /// File inside that folder.
 pub(crate) const HOOKS_FILE: &str = "hooks.json";
-/// Manifest key the user's explicit approval is recorded in. Absent = off.
-pub(crate) const ENABLED_KEY: &str = "hooks_enabled";
 /// Wall-clock budget for ONE handler. A hook is a guard, not a job: a handler
 /// that needs longer is a script and belongs in `scripts/`.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -218,11 +216,6 @@ fn command_is_contained(command: &str, plugin_dir: &Path) -> bool {
         return false;
     };
     path.canonicalize().is_ok_and(|p| p.starts_with(&root))
-}
-
-/// Whether hooks may run for this bundle.
-pub fn trusted(manifest: &Value) -> bool {
-    manifest[ENABLED_KEY].as_bool().unwrap_or(false)
 }
 
 /// Handlers of one event, filtered by the value they must match.

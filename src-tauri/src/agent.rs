@@ -3282,12 +3282,11 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "create_skill",
-            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass BOTH: `description` — one short ENGLISH line saying WHEN to use it — and `fa_keywords` — the user's PERSIAN phrases (comma-separated). To install from a repo pass `repo` instead of `content`. To EDIT, `load_skill` first then send the revised body; pass previous_name when renaming.",
+            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass `description` — one short ENGLISH line saying WHEN to use it; the agent picks skills by matching the request against it. To install from a repo pass `repo` instead of `content`. To EDIT, `load_skill` first then send the revised body; pass previous_name when renaming.",
             json!({
                 "name": {"type": "string", "description": "Skill name (also the folder slug)"},
                 "description": {"type": "string", "description": "REQUIRED. One-line ENGLISH summary of when to use this skill"},
                 "content": {"type": "string", "description": "The skill body: step-by-step instructions the agent follows"},
-                "fa_keywords": {"type": "string", "description": "REQUIRED. Comma-separated PERSIAN phrases that trigger this skill"},
                 "previous_name": {"type": "string", "description": "Old name when renaming"},
                 "repo": {"type": "string", "description": "Install from a repo instead of `content`: `owner/repo`, a GitHub URL, or a local folder"},
                 "repo_path": {"type": "string", "description": "install: sub-folder holding SKILL.md (default: discover)"},
@@ -3358,7 +3357,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // short: create/update/toggle/delete/list instead of four tools.
         (
             "plugin",
-            "Create, edit, install or run a plugin: one switchable folder bundling skills, MCP connectors, commands, sub-agents, hooks and scripts. `create` MAKES one, `install` READS one from a repo or folder, `update` patches only what is sent, `toggle` flips `enabled`, `run` executes a script. Pass its Persian `fa_keywords`. Scripts are Rust unless the user asked otherwise.",
+            "Create, edit, install or run a plugin: one switchable folder bundling skills, MCP connectors, commands, sub-agents, hooks and scripts. `create` MAKES one, `install` READS one from a repo or folder, `update` patches only what is sent, `toggle` flips `enabled`, `run` executes a script. Give every part a one-line English `description` — the agent matches requests against it. Scripts are Rust unless the user asked otherwise.",
             json!({
                 "action": {"type": "string", "enum": ["list", "install", "create", "update", "toggle", "delete", "run"]},
                 "repo": {"type": "string", "description": "install: `owner/repo`, GitHub URL, or local path"},
@@ -3366,9 +3365,8 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "repo_ref": {"type": "string", "description": "install: branch/tag/commit"},
                 "name": {"type": "string", "description": "Plugin name (also the slug)"},
                 "slug": {"type": "string", "description": "Folder slug; defaults to the lowercased name"},
-                "description": {"type": "string"},
+                "description": {"type": "string", "description": "ONE short English line saying WHEN the bundle applies — the agent matches requests against it."},
                 "version": {"type": "string", "description": "Defaults to 1.0.0"},
-                "fa_keywords": {"type": "array", "items": {"type": "string"}, "description": "PERSIAN phrases the whole bundle answers to; a skill with none of its own inherits them."},
                 "enabled": {"type": "boolean", "description": "toggle: the value to set; omit to flip"},
                 "skills": {
                     "type": "array",
@@ -3377,8 +3375,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                         "properties": {
                             "name": {"type": "string"},
                             "content": {"type": "string"},
-                            "description": {"type": "string"},
-                            "fa_keywords": {"type": "string"},
+                            "description": {"type": "string", "description": "ONE short English line saying WHEN to use it"},
                             "previous_name": {"type": "string", "description": "Old skill name when renaming"},
                             "extra_files": {"type": "object", "description": "Extra files: filename -> content"},
                             "deleted_files": {"type": "array", "items": {"type": "string"}, "description": "Extra files to delete"}
@@ -3391,8 +3388,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "deleted_commands": {"type": "array", "items": {"type": "string"}},
                 "agents": {"type": "array", "description": "Sub-agent profiles: each is a delegation tool that ALWAYS runs on the Explore model row.", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string", "description": "WHEN to delegate"}, "tools": {"type": "array", "items": {"type": "string"}, "description": "Omit for all; can only NARROW"}, "prompt": {"type": "string", "description": "Its system prompt"}}, "required": ["name", "prompt"]}},
                 "deleted_agents": {"type": "array", "items": {"type": "string"}},
-                "hooks": {"type": "object", "description": "Shell guards: {Event: [{matcher, hooks: [{command}]}]}. Exit 2 vetoes. OFF until hooks_enabled."},
-                "hooks_enabled": {"type": "boolean", "description": "The user's approval to RUN the hooks — never set it for them."},
+                "hooks": {"type": "object", "description": "Shell guards: {Event: [{matcher, hooks: [{command}]}]}. Exit 2 vetoes. They run while the bundle is enabled."},
                 "scripts": {
                     "type": "array",
                     "description": "Runnable scripts. RUST unless the user explicitly named another language: leave `language` OUT.",
@@ -3460,7 +3456,8 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "mode": {"type": "string"},
                 "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills attached to every run"},
                 "mcp_servers": {"type": "array", "items": {"type": "string"}, "description": "MCP connector names for every run"},
-                "plugins": {"type": "array", "items": {"type": "string"}, "description": "Plugins every run gets"}
+                "plugins": {"type": "array", "items": {"type": "string"}, "description": "Plugins every run gets"},
+                "allow_browser": {"type": "boolean", "description": "Let every run of this task use the in-app browser: the shared Chromium with its saved logins (e.g. a posted session cookie), for tasks like posting to Instagram or trading on a web exchange. Default false — set true only when the task really browses."}
             }),
         ),
         (
@@ -4254,19 +4251,18 @@ already approved with \"Always allow\".",
     } else {
         // The catalog is the byte-stable part: it lives on the system prompt,
         // so it must not depend on the current message — the router builds it
-        // from the skill store alone.
-        let skill_section =
-            crate::skill_router::build_section(&req.prompt, &skill_root, &req.skills);
+        // from the skill store alone, and which skill applies is the model's
+        // call made from the catalog.
+        let skill_section = crate::skill_router::build_section(&skill_root, &req.skills);
         if !skill_section.text.is_empty() {
             system.push_str(&skill_section.text);
         }
         skill_section.missing
     };
     // Plugin hooks: the SAME resolved list is used at all four lifecycle points
-    // below, read ONCE from the bundles that are enabled AND approved. A
-    // sub-agent never runs them: hooks belong to the turn the user started, and
-    // a nested explore firing the user's shell guards would run them once per
-    // delegation. Empty unless the user explicitly approved hooks for a bundle.
+    // below, read ONCE from the bundles that are enabled. A sub-agent never runs
+    // them: hooks belong to the turn the user started, and a nested explore
+    // firing the user's shell guards would run them once per delegation.
     let hooks = if req.mode == "subagent" {
         Vec::new()
     } else {
@@ -10088,8 +10084,8 @@ fn skills_context_message() -> Value {
             "{SKILLS_CONTEXT_HEAD}\n\
              The `=== AVAILABLE SKILLS ===` catalog is in your system prompt. Before \
              your first tool call of this turn, check it: if the request falls under \
-             one of those skills — including a match on its `[fa: …]` Persian \
-             keywords — call `load_skill` with that skill's name FIRST and follow its \
+             one of those skills — a request in any language matches on the \
+             description — call `load_skill` with that skill's name FIRST and follow its \
              instructions for the rest of the turn. If the catalog has no entry for \
              the task, do not read that as `no skill exists`: a large store cannot \
              all fit there, so call `load_skill` with a `query` of the task's words \
@@ -11335,6 +11331,10 @@ re-implement it from scratch. Say what is already done and continue from what \
 is actually left. Redoing finished work is a bug, not thoroughness. \
 Reply in the user's language. \
 Docstrings and comments in code must be English. \
+CODE FENCES (```) are for CODE ONLY: never put prose, tables, price levels, \
+lists or any other non-code text inside a code fence — write that data as a \
+markdown table or plain lines instead, even when column alignment tempts you \
+to fence it; a fence around Persian text renders as scrambled LTR code. \
 Workspace root: {root}. Mode: {mode}. {mode_rule}"
     )
 }
@@ -14293,13 +14293,14 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("Movie Finder"), "{out}");
+        assert!(!out.contains("WARNING"), "keywords are inert data now: {out}");
 
-        // The keywords must reach the catalog, otherwise a Persian request
-        // could never match this skill (the catalog is all the model sees).
-        let section = crate::skill_router::build_section("", root, &[]);
-        assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
+        // The description is the trigger: the catalog lists the skill with it,
+        // and any frontmatter keywords stay data — never a catalog line.
+        let section = crate::skill_router::build_section(root, &[]);
         assert!(section.text.contains("- Movie Finder"), "{}", section.text);
         assert!(section.text.contains("find movies"), "{}", section.text);
+        assert!(!section.text.contains("[fa:"), "{}", section.text);
 
         // A missing name/content is rejected instead of writing a broken skill.
         assert!(dispatch(root, "create_skill", &json!({"content": "x"}), None).is_err());
@@ -14313,22 +14314,8 @@ mod tests {
             "create_skill must claim the file so the seeder leaves it alone"
         );
 
-        // Editing with an OMITTED fa_keywords keeps the existing ones (the
-        // parser must not silently erase what a Persian request matches on).
-        let out = dispatch(
-            root,
-            "create_skill",
-            &json!({"name": "Movie Finder", "content": "Step 1: ask for the year."}),
-            None,
-        )
-        .unwrap();
-        assert!(!out.contains("WARNING"), "keywords survived, no warning: {out}");
-        let section = crate::skill_router::build_section("", root, &[]);
-        assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
-
-        // A skill saved with NO keywords is one a Persian request can never
-        // find, and
-        // the tool says so instead of reporting a plain success.
+        // A skill saved with NO keywords at all is ordinary now: selection runs
+        // off the description, so the reply is a plain success.
         let out = dispatch(
             root,
             "create_skill",
@@ -14336,7 +14323,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("WARNING") && out.contains("NO fa_keywords"), "{out}");
+        assert!(!out.contains("WARNING"), "{out}");
 
         // deleted_files from the model actually removes the extra file.
         dispatch(
@@ -14371,7 +14358,7 @@ mod tests {
         .unwrap();
         let kept = std::fs::read_to_string(dir_path.join("skill.md")).unwrap();
         assert!(
-            kept.contains("Step 1: ask for the year."),
+            kept.contains("Step 1: ask for the genre."),
             "the stored body survives a body-less save: {kept}"
         );
         // …and the empty body must never be treated as "erase the description".
@@ -14537,7 +14524,7 @@ mod tests {
         let r = root.to_str().unwrap();
 
         // Part of the catalog…
-        let section = crate::skill_router::build_section("", r, &[]);
+        let section = crate::skill_router::build_section(r, &[]);
         assert!(section.text.contains("- Release Notes"), "{}", section.text);
         // …loadable by name and by slug…
         let body = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes"}), None, Some(r)).unwrap();
@@ -14549,18 +14536,19 @@ mod tests {
         assert_eq!(extra, "- tag it");
         // A plugin skill is listed in the catalog (with its clipped detail), so
         // the model can load it by name — an unrelated prompt carries no body.
-        let cat = crate::skill_router::build_section("", r, &[]);
+        let cat = crate::skill_router::build_section(r, &[]);
         assert!(cat.text.contains("- Release Notes"), "{}", cat.text);
         assert!(!cat.text.contains("READ THE GIT LOG"), "{}", cat.text);
 
-        // …and the skill's OWN Persian keyword in the prompt attaches its body,
-        // which is how a Persian request reaches a plugin's skill at all.
-        let matched = crate::skill_router::build_section("یادداشت انتشار بساز", r, &[]);
-        assert!(matched.text.contains("READ THE GIT LOG"), "{}", matched.text);
+        // …and the skill's own keyword in the prompt attaches NOTHING: picking a
+        // skill is the model's call, made from the catalog (load_skill).
+        let matched = crate::skill_router::build_section(r, &[]);
+        assert!(matched.text.contains("- Release Notes"), "{}", matched.text);
+        assert!(!matched.text.contains("READ THE GIT LOG"), "{}", matched.text);
 
         // Disabled plugin = gone from the catalog AND unloadable.
         crate::plugins::toggle_plugin(&root, &json!({"slug": "release-notes", "enabled": false})).unwrap();
-        assert!(!crate::skill_router::build_section("", r, &[]).text.contains("- Release Notes"));
+        assert!(!crate::skill_router::build_section(r, &[]).text.contains("- Release Notes"));
         let err = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes"}), None, Some(r)).unwrap_err();
         assert!(err.contains("skill not found"), "{err}");
 

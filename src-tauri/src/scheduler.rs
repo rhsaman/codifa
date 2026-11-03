@@ -940,8 +940,17 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         data_root: data_root.to_string_lossy().to_string(),
         // Headless scheduled runs never touch the desktop.
         allow_computer: false,
-        // Nor the browser: nobody is watching a window a schedule opens.
-        allow_browser: false,
+        // The browser is OPT-IN per task (`allow_browser` in the schedule JSON,
+        // the editor's checkbox): a scheduled turn drives the SAME shared
+        // Chromium and profile the interactive panel uses, so an imported or
+        // in-app login is available to it. That is the whole point — "post to
+        // Instagram every morning", "check the chart and trade" — and also why
+        // it must be a deliberate per-schedule choice: an unattended turn with
+        // a logged-in profile can act on real accounts with nobody watching.
+        allow_browser: task
+            .get("allow_browser")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         // Nor do they author skills/connectors: a schedule has no user turn
         // asking for it, so the authoring tools stay unbound.
         allow_create: false,

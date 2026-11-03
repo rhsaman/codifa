@@ -765,19 +765,16 @@ pub fn enabled_plugin_agents(root: &Path) -> Vec<Value> {
     out
 }
 
-/// Every handler the agent may run this turn: enabled AND explicitly approved.
+/// Every handler the agent may run this turn: the ENABLED bundles' hooks.
 ///
-/// `hooks_enabled` is the user's approval of THIS bundle's code, so it is the
-/// gate — an enabled bundle with hooks off contributes none. The pair list is
-/// what `hooks::active_in` consumes.
+/// The bundle's own switch IS the approval — turning a bundle on runs its
+/// hooks, turning it off stops them. The pair list is what `hooks::active_in`
+/// consumes.
 pub fn active_hook_bundles(root: &Path) -> Vec<(PathBuf, bool)> {
     all_plugins(root)
         .into_iter()
         .filter(|(_, m)| m["enabled"].as_bool().unwrap_or(true))
-        .map(|(slug, manifest)| {
-            let approved = crate::hooks::trusted(&manifest);
-            (plugin_dir(root, &slug), approved)
-        })
+        .map(|(slug, _)| (plugin_dir(root, &slug), true))
         .collect()
 }
 
@@ -1354,8 +1351,6 @@ fn plugin_view(root: &Path, slug: &str) -> Value {
     manifest[COMMANDS] = json!(command_names(root, slug));
     manifest[crate::subagents::AGENTS] = json!(agent_names(root, slug));
     manifest["hooks"] = crate::hooks::describe(&plugin_dir(root, slug))["hooks"].clone();
-    // Always a bool, so the renderer's switch needs no "absent means off" rule.
-    manifest[crate::hooks::ENABLED_KEY] = json!(crate::hooks::trusted(&manifest));
     // Always an array, even when the file holds a hand-written string: the
     // renderer edits it as a list and would otherwise show nothing.
     manifest[KEYWORDS] = json!(keywords_of(&manifest[KEYWORDS].clone()));
@@ -1440,12 +1435,6 @@ pub fn update_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     }
     if let Some(v) = body["enabled"].as_bool() {
         manifest["enabled"] = json!(v);
-    }
-    // The hook approval switch. It lives in the manifest (one key for the whole
-    // bundle, not per handler) because it is the USER's decision about THIS
-    // plugin, and it must survive an update from source.
-    if let Some(v) = body[crate::hooks::ENABLED_KEY].as_bool() {
-        manifest[crate::hooks::ENABLED_KEY] = json!(v);
     }
     // An explicit empty list CLEARS the keywords; an absent field leaves them
     // alone, exactly like `description` above.
@@ -2408,11 +2397,17 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
             }
         }
     }
+    // Writing is the install's LAST leg; the progress bubble shows it so a slow
+    // disk write does not read as a hang either. Cleared on success, so a done
+    // install does not leave a stale bar behind (an error path leaves the last
+    // reading tick — the poller stops the moment its request settles anyway).
+    crate::repo::install_progress_set("writing", 0, 0);
     let view = if existed {
         update_plugin(root, &payload)?
     } else {
         create_plugin(root, &payload)?
     };
+    crate::repo::install_progress_clear();
     Ok(json!({
         "installed": if existed { "updated" } else { "created" },
         "slug": slug,
@@ -2718,8 +2713,8 @@ fn apply_agents(root: &Path, slug: &str, body: &Value) -> Result<(), String> {
 ///
 /// The file is written as given, then VALIDATED through the same reader the
 /// agent loop uses: what cannot run as written is rejected at write time instead
-/// of becoming a hook that silently never fires. Execution stays off until the
-/// user turns `hooks_enabled` on — writing the file never implies approval.
+/// of becoming a hook that silently never fires. The handlers run while the
+/// bundle itself is enabled — the bundle's switch is the approval.
 ///
 /// Three shapes are accepted: the canonical `{"hooks": {...}}` document a repo
 /// ships, the bare event map a chat call writes, and the FLAT row list
@@ -2970,16 +2965,6 @@ fn plugin_skills(root: &Path, include_disabled: bool) -> Vec<Value> {
             continue;
         }
         let label = manifest["name"].as_str().unwrap_or(&slug).to_string();
-        // The bundle's OWN keywords travel as a SEPARATE field, never written
-        // into a skill's `fa_keywords`. They are the last-resort trigger for a
-        // skill that carries none — a whole library answering to one Persian
-        // ask — but copying them onto every skill made all of them show the
-        // same phrases in the editor, and a mixed bundle's list can only ever
-        // describe SOME of its parts.
-        let bundle_kw: Vec<String> = keywords_of(&manifest[KEYWORDS])
-            .into_iter()
-            .take(INHERIT_KEYWORDS_MAX)
-            .collect();
         let listed = crate::skills::list_skills(&plugin_dir(root, &slug));
         for mut row in listed["skills"]
             .as_array()
@@ -2987,17 +2972,9 @@ fn plugin_skills(root: &Path, include_disabled: bool) -> Vec<Value> {
             .unwrap_or_default()
             .into_iter()
         {
-            // A skill's keywords are its OWN, never the bundle's. Inheriting
-            // them made every skill of a bundle list the same phrases, so the
-            // editor showed one identical — and usually irrelevant, because a
-            // mixed bundle's list can only describe SOME of its parts — trigger
-            // for all of them. The bundle's own keywords still route a Persian
-            // ask to the bundle (see `skill_router`), which is where a whole
-            // library belongs.
+            // A skill's keywords are its OWN, never the bundle's, and they are
+            // data only now — selection runs off the description in the catalog.
             row["plugin"] = json!(label);
-            if !bundle_kw.is_empty() {
-                row["bundle_keywords"] = json!(bundle_kw.clone());
-            }
             row["plugin_slug"] = json!(slug);
             row["plugin_enabled"] = json!(enabled);
             out.push(row);
@@ -3083,24 +3060,6 @@ pub fn delete_connector(root: &Path, body: &Value) -> Result<Value, String> {
     // inherit a description the user wrote for a different server.
     write_connector_meta(root, &slug, name, &json!({}))?;
     Ok(json!({ "ok": true, "slug": slug, "name": name, "mcp": connector_names(root, &slug) }))
-}
-
-/// Number of Persian keywords one skill inside a plugin actually carries.
-///
-/// Used right after an install to tell the model which skills a Persian request
-/// could never reach, so it writes them in the same turn instead of reporting a
-/// successful install that its user cannot trigger.
-pub fn skill_keyword_count(root: &Path, slug: &str, name: &str) -> usize {
-    crate::skills::list_skills(&plugin_dir(root, slug))["skills"]
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|r| {
-                    r["name"].as_str() == Some(name) || r["slug"].as_str() == Some(name)
-                })
-                .and_then(|r| r["fa_keywords"].as_array().map(Vec::len))
-        })
-        .unwrap_or(0)
 }
 
 /// Locate a skill folder inside ONE plugin: `<root>/plugins/<slug>/skills/<name>`.
@@ -3322,10 +3281,9 @@ mod tests {
         )
         .expect("a commands+hooks bundle must install");
 
-        // The declaration landed as a declared hook, still inert.
+        // The declaration landed as a declared hook, runnable while enabled.
         assert_eq!(out["hooks"].as_array().map(Vec::len), Some(1));
         assert_eq!(out["hooks"][0]["event"], "SessionStart");
-        assert_eq!(out["plugin"][crate::hooks::ENABLED_KEY], json!(false));
         assert!(out["summary"].as_str().unwrap().contains("1 hook"));
         // The command and the sub-agent landed too — not just the hook.
         assert_eq!(out[COMMANDS], json!(["model-check"]));
@@ -3350,7 +3308,7 @@ mod tests {
     }
 
     #[test]
-    fn hooks_land_off_until_the_user_approves_them() {
+    fn hooks_run_while_the_bundle_is_enabled() {
         let root = temp_root("hooks-off");
         let view = create_plugin(
             &root,
@@ -3364,20 +3322,21 @@ mod tests {
             }),
         )
         .expect("create");
-        // Declared, listed... and NOT runnable.
+        // Declared, listed, and runnable: the bundle's switch IS the approval.
         assert_eq!(view["hooks"].as_array().map(Vec::len), Some(1));
-        assert_eq!(view[crate::hooks::ENABLED_KEY], json!(false));
+        assert_eq!(
+            active_hook_bundles(&root)
+                .iter()
+                .filter(|(dir, approved)| *approved && dir.ends_with("guarded"))
+                .count(),
+            1
+        );
+
+        // Turning the bundle off is what stops the handlers.
+        toggle_plugin(&root, &json!({"slug": "guarded", "enabled": false})).unwrap();
         assert!(active_hook_bundles(&root)
             .iter()
-            .all(|(_, approved)| !*approved));
-
-        // The user's explicit approval is what flips it — and it survives a
-        // patch that does not mention it.
-        update_plugin(&root, &json!({"slug": "guarded", "hooks_enabled": true})).unwrap();
-        update_plugin(&root, &json!({"slug": "guarded", "description": "still guarded"}))
-            .unwrap();
-        let manifest = read_manifest(&root, "guarded").expect("manifest");
-        assert_eq!(manifest[crate::hooks::ENABLED_KEY], json!(true));
+            .all(|(dir, _)| !dir.ends_with("guarded")));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -4170,8 +4129,9 @@ mod tests {
             }),
         )
         .unwrap();
-        // The PLUGIN was seeded by the earlier fix; the SKILL must be reachable
-        // through that same list without owning it.
+        // The PLUGIN was seeded by the earlier fix; the SKILL stays bare — the
+        // bundle's phrases are its own manifest data, never copied onto skills,
+        // and selection runs off descriptions in the catalog anyway.
         assert!(!out["plugin"][KEYWORDS].as_array().unwrap().is_empty());
         let rows = enabled_plugin_skills(&root);
         let skill = rows
@@ -4180,8 +4140,8 @@ mod tests {
             .expect("the installed skill must be listed")
             .clone();
         assert!(
-            !skill["bundle_keywords"].as_array().unwrap_or(&vec![]).is_empty(),
-            "a skill with no keywords of its own must carry the bundle's as a fallback"
+            skill["bundle_keywords"].is_null(),
+            "the bundle's phrases must not ride on the skill's row"
         );
         assert!(
             keywords_of(&skill[KEYWORDS]).is_empty(),

@@ -519,16 +519,15 @@ export function ProviderModelSelect(props?: {
       </button>
       {open &&
         // مودال وسط صفحه PORTAL می‌شود به <body> — نه داخل مودال تنظیمات و
-        // نه داخل کامپوزر — پس هیچ اسکرول/کلیپی نمی‌تواند برشش دهد. کلیک روی
-        // پس‌زمینه می‌بندد؛ کلیک داخل دیالوگ stop می‌شود.
+        // نه داخل کامپوزر — پس هیچ اسکرول/کلیپی نمی‌تواند برشش دهد. بستن فقط
+        // با دکمه ✕ (یا Esc)؛ کلیک روی پس‌زمینه عمداً نمی‌بندد.
         createPortal(
-          <div className="pm-modal-overlay" dir="ltr" onClick={() => setOpen(false)}>
+          <div className="pm-modal-overlay" dir="ltr">
             <div
               className="pm-modal"
               role="dialog"
               aria-modal="true"
               aria-label="Pick a model"
-              onClick={(e) => e.stopPropagation()}
             >
               <div className="pm-modal-head">
                 <div className="pm-modal-searchbox">

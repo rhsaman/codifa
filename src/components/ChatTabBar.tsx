@@ -12,7 +12,7 @@ import {
   type TabExtent,
 } from "../lib/tabBar";
 import { previewShifts } from "../lib/tabOrder";
-import { TabListButton, type TabListSection } from "./TabListMenu";
+import { TabListButton, CloseTabsIcon, type TabListSection } from "./TabListMenu";
 import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
 
 function CloseIcon() {
@@ -178,16 +178,58 @@ export function ChatTabListButton() {
   const visibleSet = new Set(chatTree ? collectChatIds(chatTree) : visibleChatIds);
   const streamingSet = new Set(streamingKey ? streamingKey.split(",") : []);
   const inactive = inactiveTabIds(openChatIds, activeChatId, streamingSet, visibleSet);
+  // Toolbar icons inside the search row (not bar buttons): the single/multi
+  // window toggle and the bulk tab closer cost the tab row zero space. Both
+  // stay open on click so the state flips visibly.
+  const multi = (chatTree ? collectChatIds(chatTree).length : visibleChatIds.length) > 1;
+  const tools = (
+    <>
+      {openChatIds.length > 1 && (
+        <button
+          type="button"
+          className="tab-list-tool-btn"
+          aria-pressed={multi}
+          title={
+            multi
+              ? "Multi-window is on: every visible chat shows in its own window. Click to show a single chat (windows come back in place, at their sizes)."
+              : "Single chat is on. Click to show the open chats as windows again, in place and at their sizes."
+          }
+          aria-label={multi ? "Switch to single chat window" : "Switch to multi chat windows"}
+          onClick={() => useStore.getState().toggleChatWindows()}
+        >
+          {multi ? (
+            <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="9" height="7" rx="1" />
+              <path d="M6 2.5v7" />
+            </svg>
+          ) : (
+            <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="9" height="7" rx="1" />
+            </svg>
+          )}
+        </button>
+      )}
+      <button
+        type="button"
+        className="tab-list-tool-btn"
+        disabled={inactive.length === 0}
+        title={
+          inactive.length > 0
+            ? `Close ${inactive.length} inactive tab${inactive.length === 1 ? "" : "s"} (not active, not streaming, not open in a window — chats stay in the sidebar)`
+            : "No inactive tabs to close"
+        }
+        aria-label={`Close ${inactive.length} inactive chat tabs`}
+        onClick={() => useStore.getState().closeInactiveChatTabs()}
+      >
+        <CloseTabsIcon />
+      </button>
+    </>
+  );
   return (
     <TabListButton
       sections={sections}
       label="Chat tab list"
-      footer={{
-        label: inactive.length > 0 ? `Close ${inactive.length} inactive tab${inactive.length === 1 ? "" : "s"}` : "No inactive tabs",
-        title: "Close tabs that are not active, not streaming and not open in a window (chats stay in the sidebar)",
-        disabled: inactive.length === 0,
-        onPress: () => useStore.getState().closeInactiveChatTabs(),
-      }}
+      tools={tools}
     />
   );
 }

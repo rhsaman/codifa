@@ -1038,7 +1038,7 @@ export function TracePanel(props?: {
       style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}
       onClick={(e) => e.stopPropagation()}
     >
-      {!docked && <div className="review-scrim" aria-hidden="true" onClick={close} />}
+      {!docked && <div className="review-scrim" aria-hidden="true" />}
       {!docked && !fullscreen && (
         <div
           className="review-overlay-resize-handle"

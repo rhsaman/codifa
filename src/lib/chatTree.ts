@@ -27,6 +27,7 @@ export interface ChatTreeSplit {
 export type ChatTreeNode = ChatTreeLeaf | ChatTreeSplit
 
 const TREE_KEY = 'coder:chatTree'
+const SAVED_TREE_KEY = 'coder:chatTreeSaved'
 
 function nid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -534,6 +535,61 @@ export function persistChatTree(tree: ChatTreeNode | null): void {
   } catch {
     /* storage unavailable */
   }
+}
+
+/** Stash for the single/multi window toggle: collapsing to one chat saves the
+ *  split layout here so expanding can restore it (survives restarts). */
+export function loadSavedChatTree(): ChatTreeNode | null {
+  try {
+    const raw = localStorage.getItem(SAVED_TREE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as ChatTreeNode | null
+    if (!parsed || typeof parsed !== 'object') return null
+    if (parsed.kind !== 'leaf' && parsed.kind !== 'split') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+export function persistSavedChatTree(tree: ChatTreeNode | null): void {
+  try {
+    if (!tree) localStorage.removeItem(SAVED_TREE_KEY)
+    else localStorage.setItem(SAVED_TREE_KEY, JSON.stringify(tree))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Expand path of the toggle (pure for tests): restore the saved multi-window
+ *  layout, then append open tabs it does not know about (chats opened or
+ *  restored while single). Falls back to a flat split of the open tabs when
+ *  there is no saved layout (or none of its chats survived). Active chat is
+ *  guaranteed a window: it is an open tab, so the append loop re-adds it when
+ *  normalization dropped it. */
+export function restoreMultiTree(
+  saved: ChatTreeNode | null,
+  openIds: string[],
+  validIds: Set<string>,
+  activeId: string,
+  dir: ChatSplitDir,
+): ChatTreeNode | null {
+  let tree = normalizeTree(saved, validIds)
+  if (!tree) tree = buildFromList(openIds.filter((id) => validIds.has(id)), dir)
+  if (!tree) return null
+  // Defensive: the active chat is always an open tab in practice, but a stale
+  // mirror must never leave it windowless after the expand.
+  const wants =
+    activeId && validIds.has(activeId) && !openIds.includes(activeId)
+      ? [...openIds, activeId]
+      : openIds
+  const inTree = new Set(collectChatIds(tree))
+  for (const id of wants) {
+    if (!validIds.has(id) || inTree.has(id)) continue
+    tree = openBeside(tree, id, activeId, dir)
+    inTree.add(id)
+  }
+  return tree
 }
 
 export type WindowNavDir = 'left' | 'right' | 'up' | 'down'

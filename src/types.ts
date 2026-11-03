@@ -1049,15 +1049,11 @@ export interface PluginInfo {
   /** Sub-agent profiles the folder ships. Each is offered to the model as a
    *  delegation tool, and they ALL run on the Explore row of Settings → Tools. */
   agents?: string[]
-  /** Shell guards declared in `hooks/hooks.json`, as `Event: command` rows. */
+  /** Shell guards declared in `hooks/hooks.json`, as `Event: command` rows.
+   *  They run while the bundle itself is enabled — the switch on its card. */
   hooks?: Array<{ event: string; matcher?: string; command: string; dispatched?: boolean }>
-  /** The user's approval to RUN this bundle's hooks. Off until they turn it on
-   *  — writing `hooks.json` is never approval — so a bundle can land with hooks
-   *  and stay inert. */
-  hooks_enabled?: boolean
-  /** Persian phrases the WHOLE bundle answers to. A skill with none of its own
-   *  inherits these (capped), so a bundle of bare skills is still findable from
-   *  a Persian request. */
+  /** Persian phrases the WHOLE bundle answers to (data left from earlier
+   *  installs; selection runs off descriptions, not these). */
   fa_keywords?: string[]
   /** Repo (or folder) the bundle was installed from, when it was. */
   source?: string
@@ -1106,6 +1102,9 @@ export interface ScheduledTask {
   skills?: string[]
   mcp_servers?: string[]
   plugins?: string[]
+  /** اجازه‌ی مروربر برای هر اجرا: روشن = ایجنتِ زمان‌بندی‌شده می‌تواند مرورگر
+   *  داخلی (و پروفایل مشترک با لاگین‌های ذخیره‌شده) را براند. پیش‌فرض خاموش. */
+  allow_browser?: boolean
   /** نوبت بعدی اجرا (epoch ثانیه)؛ null یعنی بدون نوبت بعدی. */
   next_run?: number | null
   last_run?: number | null

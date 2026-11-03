@@ -1,7 +1,7 @@
 // Unit tests for the bidi helpers used by the chat renderer (mixed Persian+English
 // text direction detection and model-injected control-character cleanup).
 // Run: node test/bidi.test.ts
-import { RTL_CHAR_RE, detectDir, stripBidiMarks, fixZwsp, prepareContent, applyRtlToSvgText } from '../src/lib/bidi.ts'
+import { RTL_CHAR_RE, detectDir, stripBidiMarks, fixZwsp, prepareContent, applyRtlToSvgText, isMostlyRtlText } from '../src/lib/bidi.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -194,6 +194,25 @@ console.log('17) فنس با ارقام فارسی در range:')
 {
   const out = prepareContent('خط ۱۹ تا ۲۰ در Plan.go:\n\n```go:۱۹-۲۰\nx := 1\n```')
   check('اقلام فارسی به لاتین تبدیل شد', out.includes('```go:19-20:Plan.go'), out)
+}
+
+console.log('18) isMostlyRtlText: فنسِ فارسی = متن، نه کد:')
+{
+  // نمونه واقعی از چت ترید: چارت متنی سطوح قیمت داخل فنس بدون زبان
+  const levels = [
+    '1.1230  ─── سقف قبلی، مقاومت اولیه',
+    '1.1240  ─── سقف امروز ← مقاومتی که الان در تست آن هستیم',
+    '1.1200  ─── خط دفاعی / round number',
+    '1.1198  ← قیمت فعلی',
+    '1.1114  ─── کف ۱۷ ماهه (حمایتی اصلی)',
+  ].join('\n')
+  check('چارت سطوح فارسی → true', isMostlyRtlText(levels))
+  check('متن فارسی خالص → true', isMostlyRtlText('این یک متن فارسی نمونه برای تست است'))
+  check('کد انگلیسی خالص → false', !isMostlyRtlText('function add(a, b) {\n  return a + b\n}'))
+  // یک کامنت فارسی داخل کد نباید کل بلوک را متن کند
+  check('کد با یک کامنت فارسی → false', !isMostlyRtlText('const x = 1 // بررسی مقدار\nconst y = compute(x)\nexport default y'))
+  check('رشته کوتاه‌تر از حد → false', !isMostlyRtlText('سلام'))
+  check('رشته خالی → false', !isMostlyRtlText(''))
 }
 
 if (failed > 0) {

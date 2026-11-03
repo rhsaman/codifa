@@ -17,6 +17,7 @@ import type { ChatMessage, ToolActivity } from "../types";
 import {
   detectDir,
   fixZwsp,
+  isMostlyRtlText,
   prepareContent,
   stripBidiMarks,
 } from "../lib/bidi";
@@ -484,11 +485,6 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
   const startLine = codeStartLine(props.children);
   const filePath = codeFilePath(props.children);
 
-  // A ```mermaid fenced block is rendered as a live diagram, not as code.
-  if (lang === "mermaid") {
-    return <Mermaid chart={code} />;
-  }
-
   const codeLines = code.split("\n");
 
   const copy = async () => {
@@ -512,11 +508,30 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
   // none`, so selecting/copying the block copies just the code, never the numbers.
   // Memoized on (code + lang): re-renders caused by streaming tokens elsewhere
   // in the message reuse the module's cached highlight instead of re-running hljs.
+  // Runs for EVERY branch: the early returns below sit after this hook, so a
+  // fence that flips branch mid-stream (lang arriving late, Persian filling in)
+  // keeps the hook order stable across renders.
   const highlightedLines = useMemo(
     () => getHighlightedLines(codeLines.join("\n"), lang),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [code, lang],
   );
+
+  // A fence the model left UNNAMED (or ```text) whose content is mostly
+  // Persian is not code — it is prose or column-aligned data (price levels,
+  // small tables) the model fenced to preserve spacing. Rendering that as an
+  // LTR highlighted code block scrambles the bidi order, gets hljs keywords
+  // "highlighted" mid-sentence, and stretches the script in monospace, so
+  // render it as plain, per-line direction-aware text instead. A NAMED fence
+  // (```python …) always stays code, even with Persian comments inside.
+  if ((!lang || lang === "text") && isMostlyRtlText(code)) {
+    return <pre dir="auto" className="plain-fence">{code}</pre>;
+  }
+
+  // A ```mermaid fenced block is rendered as a live diagram, not as code.
+  if (lang === "mermaid") {
+    return <Mermaid chart={code} />;
+  }
 
   const lines = codeLines.map((_line, i) => {
     const num = startLine > 0 ? startLine + i : i + 1;

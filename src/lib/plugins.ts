@@ -1,13 +1,6 @@
-import { ensureSidecar, providerKeys, syncSkill } from './api'
+import { ensureSidecar } from './api'
 import type { SkillRow } from './api'
-import type {
-  McpServerConfig,
-  PluginInfo,
-  PluginInstallResult,
-  ProviderConfig,
-  ToolFallback,
-} from '../types'
-import { toolFallbackEntries } from './toolSlots'
+import type { McpServerConfig, PluginInfo, PluginInstallResult } from '../types'
 
 /** POST a plugin action and return the resulting plugin record.
  *
@@ -31,151 +24,6 @@ async function postPlugin(
     return data
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
-  }
-}
-
-/** One part whose English description should become Persian trigger phrases. */
-export interface KeywordRequestItem {
-  name: string
-  description: string
-}
-
-/** Translate part descriptions into the Persian phrases the catalog matches on.
- *
- *  The catalog is matched by KEY, so an English-only description leaves a part
- *  unreachable from a Persian request: the phrases have to be written down, and
- *  a translation of what the part says it does is the only honest source. The
- *  provider snapshot travels with the call exactly like the title call's — the
- *  backend has no settings of its own to read here. */
-export async function translateKeywords(params: {
-  provider: ProviderConfig
-  subagentModels?: Record<string, string>
-  subagentThinking?: Record<string, string>
-  /** Settings → Tools fallback lists, keyed like `subagentModels`: the "Other"
-   *  group's list is what the translation retries on when its model fails. */
-  toolFallbacks?: Record<string, string[]>
-  providers?: Record<string, ProviderConfig>
-  modelReasoning?: boolean
-  items: KeywordRequestItem[]
-}): Promise<{ keywords: Record<string, string[]>; error?: string }> {
-  const url = await ensureSidecar()
-  if (!url) return { keywords: {}, error: 'the local backend is not ready' }
-  try {
-    const res = await fetch(`${url}/plugins/keywords`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider: params.provider.kind,
-        provider_id: params.provider.id,
-        api_keys: providerKeys(params.provider),
-        base_url: params.provider.baseUrl,
-        model: params.provider.model,
-        subagent_models: params.subagentModels ?? {},
-        subagent_thinking: params.subagentThinking ?? {},
-        tool_fallbacks: params.toolFallbacks ?? {},
-        providers: params.providers ?? {},
-        model_reasoning: params.modelReasoning ?? false,
-        items: params.items,
-      }),
-      // One batched call for the whole list, so the budget only has to cover a
-      // slow model, not one round trip per skill. The backend walks a whole
-      // candidate chain before giving up (the "Other" slot model, its
-      // fallbacks, then the active model — each bounded at 45s), so the
-      // client's own cap has to outlast the chain, not the first rung.
-      signal: AbortSignal.timeout(240_000),
-    })
-    const data = (await res.json().catch(() => ({}))) as {
-      keywords?: Record<string, string[]>
-      error?: string
-      detail?: string
-    }
-    if (!res.ok) return { keywords: {}, error: data.detail || `request failed (${res.status})` }
-    return data.error && !data.keywords
-      ? { keywords: {}, error: data.error }
-      : { keywords: data.keywords ?? {}, ...(data.error ? { error: data.error } : {}) }
-  } catch (err) {
-    return { keywords: {}, error: err instanceof Error ? err.message : String(err) }
-  }
-}
-
-/** The provider snapshot a one-shot model call runs on.
- *
- *  Passed in explicitly rather than read from the store here: the two callers
- *  (a Settings component and a chat command handler) already hold this state,
- *  and a data module that reached into the store would be untestable on its own. */
-export interface KeywordFillContext {
-  provider: ProviderConfig | undefined
-  subagentModels?: Record<string, string>
-  subagentThinking?: Record<string, string>
-  toolFallbacks?: Record<string, ToolFallback[]>
-  providers?: ProviderConfig[]
-  modelReasoning?: boolean
-}
-
-export interface KeywordFillResult {
-  /** Skills that needed keywords and got them on disk. */
-  filled: number
-  /** Skills that needed them (none of their own, and a description to read). */
-  total: number
-  /** Why nothing could be filled, when that happened. */
-  error?: string
-}
-
-/** Give a bundle's keyword-less skills the Persian phrases their descriptions imply.
- *
- *  A bundle installed from a marketplace ships English descriptions, and the
- *  catalog is matched by KEY — so every skill of a fresh install was invisible to
- *  a Persian request until somebody opened the page and clicked Translate. Doing
- *  it here makes an install (from the browser or from `/plugin install`) land
- *  ready to trigger.
- *
- *  Only skills that carry NO keywords of their own AND have a description are
- *  touched: a list the repo shipped, or the user typed, is never overwritten, and
- *  the whole batch is one model call. Never throws — a failed translation reports
- *  its reason and leaves every file as it was. */
-export async function fillMissingKeywords(
-  slug: string,
-  ctx: KeywordFillContext,
-): Promise<KeywordFillResult> {
-  if (!ctx.provider) return { filled: 0, total: 0, error: 'no model provider is configured' }
-  const listed = await listPluginSkills()
-  if ('error' in listed) return { filled: 0, total: 0, error: listed.error }
-  const pending = listed.filter(
-    (row) =>
-      row.plugin_slug === slug &&
-      (row.fa_keywords ?? []).length === 0 &&
-      (row.description ?? '').trim() !== '',
-  )
-  if (pending.length === 0) return { filled: 0, total: 0 }
-  const res = await translateKeywords({
-    provider: ctx.provider,
-    subagentModels: ctx.subagentModels,
-    subagentThinking: ctx.subagentThinking,
-    toolFallbacks: toolFallbackEntries(ctx.toolFallbacks),
-    providers: Object.fromEntries((ctx.providers ?? []).map((p) => [p.id, p])),
-    modelReasoning: ctx.modelReasoning ?? false,
-    items: pending.map((row) => ({ name: row.name, description: row.description })),
-  })
-  let filled = 0
-  for (const row of pending) {
-    const phrases = res.keywords[row.name]
-    if (!phrases || phrases.length === 0) continue
-    // An empty `content` makes the writer keep the body already on disk, so only
-    // the keywords change.
-    const out = await syncSkill({
-      name: row.name,
-      description: row.description,
-      faKeywords: phrases,
-      plugin: slug,
-    })
-    if (out.ok) filled += 1
-  }
-  return {
-    filled,
-    total: pending.length,
-    // A partial fill is a success, not an error: the reason is only worth
-    // reporting when nothing landed at all.
-    ...(filled === 0 && res.error ? { error: res.error } : {}),
   }
 }
 
@@ -334,6 +182,31 @@ export async function installPlugin(body: {
   } finally {
     installingRows.delete(key)
     notifyInstalls()
+  }
+}
+
+/** Live progress of the install the sidecar is running right now.
+ *
+ *  The install is one blocking POST, so this is a POLL, not a stream: the
+ *  chat's progress bubble reads it on a timer while the request is in flight
+ *  and stops the moment the request settles (idle = nothing running).
+ *  `listing` walks the repo tree, `reading` carries done/total over the bundle
+ *  files, `writing` is the bundle hitting disk. */
+export interface InstallProgress {
+  phase: 'listing' | 'reading' | 'writing' | 'idle'
+  done: number
+  total: number
+}
+
+export async function installProgress(): Promise<InstallProgress | null> {
+  const url = await ensureSidecar()
+  if (!url) return null
+  try {
+    const res = await fetch(`${url}/plugins/install-progress`)
+    if (!res.ok) return null
+    return (await res.json()) as InstallProgress
+  } catch {
+    return null
   }
 }
 

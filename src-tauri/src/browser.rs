@@ -15,6 +15,15 @@
 //! through CDP. All entry points are safe to call while the session is down —
 //! they return `{"ok": false, "error": ...}` instead of raising, matching the
 //! Python contract the frontend already consumes.
+//!
+//! POPUPS: a `window.open` call (Google "Continue with Google", every OAuth
+//! button, plain `target="_blank"` links) opens a SECOND target that the
+//! opener tab keeps talking to via `window.opener`. Chromium creates it fine,
+//! but only the chat's own tab was ever screencast, so login popups ran
+//! invisibly and "the popup never opens". The panel now FOLLOWS popups: while
+//! a popup opened by the chat's tab lives, the panel displays it (and points
+//! input at it); when it closes, the view falls back to the tab. The cookies
+//! land in the same shared profile either way.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -83,6 +92,26 @@ static BROWSER: Mutex<Option<BrowserProc>> = Mutex::new(None);
 /// `const`-constructible without a lazy initializer.
 static TABS: Mutex<Vec<(String, Tab)>> = Mutex::new(Vec::new());
 
+/// One popup: a page some chat's tab opened via `window.open` (or a
+/// `target="_blank"` link) — the OAuth/login popups sites rely on. The popup
+/// is its own Chromium target; the opener keeps reaching it through
+/// `window.opener`, so it must stay a real separate target (collapsing it
+/// into the tab would break the callback that reports "login succeeded").
+#[derive(Clone)]
+struct Popup {
+    /// The popup's own target id: what the panel displays while it lives.
+    target_id: String,
+    /// Target id of the chat tab that opened it. Popups of popups roll up to
+    /// the same root, so panel resolution never walks more than one hop.
+    root: String,
+}
+
+/// Live popups across the shared browser, oldest first. Kept in step with
+/// Chromium by `sync_popups` (poll) plus the pushed `Target.targetDestroyed`
+/// events (instant teardown), and read on every panel poll/input by
+/// `with_visible_popup`.
+static POPUPS: Mutex<Vec<Popup>> = Mutex::new(Vec::new());
+
 // ---------------------------------------------------------------------------
 // Paths and process discovery
 // ---------------------------------------------------------------------------
@@ -131,15 +160,27 @@ fn browser_roots() -> Vec<PathBuf> {
 /// Layouts a Chromium build may use under a root: [dir-fragment, binary].
 ///
 /// Chrome-for-Testing names its macOS binary `Google Chrome for Testing` inside
-/// `Google Chrome for Testing.app`; a Playwright Chromium uses `Chromium`; the
-/// headless shell ships a loose `chrome-headless-shell`. Every fragment is
-/// tried under each matching build dir, so one list covers all of them.
+/// `Google Chrome for Testing.app`; on Windows the same build is
+/// `chrome-win64/chrome.exe` (the `.exe` suffix is added per-platform below),
+/// on Linux `chrome-linux64/chrome`. A Playwright Chromium uses `Chromium`
+/// (mac) / `chrome` (linux); the headless shell ships `chrome-headless-shell`.
+/// Every fragment is tried under each matching build dir, so one list covers
+/// all of them.
 const BROWSER_LAYOUTS: &[(&str, &str)] = &[
     ("chrome-mac-arm64", "Google Chrome for Testing"),
     ("chrome-mac-x64", "Google Chrome for Testing"),
+    // The full-chrome zip for macOS unpacks the .app at the TOP LEVEL (next
+    // to ABOUT/resources) with no wrapper dir — the "" fragment probes the
+    // build dir itself, which is what the installer's rename produces.
+    ("", "Google Chrome for Testing"),
+    ("chrome-win64", "chrome"),
+    ("chrome-linux64", "chrome"),
+    ("chrome-linux", "chrome"),
     ("chrome-mac", "Chromium"),
     ("chrome-headless-shell-mac-arm64", "chrome-headless-shell"),
     ("chrome-headless-shell-mac-x64", "chrome-headless-shell"),
+    ("chrome-headless-shell-win64", "chrome-headless-shell"),
+    ("chrome-headless-shell-linux64", "chrome-headless-shell"),
 ];
 
 /// Directories that look like an installed Chromium under `root`, best first.
@@ -187,6 +228,30 @@ fn build_rank(dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Every build-dir + layout probe under `root`, as exact candidate paths.
+/// Shared by `chromium_candidates` (which walks the app's browser roots) and
+/// `make_executable` (which must find the binary INSIDE the just-unpacked
+/// build — `find_chromium` cannot be used there: until the exec bit is set and
+/// the layout is right, it still resolves to the previous install).
+fn binaries_under(root: &std::path::Path) -> Vec<PathBuf> {
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    let mut out = Vec::new();
+    for dir in candidate_dirs(root) {
+        for (fragment, binary) in BROWSER_LAYOUTS {
+            if cfg!(target_os = "macos") {
+                out.push(
+                    dir.join(fragment)
+                        .join(format!("{binary}.app/Contents/MacOS/{binary}")),
+                );
+            }
+            out.push(dir.join(fragment).join(format!("{binary}{exe}")));
+            // A flat unpack (the installer's own layout): <dir>/<binary>.
+            out.push(dir.join(format!("{binary}{exe}")));
+        }
+    }
+    out
+}
+
 /// Every bundled-Chromium binary the app may use, newest build first.
 ///
 /// Deliberately EXCLUDES the system browsers. Running the automation browser
@@ -202,22 +267,7 @@ fn build_rank(dir: &std::path::Path) -> u64 {
 fn chromium_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in browser_roots() {
-        for dir in candidate_dirs(&root) {
-            // Every layout is probed under every build dir; `find_chromium`
-            // picks the first that is really a file, so a layout that does not
-            // apply to this build costs one failed `is_file()`.
-            for (fragment, binary) in BROWSER_LAYOUTS {
-                out.push(
-                    dir.join(fragment)
-                        .join(format!("{binary}.app/Contents/MacOS/{binary}")),
-                );
-                out.push(dir.join(fragment).join(binary));
-            }
-            // A flat unpack (the installer's own layout): <dir>/<binary>.
-            for (_, binary) in BROWSER_LAYOUTS {
-                out.push(dir.join(binary));
-            }
-        }
+        out.extend(binaries_under(&root));
     }
     out
 }
@@ -256,7 +306,16 @@ fn is_our_driver(args: &str, profile: &std::path::Path) -> bool {
 /// Split out from the spawn so the flag set is unit-testable: the flags carry
 /// real decisions (see the comments), and a wrong one either loses the frame
 /// or drags the user's own Chrome settings into the automation session.
-fn launch_args(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> Vec<String> {
+/// `ua` pins the USER-AGENT at the process level: a popup's first document
+/// request leaves the browser BEFORE any CDP session can attach and override
+/// the UA per-session, and that one request used to say `HeadlessChrome` —
+/// exactly what Google's sign-in gate reads as "not a real browser".
+fn launch_args(
+    bin: &std::path::Path,
+    port: u16,
+    profile: &std::path::Path,
+    ua: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         format!("--remote-debugging-port={port}"),
         format!(
@@ -275,16 +334,26 @@ fn launch_args(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> V
         "--disable-blink-features=AutomationControlled".to_string(),
         "--window-size=1280,800".to_string(),
     ];
+    if let Some(ua) = ua {
+        args.push(format!("--user-agent={ua}"));
+    }
     // `--disable-gpu` is only needed by the desktop builds, which rasterize on
     // the GPU. The headless shell has no GPU stack at all, and passing the flag
     // there made startup dump `CVDisplayLinkCreateWithCGDisplay failed` into the
     // log on every frame — noise that buried the real errors.
     if !is_headless_shell(bin) {
+        // The full build still runs its OUTPUT on SwiftShader: a GPU process
+        // cannot be hosted from a daemon context (launch failure 1003), and
+        // both failure modes around that are worse than software rendering —
+        // Chromium used to EXIT ("GPU process isn't usable. Goodbye.") and
+        // with the crash limit lifted it crash-LOOPS at a full CPU core. What
+        // the full build buys over the headless shell is the rest of the
+        // fingerprint: real PDF plugins, a real `window.chrome`, the desktop
+        // binary's font/codec stack — and the SwiftShader WebGL string is
+        // covered by the consistency script.
         args.push("--disable-gpu".to_string());
-        // Keep SOLO automation out of the user's browser: each of these would
-        // otherwise start a Google background service against the user's own
-        // profile / crashpad database, exactly what made the system Chrome look
-        // hung while the app was open.
+        // Chrome 139+ gates software WebGL behind an explicit opt-in.
+        args.push("--enable-unsafe-swiftshader".to_string());
         for flag in [
             "--disable-background-networking",
             "--disable-component-update",
@@ -295,6 +364,13 @@ fn launch_args(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> V
             "--disable-crash-reporter",
         ] {
             args.push(flag.to_string());
+        }
+        // The full build wants "Chromium Safe Storage" in the user's LOGIN
+        // KEYCHAIN on every launch (a password prompt over the user's work).
+        // The mock keychain keeps cookie encryption inside our own profile
+        // and never asks — cookies here are disposable automation state.
+        if cfg!(target_os = "macos") {
+            args.push("--use-mock-keychain".to_string());
         }
     }
     args
@@ -682,7 +758,10 @@ fn flush_frames(cdp: &mut Cdp, sessions: &std::collections::HashMap<String, Stri
 
 /// Handle one socket message while no batch is running. Screencast frames are
 /// stored for the panel's long-poll and acked (an unacked frame stops the
-/// stream); everything else — stray events, late replies — is dropped.
+/// stream); `Target.targetDestroyed` tears a popup out of the registry the
+/// moment Chromium closes it (the "log in succeeded, popup closes" beat must
+/// snap the panel back to the page instantly, not a poll later); everything
+/// else — stray events, late replies — is dropped.
 async fn on_socket_msg(
     conn: &mut Option<Cdp>,
     sessions: &mut std::collections::HashMap<String, String>,
@@ -700,24 +779,145 @@ async fn on_socket_msg(
     let Ok(v) = serde_json::from_str::<Value>(&txt) else {
         return;
     };
-    if v.get("method").and_then(Value::as_str) != Some("Page.screencastFrame") {
-        return;
-    }
-    if let Some(c) = conn.as_mut() {
-        c.absorb_frame(&v).await;
-        flush_frames(c, sessions);
+    match v.get("method").and_then(Value::as_str) {
+        Some("Page.screencastFrame") => {
+            if let Some(c) = conn.as_mut() {
+                c.absorb_frame(&v).await;
+                flush_frames(c, sessions);
+            }
+        }
+        Some("Target.targetDestroyed") => {
+            let gone = v["params"]["targetId"].as_str().unwrap_or_default();
+            if !gone.is_empty() {
+                if let Ok(mut popups) = POPUPS.lock() {
+                    popups.retain(|p| p.target_id != gone);
+                }
+                drop_frame(gone);
+            }
+        }
+        _ => {}
     }
 }
 
-/// Injected into every new document of a tab: the few places where a headless
-/// Chromium differs from the desktop Chrome the User-Agent now claims to be
-/// (`window.chrome` missing, `outerWidth/Height` of 0, a bare language list,
-/// `navigator.webdriver` set). Each line is guarded so one failure cannot stop
-/// the rest, and none of it changes what the page can do.
-const CONSISTENCY_JS: &str = r#"(() => {
+/// The WebGL strings the consistency script reports are PLATFORM-specific —
+/// a macOS machine claiming an NVIDIA D3D11 renderer would itself be a
+/// fingerprint. One plausible per-OS desktop GPU each; the automation browser
+/// runs on the user's own hardware, so the real build (GPU enabled) reports
+/// the genuine string and this only covers the SwiftShader fallback.
+fn gl_fingerprint() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("Apple Inc.", "ANGLE Metal Renderer: Apple M1, Unspecified Version")
+    } else if cfg!(target_os = "windows") {
+        (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x000046A6) Direct3D11 (vs_5_0, ps_5_0), D3D11)",
+        )
+    } else {
+        (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), OpenGL 4.6 (Core Profile) Mesa 23.2.1)",
+        )
+    }
+}
+
+/// The consistency script with the platform's WebGL strings spliced in.
+pub(crate) fn consistency_js() -> String {
+    let (vendor, renderer) = gl_fingerprint();
+    CONSISTENCY_JS_TEMPLATE
+        .replace("__GL_VENDOR__", vendor)
+        .replace("__GL_RENDERER__", renderer)
+}
+
+/// Injected into every new document of a tab: the places where a headless
+/// Chromium differs from the desktop Chrome the User-Agent now claims to be,
+/// which sign-in providers (Google's "This browser or app may not be secure"
+/// gate above all) probe. Each line is guarded so one failure cannot stop the
+/// rest, and none of it changes what the page can do:
+///   * `navigator.webdriver` — the automation flag;
+///   * `window.chrome` + `app`/`csi`/`loadTimes` — absent in the headless shell;
+///   * `navigator.plugins`/`mimeTypes` — a headless shell has none, desktop
+///     Chrome always ships the five PDF viewers;
+///   * `document.hasFocus` — headless reports false for every document, a
+///     clicked-open OAuth popup is focused;
+///   * WebGL `UNMASKED_VENDOR/RENDERER` — the shell renders through
+///     SwiftShader and says so, which reads as "not a real browser";
+///   * `navigator.mediaDevices` — absent in the shell.
+const CONSISTENCY_JS_TEMPLATE: &str = r#"(() => {
   try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch (e) {}
-  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
+  try {
+    window.chrome = window.chrome || {};
+    window.chrome.runtime = window.chrome.runtime || {
+      PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+      connect: function () { return { onMessage: { addListener: function () {} }, postMessage: function () {}, disconnect: function () {} }; },
+      sendMessage: function () {},
+    };
+    if (!window.chrome.app) {
+      window.chrome.app = {
+        isInstalled: false,
+        InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+        RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+        getDetails: function () {},
+        getIsInstalled: function () {},
+        installState: function () { return 'not_installed'; },
+        runningState: function () { return 'cannot_run'; },
+      };
+    }
+    window.chrome.csi = window.chrome.csi || function () {
+      return { startE: Date.now(), onloadT: Date.now(), pageT: Math.round(performance.now()), tran: 15 };
+    };
+    window.chrome.loadTimes = window.chrome.loadTimes || function () {
+      const now = Date.now() / 1000;
+      return { requestTime: now, startloadTime: now, commitLoadTime: now, finishDocumentLoadTime: now, finishLoadTime: now, firstPaintTime: now, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: false, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' };
+    };
+  } catch (e) {}
   try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+  try {
+    if (!navigator.plugins || navigator.plugins.length === 0) {
+      const mime = () => ({ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null });
+      const make = (name) => {
+        const m = mime();
+        const p = { name: name, description: 'Portable Document Format', filename: 'internal-pdf-viewer', length: 1, 0: m, item: function () { return m; }, namedItem: function () { return m; } };
+        m.enabledPlugin = p;
+        return p;
+      };
+      const list = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'].map(make);
+      const plugins = { length: list.length, item: function (i) { return list[i] || null; }, namedItem: function (n) { return list.find(function (p) { return p.name === n; }) || null; }, refresh: function () {} };
+      list.forEach(function (p, i) { plugins[i] = p; });
+      Object.defineProperty(navigator, 'plugins', { get: function () { return plugins; } });
+      const pdf = list[0][0];
+      const mimeTypes = { length: 1, 0: pdf, item: function () { return pdf; }, namedItem: function (t) { return t === 'application/pdf' ? pdf : null; } };
+      Object.defineProperty(navigator, 'mimeTypes', { get: function () { return mimeTypes; } });
+    }
+  } catch (e) {}
+  try { document.hasFocus = function () { return true; }; } catch (e) {}
+  try {
+    if (!navigator.mediaDevices) {
+      Object.defineProperty(navigator, 'mediaDevices', { get: function () { return { enumerateDevices: function () { return Promise.resolve([]); } }; } });
+    }
+  } catch (e) {}
+  try {
+    const vendor = '__GL_VENDOR__';
+    const renderer = '__GL_RENDERER__';
+    const patch = function (proto) {
+      if (!proto || !proto.getParameter) return;
+      const orig = proto.getParameter;
+      proto.getParameter = function (p) {
+        // Only the SOFTWARE fallback needs covering: when the real GPU stack
+        // is up (full build) the genuine vendor/renderer is already the best
+        // possible answer and must pass through untouched.
+        const v = orig.call(this, p);
+        try {
+          if (typeof v === 'string' && /swiftshader/i.test(v)) {
+            if (p === 37445) return vendor;
+            if (p === 37446) return renderer;
+          }
+        } catch (e) {}
+        return v;
+      };
+    };
+    if (window.WebGLRenderingContext) patch(window.WebGLRenderingContext.prototype);
+    if (window.WebGL2RenderingContext) patch(window.WebGL2RenderingContext.prototype);
+  } catch (e) {}
   try {
     if (!window.outerWidth) {
       Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
@@ -744,30 +944,30 @@ fn ua_override(version: &Value) -> Option<Value> {
         .filter(|v| !v.is_empty())?
         .to_string();
     let major = full.split('.').next().unwrap_or_default().to_string();
-    let mut params = json!({
-        "userAgent": ua.replace("HeadlessChrome", "Chrome"),
-        "acceptLanguage": "en-US,en",
-    });
-    // Client hints describe the OS, so they are only filled in for the platform
-    // this build actually runs on; elsewhere the plain UA rewrite is still safe.
-    if cfg!(target_os = "macos") {
-        params["platform"] = json!("MacIntel");
-        let brands = json!([
-            {"brand": "Chromium", "version": major},
-            {"brand": "Not=A?Brand", "version": "24"},
-            {"brand": "Google Chrome", "version": major},
-        ]);
-        let full_list = json!([
-            {"brand": "Chromium", "version": full},
-            {"brand": "Not=A?Brand", "version": "24.0.0.0"},
-            {"brand": "Google Chrome", "version": full},
-        ]);
-        params["userAgentMetadata"] = json!({
-            "brands": brands,
-            "fullVersionList": full_list,
-            "fullVersion": full,
-            "platform": "macOS",
-            "platformVersion": "14.5.0",
+        let mut params = json!({
+            "userAgent": ua.replace("HeadlessChrome", "Chrome"),
+            "acceptLanguage": "en-US,en",
+        });
+        // Client hints describe the OS, so they are only filled in for the platform
+        // this build actually runs on; elsewhere the plain UA rewrite is still safe.
+        if cfg!(target_os = "macos") {
+            params["platform"] = json!("MacIntel");
+            let brands = json!([
+                {"brand": "Chromium", "version": major},
+                {"brand": "Not=A?Brand", "version": "24"},
+                {"brand": "Google Chrome", "version": major},
+            ]);
+            let full_list = json!([
+                {"brand": "Chromium", "version": full},
+                {"brand": "Not=A?Brand", "version": "24.0.0.0"},
+                {"brand": "Google Chrome", "version": full},
+            ]);
+            params["userAgentMetadata"] = json!({
+                "brands": brands,
+                "fullVersionList": full_list,
+                "fullVersion": full,
+                "platform": "macOS",
+                "platformVersion": macos_platform_version(),
             "architecture": if cfg!(target_arch = "aarch64") { "arm" } else { "x86" },
             "bitness": "64",
             "model": "",
@@ -789,13 +989,17 @@ async fn apply_user_agent(cdp: &mut Cdp, session: &str) {
         }
     }
     cdp.session = Some(session.to_string());
+    // Page domain commands need Page.enable on this session — measured:
+    // addScriptToEvaluateOnNewDocument registered WITHOUT it replies fine but
+    // never fires, so every new document ran unpatched (UA fix and all).
+    let _ = cdp.send("Page.enable", json!({})).await;
     if let Some(params) = cdp.ua.clone() {
         let _ = cdp.send("Emulation.setUserAgentOverride", params).await;
     }
     let _ = cdp
         .send(
             "Page.addScriptToEvaluateOnNewDocument",
-            json!({"source": CONSISTENCY_JS}),
+            json!({"source": consistency_js()}),
         )
         .await;
 }
@@ -833,6 +1037,21 @@ async fn run_batch(
                             .to_string();
                         sessions.insert(target_id.clone(), s.clone());
                         apply_user_agent(cdp, &s).await;
+                        // A freshly attached POPUP's first document predates
+                        // this session, so addScriptToEvaluateOnNewDocument
+                        // never ran inside it. Re-run the consistency script
+                        // IN the live document — a reload here was tried and
+                        // is wrong: it fires exactly when the user starts
+                        // clicking/typing and wipes their focus mid-flow.
+                        // Future documents get the script via the registration.
+                        if popup_root_of(target_id).is_some() {
+                            let _ = cdp
+                                .send(
+                                    "Runtime.evaluate",
+                                    json!({"expression": consistency_js()}),
+                                )
+                                .await;
+                        }
                         s
                     }
                 };
@@ -853,7 +1072,27 @@ async fn run_batch(
                             }),
                         )
                         .await;
-                    screencast_on.insert(session);
+                    screencast_on.insert(session.clone());
+                }
+                // Only the DISPLAYED page may push frames. While a popup is on
+                // screen its opener tab still screencasts — for a live-chart
+                // page like TradingView that is a firehose of frames nobody
+                // displays, all serialized through this one socket, and the
+                // popup's own click/keystroke batches queue behind megabytes
+                // of them (measured as "the popup works but seconds late").
+                // Silence the opener while its popup is displayed; the normal
+                // `!screencast_on` path restarts it the moment the panel is
+                // back on the tab.
+                if let Some(root_id) = popup_root_of(target_id) {
+                    if let Some(root_session) = sessions.get(&root_id) {
+                        if screencast_on.contains(root_session) {
+                            let saved = cdp.session.clone();
+                            cdp.session = Some(root_session.clone());
+                            let _ = cdp.send("Page.stopScreencast", json!({})).await;
+                            cdp.session = saved;
+                            screencast_on.remove(root_session);
+                        }
+                    }
                 }
             }
             None => cdp.session = None,
@@ -994,6 +1233,15 @@ struct LiveFrame {
     image: String,
 }
 
+/// One GLOBAL sequence across every target's frames. The panel's long-poll
+/// carries `after` = the last seq it rendered, and the VISIBLE target can
+/// switch underneath it (a popup opening): with a per-target counter the
+/// popup's first frame (seq 1) could never beat the tab's last seq (57), and
+/// the panel stayed frozen on the old page forever — "clicked the button and
+/// it just stayed there" while the URL bar already showed the popup. One
+/// shared counter makes every switch strictly newer.
+static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Frames keyed by target id, each with a notify that wakes long-polls.
 /// `Option` (not a lazy cell) so the static stays `const`-constructible.
 static FRAMES: Mutex<
@@ -1015,7 +1263,7 @@ fn store_frame(target_id: &str, image: &str) {
             std::sync::Arc::new(tokio::sync::Notify::new()),
         )
     });
-    entry.0.seq += 1;
+    entry.0.seq = FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     entry.0.image = image.to_string();
     entry.1.notify_waiters();
 }
@@ -1087,7 +1335,11 @@ fn drop_pushed(target_id: &str) {
 /// cache is empty, else times out quietly (the panel just asks again).
 pub async fn frame(chat_id: &str, after: u64) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    // Popup discovery rides the panel's poll loop (throttled inside); the
+    // blocking CDP read stays off the async workers, same rule as the seed
+    // capture below.
+    let _ = tokio::task::spawn_blocking(sync_popups).await;
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let target = tab.target_id.clone();
@@ -1427,15 +1679,63 @@ fn stderr_tail(profile: &std::path::Path) -> String {
     }
 }
 
+/// The UA to pin at launch, from the binary's own `--version` output
+/// ("Google Chrome for Testing 156.0.8078.80" → the last token), so the pinned
+/// version always matches the binary — and with it its own client hints.
+/// `None` when the binary does not answer (Windows GUI builds sometimes print
+/// nothing): the per-session override then stays the only UA fix.
+fn chrome_user_agent(bin: &std::path::Path) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text.trim().rsplit(' ').next()?.trim();
+    if version.is_empty() || !version.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let platform = if cfg!(target_os = "macos") {
+        // Chrome freezes the macOS UA at 10_15_7 even on newer releases.
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    Some(format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    ))
+}
+
+/// The REAL macOS version for high-entropy client hints: Chrome freezes the
+/// UA string at 10_15_7 but reports the true OS version in `platformVersion` —
+/// a hardcoded old value there is itself a mismatch Google can read.
+fn macos_platform_version() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            Command::new("/usr/bin/sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "14.5.0".to_string())
+        })
+        .clone()
+}
+
 /// Start the shared Chromium against `profile`. stderr is captured to a file so
 /// a startup failure can be REPORTED instead of surfacing as a bare timeout.
-fn try_launch(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> Result<Child, String> {
+fn try_launch(
+    bin: &std::path::Path,
+    port: u16,
+    profile: &std::path::Path,
+    ua: Option<&str>,
+) -> Result<Child, String> {
     std::fs::create_dir_all(profile).map_err(|e| format!("cannot create profile dir: {e}"))?;
     clear_stale_profile_lock(profile);
     let err_file = std::fs::File::create(profile.join("chromium-stderr.log"))
         .map_err(|e| format!("cannot open chromium log: {e}"))?;
     let mut cmd = Command::new(bin);
-    cmd.args(launch_args(bin, port, profile))
+    cmd.args(launch_args(bin, port, profile, ua))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(err_file));
@@ -1501,55 +1801,126 @@ fn wait_for_port(child: &mut Child, port: u16, profile: &std::path::Path) -> Res
 }
 
 /// Start the shared Chromium (once) and wait until its debugging port answers.
+///
+/// Tries EVERY installed build, best first (the full Chrome-for-Testing from
+/// the one-click install, then the Playwright headless shell, ...): a build
+/// that cannot START here must not take the whole browser feature down — the
+/// full build's helper processes, for one, fail to spawn inside a daemon or
+/// sandboxed context (GPU process launch 1003 → "GPU process isn't usable.
+/// Goodbye.") while the headless shell runs fine in the same context. The
+/// first build whose debugging port answers wins; per-build errors are
+/// collected so a total failure still explains itself.
 fn spawn_browser() -> Result<u16, String> {
     // A browser left by a previous run (crash, forced quit) still holds the
     // profile and lock files; clear it before starting ours.
     reap_orphans();
-    let bin = find_chromium().ok_or_else(|| {
-        "no automation browser installed — install the built-in one from the \
-         Browser panel (or run `npx playwright install chromium`)"
-            .to_string()
-    })?;
+    let candidates = chromium_candidates();
+    if candidates.is_empty() {
+        return Err(
+            "no automation browser installed — install the built-in one from the \
+             Browser panel (or run `npx playwright install chromium`)"
+                .to_string(),
+        );
+    }
     let port = pick_port()?;
     let profile = profile_dir();
-
-    // First attempt: the shared persistent profile, so logins/cookies survive.
-    let mut child = try_launch(&bin, port, &profile)?;
-    if let Err(first) = wait_for_port(&mut child, port, &profile) {
-        // A profile another (dead) Chromium still owns can block startup even
-        // after the lock files are gone. Retry once on a throwaway profile so
-        // the panel always gets a browser instead of a dead session.
-        let _ = child.kill();
-        let _ = child.wait();
-        let fresh = std::env::temp_dir().join(format!("codifa-browser-{}", std::process::id()));
-        let mut retry = try_launch(&bin, port, &fresh)?;
-        if let Err(second) = wait_for_port(&mut retry, port, &fresh) {
-            // `wait_for_port` kills the retry child when the port never opens;
-            // without this `wait` the `?` below would drop it unreaped and leave
-            // a second zombie in the process table.
-            let _ = retry.kill();
-            let _ = retry.wait();
-            return Err(format!("{first}; retry on a fresh profile: {second}"));
+    let mut failures: Vec<String> = Vec::new();
+    for bin in &candidates {
+        let ua = chrome_user_agent(bin);
+        let mut child = match try_launch(bin, port, &profile, ua.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                failures.push(format!("{}: {e}", bin.display()));
+                continue;
+            }
+        };
+        if let Err(e) = wait_for_port(&mut child, port, &profile) {
+            // `wait_for_port` kills the child when the port never opens; the
+            // explicit `wait` keeps it from becoming a zombie. A failed child
+            // may also have left the profile lock wedged — clear it before the
+            // next candidate inherits the same profile.
+            let _ = child.kill();
+            let _ = child.wait();
+            clear_stale_profile_lock(&profile);
+            failures.push(format!("{}: {e}", bin.display()));
+            continue;
         }
-        child = retry;
+        // A build whose helper processes cannot spawn here (the full build's
+        // GPU process in a daemon/sandboxed context) binds its debugging port,
+        // then DIES the moment the first page needs compositing — the port
+        // alone is not proof of health. Wait one settle beat, then demand a
+        // REAL round trip on a short-lived browser-level connection
+        // (independent of the not-yet-registered BROWSER state): create a
+        // page, attach, and capture one frame — exactly the work that dies.
+        std::thread::sleep(Duration::from_millis(1200));
+        let died = child.try_wait().ok().flatten().is_some();
+        let health_port = port;
+        let healthy = !died
+            && block_on(async move {
+                let mut cdp = Cdp::connect(health_port).await?;
+                let res = cdp
+                    .send(
+                        "Target.createTarget",
+                        json!({"url": "about:blank#health"}),
+                    )
+                    .await?;
+                let id = res["targetId"]
+                    .as_str()
+                    .ok_or_else(|| "no targetId".to_string())?
+                    .to_string();
+                let attached = cdp
+                    .send(
+                        "Target.attachToTarget",
+                        json!({"targetId": id, "flatten": true}),
+                    )
+                    .await?;
+                cdp.session = Some(
+                    attached["sessionId"]
+                        .as_str()
+                        .ok_or_else(|| "no sessionId".to_string())?
+                        .to_string(),
+                );
+                let shot = cdp
+                    .send(
+                        "Page.captureScreenshot",
+                        json!({"format": "jpeg", "quality": 40}),
+                    )
+                    .await;
+                let _ = cdp
+                    .send("Target.closeTarget", json!({"targetId": id}))
+                    .await;
+                shot.map(|v| v["data"].as_str().is_some())
+                    .map_err(|e| format!("capture failed: {e}"))
+            })
+            .unwrap_or(false);
+        if !healthy {
+            let _ = child.kill();
+            let _ = child.wait();
+            clear_stale_profile_lock(&profile);
+            failures.push(format!(
+                "{}: debugging port opened but the browser did not survive startup",
+                bin.display()
+            ));
+            continue;
+        }
+        let mut guard = BROWSER.lock().map_err(|_| "browser lock poisoned")?;
+        // A previous process (e.g. a crashed one) is replaced.
+        if let Some(mut old) = guard.take() {
+            let _ = old.child.kill();
+            let _ = old.child.wait();
+        }
+        // A brand-new Chromium: the pooled connection (if any) points at the
+        // dead process, so the next call starts a fresh driver.
+        invalidate_cdp_pool();
+        drop_all_frames();
+        *guard = Some(BrowserProc {
+            child,
+            port,
+            last_used: Instant::now(),
+        });
+        return Ok(port);
     }
-
-    let mut guard = BROWSER.lock().map_err(|_| "browser lock poisoned")?;
-    // A previous process (e.g. a crashed one) is replaced.
-    if let Some(mut old) = guard.take() {
-        let _ = old.child.kill();
-        let _ = old.child.wait();
-    }
-    // A brand-new Chromium: the pooled connection (if any) points at the dead
-    // process, so the next call starts a fresh driver.
-    invalidate_cdp_pool();
-    drop_all_frames();
-    *guard = Some(BrowserProc {
-        child,
-        port,
-        last_used: Instant::now(),
-    });
-    Ok(port)
+    Err(failures.join("; "))
 }
 
 /// Port of the shared browser, starting it (and nothing else) when needed.
@@ -1650,33 +2021,45 @@ fn same_page(a: &str, b: &str) -> bool {
     !a.trim().is_empty() && norm(a) == norm(b)
 }
 
-/// Every PAGE target in the shared browser as `(target_id, url)`.
-///
-/// `Target.getTargets` is a browser-level call (no `sessionId` needed), so it
-/// rides the shared connection. An error or a dead browser yields an empty
-/// list rather than failing the caller.
-fn page_targets() -> Vec<(String, String)> {
-    let Ok(out) = cdp_browser_batch(vec![("Target.getTargets", json!({}))]) else {
-        return Vec::new();
-    };
-    out.into_iter()
-        .next()
-        .and_then(|res| {
-            res["targetInfos"].as_array().map(|a| {
-                a.iter()
-                    .filter_map(|t| {
-                        if t["type"].as_str() != Some("page") {
-                            return None;
-                        }
-                        let id = t["id"].as_str()?.to_string();
-                        let url = t["url"].as_str().unwrap_or_default().to_string();
-                        Some((id, url))
-                    })
-                    .collect()
+    /// Every PAGE target in the shared browser as
+    /// `(target_id, url, opener_target_id)`.
+    ///
+    /// `Target.getTargets` is a browser-level call (no `sessionId` needed), so
+    /// it rides the shared connection. An error or a dead browser yields an
+    /// empty list rather than failing the caller. The opener id is empty for
+    /// targets no other page opened (chat tabs, `Target.createTarget` pages);
+    /// it is what ties a `window.open` popup back to the tab that opened it.
+    fn page_targets() -> Vec<(String, String, String)> {
+        let Ok(out) = cdp_browser_batch(vec![("Target.getTargets", json!({}))]) else {
+            return Vec::new();
+        };
+        out.into_iter()
+            .next()
+            .and_then(|res| {
+                res["targetInfos"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|t| {
+                            if t["type"].as_str() != Some("page") {
+                                return None;
+                            }
+                            // CDP's TargetInfo spells the key `targetId` (the
+                            // legacy `/json/list` HTTP endpoint uses `id`); a
+                            // miss here silently emptied the list and made
+                            // adoption a no-op.
+                            let id = t["targetId"]
+                                .as_str()
+                                .or_else(|| t["id"].as_str())?
+                                .to_string();
+                            let url = t["url"].as_str().unwrap_or_default().to_string();
+                            let opener =
+                                t["openerId"].as_str().unwrap_or_default().to_string();
+                            Some((id, url, opener))
+                        })
+                        .collect()
+                })
             })
-        })
-        .unwrap_or_default()
-}
+            .unwrap_or_default()
+    }
 
 /// The chat's tab, ADOPTING a page another CDP client opened when the chat has
 /// nothing real to show.
@@ -1700,8 +2083,8 @@ fn adopt(chat: &str) -> Option<Tab> {
     if let Some(tab) = &registered {
         let real = targets
             .iter()
-            .find(|(id, _)| id == &tab.target_id)
-            .map(|(_, url)| !is_blank_page_url(url))
+            .find(|(id, _, _)| id == &tab.target_id)
+            .map(|(_, url, _)| !is_blank_page_url(url))
             .unwrap_or(false);
         if real {
             return registered;
@@ -1712,10 +2095,23 @@ fn adopt(chat: &str) -> Option<Tab> {
         .ok()
         .map(|t| t.iter().map(|(_, x)| x.target_id.clone()).collect())
         .unwrap_or_default();
+    let popups: Vec<String> = POPUPS
+        .lock()
+        .ok()
+        .map(|p| p.iter().map(|x| x.target_id.clone()).collect())
+        .unwrap_or_default();
     let Some(target_id) = targets
         .iter()
-        .find(|(id, url)| !is_blank_page_url(url) && !claimed.contains(id))
-        .map(|(id, _)| id.clone())
+        .find(|(id, url, opener)| {
+            !is_blank_page_url(url)
+                && !claimed.contains(id)
+                && !popups.contains(id)
+                // A POPUP of a claimed tab (or of a known popup) belongs to
+                // that chat's flow — an OAuth window mid-login must never be
+                // stolen by whichever chat currently has no real page.
+                && !(claimed.contains(opener) || popups.contains(opener))
+        })
+        .map(|(id, _, _)| id.clone())
     else {
         return registered;
     };
@@ -1735,13 +2131,172 @@ fn adopt(chat: &str) -> Option<Tab> {
     Some(tab)
 }
 
+/// Root chat-tab target of a popup chain, given the live target list
+/// `(id, url, opener)` and the registered chat-tab ids.
+///
+/// A popup opened by a POPUP (some flows do) rolls up to the same chat tab.
+/// `None` when the chain leaves the app's own tabs — a foreign CDP client's
+/// popup tree is none of the panel's business — or is absurdly deep. Pure so
+/// the walk is unit-testable without a browser.
+fn popup_root(id: &str, targets: &[(String, String, String)], claimed: &[String]) -> Option<String> {
+    let mut cur = id.to_string();
+    for _ in 0..8 {
+        let (_, _, opener) = targets.iter().find(|(tid, _, _)| *tid == cur)?;
+        if opener.is_empty() {
+            // `cur` is itself a root: `id` was never a popup.
+            return None;
+        }
+        if claimed.contains(opener) {
+            return Some(opener.clone());
+        }
+        cur = opener.clone();
+    }
+    None
+}
+
+/// How often the panel's poll paths re-read the target list for popup
+/// discovery. The pushed `Target.targetDestroyed` events already snap the
+/// registry when a popup CLOSES; this cadence bounds how long a popup that
+/// OPENS can stay invisible (one poll cycle, ~1s).
+const POPUP_SYNC_MIN: Duration = Duration::from_millis(400);
+static LAST_POPUP_SYNC: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Bring `POPUPS` in step with what Chromium actually has.
+///
+/// `window.open` (TradingView's "Continue with Google", every OAuth button) is
+/// answered by Chromium with a SECOND target that the opener reaches through
+/// `window.opener`. Nothing used to look at it, so login popups ran invisibly.
+/// This re-reads the browser-level target list and registers every page whose
+/// opener chain lands on a registered chat tab; the panel then displays the
+/// newest live popup instead of the tab (`with_visible_popup`).
+///
+/// Callers sit on blocking contexts (the `/browser/*` handlers' spawn_blocking
+/// pool, or `frame`'s seed path) — never directly on an async worker.
+fn sync_popups() {
+    // Panel polls arrive in pairs (status + frame) a few hundred ms apart;
+    // one target re-read per `POPUP_SYNC_MIN` is plenty for both.
+    if let Ok(mut last) = LAST_POPUP_SYNC.lock() {
+        if last.map(|t| t.elapsed() < POPUP_SYNC_MIN).unwrap_or(false) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let targets = page_targets();
+    if targets.is_empty() {
+        // Browser down (or no targets at all): nothing can be alive.
+        if let Ok(mut popups) = POPUPS.lock() {
+            let gone: Vec<String> = popups.drain(..).map(|p| p.target_id).collect();
+            for id in gone {
+                drop_frame(&id);
+            }
+        }
+        return;
+    }
+    let claimed: Vec<String> = TABS
+        .lock()
+        .ok()
+        .map(|t| t.iter().map(|(_, x)| x.target_id.clone()).collect())
+        .unwrap_or_default();
+    let discovered: Vec<Popup> = targets
+        .iter()
+        .filter(|(id, _, opener)| !opener.is_empty() && !claimed.contains(id))
+        .filter_map(|(id, _, _)| {
+            popup_root(id, &targets, &claimed).map(|root| Popup {
+                target_id: id.clone(),
+                root,
+            })
+        })
+        .collect();
+    if let Ok(mut popups) = POPUPS.lock() {
+        // Keep the discovery order stable (oldest first, "newest wins" for the
+        // display) and forget frames of popups that went away.
+        let mut merged: Vec<Popup> = popups
+            .iter()
+            .filter_map(|old| {
+                discovered
+                    .iter()
+                    .find(|d| d.target_id == old.target_id)
+                    .cloned()
+            })
+            .collect();
+        for d in &discovered {
+            if !merged.iter().any(|m| m.target_id == d.target_id) {
+                merged.push(d.clone());
+            }
+        }
+        let gone: Vec<String> = popups
+            .iter()
+            .filter(|old| !merged.iter().any(|m| m.target_id == old.target_id))
+            .map(|old| old.target_id.clone())
+            .collect();
+        *popups = merged;
+        for id in gone {
+            // A dropped entry is either a popup Chromium already closed (its
+            // target is gone — nothing to do) or one that OUTLIVED its root
+            // (root reaped/closed first): close the straggler so no invisible
+            // renderer lingers holding the profile.
+            if targets.iter().any(|(tid, _, _)| *tid == id) {
+                let _ = cdp_browser_batch(vec![(
+                    "Target.closeTarget",
+                    json!({"targetId": id}),
+                )]);
+            }
+            drop_frame(&id);
+        }
+    }
+}
+
+/// Root chat-tab target of `target_id` when it is a live popup, else None.
+/// Used by the CDP driver to silence an opener tab's screencast while one of
+/// its popups owns the display.
+fn popup_root_of(target_id: &str) -> Option<String> {
+    let popups = POPUPS.lock().ok()?;
+    popups
+        .iter()
+        .find(|p| p.target_id == target_id)
+        .map(|p| p.root.clone())
+}
+
+/// Target id of the chat's live popup to display instead of `root`, if any.
+/// The NEWEST popup wins (a second `window.open` replaces the first on
+/// screen); when it closes the view falls back to any older one, then to the
+/// tab itself.
+fn visible_popup(root: &str) -> Option<String> {
+    let popups = POPUPS.lock().ok()?;
+    popups
+        .iter()
+        .rev()
+        .find(|p| p.root == root)
+        .map(|p| p.target_id.clone())
+}
+
+/// The chat's tab with the display swapped to its live popup, if one is open.
+///
+/// Only the CDP target changes: the viewport stays the chat's own, and every
+/// batch re-applies it to whichever target is visible, so frames and click
+/// coordinates keep one coordinate space across the swap.
+fn with_visible_popup(mut tab: Tab) -> Tab {
+    if let Some(popup) = visible_popup(&tab.target_id) {
+        tab.target_id = popup;
+    }
+    tab
+}
+
+/// The chat's registered tab as the PANEL should see it (no discovery — input
+/// calls stay cheap; the poll paths refresh the registry).
+fn panel_tab(chat: &str) -> Option<Tab> {
+    existing_tab(chat).map(with_visible_popup)
+}
+
 /// ADOPT a page another CDP client opened when the chat has nothing real to
-/// show. Deliberately used ONLY by `launch`/`status`/`screenshot`: those three
-/// run on the panel's polling path, so when one of them adopts a foreign page
-/// it is registered for the chat and every other `/browser/*` call follows it
-/// automatically — no other call site needs to know about adoption.
+/// show, then follow the chat's own popups. Deliberately used ONLY by
+/// `launch`/`status`/`screenshot`: those three run on the panel's polling
+/// path, so when one of them adopts a foreign page it is registered for the
+/// chat and every other `/browser/*` call follows it automatically — no other
+/// call site needs to know about adoption.
 fn active_tab(chat: &str) -> Option<Tab> {
-    adopt(chat)
+    sync_popups();
+    adopt(chat).map(with_visible_popup)
 }
 
 /// The chat's registered tab without creating one.
@@ -1822,23 +2377,209 @@ fn store_viewport(chat: &str, size: (u32, u32)) {
     }
 }
 
-/// Close one chat's tab. The shared browser stays up: other chats may be using
-/// it, and a fresh panel reuses the warm process (and its profile).
+// ---------------------------------------------------------------------------
+// Session cookie import ("log in outside, keep the session inside")
+// ---------------------------------------------------------------------------
+
+/// One pasted cookie ready for `Network.setCookie`.
+#[derive(Clone, Debug, PartialEq)]
+struct PastedCookie {
+    name: String,
+    value: String,
+}
+
+/// Set-Cookie attribute names that must never become a cookie when the user
+/// pastes a whole `Set-Cookie:` header line.
+const COOKIE_ATTRS: [&str; 8] = [
+    "path",
+    "domain",
+    "expires",
+    "max-age",
+    "secure",
+    "httponly",
+    "samesite",
+    "partitioned",
+];
+
+/// Parse what the user pasted into the import dialog. Accepted shapes, most
+/// specific first:
+///   * a JSON array of DevTools-style cookie objects (`[{"name": ..., "value": ...}]`);
+///   * `name=value; name2=value2` — the shape of `document.cookie` / a
+///     `Cookie:` header / a `Set-Cookie:` line (attributes are dropped);
+///   * one bare token with no `=` — treated as the `sessionid` value, the one
+///     cookie an Instagram session needs.
+/// Later duplicates of the same name win (the paste's own intent).
+fn parse_cookie_blob(raw: &str) -> Vec<PastedCookie> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    // JSON array of cookie objects (the "EditThisCookie"-style export).
+    if raw.starts_with('[') {
+        if let Ok(items) = serde_json::from_str::<Vec<Value>>(raw) {
+            let out: Vec<PastedCookie> = items
+                .iter()
+                .filter_map(|c| {
+                    let name = c["name"].as_str()?.trim().to_string();
+                    let value = c["value"].as_str()?.to_string();
+                    (!name.is_empty()).then_some(PastedCookie { name, value })
+                })
+                .collect();
+            if !out.is_empty() {
+                return dedupe_cookies(out);
+            }
+        }
+    }
+    // name=value pairs. No `=` anywhere: a single bare token is the sessionid
+    // value itself.
+    if !raw.contains('=') {
+        return vec![PastedCookie {
+            name: "sessionid".to_string(),
+            value: raw.to_string(),
+        }];
+    }
+    let out: Vec<PastedCookie> = raw
+        .split(';')
+        .filter_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            let name = name.trim().to_string();
+            if name.is_empty() || COOKIE_ATTRS.contains(&name.to_ascii_lowercase().as_str()) {
+                return None;
+            }
+            Some(PastedCookie {
+                name,
+                value: value.trim().to_string(),
+            })
+        })
+        .collect();
+    dedupe_cookies(out)
+}
+
+/// Keep the LAST value for every name (a paste that repeats a cookie means
+/// "the later one is the current one").
+fn dedupe_cookies(cookies: Vec<PastedCookie>) -> Vec<PastedCookie> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<PastedCookie> = Vec::with_capacity(cookies.len());
+    for c in cookies {
+        match seen.get(&c.name) {
+            Some(&i) => out[i] = c,
+            None => {
+                seen.insert(c.name.clone(), out.len());
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Import pasted session cookies into the shared browser profile.
+///
+/// The paste flow exists for sites whose server-side bot defenses reject even
+/// a perfectly presented login form from an automation browser — Instagram
+/// above all. Importing the user's OWN session cookie is ordinary multi-device
+/// behavior: no password is typed into the virtual browser, so there is no
+/// failed-login signal, and the cookie lands in the same persistent profile
+/// the in-app logins live in.
+pub fn import_cookies(chat_id: &str, domain: &str, raw: &str) -> Value {
+    let cookies = parse_cookie_blob(raw);
+    if cookies.is_empty() {
+        return json!({"ok": false, "error": "no cookies found in the paste"});
+    }
+    let host = domain
+        .trim()
+        .split("://")
+        .last()
+        .unwrap_or_default()
+        .trim_matches('/')
+        .trim_start_matches('.')
+        .to_string();
+    if host.is_empty() || !host.contains('.') {
+        return json!({"ok": false, "error": "a domain like instagram.com is required"});
+    }
+    let chat = normalize_chat(chat_id);
+    // The setCookie call rides a tab's CDP session; cookies are browser-global
+    // once set, so the choice of tab does not matter — any live one works.
+    let tab = match existing_tab(&chat) {
+        Some(t) if tab_usable(&t.target_id) => t,
+        _ => match ensure_tab(&chat) {
+            Ok(t) => t,
+            Err(e) => return json!({"ok": false, "error": e}),
+        },
+    };
+    // One year out: a session-scoped cookie would vanish with the browser,
+    // and the paste came from a long-lived login.
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        + 365 * 24 * 3600;
+    let mut calls: Vec<(&'static str, Value)> = vec![("Network.enable", json!({}))];
+    let mut names = Vec::new();
+    for c in &cookies {
+        calls.push((
+            "Network.setCookie",
+            json!({
+                "name": c.name,
+                "value": c.value,
+                "domain": format!(".{host}"),
+                "path": "/",
+                "secure": true,
+                "httpOnly": true,
+                "sameSite": "Lax",
+                "expires": expires,
+            }),
+        ));
+        names.push(c.name.clone());
+    }
+    match cdp_calls_on(&tab, calls, false) {
+        Ok(results) => {
+            let imported = results
+                .iter()
+                .skip(1) // Network.enable's ack
+                .filter(|r| r["success"] == true)
+                .count();
+            json!({"ok": true, "imported": imported, "names": names, "domain": host})
+        }
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+/// Close one chat's tab (the shared browser stays up: other chats may be using
+/// it, and a fresh panel reuses the warm process and its profile).
+///
+/// The chat's open POPUPS are closed with it: Chromium tears them down with
+/// the opener anyway, but closing them here keeps the registry, the frame
+/// cache and the renderer count from depending on that timing.
 fn close_tab(chat: &str) -> bool {
     let Some(tab) = existing_tab(chat) else {
         return false;
     };
+    let mut targets = vec![tab.target_id.clone()];
+    if let Ok(popups) = POPUPS.lock() {
+        targets.extend(
+            popups
+                .iter()
+                .filter(|p| p.root == tab.target_id)
+                .map(|p| p.target_id.clone()),
+        );
+    }
     TABS.lock()
         .ok()
         .map(|mut tabs| tabs.retain(|(k, _)| k != chat));
     restart_idle_clock_if_unused();
-    // "Already gone" arrives as a transport-shaped error and is ignored —
-    // closing a target that vanished is a no-op, not a failure.
-    let _ = cdp_browser_batch(vec![(
-        "Target.closeTarget",
-        json!({"targetId": tab.target_id}),
-    )]);
-    drop_frame(&tab.target_id);
+    // One batch per target: an "already gone" target arrives as a
+    // transport-shaped error that would stop a merged batch short, and a
+    // vanished popup must not prevent the tab itself from closing.
+    for target in &targets {
+        let _ = cdp_browser_batch(vec![(
+            "Target.closeTarget",
+            json!({"targetId": target}),
+        )]);
+        drop_frame(target);
+    }
+    if let Ok(mut popups) = POPUPS.lock() {
+        popups.retain(|p| p.root != tab.target_id);
+    }
     true
 }
 
@@ -1900,13 +2641,16 @@ fn cft_platform() -> &'static str {
     }
 }
 
-/// The headless-shell download URL for this platform.
+/// The full Chrome-for-Testing download for this platform, as `(url, version)`.
 ///
-/// The headless shell is the right artifact here: it is a purpose-built
-/// automation build with no window, no updater and no background services, so it
-/// can never register with LaunchServices or touch the user's own Chrome
-/// profile the way a `/Applications` fallback did.
-fn cft_shell_url() -> Result<String, String> {
+/// The FULL browser is the right artifact, not the headless shell: the new
+/// headless mode keeps the real GPU stack (ANGLE/Metal), so heavy pages
+/// rasterize on the GPU instead of SwiftShader software rendering, and the
+/// WebGL fingerprint reports a genuine Apple GPU — the shell's SwiftShader
+/// string is exactly what Google's "may not be secure" sign-in gate reads as
+/// "not a real browser". It still lives inside the app's own data root, so
+/// the system-Chrome hijacking concerns in `chromium_candidates` never apply.
+fn cft_browser_url() -> Result<(String, String), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -1918,7 +2662,12 @@ fn cft_shell_url() -> Result<String, String> {
         .json()
         .map_err(|e| format!("browser index is not json: {e}"))?;
     let want = cft_platform();
-    index["channels"]["Stable"]["downloads"]["chrome-headless-shell"]
+    let stable = &index["channels"]["Stable"];
+    let version = stable["version"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let url = stable["downloads"]["chrome"]
         .as_array()
         .and_then(|list| {
             list.iter()
@@ -1926,9 +2675,8 @@ fn cft_shell_url() -> Result<String, String> {
                 .and_then(|d| d["url"].as_str())
         })
         .map(str::to_string)
-        .ok_or_else(|| {
-            format!("chrome-for-testing has no headless-shell build for {want}")
-        })
+        .ok_or_else(|| format!("chrome-for-testing has no chrome build for {want}"))?;
+    Ok((url, version))
 }
 
 fn set_progress(phase: &str, percent: u32) {
@@ -1996,7 +2744,7 @@ pub fn install_status() -> Value {
 }
 
 fn install_blocking() -> Result<(), String> {
-    let url = cft_shell_url()?;
+    let (url, version) = cft_browser_url()?;
     let root = data_root().join("browser");
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("cannot create {}: {e}", root.display()))?;
@@ -2011,13 +2759,11 @@ fn install_blocking() -> Result<(), String> {
         std::fs::create_dir_all(&staging).map_err(|e| format!("cannot stage: {e}"))?;
         extract_zip(&zip_path, &staging)?;
         let unpacked = single_child_dir(&staging)?;
-        let name = unpacked
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .ok_or_else(|| "unexpected archive layout".to_string())?;
-        // Swap into place: the archive's own top-level name is kept, because
-        // that is the shape `candidate_dirs` looks for.
-        let dest = root.join(&name);
+        // The zip's own top-level name (`chrome-mac-arm64`) is NOT a shape
+        // `candidate_dirs` filters on; rehouse it under the versioned
+        // chrome-for-testing name so the numeric rank orders it and the
+        // layout probes find the binary.
+        let dest = root.join(format!("chrome-for-testing-{version}"));
         let _ = std::fs::remove_dir_all(&dest);
         std::fs::rename(&unpacked, &dest).map_err(|e| {
             format!("cannot move the browser into {}: {e}", dest.display())
@@ -2128,21 +2874,24 @@ fn single_child_dir(root: &std::path::Path) -> Result<PathBuf, String> {
 }
 
 /// ZIP archives do not always carry the executable bit through, and a browser
-/// binary without it fails with a bare permission error.
+/// binary without it fails with a bare permission error. The probe walks the
+/// unpacked build itself — NOT `find_chromium()`, which until this fix lands
+/// still resolves to the previous install and once made it skip the chmod
+/// entirely (`Permission denied` on the very next launch).
 fn make_executable(dir: &std::path::Path) {
-    let Some(bin) = find_chromium() else {
-        return;
-    };
-    if !bin.starts_with(dir) {
-        return;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&bin) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o755);
-            let _ = std::fs::set_permissions(&bin, perms);
+        for bin in binaries_under(dir) {
+            if bin.is_file() {
+                if let Ok(meta) = std::fs::metadata(&bin) {
+                    let mut perms = meta.permissions();
+                    if perms.mode() & 0o111 == 0 {
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&bin, perms);
+                    }
+                }
+            }
         }
     }
     #[cfg(not(unix))]
@@ -2217,7 +2966,7 @@ fn navigate(tab: &Tab, url: &str) -> Result<(), String> {
 /// "browser is not running" error the panel already handles.
 pub fn navigate_to(url: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let target = url.trim();
@@ -2303,7 +3052,12 @@ async fn wait_page_settled(tab: &Tab, timeout: Duration) {
             .ok()
             .and_then(|res| res.into_iter().next())
             .and_then(|r| {
-                r["result"]["result"]["value"]
+                // Runtime.evaluate's reply carries the RemoteObject under its
+                // own `result` key (`{"result": {"result": {...}}}` on the
+                // wire, one level stripped by `Cdp::send`). Reading one level
+                // deeper than that always yielded Null, so every navigation
+                // waited out the whole timeout instead of settling early.
+                r["result"]["value"]
                     .as_str()
                     .map(str::to_string)
             })
@@ -2349,7 +3103,11 @@ pub fn screenshot(chat_id: &str) -> Value {
                 .ok()
                 .and_then(|res| res.into_iter().next())
                 .and_then(|res| {
-                    res["result"]["result"]["value"]
+                    // Same reply depth as `wait_page_settled`: one `result`
+                    // from the CDP envelope (stripped by send), one from the
+                    // RemoteObject. A deeper read was always Null and made
+                    // every seed capture burn its whole 6s deadline.
+                    res["result"]["value"]
                         .as_str()
                         .map(str::to_string)
                 })
@@ -2419,7 +3177,7 @@ fn mouse_event(
 /// the panel, splitting the click.
 pub fn click(x: i64, y: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let press = json!({
@@ -2453,7 +3211,7 @@ pub fn click(x: i64, y: i64, chat_id: &str) -> Value {
 /// Move the virtual cursor (hover).
 pub fn move_mouse(x: i64, y: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     match mouse_event(&tab, "mouseMoved", x, y, json!({"buttons": 0})) {
@@ -2509,7 +3267,7 @@ pub(crate) fn char_key_events(ch: char) -> [Value; 2] {
 /// Type text into the focused element.
 pub fn type_text(text: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let calls: Vec<(&'static str, Value)> = if is_short_plain_text(text) {
@@ -2550,7 +3308,7 @@ fn key_spec(name: &str) -> Option<(i64, &'static str, &'static str)> {
 /// Press one key (a named key, or a single character typed literally).
 pub fn press_key(key: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let Some((code, name, dom_code)) = key_spec(key) else {
@@ -2582,7 +3340,7 @@ pub fn press_key(key: &str, chat_id: &str) -> Value {
 /// Scroll the page by a wheel delta.
 pub fn scroll(dx: i64, dy: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let (w, h) = tab.viewport;
@@ -2608,7 +3366,7 @@ pub fn scroll(dx: i64, dy: i64, chat_id: &str) -> Value {
 /// panel's ruler and fit-to-pane resizes survive the next status poll.
 pub fn set_viewport(width: u32, height: u32, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     // Guard against a zero/absurd size from a mid-typing input.
@@ -2630,7 +3388,7 @@ pub fn set_viewport(width: u32, height: u32, chat_id: &str) -> Value {
 /// Back / forward / reload through the page's own history.
 pub fn history(action: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let expr = match action {
@@ -2657,7 +3415,7 @@ pub fn history(action: &str, chat_id: &str) -> Value {
 /// that actually loads wins, and its results URL is returned for the address bar.
 pub fn search(query: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let q = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC)
@@ -2690,7 +3448,7 @@ pub fn search(query: &str, chat_id: &str) -> Value {
 /// at the browser-level endpoint — the latter is not inspectable.
 pub fn devtools_url(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = panel_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let Some(port) = alive_port() else {
@@ -2743,14 +3501,14 @@ pub(crate) mod driver_hooks {
     /// version. The agent's driver is a SEPARATE CDP session on the same tab, so
     /// it has to send the same override or the two sessions disagree about who
     /// the browser is.
-    pub(crate) fn identity() -> Option<(serde_json::Value, &'static str)> {
+    pub(crate) fn identity() -> Option<(serde_json::Value, String)> {
         let port = super::alive_port()?;
         let info = super::http_get_json(port, "/json/version").ok()?;
         let version = serde_json::json!({
             "userAgent": info["User-Agent"],
             "product": info["Browser"],
         });
-        super::ua_override(&version).map(|ua| (ua, super::CONSISTENCY_JS))
+        super::ua_override(&version).map(|ua| (ua, super::consistency_js()))
     }
 
     /// Normalized chat key.
@@ -3072,6 +3830,271 @@ mod tests {
     }
 
     #[test]
+    fn popup_root_walks_to_the_registered_chat_tab() {
+        let targets = vec![
+            ("root-1".to_string(), "https://site".to_string(), String::new()),
+            ("pop-1".to_string(), "about:blank".to_string(), "root-1".to_string()),
+            ("pop-2".to_string(), "about:blank".to_string(), "pop-1".to_string()),
+            ("foreign".to_string(), "https://other".to_string(), String::new()),
+            ("foreign-pop".to_string(), "about:blank".to_string(), "foreign".to_string()),
+        ];
+        let claimed = vec!["root-1".to_string()];
+        assert_eq!(
+            popup_root("pop-1", &targets, &claimed).as_deref(),
+            Some("root-1")
+        );
+        // A popup of a popup rolls up to the same chat tab.
+        assert_eq!(
+            popup_root("pop-2", &targets, &claimed).as_deref(),
+            Some("root-1")
+        );
+        // A root is not a popup; a foreign client's popup tree and a ghost id
+        // are none of the panel's business.
+        assert_eq!(popup_root("root-1", &targets, &claimed), None);
+        assert_eq!(popup_root("foreign-pop", &targets, &claimed), None);
+        assert_eq!(popup_root("ghost", &targets, &claimed), None);
+    }
+
+    #[test]
+    fn panel_display_follows_the_newest_live_popup() {
+        // Other tests in this suite mutate the shared TABS/POPUPS statics
+        // concurrently (the idle-clock one wipes TABS wholesale), so a wipe
+        // landing mid-test would surface as a spurious None. Re-seed and
+        // retry: a race that says nothing about the code under test must not
+        // fail it, and the walk itself is pure in-memory work.
+        let attempt = || -> Option<()> {
+            TABS.lock().unwrap().retain(|(k, _)| k != "popup-display-test");
+            TABS.lock().unwrap().push((
+                "popup-display-test".to_string(),
+                Tab {
+                    target_id: "T-root".to_string(),
+                    viewport: DEFAULT_VIEWPORT,
+                    last_used: Instant::now(),
+                },
+            ));
+            POPUPS.lock().unwrap().clear();
+            POPUPS.lock().unwrap().push(Popup {
+                target_id: "T-pop1".to_string(),
+                root: "T-root".to_string(),
+            });
+            // Another chat's popup must never leak into this chat's display.
+            POPUPS.lock().unwrap().push(Popup {
+                target_id: "T-other".to_string(),
+                root: "T-unrelated".to_string(),
+            });
+            if panel_tab("popup-display-test").map(|t| t.target_id)
+                != Some("T-pop1".to_string())
+            {
+                return None;
+            }
+            POPUPS.lock().unwrap().push(Popup {
+                target_id: "T-pop2".to_string(),
+                root: "T-root".to_string(),
+            });
+            // Newest wins while both live…
+            if panel_tab("popup-display-test").map(|t| t.target_id)
+                != Some("T-pop2".to_string())
+            {
+                return None;
+            }
+            POPUPS.lock().unwrap().retain(|p| p.target_id != "T-pop2");
+            // …and closing it falls back to the older popup, then to the tab.
+            if panel_tab("popup-display-test").map(|t| t.target_id)
+                != Some("T-pop1".to_string())
+            {
+                return None;
+            }
+            POPUPS.lock().unwrap().clear();
+            if panel_tab("popup-display-test").map(|t| t.target_id)
+                != Some("T-root".to_string())
+            {
+                return None;
+            }
+            TABS.lock().unwrap().retain(|(k, _)| k != "popup-display-test");
+            Some(())
+        };
+        let mut settled = false;
+        for _ in 0..50 {
+            if attempt().is_some() {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        POPUPS.lock().unwrap().clear();
+        assert!(
+            settled,
+            "the popup display walk never settled (state kept getting wiped by a concurrent test)"
+        );
+    }
+
+    #[test]
+    fn parse_cookie_blob_accepts_every_paste_shape() {
+        // The bare sessionid token (the Instagram flow).
+        assert_eq!(
+            parse_cookie_blob("abcDEF123xyz"),
+            vec![PastedCookie {
+                name: "sessionid".to_string(),
+                value: "abcDEF123xyz".to_string()
+            }]
+        );
+        // document.cookie / Cookie-header shape.
+        assert_eq!(
+            parse_cookie_blob("sessionid=AAA; csrftoken=BBB; ds_user_id=123"),
+            vec![
+                PastedCookie { name: "sessionid".to_string(), value: "AAA".to_string() },
+                PastedCookie { name: "csrftoken".to_string(), value: "BBB".to_string() },
+                PastedCookie { name: "ds_user_id".to_string(), value: "123".to_string() },
+            ]
+        );
+        // A pasted Set-Cookie line: attributes are dropped, not imported.
+        assert_eq!(
+            parse_cookie_blob("sessionid=AAA; Path=/; Domain=.instagram.com; Secure; HttpOnly"),
+            vec![PastedCookie { name: "sessionid".to_string(), value: "AAA".to_string() }]
+        );
+        // DevTools-style JSON export.
+        assert_eq!(
+            parse_cookie_blob(r#"[{"name":"sessionid","value":"AAA","domain":".instagram.com"}]"#),
+            vec![PastedCookie { name: "sessionid".to_string(), value: "AAA".to_string() }]
+        );
+        // A later duplicate wins.
+        assert_eq!(
+            parse_cookie_blob("sessionid=OLD; sessionid=NEW"),
+            vec![PastedCookie { name: "sessionid".to_string(), value: "NEW".to_string() }]
+        );
+        // Empty paste yields nothing (the caller reports it).
+        assert!(parse_cookie_blob("   ").is_empty());
+        // Whitespace around pairs and values is trimmed.
+        assert_eq!(
+            parse_cookie_blob("  sessionid =  AAA  ; "),
+            vec![PastedCookie { name: "sessionid".to_string(), value: "AAA".to_string() }]
+        );
+    }
+
+    /// Live check that an imported cookie really lands in the shared profile
+    /// and is visible to the site: import a marker cookie for a local origin,
+    /// then read it back through the page. Run on demand:
+    /// `cargo test --ignored imported_cookies_reach_the_site`.
+    #[test]
+    #[ignore]
+    fn imported_cookies_reach_the_site() {
+        let chat = "live-cookie";
+        let tab = ensure_tab(chat).expect("tab");
+        // Land the tab on a stable origin first (the cookie is domain-scoped).
+        let nav = navigate_to("https://example.com/", chat);
+        assert_eq!(nav["ok"], true, "{nav}");
+        let v = import_cookies(
+            chat,
+            "example.com",
+            "codifa_import_test=hello-import",
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["imported"], 1, "{v}");
+        // The page sees it: the cookie is set httpOnly, so read the jar via
+        // CDP instead of document.cookie.
+        let seen = cdp_calls(
+            &tab,
+            vec![
+                ("Network.enable", json!({})),
+                (
+                    "Network.getCookies",
+                    json!({"urls": ["https://example.com/"]}),
+                ),
+            ],
+        )
+        .expect("getCookies");
+        let cookies = &seen[1]["cookies"];
+        let hit = cookies
+            .as_array()
+            .map(|a| {
+                a.iter().any(|c| {
+                    c["name"] == "codifa_import_test" && c["value"] == "hello-import"
+                })
+            })
+            .unwrap_or(false);
+        assert!(hit, "imported cookie must be in the jar: {cookies}");
+        assert!(close_tab(chat));
+        kill_all_sessions();
+    }
+
+    /// Live check that a `window.open` popup is discovered and FOLLOWED: the
+    /// panel switches to the popup while it lives and falls back to the chat's
+    /// tab when it closes. This is the OAuth shape ("Continue with Google"
+    /// opens a popup whose callback talks to `window.opener`) that used to run
+    /// invisibly — the popup target existed, nothing ever displayed it.
+    ///
+    /// Ignored by default (starts a real Chromium), like the other live test:
+    /// `cargo test --ignored the_panel_follows_window_open_popups`.
+    #[test]
+    #[ignore]
+    fn the_panel_follows_window_open_popups() {
+        let chat = "live-popup";
+        let tab = ensure_tab(chat).expect("tab");
+        POPUPS.lock().unwrap().clear();
+        // Open the popup THROUGH the page, so the opener relation is the real
+        // `window.open` path (`userGesture` bypasses the popup blocker the way
+        // a click would; the return value is coerced to a boolean because the
+        // Window object itself does not serialize with returnByValue).
+        let opened = cdp_calls(
+            &tab,
+            vec![(
+                "Runtime.evaluate",
+                json!({
+                    "expression":
+                        "!!window.open('data:text/html,<h1>popup</h1>', '_blank', 'width=480,height=640')",
+                    "returnByValue": true,
+                    "userGesture": true,
+                }),
+            )],
+        )
+        .expect("window.open must evaluate");
+        assert_eq!(
+            opened[0]["result"]["value"], true,
+            "window.open must return a window, not null (popup-blocked?): {opened:?}"
+        );
+        let mut popup = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            sync_popups();
+            if let Some(p) = visible_popup(&tab.target_id) {
+                popup = p;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        assert!(
+            !popup.is_empty(),
+            "the popup must be discovered; page_targets={:?}",
+            page_targets()
+        );
+        // The panel (and every panel input call) now points at the popup.
+        assert_eq!(
+            panel_tab(chat).map(|t| t.target_id),
+            Some(popup.clone())
+        );
+        // Closing the popup snaps the view back to the chat's own tab.
+        let _ = cdp_browser_batch(vec![(
+            "Target.closeTarget",
+            json!({"targetId": popup}),
+        )]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            sync_popups();
+            if visible_popup(&tab.target_id).is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        assert!(visible_popup(&tab.target_id).is_none());
+        assert_eq!(
+            panel_tab(chat).map(|t| t.target_id),
+            Some(tab.target_id.clone())
+        );
+        assert!(close_tab(chat));
+        kill_all_sessions();
+    }
+
+    #[test]
     fn browser_never_falls_back_to_a_system_browser() {
         // The freeze: the automation browser ran out of /Applications/Google
         // Chrome.app, so the headless instance shared its bundle id
@@ -3156,21 +4179,78 @@ mod tests {
             "/opt/chromium-1223/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
         );
         let profile = std::path::Path::new("/Users/x/.codifa/browser-profile");
-        let args = launch_args(bin, 61995, profile).join(" ");
+        let args = launch_args(bin, 61995, profile, None).join(" ");
         // Headless + our own profile: never the user's Chrome profile.
         assert!(args.contains("--headless"));
         assert!(args.contains("--user-data-dir=/Users/x/.codifa/browser-profile"));
         assert!(args.contains("--remote-debugging-port=61995"));
+        assert!(!args.contains("--user-agent="));
         // The Google background services that reached into the user's own
         // profile / crashpad database.
         assert!(args.contains("--disable-crash-reporter"));
         assert!(args.contains("--disable-background-networking"));
         assert!(args.contains("--no-service-autorun"));
-        // A full build needs the GPU off; the shell must not be told to.
+        // The full build renders on SwiftShader ON PURPOSE: a GPU process
+        // cannot be hosted from a daemon context, and both failure modes
+        // around that (fatal exit / crash-loop at 100% CPU) are worse than
+        // software rendering. Software WebGL needs its Chrome-139+ opt-in,
+        // and macOS must never touch the user's keychain.
         assert!(args.contains("--disable-gpu"));
+        assert!(args.contains("--enable-unsafe-swiftshader"));
+        assert!(args.contains("--use-mock-keychain"));
         let shell = std::path::Path::new("/opt/browser/chrome-headless-shell");
-        let shell_args = launch_args(shell, 61995, profile).join(" ");
+        let shell_args = launch_args(shell, 61995, profile, None).join(" ");
         assert!(!shell_args.contains("--disable-gpu"));
+        assert!(!shell_args.contains("--use-mock-keychain"));
         assert!(shell_args.contains("--headless"));
+    }
+
+    #[test]
+    fn launch_args_pin_the_process_level_user_agent() {
+        // A popup's FIRST document request leaves the browser before any CDP
+        // session can attach and override the UA — the process-level flag is
+        // the only thing that covers it.
+        let bin = std::path::Path::new("/opt/browser/chrome-headless-shell");
+        let profile = std::path::Path::new("/Users/x/.codifa/browser-profile");
+        let args = launch_args(
+            bin,
+            61995,
+            profile,
+            Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.8078.80 Safari/537.36"),
+        )
+        .join(" ");
+        assert!(args.contains("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"));
+        assert!(args.contains("Chrome/156.0.8078.80 Safari/537.36"));
+    }
+
+    #[test]
+    fn chrome_user_agent_builds_from_the_binary_version() {
+        // Pure construction check via a stubbed binary: a shell script whose
+        // `--version` output carries the version token.
+        let dir = std::env::temp_dir().join(format!("codifa-ua-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fake-chrome");
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+            let mut f = std::fs::File::create(&bin).unwrap();
+            f.write_all(b"#!/bin/sh\necho \"Google Chrome for Testing 156.0.8078.80\"\n").unwrap();
+            drop(f);
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ua = chrome_user_agent(&bin).expect("version must parse");
+            assert!(ua.ends_with("Chrome/156.0.8078.80 Safari/537.36"), "{ua}");
+            assert!(ua.starts_with("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"), "{ua}");
+            // A binary that prints nothing yields None (per-session override
+            // stays the only UA fix).
+            let silent = dir.join("silent-chrome");
+            let mut f = std::fs::File::create(&silent).unwrap();
+            f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+            drop(f);
+            std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(chrome_user_agent(&silent), None);
+        }
+        let _ = bin;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

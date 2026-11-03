@@ -158,6 +158,18 @@ function ScheduleRow(props: {
     else onChanged();
   };
 
+  // Browser access is the same full-upsert pattern: flip `allow_browser` on
+  // the stored task and let the backend keep the rest. The scheduled turn
+  // reads the flag at run time (scheduler.rs) and binds the browser_* tools
+  // only when it is on.
+  const toggleBrowser = async () => {
+    setBusy(true);
+    const out = await saveSchedule({ ...task, allow_browser: !task.allow_browser });
+    setBusy(false);
+    if ("error" in out) onError(out.error);
+    else onChanged();
+  };
+
   return (
     <div className={`schedule-item${task.enabled ? "" : " disabled"}`} dir={dir}>
       <div className="schedule-item-head">
@@ -206,6 +218,18 @@ function ScheduleRow(props: {
               {/* Activity pulse: the run's own log (LLM + tool calls), distinct
                   from the inbox icon which shows the finished outputs. */}
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>
+            </button>
+            <button
+              className={`schedule-btn schedule-icon-btn${task.allow_browser ? " active" : ""}`}
+              onClick={() => void toggleBrowser()}
+              disabled={busy}
+              title={task.allow_browser ? `Browser access ON for ${task.name} — runs may drive the in-app browser (its saved logins included). Click to turn off.` : `Browser access OFF for ${task.name} — runs cannot open a page. Click to allow (the agent's runs then browse with the panel's saved logins).`}
+              aria-label={task.allow_browser ? `Disable browser access for ${task.name}` : `Enable browser access for ${task.name}`}
+              aria-pressed={!!task.allow_browser}
+            >
+              {/* Globe: browser access is per-task and opt-in — an unattended
+                  turn with the shared profile's logins must never be a default. */}
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18" /><path d="M12 3a14.5 14.5 0 0 1 0 18 14.5 14.5 0 0 1 0-18z" /></svg>
             </button>
             <button className="schedule-btn schedule-icon-btn" onClick={openInInbox} title={`Open ${task.name} in inbox`} aria-label={`Open ${task.name} in inbox`}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></svg>

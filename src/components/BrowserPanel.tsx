@@ -137,6 +137,15 @@ export function BrowserPanel({
   // "..." overflow menu (CDP endpoint for DevTools comes from the backend
   // on demand — see openDevTools).
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
+  // Session-cookie import dialog: the path for sites whose server-side bot
+  // defense rejects every login form the virtual browser submits (Instagram).
+  // The user logs in ONCE in their own browser and pastes the session cookie
+  // here — no password ever touches the virtual browser.
+  const [cookieOpen, setCookieOpen] = useState<boolean>(false);
+  const [cookieDomain, setCookieDomain] = useState<string>("instagram.com");
+  const [cookieText, setCookieText] = useState<string>("");
+  const [cookieBusy, setCookieBusy] = useState<boolean>(false);
+  const [cookieMsg, setCookieMsg] = useState<string>("");
   const capWRef = useRef<number>(fitMemory && fitMemory.capW > 0 ? fitMemory.capW : DEFAULT_VIEWPORT_SIZE.width);
   // Last size WE applied (manual or fit). A status poll that echoes this back
   // is our own resize, not an external one, so it must not touch the cap.
@@ -979,6 +988,51 @@ export function BrowserPanel({
   const frameW = Math.max(1, Math.round(viewport.w * zoom));
   const frameH = Math.max(1, Math.round(viewport.h * zoom));
 
+  // Apply the pasted session cookies, then land on the site so the imported
+  // session is immediately visible. The backend needs a live tab to carry the
+  // cookie call, so a down session launches first (landing there anyway).
+  async function applyCookies(): Promise<void> {
+    const domain = cookieDomain.trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
+    const text = cookieText.trim();
+    if (!domain || !text) return;
+    setCookieBusy(true);
+    setCookieMsg("");
+    try {
+      if (!active) {
+        await sidecarFetch("/browser/launch", {
+          method: "POST",
+          body: JSON.stringify({ url: `https://${domain}/` }),
+        });
+      }
+      const res = await sidecarFetch("/browser/cookies/import", {
+        method: "POST",
+        body: JSON.stringify({ domain, text }),
+      });
+      if (res.ok === false) throw new Error(String(res.error || "import failed"));
+      setCookieText("");
+      setCookieOpen(false);
+      setBusy(true);
+      // The import changed SERVER-side state for a URL that may already be
+      // open — the idempotent navigate skips a same-page navigation, so a
+      // plain navigate alone never let the site see the fresh session (the
+      // panel sat on the old login wall "loading"). Land on the domain, then
+      // force a real reload.
+      await sidecarFetch("/browser/navigate", {
+        method: "POST",
+        body: JSON.stringify({ url: `https://${domain}/` }),
+      });
+      await sidecarFetch("/browser/history", {
+        method: "POST",
+        body: JSON.stringify({ action: "reload" }),
+      });
+      await refreshStatus();
+    } catch (err) {
+      setCookieMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCookieBusy(false);
+    }
+  }
+
   return (
     <div className="browser-panel">
       {/* Chrome-style toolbar: history + ONE omnibox + session controls */}
@@ -1089,6 +1143,20 @@ export function BrowserPanel({
             >
               <span className="browser-menu-item-icon" aria-hidden="true">🐞</span>
               Open DevTools
+            </button>
+            <button
+              type="button"
+              className="browser-menu-item"
+              role="menuitem"
+              aria-label="Import session cookies"
+              onClick={() => {
+                setMenuOpen(false);
+                setCookieMsg("");
+                setCookieOpen(true);
+              }}
+            >
+              <span className="browser-menu-item-icon" aria-hidden="true">🍪</span>
+              Import session cookies
             </button>
           </div>
         </div>
@@ -1306,6 +1374,68 @@ export function BrowserPanel({
       >
         {error || pageUrl || (active ? "running" : "stopped")}
       </div>
+
+      {/* Session-cookie import dialog: the "log in outside, keep the session
+          inside" path for sites whose bot defense rejects every login form
+          the virtual browser submits (Instagram). */}
+      {cookieOpen && (
+        <div
+          className="browser-cookie-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Import session cookies"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setCookieOpen(false);
+          }}
+        >
+          <div className="browser-cookie-modal">
+            <div className="browser-cookie-title">Import session cookies</div>
+            <p className="browser-cookie-hint">
+              Log into the site ONCE in your own browser, then hand the session
+              here — your password is never typed into the virtual browser.
+              For Instagram: Chrome → instagram.com → F12 → Application →
+              Cookies → copy the value of <code>sessionid</code> and paste it
+              below.
+            </p>
+            <input
+              className="browser-cookie-domain"
+              value={cookieDomain}
+              onChange={(e) => setCookieDomain(e.target.value)}
+              placeholder="instagram.com"
+              aria-label="Cookie domain"
+              spellCheck={false}
+            />
+            <textarea
+              className="browser-cookie-text"
+              value={cookieText}
+              onChange={(e) => setCookieText(e.target.value)}
+              placeholder={"sessionid value — or name=value; name2=value2 pairs"}
+              rows={5}
+              aria-label="Cookie data"
+              spellCheck={false}
+              autoFocus
+            />
+            {cookieMsg && <div className="browser-cookie-msg">{cookieMsg}</div>}
+            <div className="browser-cookie-actions">
+              <button
+                type="button"
+                className="browser-cookie-btn"
+                onClick={() => setCookieOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="browser-cookie-btn browser-cookie-btn--primary"
+                disabled={cookieBusy || !cookieText.trim() || !cookieDomain.trim()}
+                onClick={() => void applyCookies()}
+              >
+                {cookieBusy ? "Importing…" : "Import & open"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -800,10 +800,10 @@ export default function App() {
                           overflow: "hidden",
                         }
                       : ({
-                          /* The width animates 0 ↔ splitW on the persistent
+                             /* The width animates 0 ↔ splitW on the persistent
                              section; closed it rests at 0 (invisible, inert).
                              max-width rides along INLINE: the stylesheet's
-                             min(50%, …) cap would otherwise clamp the first
+                             max-width cap would otherwise clamp the first
                              ~40% of the close transition into a visible
                              plateau (width stuck, then a sudden drop). */
                           flexBasis: paneOpen ? splitW : 0,

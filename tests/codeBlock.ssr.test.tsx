@@ -199,11 +199,6 @@ console.log('7) فرمت کانونیکال lang:START-END:path شماره خط 
   check('شماره خط ۱۹ در gutter هست', html.includes('code-gutter" aria-hidden="true">19<'))
 }
 
-if (failed > 0) {
-  console.error(`\n${failed} تست شکست خورد ❌`)
-  process.exit(1)
-}
-
 console.log('8) دو بلوک کد متوالی هر کدام مسیر فایل جداگانه دارند:')
 {
   const html1 = renderToString(
@@ -224,6 +219,40 @@ console.log('8) دو بلوک کد متوالی هر کدام مسیر فایل 
   check('بلوک اول: شماره خط ۱۹', html1.includes('code-gutter" aria-hidden="true">19<'), html1)
   check('بلوک دوم: مسیر utils.py در هدر', html2.includes('utils.py'), html2)
   check('بلوک دوم: شماره خط ۵', html2.includes('code-gutter" aria-hidden="true">5<'), html2)
+}
+
+console.log('9) فنس بدون زبان با محتوای عمدتاً فارسی به‌صورت متن ساده رندر می‌شود:')
+{
+  // نمونه واقعی: مدل چارت سطوح قیمت فارسی را داخل فنس بدون زبان می‌نویسد —
+  // نباید به‌عنوان کد LTR با شماره‌خط و هایلایت رندر شود.
+  const levels = '1.1230  ─── سقف قبلی، مقاومت اولیه\n1.1198  ← قیمت فعلی\n1.1114  ─── کف ۱۷ ماهه (حمایتی اصلی)'
+  const html = renderToString(
+    <CodeBlock>
+      <code>{levels}</code>
+    </CodeBlock>,
+  )
+  check('کلاس plain-fence دارد', html.includes('plain-fence'), html.slice(0, 200))
+  check('بلوک کد code-lines ندارد', !html.includes('code-lines'))
+  check('gutter شماره‌خط ندارد', !html.includes('code-gutter'))
+  check('متن فارسی حاضر است', html.replace(/<[^>]+>/g, '').includes('سقف قبلی، مقاومت اولیه'))
+
+  // فنس نام‌دار (```python) حتی با کامنت فارسی کد می‌ماند.
+  const codeHtml = renderToString(
+    <CodeBlock className="language-python">
+      <code className="language-python">{'def f():\n    return 1  # بررسی مقدار ورودی'}</code>
+    </CodeBlock>,
+  )
+  check('فنس نام‌دار: code-lines دارد', codeHtml.includes('code-lines'))
+  check('فنس نام‌دار: plain-fence ندارد', !codeHtml.includes('plain-fence'))
+
+  // فنس انگلیسی بدون زبان هم کد می‌ماند.
+  const enHtml = renderToString(
+    <CodeBlock>
+      <code>{'function add(a, b) {\n  return a + b\n}'}</code>
+    </CodeBlock>,
+  )
+  check('فنس انگلیسی: code-lines دارد', enHtml.includes('code-lines'))
+  check('فنس انگلیسی: plain-fence ندارد', !enHtml.includes('plain-fence'))
 }
 
 if (failed > 0) {

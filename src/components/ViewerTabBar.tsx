@@ -13,7 +13,7 @@ import { previewShifts } from "../lib/tabOrder";
 import { shownViewerTabId, TAB_STRIP_KINDS, useViewerScope, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerScope, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
-import { TabListButton, type TabListSection } from "./TabListMenu";
+import { TabListButton, CloseTabsIcon, type TabListSection } from "./TabListMenu";
 import { FileIcon } from "./FileIcon";
 import { fmtAgo } from "../lib/time";
 import { unseenRunCount } from "../lib/schedule-notify";
@@ -288,20 +288,34 @@ export function ViewerTabListButton() {
   // The count (and the bulk close) covers the STRIP tabs only — dock pages are
   // toggled from the dock, never swept by the tab list.
   const stripTabs = visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind));
+  // Bulk close lives as a toolbar icon next to the search (same pattern as
+  // the chat tab list) instead of a footer button, so the menu top row is:
+  // search + tool icons.
+  const tools = (
+    <button
+      type="button"
+      className="tab-list-tool-btn"
+      disabled={stripTabs.length === 0}
+      title={
+        stripTabs.length > 0
+          ? `Close all tabs (${stripTabs.length}) — every open tab of the active chat (kept in Recently closed)`
+          : "No open tabs to close"
+      }
+      aria-label={`Close all viewer tabs (${stripTabs.length})`}
+      onClick={() => {
+        for (const t of stripTabs) useViewerTabs.getState().closeViewer(t.id);
+      }}
+    >
+      <CloseTabsIcon />
+    </button>
+  );
   return (
     <TabListButton
       sections={sections}
       label="Tab list"
       placement="bottom"
       menuWidth={TAB_LIST_MENU_WIDTH}
-      footer={{
-        label: stripTabs.length > 0 ? `Close all tabs (${stripTabs.length})` : "No open tabs",
-        title: "Close every open tab of the active chat (kept in Recently closed)",
-        disabled: stripTabs.length === 0,
-        onPress: () => {
-          for (const t of stripTabs) useViewerTabs.getState().closeViewer(t.id);
-        },
-      }}
+      tools={tools}
     />
   );
 }

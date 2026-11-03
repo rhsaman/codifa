@@ -187,8 +187,9 @@ export function ReadingMode({
       style={{ '--reading-w': `${width}px` } as React.CSSProperties}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* Soft scrim — click anywhere outside the panel to close. */}
-      <div className="reading-mode-scrim" aria-hidden="true" onClick={onClose} />
+      {/* Soft scrim — blocks clicks behind the panel; closing is via the ✕
+          button or Esc, never an outside click. */}
+      <div className="reading-mode-scrim" aria-hidden="true" />
       <div
         className="reading-mode-panel"
         role="dialog"

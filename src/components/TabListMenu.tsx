@@ -34,10 +34,23 @@ export interface TabListFooter {
   onPress: () => void;
 }
 
+/** "Close tabs" glyph for the toolbar icon buttons (chat + viewer menus):
+ *  a front sheet with an × over a back sheet — many tabs, one sweep. */
+export function CloseTabsIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3.5" y="6.5" width="13" height="13" rx="2.5" />
+      <path d="M7.5 3h9a4 4 0 0 1 4 4v9" />
+      <path d="M8 10l4 4M12 10l-4 4" />
+    </svg>
+  );
+}
+
 export function TabListButton({
   sections,
   label,
   footer,
+  tools,
   placement = "bottom",
   menuWidth,
   icon,
@@ -46,6 +59,10 @@ export function TabListButton({
   sections: TabListSection[];
   label: string;
   footer?: TabListFooter;
+  /** Icon buttons rendered INSIDE the search row (toolbar): mode toggles and
+   *  bulk actions live here so they never cost the tab bar any space and stay
+   *  reachable even when the search empties the lists below. */
+  tools?: React.ReactNode;
   /** Which way the dropdown opens: below the trigger (chat bar) or flipped to
    *  the window's left (viewer rail, which hugs the right edge). */
   placement?: MenuPlacement;
@@ -155,28 +172,31 @@ export function TabListButton({
           style={{ position: "fixed", top: pos.top, left: pos.left }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <label className="tab-list-search">
-            <svg
-              width="13"
-              height="13"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              aria-hidden="true"
-            >
-              <circle cx="11" cy="11" r="7" />
-              <path d="m20 20-3.5-3.5" />
-            </svg>
-            <input
-              ref={inputRef}
-              type="text"
-              placeholder="Search tabs…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-          </label>
+          <div className="tab-list-toolbar">
+            <label className="tab-list-search">
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+              <input
+                ref={inputRef}
+                type="text"
+                placeholder="Search tabs…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+            </label>
+            {tools}
+          </div>
           {visible.length === 0 && (
             <div className="tab-list-empty">No tabs match.</div>
           )}

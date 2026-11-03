@@ -2983,44 +2983,10 @@ fn skill_haystack(sk: &Value) -> String {
     hay.to_lowercase()
 }
 
-/// Warn when a bundle was written with skills no Persian request can reach.
-///
-/// A skill's trigger is its `fa_keywords`, and the model only sees a JSON blob of
-/// names — it cannot tell a bundle that routes from one that does not. So EVERY
-/// write says it outright (install, create AND update), so a bundle made in chat
-/// is as findable as one installed from a marketplace. The warning rides AFTER
-/// the JSON so the reply stays machine-readable up to the first newline.
-fn plugin_keyword_warning(store: &Path, view: &Value) -> String {
-    let Some(slug) = view["slug"].as_str() else {
-        return String::new();
-    };
-    let bare: Vec<String> = view["skills"]
-        .as_array()
-        .map(|names| {
-            names
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|name| crate::plugins::skill_keyword_count(store, slug, name) == 0)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if bare.is_empty() {
-        return String::new();
-    }
-    format!(
-        "\nWARNING: these skills have NO fa_keywords, so a Persian request has nothing to find \
-         them by: {}. Send another plugin call with action=update and fa_keywords per skill (the \
-         user's own Persian phrases), or set fa_keywords on the plugin itself so a skill with \
-         none of its own still triggers through the bundle.",
-        bare.join(", ")
-    )
-}
-
 /// Warn when a bundle's scripts hard-code a `$HOME` path outside their own
 /// folder.
 ///
-/// Same shape as [`plugin_keyword_warning`]: the model writes the source, and a
+/// The model writes the source, and a
 /// literal home path looks perfectly fine until the bundle runs somewhere else —
 /// or, worse, until a scheduled run (who nobody can answer a permission gate)
 /// touches it. The warning rides AFTER the JSON so the reply stays
@@ -3845,24 +3811,9 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             if let Some(dir) = crate::plugins::skill_dir_for(Path::new(store_base), &name_out) {
                 crate::skills::mark_user_edit(&dir);
             }
-            // An empty keyword list leaves the catalog line English-only, so a
-            // Persian request has no trigger to find the skill by: the model
-            // must be told to fix it instead of believing the save was enough.
-            //
-            // The count is read from the REPLY — it is measured off the file that
-            // was actually written. Reading the request instead warned about an
-            // edit that omits `fa_keywords` on purpose (which KEEPS the stored
-            // list), so the model was told to "fix" a skill that was fine.
-            let warning = if res["fa_keyword_count"].as_u64().unwrap_or(0) == 0 {
-                "\nWARNING: this skill has NO fa_keywords, so a Persian request has \
-                 nothing to find it by. Call create_skill again with fa_keywords set \
-                 (comma-separated Persian phrases the user would actually say)."
-            } else {
-                ""
-            };
             Ok(format!(
                 "Skill saved: {name_out} (bundle: {})\nThe catalog in the system prompt now lists \
-                 it, so it can be loaded on demand in later turns.{warning}",
+                 it, so it can be loaded on demand in later turns.",
                 res["slug"].as_str().unwrap_or("")
             ))
         }
@@ -3913,21 +3864,18 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             match action.as_str() {
                 "list" => Ok(crate::plugins::list_plugins(store).to_string()),
                 "install" => crate::plugins::install_plugin(store, args).map(|v| {
-                    let warning = plugin_keyword_warning(store, &v["plugin"]);
                     let detached = plugin_detached_path_warning(store, &v["plugin"]);
-                    format!("{v}{warning}{detached}")
+                    format!("{v}{detached}")
                 }),
                 // Creating and updating a bundle writes skills exactly like an
                 // install does, so both say the same thing when they land bare.
                 "create" => crate::plugins::create_plugin(store, args).map(|v| {
-                    let warning = plugin_keyword_warning(store, &v);
                     let detached = plugin_detached_path_warning(store, &v);
-                    format!("{v}{warning}{detached}")
+                    format!("{v}{detached}")
                 }),
                 "update" => crate::plugins::update_plugin(store, args).map(|v| {
-                    let warning = plugin_keyword_warning(store, &v);
                     let detached = plugin_detached_path_warning(store, &v);
-                    format!("{v}{warning}{detached}")
+                    format!("{v}{detached}")
                 }),
                 "toggle" => crate::plugins::toggle_plugin(store, args).map(|v| {
                     let on = v["enabled"].as_bool().unwrap_or(false);
@@ -3989,6 +3937,13 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                     }
                     if let Some(on) = args["enabled"].as_bool() {
                         obj.insert("enabled".into(), json!(on));
+                    }
+                    // Opt-in browser access for every run of this task: the
+                    // turn drives the shared Chromium and profile (its saved
+                    // logins included) while nobody watches — a deliberate,
+                    // per-task choice, never a default.
+                    if let Some(on) = args["allow_browser"].as_bool() {
+                        obj.insert("allow_browser".into(), json!(on));
                     }
                     // The run context: skills are names, connectors are names,
                     // plugins are slugs whose skills + scripts + connectors are
@@ -4690,22 +4645,16 @@ mod tests {
         );
     }
 
-    /// Every `plugin` action that WRITES a bundle must say when it landed bare.
-    ///
-    /// A skill's Persian trigger is its `fa_keywords`, and the model only sees a
-    /// JSON blob of names — so a bundle built by `action=create` (which is what
-    /// `/plugin create` hands to the agent) was written and reported as a plain
-    /// success, leaving a bundle no Persian request could ever reach. The warning
-    /// is what makes the model fill them in the same turn.
+    /// A plugin write answers machine-readable JSON: one line, parseable, with
+    /// no trailing prose attached (the old keyword warning appended a WARNING
+    /// line after the JSON — keyword routing is gone, and with it that line).
     #[test]
-    fn every_plugin_write_warns_about_skills_left_without_keywords() {
+    fn every_plugin_write_answers_plain_json() {
         let root = std::env::temp_dir().join(format!("codifa-plugin-warn-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let base = root.to_str().unwrap();
 
-        // create: a skill with a description and NO keywords is exactly the case
-        // the model must be told about.
         let made = dispatch_with_data_root(
             base,
             "plugin",
@@ -4718,38 +4667,12 @@ mod tests {
             Some(base),
         )
         .unwrap();
-        assert!(made.contains("WARNING"), "create must warn: {made}");
-        assert!(made.contains("Bare Skill"), "the bare skill must be named: {made}");
-        // The reply stays machine-readable: the JSON comes FIRST, the warning after.
+        assert!(!made.contains("WARNING"), "no keyword warning anymore: {made}");
+        assert!(made.contains("Bare Skill"), "the skill must be listed: {made}");
+        // The reply stays machine-readable: the JSON comes FIRST.
         let first_line = made.lines().next().unwrap();
         let parsed: Value = serde_json::from_str(first_line).expect("line 1 is still JSON");
         assert_eq!(parsed["slug"], json!("bare-bundle"));
-
-        // update: fixing the skill through the tool must clear the warning.
-        let fixed = dispatch_with_data_root(
-            base,
-            "plugin",
-            &json!({
-                "action": "update",
-                "name": "Bare Bundle",
-                "skills": [{"name": "Bare Skill", "fa_keywords": "مهارت لخت"}]
-            }),
-            None,
-            Some(base),
-        )
-        .unwrap();
-        assert!(!fixed.contains("WARNING"), "keywords now present: {fixed}");
-
-        // A read-only action answers plainly — no warning to react to.
-        let listed = dispatch_with_data_root(
-            base,
-            "plugin",
-            &json!({"action": "list"}),
-            None,
-            Some(base),
-        )
-        .unwrap();
-        assert!(!listed.contains("WARNING"), "list writes nothing: {listed}");
 
         let _ = fs::remove_dir_all(&root);
     }

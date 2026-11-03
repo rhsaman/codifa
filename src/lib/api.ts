@@ -2354,6 +2354,8 @@ export interface ScheduleUpsert {
   skills?: string[]
   mcp_servers?: string[]
   plugins?: string[]
+  /** اجازه‌ی مرورگر برای هر اجرا (پیش‌فرض خاموش — عمداً per-task). */
+  allow_browser?: boolean
 }
 
 /** لیست تسک‌های زمان‌بندی (همراه next_run محاسبه‌شده). */

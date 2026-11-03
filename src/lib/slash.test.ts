@@ -229,7 +229,7 @@ console.log("14) SUBCOMMANDS table drives the menu and help:")
 {
   check("plugin lists install/remove", (SUBCOMMANDS.plugin ?? []).some((s) => s.name === "install") && (SUBCOMMANDS.plugin ?? []).some((s) => s.name === "remove"), SUBCOMMANDS.plugin?.map((s) => s.name))
   check("skill update takes a name", (SUBCOMMANDS.skill ?? []).find((s) => s.name === "update")?.arg === "name")
-  check("install takes a repo then free text", (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.arg === "repo" && (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.rest === "free")
+  check("install takes a repo then free text", (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.arg === "url" && (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.rest === "free")
   // A value level whose `rest` is `repo` would offer the repo names again for
   // the sub-folder and the branch — those are free text, not repo references.
   // Installing a connector bundle was implemented in the dispatcher but missing

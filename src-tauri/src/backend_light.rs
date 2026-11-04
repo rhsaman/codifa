@@ -347,7 +347,37 @@ pub struct GitAutoCommitBody {
     /// enumerated for this model before it is sent.
     #[serde(default)]
     pub providers: std::collections::HashMap<String, Value>,
+    /// The chat's OWN model identity — what a "Main model" rung in the tool's
+    /// fallback list stands for. `provider`/`model`/… above carry the commit's
+    /// PRIMARY pick (the Other group's model), which is not the chat model when
+    /// the group names one. Empty `main_model` = the primary pick IS the chat's.
+    #[serde(default)]
+    pub main_provider: String,
+    #[serde(default)]
+    pub main_provider_id: String,
+    #[serde(default)]
+    pub main_model: String,
+    #[serde(default)]
+    pub main_base_url: String,
+    #[serde(default)]
+    pub main_api_keys: Vec<String>,
+    /// Tool Models + per-tool fallback lists (Settings → Tools). The commit
+    /// message runs on the "Other" group, so it walks that group's own list when
+    /// its model fails — same chain the title and compact calls use.
+    #[serde(default)]
+    pub subagent_models: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub tool_fallbacks: std::collections::HashMap<String, Vec<String>>,
 }
+
+/// How many times the WHOLE commit-message model list is walked top to bottom.
+/// After the last fallback fails the walk starts over from the first model (a
+/// provider that was down a minute ago is often back). A list of one model is
+/// not rotated. Mirrors `COMPACT_MAX_CYCLES` in compact.rs.
+const COMMIT_MAX_CYCLES: usize = 3;
+
+/// Pause between two passes over the list, so dead rungs are not hammered.
+const COMMIT_CYCLE_PAUSE_SECS: u64 = 4;
 
 /// Stage everything, ask the model for a Conventional-Commits message from the
 /// real diff, and commit with it. Runs natively: the renderer's Commit button
@@ -427,23 +457,126 @@ No code fences, no quotes, no preamble, no trailing explanation.";
         "Staged changes (git status --porcelain):\n{status}\n\nDiff:\n{diff}",
         status = serde_json::to_string(&status["entries"]).unwrap_or_default()
     );
-    let mut summary = match llm::complete(&client, &cfg, SYSTEM, &user).await {
-        Ok(r) if !r.text.trim().is_empty() => r,
-        Ok(_) => {
-            // Reasoning models can burn the whole budget on the thinking block
-            // and return empty content; log it so rust.log shows the cause.
-            eprintln!(
-                "[git] empty commit message from {}/{}",
-                cfg.provider, cfg.model
-            );
-            return bad_request("the model returned an empty commit message");
-        }
-        Err(e) => {
-            eprintln!("[git] commit message failed ({}/{}): {e}", cfg.provider, cfg.model);
-            return bad_request(&e);
-        }
+    // Try order: the commit's own model (rung 0, exactly what the renderer
+    // picked), then the "Other" group's fallback list (Settings → Tools) in the
+    // order the user arranged it — and NOTHING else, like title/compact. Rebuilt
+    // per call, so the next commit starts at the first model again. The chain is
+    // resolved through `resolve_slot_chain`, so a fallback routes cross-provider
+    // (its own base URL, keys and endpoint kind); a rung that resolves to a model
+    // already in the list is dropped.
+    let (p_kind, p_model, p_base, p_keys, p_pid) = if body.main_model.trim().is_empty() {
+        (
+            body.provider.clone(),
+            body.model.clone(),
+            body.base_url.clone(),
+            cfg.api_keys.clone(),
+            body.provider_id.clone(),
+        )
+    } else {
+        (
+            if body.main_provider.trim().is_empty() {
+                body.provider.clone()
+            } else {
+                body.main_provider.clone()
+            },
+            body.main_model.clone(),
+            body.main_base_url.clone(),
+            body.main_api_keys.clone(),
+            body.main_provider_id.clone(),
+        )
     };
-    let usage = normalize_compact_usage(summary.usage.take(), &cfg.model, &body.provider_id);
+    let slot_rungs = resolve_slot_chain(
+        other_slot_entry(&body.subagent_models),
+        other_slot_fallbacks(&body.tool_fallbacks),
+        &p_model,
+        &p_base,
+        &p_keys,
+        &p_pid,
+        &p_kind,
+        &body.providers,
+    );
+    let mut chain: Vec<LlmConfig> = vec![cfg];
+    for (m, b, k, pid, kind) in slot_rungs {
+        if m.trim().is_empty() || chain.iter().any(|c| c.provider_id == pid && c.model == m) {
+            continue;
+        }
+        // Each rung inherits the commit's reasoning level, re-checked against
+        // ITS OWN model's enumerated levels: a fallback changes the model and
+        // its routing, never the effort the user chose.
+        let (lvl, mr, auto) = crate::llm::reasoning_fields(
+            &kind,
+            &crate::llm::level_from_source(
+                crate::agent::provider_model_thinking_levels(&body.providers, &pid, &m)
+                    .as_deref(),
+                &body.thinking_level,
+            ),
+            crate::agent::provider_model_reasoning(&body.providers, &pid, &m),
+        );
+        chain.push(LlmConfig {
+            provider: kind,
+            provider_id: pid,
+            model: m,
+            base_url: b,
+            api_keys: k,
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+            reasoning_level: lvl,
+            model_reasoning: mr,
+            auto_think: auto,
+        });
+    }
+    // Walk the list top to bottom; after the last rung fails, start over from the
+    // first (see COMMIT_MAX_CYCLES). No wall-clock cap: a model that is thinking
+    // must never be cut off, so only a real failure moves the walk on.
+    let cycles = if chain.len() > 1 { COMMIT_MAX_CYCLES } else { 1 };
+    let mut first_error = String::new();
+    let mut tried: Vec<String> = Vec::new();
+    let mut done = None;
+    'walk: for cycle in 0..cycles {
+        if cycle > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(COMMIT_CYCLE_PAUSE_SECS)).await;
+        }
+        for c in &chain {
+            let why = match llm::complete(&client, c, SYSTEM, &user).await {
+                Ok(r) if !r.text.trim().is_empty() => {
+                    done = Some((r, c));
+                    break 'walk;
+                }
+                // Reasoning models can burn the whole budget on the thinking
+                // block and return empty content; log it so rust.log shows the
+                // cause.
+                Ok(_) => "the model returned an empty commit message".to_string(),
+                Err(e) => e,
+            };
+            let label = if c.provider_id.is_empty() {
+                c.model.clone()
+            } else {
+                format!("{}/{}", c.provider_id, c.model)
+            };
+            eprintln!("[git] commit message failed ({label}): {why}");
+            // Only the FIRST pass is reported: later passes repeat the same
+            // models and would bury the reasons.
+            if cycle == 0 {
+                if first_error.is_empty() {
+                    first_error = why.clone();
+                }
+                tried.push(format!("{label}: {why}"));
+            }
+        }
+    }
+    let Some((mut summary, used)) = done else {
+        // One model: its own reason, unchanged. A list: name every model that
+        // was tried, so a banner can no longer hide a fallback list that ran
+        // and failed.
+        return bad_request(&if chain.len() > 1 {
+            format!("every commit-message model failed — {}", tried.join("; "))
+        } else {
+            first_error
+        });
+    };
+    // Attribute the usage to the rung that ACTUALLY answered, not to rung 0.
+    let usage = normalize_compact_usage(summary.usage.take(), &used.model, &used.provider_id);
     let summary = summary.text.trim().to_string();
     // Strip a code fence if the model wrapped the message anyway.
     let message = summary

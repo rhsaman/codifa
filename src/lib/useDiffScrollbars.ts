@@ -11,11 +11,14 @@
  * scroller is laid out in the SCROLLING CONTENT, so `right: 0`/`bottom: 0`
  * measure from the content's END and scrolling drags the bar off-screen —
  * the horizontal bar looked stuck mid-pane and the thumb never followed.
- * So the lanes are content children too, but `place()` PINS them to the
- * scrollport on every scroll event: their offset is set to the host's
- * current scroll position, which the browser applies before that frame
- * paints. The lane holds still relative to the pane while the content
- * slides under it, exactly like a real overlay scrollbar.
+ * Pinning a content child with `top = scrollTop` fixes that visually, but the
+ * pinned child itself is part of the scroller's scrollable overflow: at the
+ * bottom it adds a whole viewport of empty scroll range, so when the content
+ * shrinks (widening the chat re-wraps messages shorter) the browser can no
+ * longer clamp scrollTop to the real end — the viewport stays past the last
+ * message and the pane looks blank. The lanes therefore live in a non-scrolling
+ * positioned ancestor and are positioned over the scrollport with layout
+ * coordinates: no scroll offset, no contribution to the scroll range.
  *
  * Nothing reserves space: no dynamic padding, no custom-property feedback
  * loop (a dynamic inset shrank clientWidth, which made the other axis look
@@ -60,8 +63,86 @@ const qualifies = (el: HTMLElement) => {
   return scrollsY || scrollsX;
 };
 
+const scrolls = (el: Element) => {
+  const cs = getComputedStyle(el);
+  return (
+    /(auto|scroll|overlay)/.test(cs.overflowX) ||
+    /(auto|scroll|overlay)/.test(cs.overflowY)
+  );
+};
+
+/**
+ * Where a lane must live: a POSITIONED ancestor that does not itself scroll.
+ * A lane inside the scroller is content — at the bottom it inflates
+ * `scrollHeight` by a whole viewport (see the header note), and even inside a
+ * scrolling ancestor it would scroll away with the rows. `nested` reports
+ * whether a scrolling ancestor was skipped: the lane then has to follow that
+ * ancestor's scrolls too.
+ */
+const laneHost = (host: HTMLElement): { el: HTMLElement; nested: boolean } => {
+  let nested = false;
+  for (let el = host.parentElement; el; el = el.parentElement) {
+    if (scrolls(el)) {
+      nested = true;
+      continue;
+    }
+    if (getComputedStyle(el).position !== "static") return { el, nested };
+  }
+  return { el: document.body, nested };
+};
+
+type LaneBox = {
+  parent: HTMLElement;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+/** The host's scrollport in the lane parent's layout coordinates. Rects keep
+ *  this exact across borders, margins and zoom; the parent's own scroll offset
+ *  converts the visual delta back into the space absolute children live in. */
+const laneBox = (host: HTMLElement): LaneBox => {
+  const { el: parent } = laneHost(host);
+  const hr = host.getBoundingClientRect();
+  const pr = parent.getBoundingClientRect();
+  const root = parent === document.body ? document.scrollingElement : null;
+  // Floating UI can cover the bottom of a scroller (the chat composer). A host
+  // declares that height in `--sp-inset-bottom`; the track stops above it.
+  const inset =
+    Number.parseFloat(getComputedStyle(host).getPropertyValue("--sp-inset-bottom")) || 0;
+  return {
+    parent,
+    left:
+      hr.left + host.clientLeft - pr.left - parent.clientLeft +
+      (root?.scrollLeft ?? parent.scrollLeft),
+    top:
+      hr.top + host.clientTop - pr.top - parent.clientTop +
+      (root?.scrollTop ?? parent.scrollTop),
+    width: host.clientWidth,
+    height: Math.max(MIN_THUMB, host.clientHeight - inset),
+  };
+};
+
+/** Place one lane over the host's scrollport. Nothing here depends on the
+ *  host's scroll offset: the lane never moves with the content. */
+const placeLane = (lane: HTMLElement, box: LaneBox, axis: "y" | "x") => {
+  if (lane.parentElement !== box.parent) box.parent.appendChild(lane);
+  if (axis === "y") {
+    lane.style.left = `${box.left + box.width - THICK}px`;
+    lane.style.top = `${box.top}px`;
+    lane.style.width = `${THICK}px`;
+    lane.style.height = `${box.height}px`;
+  } else {
+    lane.style.left = `${box.left}px`;
+    lane.style.top = `${box.top + box.height - THICK}px`;
+    lane.style.width = `${box.width}px`;
+    lane.style.height = `${THICK}px`;
+  }
+};
+
 /** Install the drawn bars on ONE scroller (idempotent). Mirrors the hook:
- *  content-child lanes pinned per frame by place(). */
+ *  lanes live in a non-scrolling ancestor and are placed over the scrollport. */
 const attach = (el: HTMLElement) => {
   if (el.closest(SP_SKIP)) return;
   if (el.dataset.sp !== undefined) return;
@@ -76,7 +157,8 @@ const attach = (el: HTMLElement) => {
     thumb.className = "sp-thumb";
     thumb.dataset.axis = axis;
     lane.appendChild(thumb);
-    el.appendChild(lane);
+    // Attached by placeLane() on the first real placement — never a content
+    // child of the scroller (see the header note).
     return { lane, thumb, axis };
   };
   const v = makeBar("y");
@@ -89,6 +171,7 @@ const attach = (el: HTMLElement) => {
   const place = () => {
     const maxL = el.scrollWidth - el.clientWidth;
     const maxT = el.scrollHeight - el.clientHeight;
+    const box = maxT > 1 || maxL > 1 ? laneBox(el) : null;
 
     // An ancestor host that really scrolls sideways owns the horizontal bar
     // for this content (the Review list around the diff container).
@@ -100,28 +183,22 @@ const attach = (el: HTMLElement) => {
       }
     }
 
-    if (maxT > 1) {
-      const track = el.clientHeight;
+    if (maxT > 1 && box) {
+      const track = box.height;
       const len = thumbLen(track, el.scrollHeight);
       v.lane.style.display = "";
-      v.lane.style.left = `${el.scrollLeft + el.clientWidth - THICK}px`;
-      v.lane.style.top = `${el.scrollTop}px`;
-      v.lane.style.width = `${THICK}px`;
-      v.lane.style.height = `${track}px`;
+      placeLane(v.lane, box, "y");
       v.thumb.style.height = `${len}px`;
       v.thumb.style.transform = `translateY(${Math.round((el.scrollTop / maxT) * (track - len))}px)`;
     } else {
       v.lane.style.display = "none";
     }
 
-    if (maxL > 1 && !outerX) {
-      const track = el.clientWidth;
+    if (maxL > 1 && !outerX && box) {
+      const track = box.width;
       const len = thumbLen(track, el.scrollWidth);
       h.lane.style.display = "";
-      h.lane.style.left = `${el.scrollLeft}px`;
-      h.lane.style.top = `${el.scrollTop + el.clientHeight - THICK}px`;
-      h.lane.style.width = `${track}px`;
-      h.lane.style.height = `${THICK}px`;
+      placeLane(h.lane, box, "x");
       h.thumb.style.width = `${len}px`;
       h.thumb.style.transform = `translateX(${Math.round((el.scrollLeft / maxL) * (track - len))}px)`;
     } else {
@@ -130,8 +207,14 @@ const attach = (el: HTMLElement) => {
   };
 
   // Drag + wheel passthrough: identical to the hook's handlers.
-  let drag: { axis: "y" | "x"; start: number; startScroll: number; len: number; max: number } | null =
-    null;
+  let drag: {
+    axis: "y" | "x";
+    start: number;
+    startScroll: number;
+    len: number;
+    max: number;
+    track: number;
+  } | null = null;
   const onDown = (bar: Bar) => (e: PointerEvent) => {
     const axis = bar.axis;
     const max =
@@ -139,7 +222,7 @@ const attach = (el: HTMLElement) => {
     if (max <= 1) return;
     e.preventDefault();
     const rect = bar.lane.getBoundingClientRect();
-    const track = axis === "y" ? el.clientHeight : el.clientWidth;
+    const track = axis === "y" ? bar.lane.clientHeight : bar.lane.clientWidth;
     const len = axis === "y" ? bar.thumb.offsetHeight : bar.thumb.offsetWidth;
     const p = axis === "y" ? e.clientY - rect.top : e.clientX - rect.left;
     const tr = bar.thumb.getBoundingClientRect();
@@ -153,15 +236,14 @@ const attach = (el: HTMLElement) => {
     const startScroll = ratio * max;
     if (axis === "y") el.scrollTop = startScroll;
     else el.scrollLeft = startScroll;
-    drag = { axis, start: axis === "y" ? e.clientY : e.clientX, startScroll, len, max };
+    drag = { axis, start: axis === "y" ? e.clientY : e.clientX, startScroll, len, max, track };
   };
   v.lane.addEventListener("pointerdown", onDown(v));
   h.lane.addEventListener("pointerdown", onDown(h));
   const move = (e: PointerEvent) => {
     if (!drag) return;
-    const track = drag.axis === "y" ? el.clientHeight : el.clientWidth;
     const d = (drag.axis === "y" ? e.clientY : e.clientX) - drag.start;
-    const next = drag.startScroll + d * (drag.max / Math.max(1, track - drag.len));
+    const next = drag.startScroll + d * (drag.max / Math.max(1, drag.track - drag.len));
     if (drag.axis === "y") el.scrollTop = next;
     else el.scrollLeft = next;
     e.preventDefault();
@@ -174,6 +256,14 @@ const attach = (el: HTMLElement) => {
   window.addEventListener("pointercancel", release);
 
   el.addEventListener("scroll", place, { passive: true });
+  // If a scrolling ancestor was skipped (see laneHost), the lane lives
+  // outside it and must be re-placed when that ancestor scrolls.
+  const onAncestorScroll = (e: Event) => {
+    if (e.target !== el) place();
+  };
+  if (laneHost(el).nested) {
+    document.addEventListener("scroll", onAncestorScroll, true);
+  }
   place();
   let raf = requestAnimationFrame(() => {
     place();
@@ -184,11 +274,12 @@ const attach = (el: HTMLElement) => {
   // A global installer cannot know when a surface's content lands; watch the
   // subtree so rows arriving after mount re-place too.
   const mo = new MutationObserver(place);
-  mo.observe(el, { childList: true, subtree: true });
+  mo.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ["style"] });
   const detach = () => {
     ro?.disconnect();
     mo.disconnect();
     el.removeEventListener("scroll", place);
+    document.removeEventListener("scroll", onAncestorScroll, true);
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", release);
     window.removeEventListener("pointercancel", release);
@@ -273,8 +364,8 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
       thumb.className = "sp-thumb";
       thumb.dataset.axis = axis;
       lane.appendChild(thumb);
-      // A content child, pinned per frame by place() — see the header note.
-      host.appendChild(lane);
+      // Attached by placeLane() on the first real placement — never a content
+      // child of the scroller (see the header note).
       return { lane, thumb, axis };
     };
     const v = makeBar("y");
@@ -283,18 +374,24 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
     // Marks the host for the global sweep, which would otherwise attach a
     // second pair of bars in the window before this effect ran.
     host.dataset.sp = "h";
+    // A lane placed outside a scrolling ancestor (the Review list around a
+    // diff) must also follow THAT ancestor's scrolls — the host never scrolls
+    // for them, so its own listener never fires.
+    const nested = laneHost(host).nested;
 
     /** Thumb length along its own axis, proportional to visible/content. */
     const thumbLen = (view: number, content: number) =>
       Math.max(MIN_THUMB, Math.round((view * view) / Math.max(1, content)));
 
     /**
-     * Pin the lanes to the scrollport and size the thumbs. Runs on every
-     * scroll (the pin MUST track the offset) and on every layout change.
+     * Place the lanes over the scrollport and size the thumbs. Runs on every
+     * scroll and on every layout change; the lane's own box does not depend on
+     * the host's scroll offset (only the thumb does).
      */
     const place = () => {
       const maxL = host.scrollWidth - host.clientWidth;
       const maxT = host.scrollHeight - host.clientHeight;
+      const box = maxT > 1 || maxL > 1 ? laneBox(host) : null;
 
       // An ancestor host that really scrolls sideways owns the horizontal bar
       // for this content (the Review list around the diff container): two
@@ -307,28 +404,22 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
         }
       }
 
-      if (maxT > 1) {
-        const track = host.clientHeight;
+      if (maxT > 1 && box) {
+        const track = box.height;
         const len = thumbLen(track, host.scrollHeight);
         v.lane.style.display = "";
-        v.lane.style.left = `${host.scrollLeft + host.clientWidth - THICK}px`;
-        v.lane.style.top = `${host.scrollTop}px`;
-        v.lane.style.width = `${THICK}px`;
-        v.lane.style.height = `${track}px`;
+        placeLane(v.lane, box, "y");
         v.thumb.style.height = `${len}px`;
         v.thumb.style.transform = `translateY(${Math.round((host.scrollTop / maxT) * (track - len))}px)`;
       } else {
         v.lane.style.display = "none";
       }
 
-      if (maxL > 1 && !outerX) {
-        const track = host.clientWidth;
+      if (maxL > 1 && !outerX && box) {
+        const track = box.width;
         const len = thumbLen(track, host.scrollWidth);
         h.lane.style.display = "";
-        h.lane.style.left = `${host.scrollLeft}px`;
-        h.lane.style.top = `${host.scrollTop + host.clientHeight - THICK}px`;
-        h.lane.style.width = `${track}px`;
-        h.lane.style.height = `${THICK}px`;
+        placeLane(h.lane, box, "x");
         h.thumb.style.width = `${len}px`;
         h.thumb.style.transform = `translateX(${Math.round((host.scrollLeft / maxL) * (track - len))}px)`;
       } else {
@@ -342,6 +433,7 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
       startScroll: number;
       len: number;
       max: number;
+      track: number;
     } | null = null;
 
     const onDown = (bar: Bar) => (e: PointerEvent) => {
@@ -353,7 +445,7 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
       if (max <= 1) return;
       e.preventDefault();
       const rect = bar.lane.getBoundingClientRect();
-      const track = axis === "y" ? host.clientHeight : host.clientWidth;
+      const track = axis === "y" ? bar.lane.clientHeight : bar.lane.clientWidth;
       const len = axis === "y" ? bar.thumb.offsetHeight : bar.thumb.offsetWidth;
       const p = axis === "y" ? e.clientY - rect.top : e.clientX - rect.left;
       // On the thumb: grab it where it is. On the bare track: jump the thumb
@@ -375,6 +467,7 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
         startScroll,
         len,
         max,
+        track,
       };
     };
     v.lane.addEventListener("pointerdown", onDown(v));
@@ -382,9 +475,8 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
 
     const move = (e: PointerEvent) => {
       if (!drag) return;
-      const track = drag.axis === "y" ? host.clientHeight : host.clientWidth;
       const d = (drag.axis === "y" ? e.clientY : e.clientX) - drag.start;
-      const next = drag.startScroll + d * (drag.max / Math.max(1, track - drag.len));
+      const next = drag.startScroll + d * (drag.max / Math.max(1, drag.track - drag.len));
       if (drag.axis === "y") host.scrollTop = next;
       else host.scrollLeft = next;
       e.preventDefault();
@@ -398,6 +490,12 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
 
     const relayout = () => place();
     host.addEventListener("scroll", relayout, { passive: true });
+    // A lane placed outside a scrolling ancestor (see `nested`) must follow
+    // that ancestor's scrolls too.
+    const onAncestorScroll = (e: Event) => {
+      if (e.target !== host) place();
+    };
+    if (nested) document.addEventListener("scroll", onAncestorScroll, true);
     place();
     // Two frames: the first settles the host's own layout, the second the
     // content's (fonts, highlight spans) — both before the user sees a bar.
@@ -413,7 +511,7 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
     // Rows arriving after mount (an empty Review list that fills on open) are
     // a DOM change, not a host resize: watch the subtree too.
     const mo = new MutationObserver(relayout);
-    mo.observe(host, { childList: true, subtree: true });
+    mo.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ["style"] });
     // Fonts/highlighting settle late: re-place on a short poll that stops as
     // soon as the content size holds still.
     let ticks = 0;
@@ -433,6 +531,7 @@ export function useOverlayScrollbars(hostRef: Host, signature?: unknown) {
       ro?.disconnect();
       mo.disconnect();
       host.removeEventListener("scroll", relayout);
+      document.removeEventListener("scroll", onAncestorScroll, true);
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", release);
       window.removeEventListener("pointercancel", release);

@@ -108,6 +108,19 @@ function closeFocusedTerminal(): void {
   if (active?.kind === 'terminal') tabs.closeViewer(active.id)
 }
 
+/** Pick the app bar's compact level from its REAL overflow (no magic widths:
+ *  the bar's content differs with the sidebar state, the wallet chip, the
+ *  update button…). Drops one optional part per step — see
+ *  `.titlebar[data-compact]` in global.css. Measuring happens synchronously, so
+ *  the intermediate states are never painted. */
+function fitTitlebar(el: HTMLElement) {
+  delete el.dataset.compact
+  if (el.scrollWidth <= el.clientWidth + 1) return
+  el.dataset.compact = 'sm'
+  if (el.scrollWidth <= el.clientWidth + 1) return
+  el.dataset.compact = 'xs'
+}
+
 export default function App() {
   const loaded = useStore((s) => s.loaded)
   const load = useStore((s) => s.load)
@@ -174,6 +187,35 @@ export default function App() {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }
+
+  // Keeps the app bar's compact level in sync with the chat column's width
+  // AND with its content (token count growing, a chip appearing). A callback
+  // ref because the header only mounts after the store has loaded. The level
+  // lives in a data attribute React never manages, so re-renders keep it.
+  const titlebarCleanup = useRef<(() => void) | null>(null)
+  const titlebarRef = useCallback((el: HTMLElement | null) => {
+    titlebarCleanup.current?.()
+    titlebarCleanup.current = null
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let raf = 0
+    const schedule = () => {
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        fitTitlebar(el)
+      })
+    }
+    fitTitlebar(el)
+    const ro = new ResizeObserver(schedule)
+    ro.observe(el)
+    const mo = new MutationObserver(schedule)
+    mo.observe(el, { childList: true, subtree: true, characterData: true })
+    titlebarCleanup.current = () => {
+      ro.disconnect()
+      mo.disconnect()
+      if (raf) cancelAnimationFrame(raf)
+    }
+  }, [])
 
   // Loads persisted state. On failure we surface the error on the loading
   // screen (with a Retry button) instead of trapping the user on an endless
@@ -733,6 +775,7 @@ export default function App() {
                   sidebar is open the cluster lives in the sidebar's strip and
                   this bar starts right at the chat column. */}
               <header
+                ref={titlebarRef}
                 className={`titlebar chat-topbar${sidebarOpen ? "" : " solo"}`}
                 role="banner"
               >

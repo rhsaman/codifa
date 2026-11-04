@@ -351,10 +351,9 @@ export function ReadingMode({
   )
 
   // Render via a portal to <body> so `position: fixed` is relative to the
-  // viewport. The panel is mounted inside `.msg` (content-visibility: auto),
-  // which implicitly applies `contain: layout` — that would make the fixed
-  // panel a containing block of the message and clip it to the message's
-  // height instead of the full right side. In SSR (no document) render inline
+  // viewport. A fixed panel left inside `.msg` would be positioned against any
+  // contained/transformed transcript ancestor and clipped to the message box
+  // instead of covering the full right side. In SSR (no document) render inline
   // so the sanity test still sees the markup.
   if (typeof document === 'undefined') return panel
   return createPortal(panel, document.body)

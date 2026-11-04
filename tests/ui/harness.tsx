@@ -477,6 +477,36 @@ function initialState(scenario: string | null) {
           }),
         ],
       };
+    case "appshell": {
+      // Full App shell (titlebar + chat + resizable right pane) for layout
+      // regressions that only reproduce with the real flex split, e.g. the
+      // transcript blanking after the right pane is dragged wide then narrow.
+      // Long, width-sensitive messages so the transcript is scrollable at the
+      // narrow width and much shorter at the wide one.
+      const body = Array.from(
+        { length: 60 },
+        (_, i) =>
+          `Paragraph ${i + 1}: the quick brown fox jumps over the lazy dog while the transcript re-wraps at a new column width.`,
+      ).join("\n\n");
+      const messages = Array.from({ length: 4 }, (_, i) => ({
+        id: `m${i + 1}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `## Message ${i + 1}\n\n${body}`,
+        createdAt: now + i,
+      }));
+      return {
+        loaded: true,
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        openChatIds: ["c1"],
+        visibleChatIds: ["c1"],
+        chatTree: null,
+        workspaces: [
+          { key: "/tmp/codifa-ui-harness", root: "/tmp/codifa-ui-harness", label: "harness" },
+        ],
+        chats: [chat({ messages })],
+      };
+    }
     case "composer":
     default:
       return {
@@ -914,6 +944,17 @@ if (params.get("scenario") === "schedules") {
       />
     </div>,
   );
+} else if (params.get("scenario") === "appshell") {
+  // Real App shell so the right-pane split/resize runs through the production
+  // layout and CSS transitions. The harness stub covers the Tauri bridge.
+  const { default: App } = await import("../../src/App");
+  const { useViewerTabs } = await import("../../src/lib/viewerTabs");
+  useViewerTabs.setState({ paneOpen: true });
+  root.render(<App />);
+  // The shell's own load() settles against the stub (an empty backend miss
+  // looks like a genuine wipe), so re-apply the seeded chat once it finishes.
+  const seeded = initialState("appshell");
+  setTimeout(() => (useStore as any).setState(seeded), 1500);
 } else {
   root.render(<ChatPanel />);
 }

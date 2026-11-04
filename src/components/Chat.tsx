@@ -2189,9 +2189,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     atBottom: boolean;
   } | null>(null);
   /** While a saved viewport is being restored, keep re-anchoring to it as the
-   *  content around the anchor actually renders (content-visibility placeholders
-   *  → real heights, images, code blocks). Cleared once stable or when the user
-   *  scrolls away. */
+   *  content around the anchor actually renders (images, code blocks and fonts
+   *  settle after mount). Cleared once stable or when the user scrolls away. */
   const restoreTargetRef = useRef<{ id: string; offset: number } | null>(null);
   /** True while a programmatic scrollTop set (restore / re-anchor) is "in
    *  flight": the scroll events it fires must be ignored (they are not user
@@ -2200,8 +2199,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  frame, before the rAF callback, so the flag window exactly covers them.
    *  Unlike comparing the set value against the event's scrollTop, this is
    *  immune to the browser clamping the requested value to the scroll range
-   *  (content-visibility placeholders make the requested restore position
-   *  exceed scrollHeight - clientHeight on a fresh mount). */
+   *  (late-settling images/code blocks can leave the requested restore position
+   *  past scrollHeight - clientHeight on a fresh mount). */
   const programmaticScrollRef = useRef(false);
   /** Bumped to force the transcript to the bottom even when the user scrolled
    *  up (send / queue / steer). The auto-scroll effect depends on it. */
@@ -2771,7 +2770,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // If the user scrolls away from the position the restore set, stop
     // re-anchoring (the restore is only for the initial viewport).
     // A programmatic re-anchor (the restore itself re-setting scrollTop as
-    // content-visibility placeholders settle) must NOT be treated as a user
+    // late content settles) must NOT be treated as a user
     // scroll: it fires a scroll event at the clamped position, where
     // isAtBottom can wrongly report "at bottom" and flip stickToBottom on —
     // the first message update would then yank the viewport to the end and
@@ -2894,9 +2893,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (!el) return;
     const reconcile = () => {
       // While restoring a saved viewport, re-anchor to it on every content
-      // resize — content-visibility: auto lays off-screen messages out with
-      // 140px placeholders on a fresh mount, and images/code blocks settle
-      // later, so the anchor's real position only stabilizes over time.
+      // resize — images and code blocks settle after mount, so the anchor's
+      // real position only stabilizes over time.
       const target = restoreTargetRef.current;
       if (target) {
         const a = el.querySelector<HTMLElement>(`[data-msg-id="${target.id}"]`);
@@ -2946,6 +2944,50 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A drag-resize (right pane / sidebar / terminal) re-wraps the whole
+  // transcript on every mouse move, and the ResizeObserver pin above reacts one
+  // observation late. While the gesture runs, and for a short settle window
+  // after it, re-pin on EVERY frame (a pinned viewport only; a user who
+  // scrolled away keeps their place) so the viewport tracks the newest message
+  // instead of being left behind — or clamped — by a mid-drag reflow. One
+  // observer covers all three drag handlers: they all toggle the same body
+  // class.
+  useEffect(() => {
+    let was = document.body.classList.contains("coder-resizing");
+    let raf = 0;
+    let settleUntil = 0;
+    const tick = () => {
+      raf = 0;
+      const el = scrollRef.current;
+      if (el && stickToBottom.current) setProgrammaticScroll(el, el.scrollHeight);
+      if (
+        document.body.classList.contains("coder-resizing") ||
+        performance.now() < settleUntil
+      ) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+    const kick = () => {
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+    if (was) kick();
+    const mo = new MutationObserver(() => {
+      const now = document.body.classList.contains("coder-resizing");
+      if (now === was) return;
+      was = now;
+      settleUntil = performance.now() + 400;
+      kick();
+    });
+    mo.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+    return () => {
+      mo.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+    // Refs only (scrollRef, stickToBottom, and the ref-based pin helper), so
+    // subscribing once is safe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // The composer floats over the conversation (position: absolute; bottom: 0)
   // and the ask/perm cards anchor above it (bottom: calc(100% + 10px)), so the
   // fixed 210px padding-bottom on .chat-scroll only clears the idle composer.
@@ -2964,6 +3006,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const diffBarH = diffBar ? diffBar.getBoundingClientRect().height : null;
       const padding = composerScrollPadding(composerH, cardH, diffBarH);
       el.style.paddingBottom = `${padding}px`;
+      // The drawn chat scrollbar ends at the composer's top edge instead of
+      // running on behind it (useDiffScrollbars reads this from the host).
+      el.style.setProperty("--sp-inset-bottom", `${Math.round(composerH)}px`);
       // فلش فقط وقتی معنا دارد که متن‌های چت واقعاً پشت کامپوزر پنهان شده
       // باشند؛ آستانه = فضای رزروشدهٔ انتهای محتوا منهای ارتفاع UI شناور
       // (کامپوزر + کارت + نوار گیت که داخل composerH اندازه‌گیری می‌شود).
@@ -2977,6 +3022,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return () => {
       ro.disconnect();
       el.style.paddingBottom = "";
+      el.style.removeProperty("--sp-inset-bottom");
     };
   }, [askReq, permissionReq]);
 
@@ -3117,12 +3163,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const anchorRect = anchor.getBoundingClientRect();
     setProgrammaticScroll(el, el.scrollTop + (anchorRect.top - containerRect.top - pos.offset));
     setShowJump(false);
-    // content-visibility: auto skips off-screen messages on a fresh mount, so
-    // the first pass lands near the anchor using 140px placeholders — the
-    // restored viewport can be off by the difference between placeholder and
-    // real heights. Keep re-anchoring (via the ResizeObserver reconcile above)
-    // as the browser actually renders the content around the anchor, until the
-    // position stabilizes or the user scrolls away.
+    // The first pass can land slightly off the anchor's final position because
+    // images and code blocks settle after mount. Keep re-anchoring (via the
+    // ResizeObserver reconcile above) as the content around the anchor
+    // stabilizes, until the position is stable or the user scrolls away.
     restoreTargetRef.current = { id: anchorId, offset: pos.offset };
   }, [restoreTick, msgLimit, chat?.hydrated, chat?.messages?.length]);
 

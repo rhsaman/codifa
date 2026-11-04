@@ -2597,6 +2597,30 @@ body.coder-resizing .terminal-panel {
   font-weight: 500;
 }
 
+/* Narrow chat column (right pane dragged wide, split windows). App.tsx stamps
+   `data-compact` on the bar from its REAL overflow: "sm" when the pills no
+   longer fit, "xs" when they still do not. Each step drops the least important
+   part instead of letting the pills clip and scroll sideways:
+   sm → the workspace name (the Finder pill keeps icon + chevron; the full name
+        stays in its tooltip),
+   xs → also the cached-token half of the usage chip (count + reset remain). */
+.titlebar[data-compact] .workspace-btn-label {
+  display: none;
+}
+
+.titlebar[data-compact] .titlebar-icon-btn.workspace-menu-btn {
+  padding: 0 8px;
+  gap: 5px;
+}
+
+.titlebar[data-compact="xs"] {
+  gap: 4px;
+}
+
+.titlebar[data-compact="xs"] .usage-chip-cached {
+  display: none;
+}
+
 /* Cluster's icon-only buttons (sidebar toggle, settings): uniform 17px
    glyphs — same as the titlebar default — sized against the traffic
    lights' proportions (close, minimize, zoom). */
@@ -4309,11 +4333,6 @@ body.coder-dragging .chat-split-child {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  /* The chat renders every message in a single commit; skip rendering/layout
-     of off-screen messages entirely and let the browser lay them out on demand
-     as the user scrolls. contain-intrinsic-size keeps the scrollbar stable. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 140px;
 }
 
 /* "Load earlier messages" row shown at the top of the transcript until every
@@ -4446,9 +4465,6 @@ body.coder-dragging .chat-split-child {
   /* Clear gap both sides so the bubble reads as a separate user message, not a
      tool card glued to its neighbors (the surrounding tool cards use 4px). */
   margin: 16px 0;
-  /* The .msg base class uses content-visibility for the chat list; inside an
-     already-rendered segmented bubble the steer must always paint. */
-  content-visibility: visible;
 }
 
 .msg-bubble.segmented>.chat-message+.chat-message {
@@ -4463,9 +4479,8 @@ body.coder-dragging .chat-split-child {
   margin: 16px 4px;
 }
 
-/* Room for the bubble tail: .msg has content-visibility:auto → contain:paint
-   clips at the border box, so the tail (which pokes 7px past the bubble) must
-   sit inside this padding to stay fully visible in both LTR and RTL. */
+/* Room for the bubble tail: the tail pokes 7px past the bubble, so it must sit
+   inside this padding to stay fully visible in both LTR and RTL. */
 .msg.user {
   padding-inline: 10px;
 }
@@ -15263,12 +15278,17 @@ body.coder-dragging .chat-split-child {
 }
 
 /* A scroller carrying drawn bars: its own bar is hidden — the drawn lanes
-   replace it. It stays the lanes' containing block (position: relative).
-   NO padding is reserved: the content scrolls under the thumb, macOS overlay
-   style. A dynamic inset here WAS the earlier flicker loop — it shrank
-   clientWidth, made the other axis look scrollable, re-showed its bar. */
+   replace it. NO padding is reserved: the content scrolls under the thumb,
+   macOS overlay style. A dynamic inset here WAS the earlier flicker loop — it
+   shrank clientWidth, made the other axis look scrollable, re-showed its bar.
+
+   The lanes do NOT live inside this box (an absolutely positioned child is
+   still content: at the bottom it inflated scrollHeight by a viewport and the
+   browser could no longer clamp scrollTop when the content shrank — the chat
+   blanked after widening the pane). placeLane() attaches them to a
+   non-scrolling positioned ancestor instead, so nothing here needs
+   position: relative. */
 .sp-scroll {
-  position: relative;
   scrollbar-width: none;
 }
 
@@ -19653,10 +19673,6 @@ body.coder-dragging .chat-split-child {
      box is height-bounded, so its bar always sits on the visible bottom edge
      instead of at the end of a long diff. */
   overflow-x: auto;
-  /* The drawn bars (useDiffScrollbars) are absolute children of this box;
-     the hook also adds .sp-scroll in JS, this repeats it in CSS so the frame
-     exists from the first paint. */
-  position: relative;
 }
 
 .review-file-block {
@@ -22573,7 +22589,6 @@ mark.trace-hit-active {
   position: relative;
   isolation: isolate;
   min-height: 0;
-  border-left: 1px solid color-mix(in srgb, var(--link) 22%, var(--border));
   background: var(--bg-alt);
   box-shadow: none;
   /* Animated open/close (width + fade) in BOTH directions: the pane mounts
@@ -22630,7 +22645,6 @@ mark.trace-hit-active {
 .editor-area.viewer-full .viewer-group {
   flex: 1 1 auto;
   max-width: none;
-  border-left: 0;
 }
 
 .editor-area.viewer-full .dock-resize-handle {

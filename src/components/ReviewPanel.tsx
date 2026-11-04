@@ -28,7 +28,7 @@ import {
   type GitCommitInfo,
 } from "../lib/api";
 import { normalizeUsageModel } from "../lib/usage";
-import { otherSlotLevel, otherSlotModel } from "../lib/toolSlots";
+import { otherSlotLevel, otherSlotModel, toolFallbackEntries } from "../lib/toolSlots";
 import { supportsReasoning } from "../lib/thinking";
 import { modelReasoning, modelThinkingLevels } from "../lib/context";
 import { levelFromSource } from "../lib/thinking-options";
@@ -405,6 +405,24 @@ export function ReviewPanel(props?: {
               ),
           },
           Object.fromEntries(st.settings.providers.map((p) => [p.id, p])),
+          {
+            // The "Other" group's fallback list (Settings → Tools): without it the
+            // backend only tries the first model and fails on its first error.
+            subagentModels: st.subagentModels ?? {},
+            toolFallbacks: toolFallbackEntries(st.toolFallbacks),
+            // A "Main model" rung means the CHAT's model, which differs from the
+            // commit's primary pick whenever the Other group names one.
+            main:
+              otherEntry && gitProvider
+                ? {
+                    kind: gitProvider.kind,
+                    model: gitChat.model ?? gitProvider.model,
+                    baseUrl: gitProvider.baseUrl,
+                    apiKeys: providerApiKeys(gitProvider),
+                    id: gitProvider.id,
+                  }
+                : undefined,
+          },
         );
         if ("error" in res) {
           useStore.getState().setChatCmdError(ownerChatId ?? st.activeChatId, res.error);

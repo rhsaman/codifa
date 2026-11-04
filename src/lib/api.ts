@@ -2309,6 +2309,16 @@ export async function gitAutoCommit(
   /** Provider rows keyed by id, so the backend checks the level against the
    *  list a source really enumerated for this model (same rule as a turn). */
   providers: Record<string, unknown> = {},
+  /** Settings → Tools: the "Other" group's model pick + its fallback list, so
+   *  the backend can walk the fallbacks when the first model fails (without
+   *  these it only ever tries `provider.model`). `main` is the chat's OWN
+   *  model, which a "Main model" rung stands for; omit it when `provider`
+   *  already IS the chat's model. */
+  slots: {
+    subagentModels?: Record<string, string>
+    toolFallbacks?: Record<string, string[]>
+    main?: { kind: string; model: string; baseUrl: string; apiKeys: string[]; id?: string }
+  } = {},
 ): Promise<GitAutoCommitResult | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: "the local backend is not ready" }
@@ -2326,6 +2336,13 @@ export async function gitAutoCommit(
         thinking_level: provider.thinkingLevel ?? "",
         model_reasoning: provider.modelReasoning ?? false,
         providers,
+        subagent_models: slots.subagentModels ?? {},
+        tool_fallbacks: slots.toolFallbacks ?? {},
+        main_provider: slots.main?.kind ?? '',
+        main_provider_id: slots.main?.id ?? '',
+        main_model: slots.main?.model ?? '',
+        main_base_url: slots.main?.baseUrl ?? '',
+        main_api_keys: slots.main?.apiKeys ?? [],
       }),
     })
     if (!res.ok) {

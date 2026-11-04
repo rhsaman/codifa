@@ -1,9 +1,9 @@
 import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
+import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderHeader, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import type { MarketplaceSource, PluginInfo } from '../types'
 import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES, setPersistSuspended } from '../lib/store'
-import { getSkillFile, listMcp, listSkills, syncSkill } from '../lib/api'
+import { getSkillFile, listMcp, listSkills, providerHeaders, syncSkill } from '../lib/api'
 import {
   deletePlugin,
   installPlugin,
@@ -1664,6 +1664,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // New-key draft + per-row visibility for the multi-key list.
   const [newKey, setNewKey] = useState('')
   const [showKeys, setShowKeys] = useState<Record<number, boolean>>({})
+  // Draft pair of the header list (header values are shown as text, they are
+  // identifiers/signatures rather than long secrets).
+  const [newHeader, setNewHeader] = useState({ key: '', value: '' })
   // ورودی «افزودن مدل دستی»: وقتی گیت‌وی فهرست مدل‌هایش را از /models نشان
   // نمی‌دهد (یا فچ شکست می‌خورد)، کاربر می‌تواند id مدل را مستقیم تایپ کند.
   const [manualModel, setManualModel] = useState('')
@@ -2449,6 +2452,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setCfg({ ...cfg, apiKeys: next })
   }
 
+  // Extra request headers. Sent verbatim with every call to this provider, which
+  // is how a gateway that only answers its own client (OpenCode Zen's
+  // `x-opencode-*` signature) can be used at all.
+  const cfgHeaders = providerHeaders(cfg)
+  const setHeaders = (next: ProviderHeader[]) => setCfg({ ...cfg, headers: next })
+  const addHeader = () => {
+    const key = newHeader.key.trim()
+    if (!key) return
+    setHeaders([...cfgHeaders, { key, value: newHeader.value.trim() }])
+    setNewHeader({ key: '', value: '' })
+  }
+
   // ورودی عددی طول کانتکست فقط برای kind‌هایی معنا دارد که /models‌شان پنجره‌ی
   // قابل‌اعتماد گزارش نمی‌کند (`manualContextInput` در PROVIDER_META)؛ برای بقیه‌ی
   // kind‌ها فرم دقیقاً مثل قبل تک‌فیلدی می‌ماند.
@@ -2952,6 +2967,100 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
               </div>
             )}
+
+            <div className="field">
+              <div className="field-head">
+                <label>Custom headers</label>
+                {cfgHeaders.length > 0 && (
+                  <span className="field-value-badge">{cfgHeaders.length} header{cfgHeaders.length === 1 ? '' : 's'}</span>
+                )}
+              </div>
+              <div className="hint">
+                Sent verbatim with every request (models list, probe and chat). Use it for a gateway
+                that only answers its own client — e.g. OpenCode Zen needs its <code>x-opencode-*</code>{' '}
+                signature. An <code>Authorization</code> header here replaces the API-key one. Values are
+                encrypted when you press Save.
+              </div>
+              {cfgHeaders.map((h, i) => (
+                <div key={`${h.key}-${i}`} className="api-key-row">
+                  <input
+                    className="api-key-input"
+                    value={h.key}
+                    onChange={(e) => {
+                      const next = [...cfgHeaders]
+                      next[i] = { ...next[i], key: e.target.value }
+                      setHeaders(next)
+                    }}
+                    placeholder="Header name"
+                    dir="ltr"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <input
+                    className="api-key-input"
+                    value={h.value}
+                    onChange={(e) => {
+                      const next = [...cfgHeaders]
+                      next[i] = { ...next[i], value: e.target.value }
+                      setHeaders(next)
+                    }}
+                    placeholder="Value"
+                    dir="ltr"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <div className="api-key-actions">
+                    <button
+                      type="button"
+                      className="icon-btn danger"
+                      title="Remove header"
+                      aria-label="Remove header"
+                      onClick={() => setHeaders(cfgHeaders.filter((_, j) => j !== i))}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <div className="api-key-row add">
+                <span className="api-key-order new" title="New header">+</span>
+                <input
+                  className="api-key-input"
+                  value={newHeader.key}
+                  onChange={(e) => setNewHeader((h) => ({ ...h, key: e.target.value }))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      addHeader()
+                    }
+                  }}
+                  placeholder="Header name — e.g. x-opencode-client"
+                  dir="ltr"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <input
+                  className="api-key-input"
+                  value={newHeader.value}
+                  onChange={(e) => setNewHeader((h) => ({ ...h, value: e.target.value }))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      addHeader()
+                    }
+                  }}
+                  placeholder="Value"
+                  dir="ltr"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <div className="api-key-actions">
+                  <button type="button" className="btn tiny primary" disabled={!newHeader.key.trim()} onClick={addHeader}>
+                    Add
+                  </button>
+                </div>
+              </div>
+            </div>
 
             <div className="field">
               <label>Models catalog</label>

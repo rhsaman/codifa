@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, ProviderHeader, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 import { sttDecodeFields } from './stt'
@@ -214,6 +214,15 @@ export function providerKeys(cfg: Pick<ProviderConfig, 'apiKeys'> & { apiKey?: s
   const out = raw.filter((k): k is string => typeof k === 'string' && k.trim() !== '')
   if (typeof cfg.apiKey === 'string' && cfg.apiKey.trim() !== '' && !out.includes(cfg.apiKey.trim())) out.push(cfg.apiKey.trim())
   return out
+}
+
+/** Verbatim header pairs of a provider row, sent with every request. Blank
+ *  names are dropped so callers can pass the list straight through. */
+export function providerHeaders(cfg: Pick<ProviderConfig, 'headers'>): ProviderHeader[] {
+  const raw = Array.isArray(cfg.headers) ? cfg.headers : []
+  return raw
+    .map((h) => ({ key: (h.key ?? '').trim(), value: (h.value ?? '').trim() }))
+    .filter((h) => h.key !== '')
 }
 
 /** Remote STT provider details forwarded to POST /transcribe. Omit for local Whisper. */
@@ -623,6 +632,7 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
     provider: cfg.kind,
     base_url: cfg.baseUrl,
     api_keys: JSON.stringify(providerKeys(cfg)),
+    headers: JSON.stringify(providerHeaders(cfg)),
   })
   const p = (async () => {
     const res = await fetch(`${url}/models?${params}`, { signal: AbortSignal.timeout(90_000) })
@@ -687,6 +697,7 @@ export async function testModel(cfg: ProviderConfig, model: string): Promise<Mod
     provider_id: cfg.id ?? '',
     base_url: cfg.baseUrl ?? '',
     api_keys: providerKeys(cfg),
+    headers: providerHeaders(cfg),
     model,
   }
   const res = await fetch(`${url}/models/test`, {
@@ -726,6 +737,7 @@ export async function testModelsBatch(cfg: ProviderConfig, models: string[]): Pr
       provider_id: cfg.id ?? '',
       base_url: cfg.baseUrl ?? '',
       api_keys: providerKeys(cfg),
+      headers: providerHeaders(cfg),
       models: uniq,
     }),
     signal: AbortSignal.timeout(75_000),
@@ -743,6 +755,7 @@ function providerRequestKey(cfg: ProviderConfig): string {
     cfg.kind,
     cfg.baseUrl ?? "",
     providerKeys(cfg).join(','),
+    JSON.stringify(providerHeaders(cfg)),
   ].join("|")
 }
 

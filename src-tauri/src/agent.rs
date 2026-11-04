@@ -177,6 +177,7 @@ async fn run_slot_distill(
         );
         let cfg = LlmConfig {
             provider: k,
+            headers: crate::llm::custom_headers(&req.providers, &pid),
             provider_id: pid,
             model: m,
             base_url: b,
@@ -386,6 +387,7 @@ async fn run_vision_slot(
         );
         let v_cfg = LlmConfig {
             provider: c_kind,
+            headers: crate::llm::custom_headers(&req.providers, &c_provider_id),
             provider_id: c_provider_id,
             model: c_model.clone(),
             base_url: c_base,
@@ -4180,6 +4182,7 @@ pub async fn run_turn(
     let trace = crate::trace::TraceStore::new(req.chat_id.clone()).with_run(run_id);
     let cfg = LlmConfig {
         provider: req.provider.clone(),
+        headers: crate::llm::custom_headers(&req.providers, &req.provider_id),
         provider_id: req.provider_id.clone(),
         model: req.model.clone(),
         base_url: req.base_url.clone(),
@@ -5206,6 +5209,7 @@ already approved with \"Always allow\".",
                     );
                 let compact_model = LlmConfig {
                     provider: cfg.provider.clone(),
+                    headers: crate::llm::custom_headers(&req.providers, &slot_provider_id),
                     provider_id: slot_provider_id.clone(),
                     model: slot_model.clone(),
                     base_url: slot_base,
@@ -5229,6 +5233,7 @@ already approved with \"Always allow\".",
                     .iter()
                     .map(|(m, b, keys, pid, k)| LlmConfig {
                         provider: k.clone(),
+                        headers: crate::llm::custom_headers(&req.providers, pid),
                         provider_id: pid.clone(),
                         model: m.clone(),
                         base_url: b.clone(),
@@ -15227,6 +15232,7 @@ mod tests {
         );
         let main = LlmConfig {
             provider: "custom".into(),
+            headers: Vec::new(),
             provider_id: "main-prov".into(),
             model: "main-model".into(),
             base_url: "http://parent/v1".into(),
@@ -15284,6 +15290,7 @@ mod tests {
         );
         let main = LlmConfig {
             provider: "custom".into(),
+            headers: Vec::new(),
             provider_id: "p1".into(),
             model: "main-model".into(),
             base_url: format!("{mock_base}/v1"),
@@ -15339,6 +15346,7 @@ mod tests {
         );
         let main = LlmConfig {
             provider: "custom".into(),
+            headers: Vec::new(),
             provider_id: "main-prov".into(),
             model: "main-model".into(),
             base_url: "http://parent/v1".into(),

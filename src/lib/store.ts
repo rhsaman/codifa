@@ -1226,6 +1226,14 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     name: p.name || PROVIDER_NAMES[kind] || 'Custom API',
     kind,
     apiKeys: keys,
+    // Verbatim request headers (e.g. a gateway's own client signature); the
+    // values are encrypted at rest like the keys, so nothing is validated here
+    // beyond the shape.
+    headers: Array.isArray(p.headers)
+      ? p.headers
+          .filter((h) => h && typeof h.key === 'string' && h.key.trim() !== '')
+          .map((h) => ({ key: (h.key as string).trim(), value: String(h.value ?? '') }))
+      : [],
     // Use defaultBaseUrl from provider meta if user hasn't set a custom baseUrl
     baseUrl,
     accountId: scoped ? accountId : undefined,

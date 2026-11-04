@@ -810,6 +810,7 @@ pub async fn chat_title(
         );
         let cfg = crate::llm::LlmConfig {
             provider: c_kind,
+            headers: crate::llm::custom_headers(&body.providers, &c_provider_id),
             provider_id: c_provider_id.clone(),
             model: c_model.clone(),
             base_url: c_base,

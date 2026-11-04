@@ -46,6 +46,57 @@ pub struct LlmConfig {
     /// models (openrouter / nvidia / cloudflare).
     /// Gates the reasoning param the same way the Python `auto_think` did.
     pub auto_think: bool,
+    /// Extra request headers configured on the provider ROW (Settings →
+    /// provider form), sent verbatim after the auth header. A gateway that
+    /// only answers its own client (OpenCode Zen and its `x-opencode-*`
+    /// signature) needs them, and the kind alone cannot express that.
+    pub headers: Vec<(String, String)>,
+}
+
+/// Read the `headers` list of one provider row out of the request's provider
+/// map. Accepted shapes: an array of `{key, value}` pairs (what the form
+/// saves) and a plain `{"k": "v"}` object. Blank names and rows without
+/// headers yield an empty list, so every caller can pass it straight through.
+pub fn custom_headers(
+    providers: &std::collections::HashMap<String, Value>,
+    provider_id: &str,
+) -> Vec<(String, String)> {
+    header_pairs(providers.get(provider_id).and_then(|row| row.get("headers")))
+}
+
+/// Parse one `headers` value (array of `{key, value}` or plain `{"k": "v"}`)
+/// into pairs, dropping blank names. Separate from [`custom_headers`] so paths
+/// that carry no provider map (the model list, the probe) can reuse it.
+pub fn header_pairs(raw: Option<&Value>) -> Vec<(String, String)> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let pair = |k: Option<&Value>, v: Option<&Value>| -> Option<(String, String)> {
+        let name = k.and_then(Value::as_str).map(str::trim)?;
+        if name.is_empty() {
+            return None;
+        }
+        let value = v.and_then(Value::as_str).unwrap_or("").trim();
+        Some((name.to_string(), value.to_string()))
+    };
+    match raw {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|it| pair(it.get("key"), it.get("value")))
+            .collect(),
+        Value::Object(map) => map
+            .iter()
+            .filter_map(|(k, v)| pair(Some(&Value::String(k.clone())), Some(v)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// True when the row already sets `name` itself. The auth header is derived
+/// from the key, so a row that spells `Authorization` out must win instead of
+/// being sent twice (reqwest appends, it does not replace).
+pub fn has_header(headers: &[(String, String)], name: &str) -> bool {
+    headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
 }
 
 /// Resolve the reasoning trio (`reasoning_level`, `model_reasoning`,
@@ -1118,10 +1169,13 @@ async fn complete_with_key(
 ) -> Result<LlmResult, (u16, String)> {
     let (url, header_name, header_value) = endpoint_and_auth(cfg, key);
     let mut req = client.post(&url).json(body);
-    if !header_name.is_empty() {
+    if !header_name.is_empty() && !has_header(&cfg.headers, header_name) {
         req = req.header(header_name, header_value);
     }
-    if cfg.provider == "anthropic" {
+    for (name, value) in &cfg.headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    if cfg.provider == "anthropic" && !has_header(&cfg.headers, "anthropic-version") {
         req = req.header("anthropic-version", "2023-06-01");
     }
     // `timeout_secs` bounds the WHOLE one-shot request (headers + body). These
@@ -1641,10 +1695,16 @@ async fn stream_with_key(
     let resp = loop {
         let send_body = retry_body.as_ref().unwrap_or(body);
         let mut req = client.post(&url).json(send_body);
-        if !header_name.is_empty() {
+        // The row's own header list goes FIRST, and the key-derived auth header
+        // is skipped when the row already spells that name out — reqwest
+        // appends instead of replacing, so sending both would duplicate it.
+        for (name, value) in &cfg.headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        if !header_name.is_empty() && !has_header(&cfg.headers, header_name) {
             req = req.header(header_name, header_value.as_str());
         }
-        if cfg.provider == "anthropic" {
+        if cfg.provider == "anthropic" && !has_header(&cfg.headers, "anthropic-version") {
             req = req.header("anthropic-version", "2023-06-01");
         }
         let resp = tokio::select! {
@@ -1899,6 +1959,7 @@ mod tests {
     fn cfg(provider: &str, base: &str, keys: &[&str]) -> LlmConfig {
         LlmConfig {
             provider: provider.into(),
+            headers: Vec::new(),
             provider_id: provider.into(),
             model: "m".into(),
             base_url: base.into(),
@@ -1910,6 +1971,56 @@ mod tests {
             model_reasoning: false,
             auto_think: false,
         }
+    }
+
+    #[test]
+    fn header_pairs_reads_both_shapes_and_drops_blank_names() {
+        // Array of {key, value} — what the form saves.
+        let arr = json!([
+            {"key": "x-opencode-client", "value": "cli"},
+            {"key": "  ", "value": "ignored"},
+            {"key": " x-opencode-session "},
+        ]);
+        assert_eq!(
+            header_pairs(Some(&arr)),
+            vec![
+                ("x-opencode-client".to_string(), "cli".to_string()),
+                // A missing value is an empty one, not a dropped pair.
+                ("x-opencode-session".to_string(), String::new()),
+            ]
+        );
+        // Plain object shape.
+        assert_eq!(
+            header_pairs(Some(&json!({"x-opencode-client": "cli"}))),
+            vec![("x-opencode-client".to_string(), "cli".to_string())]
+        );
+        assert!(header_pairs(None).is_empty());
+        assert!(header_pairs(Some(&json!("nope"))).is_empty());
+    }
+
+    #[test]
+    fn custom_headers_reads_the_named_row_only() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "zen".to_string(),
+            json!({"headers": [{"key": "x-opencode-client", "value": "cli"}]}),
+        );
+        providers.insert("other".to_string(), json!({"kind": "custom"}));
+        assert_eq!(
+            custom_headers(&providers, "zen"),
+            vec![("x-opencode-client".to_string(), "cli".to_string())]
+        );
+        // A row without headers, and an unknown id, both yield an empty list.
+        assert!(custom_headers(&providers, "other").is_empty());
+        assert!(custom_headers(&providers, "missing").is_empty());
+    }
+
+    #[test]
+    fn has_header_matches_case_insensitively() {
+        let h = vec![("authorization".to_string(), "Bearer x".to_string())];
+        assert!(has_header(&h, "Authorization"));
+        assert!(!has_header(&h, "x-api-key"));
+        assert!(!has_header(&[], "Authorization"));
     }
 
     #[test]

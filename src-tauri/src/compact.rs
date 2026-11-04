@@ -631,6 +631,7 @@ mod tests {
         let client = llm::http_client();
         let model = LlmConfig {
             provider: "custom".into(),
+            headers: Vec::new(),
             provider_id: "custom".into(),
             model: "m".into(),
             base_url: "http://127.0.0.1:1".into(),
@@ -656,6 +657,7 @@ mod tests {
     fn cfg(provider: &str, model: &str, base: &str) -> LlmConfig {
         LlmConfig {
             provider: provider.into(),
+            headers: Vec::new(),
             provider_id: provider.into(),
             model: model.into(),
             base_url: base.into(),

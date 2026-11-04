@@ -128,6 +128,9 @@ pub struct ModelTestBody {
     model: String,
     #[serde(default)]
     models: Vec<String>,
+    /// Extra request headers set on the provider row (sent verbatim).
+    #[serde(default)]
+    headers: Option<Value>,
     /// The provider ROW the picker is testing against. A model can be listed by
     /// several providers, so without it the probe would run on whichever row
     /// happened to match the kind.
@@ -152,6 +155,7 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
     let (r_level, r_model, r_auto) = crate::llm::reasoning_fields(&body.provider, "", false);
     let cfg = LlmConfig {
         provider: body.provider.clone(),
+        headers: crate::llm::header_pairs(body.headers.as_ref()),
         provider_id: if body.provider_id.is_empty() {
             body.provider.clone()
         } else {
@@ -435,6 +439,7 @@ async fn git_autocommit(Json(body): Json<GitAutoCommitBody>) -> Response<Body> {
     );
     let cfg = LlmConfig {
         provider: body.provider.clone(),
+        headers: crate::llm::custom_headers(&body.providers, &body.provider_id),
         provider_id: body.provider_id.clone(),
         model: body.model.clone(),
         base_url: body.base_url.clone(),
@@ -514,6 +519,7 @@ No code fences, no quotes, no preamble, no trailing explanation.";
         );
         chain.push(LlmConfig {
             provider: kind,
+            headers: crate::llm::custom_headers(&body.providers, &pid),
             provider_id: pid,
             model: m,
             base_url: b,
@@ -1739,6 +1745,7 @@ async fn compact_worker(
     );
     let model = LlmConfig {
         provider: slot_kind,
+        headers: crate::llm::custom_headers(&body.providers, &slot_provider_id),
         provider_id: slot_provider_id.clone(),
         model: model_name.clone(),
         base_url,
@@ -1789,6 +1796,7 @@ async fn compact_worker(
         .iter()
         .map(|(m, b, keys, pid, k)| LlmConfig {
             provider: k.clone(),
+            headers: crate::llm::custom_headers(&body.providers, pid),
             provider_id: pid.clone(),
             model: m.clone(),
             base_url: b.clone(),

@@ -60,6 +60,9 @@ pub struct ModelsQuery {
     pub env_var: String,
     #[serde(default)]
     pub api_keys: Option<Value>,
+    /// Extra request headers set on the provider row (sent verbatim after auth).
+    #[serde(default)]
+    pub headers: Option<Value>,
 }
 
 /// Static per-kind metadata (mirrors providers.py `_PROVIDERS`).
@@ -960,7 +963,17 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
         }
     };
 
-    let headers = auth_headers(&keys[0]);
+    // Row-configured headers come FIRST and suppress the auth default they
+    // spell out themselves (a gateway that wants another scheme sets
+    // `Authorization`/`x-api-key` itself); reqwest appends, so sending both
+    // would duplicate the header. Applied on every retry below too.
+    let extra = crate::llm::header_pairs(q.headers.as_ref());
+    let mut headers = extra.clone();
+    for (name, value) in auth_headers(&keys[0]) {
+        if !crate::llm::has_header(&headers, &name) {
+            headers.push((name, value));
+        }
+    }
     let mut res = match send_list(&client, &url, &headers, timeout).await {
         Ok(r) => r,
         Err(e) => return bad_request(format!("failed to fetch models from {url}: {e}")),
@@ -982,7 +995,12 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
     // Top-down key fallback: a dead first key falls through to the next.
     if matches!(res.status().as_u16(), 401 | 403 | 429) && keys.len() > 1 {
         for alt in keys.iter().skip(1) {
-            let alt_headers = auth_headers(alt);
+            let mut alt_headers = extra.clone();
+            for (name, value) in auth_headers(alt) {
+                if !crate::llm::has_header(&alt_headers, &name) {
+                    alt_headers.push((name, value));
+                }
+            }
             if let Ok(retry) = send_list(&client, &url, &alt_headers, timeout).await {
                 if !matches!(retry.status().as_u16(), 401 | 403 | 429) {
                     res = retry;

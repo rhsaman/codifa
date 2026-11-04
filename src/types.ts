@@ -90,6 +90,12 @@ export interface SearchConsoleConfig {
   siteUrl: string
 }
 
+/** One verbatim request header of a provider row. */
+export interface ProviderHeader {
+  key: string
+  value: string
+}
+
 export interface ProviderConfig {
   id: string
   name: string
@@ -98,6 +104,10 @@ export interface ProviderConfig {
   apiKeys: string[]
   /** Legacy single key (migrated into apiKeys on load). */
   apiKey?: string
+  /** Extra request headers sent verbatim with every call to this provider —
+   *  for gateways that only answer their own client (OpenCode Zen and its
+   *  `x-opencode-*` signature). Values are encrypted at rest like the keys. */
+  headers?: ProviderHeader[]
   baseUrl: string
   /** Account id of an account-scoped gateway (Cloudflare): its base URL is
    *  built from this id, so it is the field the user fills in. */

@@ -106,6 +106,13 @@ async function decryptKeyList(keys: unknown): Promise<string[]> {
 async function encryptProvider(p: ProviderConfig): Promise<ProviderConfig> {
   const out: ProviderConfig = { ...p }
   out.apiKeys = await encryptKeyList((p as unknown as Record<string, unknown>).apiKeys)
+  // Header VALUES are secrets too (a client signature / gateway token), so they
+  // get the same treatment. Names stay readable.
+  out.headers = Array.isArray(p.headers)
+    ? await Promise.all(
+        p.headers.map(async (h) => ({ key: h.key, value: await encryptSecret(h.value || '') })),
+      )
+    : []
   // Migrate a legacy plaintext apiKey into the list so nothing is lost.
   const legacy = (p as unknown as Record<string, unknown>).apiKey
   if (out.apiKeys.length === 0 && typeof legacy === 'string' && legacy) {
@@ -118,6 +125,9 @@ async function encryptProvider(p: ProviderConfig): Promise<ProviderConfig> {
 async function decryptProvider(p: ProviderConfig): Promise<ProviderConfig> {
   const out: ProviderConfig = { ...p }
   out.apiKeys = await decryptKeyList((p as unknown as Record<string, unknown>).apiKeys)
+  out.headers = Array.isArray(p.headers)
+    ? await Promise.all(p.headers.map(async (h) => ({ key: h.key, value: await decryptSecret(h.value || '') })))
+    : []
   const legacy = (p as unknown as Record<string, unknown>).apiKey
   if (out.apiKeys.length === 0 && typeof legacy === 'string' && legacy) {
     const d = await decryptSecret(legacy)

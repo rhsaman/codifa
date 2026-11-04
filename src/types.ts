@@ -562,6 +562,11 @@ export interface ChatMessage {
    *  error) from `workingStartedAt`. Rendered statically in the message footer
    *  so every finished turn keeps its working time visible in the chat. */
   turnElapsedMs?: number
+  /** The failure text of a turn that ended in an error, kept so the footer's
+   *  retry line can show WHY even on turns that never entered a retry ladder.
+   *  Stored decoded (the provider body is escaped JSON) so both the truncated
+   *  line and the hover tooltip can render it directly. */
+  errorReason?: string
   /** True when this message was persisted mid-stream (heartbeat snapshot) and
    *  the app died before the turn completed — shown as "interrupted" after a
    *  crash/power cut instead of looking like a complete reply. Cleared by the
@@ -594,7 +599,23 @@ export interface ChatMessage {
   skills?: string[]
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; branch?: number; fallback?: boolean; reconnecting?: boolean; startedAt?: number; /** Rendered as a compact line in the message footer, never as the transcript-end banner. */ inline?: boolean } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; branch?: number; fallback?: boolean; reconnecting?: boolean; startedAt?: number; /** Rendered as a compact line in the message footer, never as the transcript-end banner. */ inline?: boolean; /** A plain STATUS row (no ladder): compact progress, an interrupted reply. Shares the footer slot so every notice lives in one place. */ status?: boolean; /** Determinate 0-100 for a measurable status (compaction). Drives the footer progress bar; absent means indeterminate. */ percent?: number; attempts?: number } | null
+  /** Footer status overrides owned by the chat body (e.g. live compaction
+   *  progress). Rendered in the LAST assistant message's footer, in the same
+   *  slot as the retry/error line, so no banner is needed above the composer. */
+  footerStatus?: {
+    kind: "compact" | "info" | "error"
+    text: string
+    /** 0-100 when the status is a measurable job (compaction). Drives the
+     *  determinate progress bar in the footer; absent means indeterminate. */
+    percent?: number
+    /** "elapsed / budget" seconds, shown beside the bar. */
+    elapsedSecs?: number
+    budgetSecs?: number
+    /** "try 2/3" — only when the run may retry. */
+    attempt?: number
+    attempts?: number
+  } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
@@ -836,7 +857,9 @@ export interface TraceEntry {
  *  it answers, so the only truthful numbers are the phase, which attempt is
  *  running, and how much of the backend's wall-clock budget is already spent. */
 export interface ChatCompactProgress {
-  /** `preparing` (selecting the verbatim tail) | `summarizing` | `merging`. */
+  /** `waiting` (manual /compact queued behind a live stream — nothing has
+   *  started yet) | `preparing` (selecting the verbatim tail) | `summarizing`
+   *  | `merging`. */
   phase: string
   /** 1-based attempt across the primary + fallback chain; 0 before the first. */
   attempt: number

@@ -1,18 +1,32 @@
 // Wall-clock formatting for message timestamps (chat transcript) and sidebar
 // activity ages. All user-facing strings are English.
+export function isToday(ts: number): boolean {
+  return new Date(ts).toDateString() === new Date().toDateString();
+}
+
+// Month + day only ("Nov 2") — the footer renders this as a separate, dimmer
+// chip ahead of the clock, so the combined `fmtClock` string below is only used
+// where a single self-contained label is needed.
+export function fmtMonthDay(ts: number): string {
+  return new Date(ts).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+}
+
 export function fmtClock(ts: number): string {
-  const d = new Date(ts);
-  const time = d.toLocaleTimeString("en-US", {
+  const time = fmtClockTime(ts);
+  if (isToday(ts)) return time;
+  return `${fmtMonthDay(ts)} ${time}`;
+}
+
+/** Time only, never the date — for callers that render the date separately. */
+export function fmtClockTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString("en-US", {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
   });
-  if (d.toDateString() === new Date().toDateString()) return time;
-  const date = d.toLocaleDateString("en-US", {
-    month: "numeric",
-    day: "numeric",
-  });
-  return `${date} ${time}`;
 }
 
 export function fmtClockFull(ts: number): string {

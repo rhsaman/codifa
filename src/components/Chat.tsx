@@ -207,7 +207,6 @@ import type {
 import {
   ChatMessageView,
   QueuedCollapsibleText,
-  RetryBanner,
   editQueuedText,
   isCollapsibleText,
 } from "./ChatMessage";
@@ -580,99 +579,6 @@ function ChatLoader() {
  *  already spent, and a clock that keeps counting between ticks: the backend
  *  cannot report true completion of a model call, but "42s of 180s" is honest
  *  and enough to decide whether to keep waiting. */
-function CompactBanner({ progress }: { progress: ChatCompactProgress | null }) {
-  // Own 1s ticker: the backend only speaks when the phase or attempt changes,
-  // which can be a minute apart. Elapsed is derived from the local stamp of the
-  // last tick so the clock stays in sync with the backend's own count.
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const iv = setInterval(() => setTick((t) => t + 1), 1000);
-    return () => clearInterval(iv);
-  }, []);
-  // The provider the running model is routed to, as the user knows it: the row
-  // they configured. The backend reports the provider ID because its wire KIND
-  // ("custom") names nothing the user would recognise.
-  const providerName = useStore((s) => {
-    const pid = progress?.providerId;
-    if (!pid) return "";
-    const row = s.settings.providers.find((p) => p.id === pid);
-    return row ? providerDisplayName(row) : pid;
-  });
-
-  if (!progress) {
-    return (
-      <div className="notice-banner notice-loading" dir="ltr">
-        <span className="notice-icon">
-          <span className="spinner" />
-        </span>
-        <span className="notice-text">
-          Compacting context — older messages are being summarized…
-        </span>
-      </div>
-    );
-  }
-
-  const phaseLabel =
-    progress.phase === "preparing"
-      ? "Reading the conversation"
-      : progress.phase === "merging"
-        ? "Writing the summary"
-        : "Summarizing";
-  // Count on from the last tick instead of showing a frozen number.
-  const elapsed =
-    progress.elapsedSecs + Math.max(0, Math.round((Date.now() - progress.at) / 1000));
-  // Never shrink the bar as the clock drifts past the reported percent, and
-  // never claim 100% while the call is still running.
-  const percent = Math.min(99, Math.max(progress.percent, progress.budgetSecs > 0
-    ? Math.round((elapsed * 100) / progress.budgetSecs)
-    : progress.percent));
-  const attemptLabel =
-    progress.attempt > 0 && progress.attempts > 0
-      ? progress.attempts > 1
-        ? `attempt ${progress.attempt}/${progress.attempts}`
-        : null
-      : null;
-  const overBudget = progress.budgetSecs > 0 && elapsed > progress.budgetSecs;
-
-  return (
-    <div
-      className={`notice-banner notice-loading notice-compact${overBudget ? " notice-warn" : ""}`}
-      dir="ltr"
-    >
-      <span className="notice-icon">
-        <span className="spinner" />
-      </span>
-      <span className="notice-text">
-        <span className="notice-compact-row">
-          <span className="notice-compact-phase">
-            {phaseLabel} — {percent}%
-          </span>
-          <span className="notice-compact-meta">
-            {attemptLabel && <span>{attemptLabel}</span>}
-            <span>
-              {elapsed}s
-              {progress.budgetSecs > 0 ? ` / ${progress.budgetSecs}s` : ""}
-            </span>
-          </span>
-        </span>
-        <span className="notice-compact-bar" aria-hidden="true">
-          <span style={{ width: `${percent}%` }} />
-        </span>
-        <span className="notice-compact-foot">
-          {overBudget
-            ? "Taking longer than the summary budget — will stop on its own."
-            : "Older messages are being summarized…"}
-          {progress.model ? (
-            <span className="notice-compact-model">
-              {providerName ? `${providerName}/` : ""}
-              {progress.model}
-            </span>
-          ) : null}
-        </span>
-      </span>
-    </div>
-  );
-}
 
 export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Multi-window: each stacked window mounts its own ChatPanel with an
@@ -2456,27 +2362,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
-  // Auto-dismiss the "Context compacted" notice: show it ~4.5s, fade out over
-  // 0.5s, then clear it from the store. Per-chat, so switching away and back
-  // restarts the countdown instead of leaving a stale banner forever.
-  const [noticeLeaving, setNoticeLeaving] = useState(false);
-  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (!chat?.compactNotice) {
-      setNoticeLeaving(false);
-      return;
-    }
-    setNoticeLeaving(false);
-    noticeTimerRef.current = setTimeout(() => {
-      setNoticeLeaving(true);
-      noticeTimerRef.current = setTimeout(() => {
-        useStore.getState().setChatCompactNotice(chat.id, null);
-      }, 500);
-    }, 4500);
-    return () => {
-      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
-    };
-  }, [chat?.id, chat?.compactNotice]);
+  // "Context compacted" is deliberately NOT shown any more. The progress bar
+  // reaching 100% IS the success signal — a follow-up row restating "it worked"
+  // was pure noise the user has to read and then watch disappear. The transcript
+  // itself shows the resulting CONTEXT SUMMARY card, so the outcome is already
+  // visible without a status line.
+  // `compactNotice` is still cleared below where it was set, so any value
+  // persisted from an older build cannot resurrect the row.
 
   // Same auto-dismiss for the /undo and /redo feedback: show it ~4.5s, fade out
   // over 0.5s, then drop it from the store. Kept separate from the compact
@@ -5381,16 +5273,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               ? event.keep
               : undefined;
           store.compactChat(chatId, event.content ?? "", backendKeep ?? 1);
-          // Auto-compact completed — surface the same confirmation the manual
-          // /compact path shows, so the user knows older messages were folded
-          // into a summary. Stored per-chat so it's still there if the user
-          // switches away and comes back (no auto-dismiss — dismissed via ✕).
-          useStore
-            .getState()
-            .setChatCompactNotice(
-              chat.id,
-              "Context compacted — older messages are summarized below (after the conversation).",
-            );
+          // NO "Context compacted" confirmation on purpose: the footer progress
+          // bar hitting 100% already says it finished, and the transcript shows
+          // the resulting CONTEXT SUMMARY card. Storing a notice here made the
+          // success path leave a row behind that then had to fade out.
           // Queued messages during compact are delivered only after compact ends.
           // Epoch-guarded so an explicit Stop drops the drain.
           autoRetryFor(chat.id).schedule(0, () => {
@@ -6182,7 +6068,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       return c?.messages.some((m) => m.streaming) ?? false;
     };
     if (chatStreaming()) {
-      useStore.getState().setChatCompacting(chatId, true);
+      // DO NOT set `compacting` while merely WAITING for the stream: that flag
+      // is what the footer renders, so a chat that was streaming showed a bare
+      // "· compacting" row for up to a minute while nothing had started yet —
+      // and the assistant's own streaming bubble looked replaced by it.
+      // Signal the wait separately and truthfully.
+      useStore.getState().setChatCompactProgress(chatId, {
+        phase: "waiting",
+        attempt: 0,
+        attempts: 0,
+        model: "",
+        providerId: "",
+        percent: 0,
+        budgetSecs: 0,
+        elapsedSecs: 0,
+        at: Date.now(),
+      });
       const streamEnded = await new Promise<boolean>((resolve) => {
         let settled = false;
         const finish = (ended: boolean) => {
@@ -6201,6 +6102,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // "Compacting…" banner — with no timeout and no way out.
         const waitTimer = setTimeout(() => finish(false), COMPACT_STREAM_WAIT_MS);
       });
+      useStore.getState().setChatCompactProgress(chatId, null);
       if (!streamEnded) {
         // Summarizing underneath a live stream interleaves two model streams, so
         // give up loudly instead of hanging or compacting concurrently.
@@ -6432,12 +6334,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         },
       );
     }
-    useStore
-      .getState()
-      .setChatCompactNotice(
-        ch.id,
-        "Context compacted — older messages are summarized below (after the conversation).",
-      );
+    // Manual /compact finished. As with the auto path, no confirmation row: the
+    // progress bar completing plus the CONTEXT SUMMARY card in the transcript
+    // already report success, so a separate notice would just duplicate it.
     // Queued messages during manual compact are delivered only after compact ends.
     // Epoch-guarded so an explicit Stop drops the drain.
     autoRetryFor(ch.id).schedule(0, () => {
@@ -10490,6 +10389,78 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
             );
             const hidden = visible.length - windowed.length;
+            // EVERY notice that used to be a banner above the composer now rides
+            // the footer of the LAST visible assistant message, through the one
+            // status slot in ChatMessageView. Highest-signal wins: an actual
+            // failure beats a transient ack, and compaction progress beats both
+            // because it blocks the turn entirely.
+            const footerStatus: ChatMessage["footerStatus"] = (() => {
+              const err = cmdError ?? compactError ?? null;
+              if (err) return { kind: "error", text: err };
+              if (compacting) {
+                // Same information the removed CompactBanner carried, but split
+                // into structured fields instead of one long sentence: the
+                // footer renders a real progress BAR from `percent` and keeps
+                // the copy to a few words. The old string ("Compacting context
+                // — older messages are being summarized…") is gone: it was the
+                // longest possible way to say "working".
+                if (!compactProgress)
+                  // Pre-progress beat (the backend has acknowledged but not yet
+                  // ticked). Kept to one short word so the row never flashes the
+                  // long "Compacting context — older messages are summarized…"
+                  // sentence before the bar appears.
+                  return { kind: "compact", text: "compacting" };
+                // Waiting for the live reply to end before the summarizer may
+                // start. This is NOT compaction progress, so it gets words, not
+                // a bar: a 0% bar here read as "stuck at zero" and sat where the
+                // assistant's own streaming row should have been.
+                if (compactProgress.phase === "waiting")
+                  return {
+                    kind: "compact",
+                    text: "waiting for the reply to finish",
+                  };
+                const phase =
+                  compactProgress.phase === "preparing"
+                    ? "reading"
+                    : compactProgress.phase === "merging"
+                      ? "writing"
+                      : "summarizing";
+                // Only the PERCENTAGE is rendered: elapsed / budget / attempt
+                // count were dropped because the bar already says how far along
+                // the job is, and they made the line read as a wall of numbers.
+                // A missing `at` must not yield `NaN%` — treat it as "just now".
+                const at = typeof compactProgress.at === "number" ? compactProgress.at : Date.now();
+                const elapsed =
+                  compactProgress.elapsedSecs +
+                  Math.max(0, Math.round((Date.now() - at) / 1000));
+                const budget = compactProgress.budgetSecs > 0 ? compactProgress.budgetSecs : 0;
+                const percent = Math.min(
+                  99,
+                  Math.max(
+                    compactProgress.percent || 0,
+                    budget > 0 ? Math.round((elapsed * 100) / budget) : compactProgress.percent || 0,
+                  ),
+                );
+                return {
+                  kind: "compact",
+                  text: phase,
+                  percent,
+                };
+              }
+              // NO "compacted successfully" row on purpose: the progress bar
+              // reaching its end IS the success signal. A status line that can
+              // only appear once the work already finished reports nothing the
+              // user can act on, and it outlived the thing it described.
+              if (skillNotice) return { kind: "info", text: skillNotice };
+              if (undoNotice) return { kind: "info", text: undoNotice };
+              if (liveError) return { kind: "error", text: liveError };
+              if (chat?.liveError) return { kind: "error", text: chat.liveError };
+              if (chat?.ttsError) return { kind: "error", text: chat.ttsError };
+              return undefined;
+            })();
+            const lastVisibleId = windowed.length
+              ? windowed[windowed.length - 1].id
+              : null;
             return (
               <>
                 {hidden > 0 && (
@@ -10517,7 +10488,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 {windowed
                   .map((m: ChatMessage) => (
                     <Fragment key={m.id}>
-                      <ChatMessageView message={m} onRetry={onRetry} onEdit={onEdit} />
+                      <ChatMessageView
+                        message={
+                          footerStatus && m.id === lastVisibleId
+                            ? { ...m, footerStatus }
+                            : m
+                        }
+                        onRetry={onRetry}
+                        onEdit={onEdit}
+                      />
                       {/* Newer messages render tool cards inline via `segments`; only
                         older persisted messages without segments keep the stacked
                         timeline below the bubble. */}
@@ -10657,406 +10636,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               ))}
             </div>
           )}
-          {(() => {
-            // A real retry banner, OR a stalled-but-busy run (no retry event
-            // yet) — both render the SAME RetryBanner so the user always has a
-            // one-click Retry and the "still waiting" hint, never a dead-end
-            // "Still waiting" notice with only a Stop button.
-            //
-            // The stall hint has no `message.retry` of its own, so the ✕
-            // dismissal has to be honoured explicitly here — otherwise closing
-            // that notice would change nothing at all.
-            const newestAssistantId =
-              [...(chat?.messages ?? [])]
-                .reverse()
-                .find((m) => m.role === "assistant")?.id ?? null;
-            const stallDismissed =
-              !!newestAssistantId &&
-              dismissedRetryIdsRef.current.has(newestAssistantId);
-            const effectiveRetry =
-              retryingMsg?.retry ??
-              (busy && stalled && !stallDismissed
-                ? {
-                  attempt: 1,
-                  maxAttempts: 10,
-                  delay: 30,
-                  reason: "Still waiting for the provider…",
-                  gaveUp: false,
-                }
-                : null);
-            if (!effectiveRetry) return null;
-            return (
-              <RetryBanner
-                // Keyed by the message it belongs to: without it React reuses
-                // the instance when the retrying message CHANGES, and the new
-                // banner inherits the previous one's `leaving` state — it would
-                // mount already mid-fade and be retired on the spot, so a fresh
-                // failure appeared to never show.
-                key={retryingMsg?.id ?? "stalled"}
-                attempt={effectiveRetry.attempt}
-                maxAttempts={effectiveRetry.maxAttempts}
-                delay={effectiveRetry.delay}
-                reason={effectiveRetry.reason}
-                gaveUp={effectiveRetry.gaveUp}
-                watchdog={effectiveRetry.watchdog}
-                model={effectiveRetry.model}
-                providerId={effectiveRetry.providerId}
-                agent={effectiveRetry.agent}
-                tool={effectiveRetry.tool}
-                fallback={effectiveRetry.fallback}
-                // Transient: a banner dissolves on its own only when it is
-                // PURE INFORMATION — nothing to click, nothing the user must
-                // reach for.
-                //  - the sub-agent fallback notice is exactly that: no button,
-                //    and the main turn keeps streaming behind it. It must still
-                //    fade while `busy` (the backend marks it `reconnecting`,
-                //    and a live turn is busy by definition) — gating it on
-                //    `!busy` would mean it never fades at all.
-                //  - an exhausted-retry banner keeps a Retry button, so it only
-                //    dissolves once its turn is no longer running; before that,
-                //    fading would take the button away mid-reach.
-                // A watchdog banner never dissolves: that turn did not quietly
-                // heal, it needs an explicit click.
-                transient={
-                  effectiveRetry.watchdog !== true &&
-                  (effectiveRetry.fallback === true ||
-                    (effectiveRetry.gaveUp === true &&
-                      effectiveRetry.reconnecting !== true &&
-                      !busy))
-                }
-                stalled={stalled}
-                startedAt={effectiveRetry.startedAt}
-                onRetire={() => {
-                  const id = retryingMsg?.id;
-                  if (!id) return;
-                  // Stage A: take the message out of the "newest retry" scan
-                  // FIRST, so any newer retry event wins immediately instead
-                  // of being shadowed by the banner we are about to drop.
-                  retiringIdsRef.current.add(id);
-                  useStore.getState().updateMessage(id, { retry: null });
-                  // Then release: a NEW retry on the same message has to be
-                  // able to show again, so the ID leaves the skip-list right
-                  // after this render has flushed.
-                  setTimeout(() => {
-                    retiringIdsRef.current.delete(id);
-                  }, 100);
-                }}
-                onRetry={() => {
-                  // Resume-only (banner semantics via planRetry): re-send the last
-                  // user turn WITHOUT deleting anything, reusing the user bubble
-                  // and continuing the failed assistant bubble so completed tools,
-                  // plan and preservedToolSummary are kept. Never falls through
-                  // to truncate-and-restart.
-                  const msgs = chat?.messages ?? [];
-                  const idx = retryingMsg
-                    ? msgs.findIndex((m) => m.id === retryingMsg.id)
-                    : -1;
-                  const userMsg = [
-                    ...msgs.slice(0, idx === -1 ? msgs.length : idx),
-                  ]
-                    .reverse()
-                    .find((m) => m.role === "user");
-                  const resumeTurn = () => {
-                    // A banner can outlive the retry it describes while the
-                    // turn itself keeps running. Re-sending then would be
-                    // swallowed by send()'s single-flight guard, so retire the
-                    // stale banner instead: the only honest reading of "this
-                    // retry is over" while the turn is alive.
-                    const liveChat = useStore
-                      .getState()
-                      .chats.find((c) => c.id === chat?.id);
-                    if (liveChat?.messages.some((m) => m.streaming)) {
-                      const staleId = retryingMsg?.id;
-                      if (staleId) {
-                        useStore
-                          .getState()
-                          .updateMessage(staleId, { retry: null });
-                      }
-                      return;
-                    }
-                    if (!userMsg) return;
-                    const plan = planRetry(msgs, userMsg.id, 'banner');
-                    send(
-                      userMsg.content,
-                      userMsg.attachments ?? [],
-                      userMsg.images ?? [],
-                      false,
-                      userMsg.id,
-                      plan?.target.continueAssistantId ?? retryingMsg?.id,
-                    );
-                  };
-                  // A LIVE sub-agent retry (no gaveUp): the parent turn is STILL
-                  // streaming, so re-sending the turn is swallowed by send()'s
-                  // own single-flight guard (`abortMapRef` still holds this
-                  // chat's controller) and the button appeared DEAD. The right
-                  // action here is not to reboot the turn but to stop waiting:
-                  // ask the backend to run the next attempt immediately.
-                  if (effectiveRetry.agent && !effectiveRetry.gaveUp) {
-                    const originId = chat?.id;
-                    const id = retryingMsg?.id;
-                    const before = effectiveRetry.attempt;
-                    // The attempt number this click acknowledged. The confirmation
-                    // window below waits for the badge to move PAST it.
-                    let ackedAttempt = before;
-                    if (!originId) {
-                      resumeTurn();
-                      return;
-                    }
-                    // A banner can outlive the ladder that produced it. When the
-                    // click cannot be acted on, the banner is describing a retry
-                    // that no longer exists: retire it (then resume only if the
-                    // turn is already over) instead of leaving a button that does
-                    // nothing. It must NEVER abort the turn — a leftover explore
-                    // banner would otherwise kill a parent turn that is still
-                    // working, and "Contacting model" is often the PARENT.
-                    const retireStale = () => {
-                      if (id) {
-                        useStore.getState().updateMessage(id, { retry: null });
-                      }
-                      resumeTurn();
-                    };
-                    return retrySubagentNow(originId).then((accepted) => {
-                      // Only acknowledge a click the backend actually consumed.
-                      // A banner can outlive its ladder (the turn ended while it
-                      // was up), and painting "retrying now (requested)" on a
-                      // click nothing is listening for is exactly how this
-                      // button came to look broken.
-                      if (!accepted || !id) {
-                        retireStale();
-                        return;
-                      }
-                      const cur = useStore
-                        .getState()
-                        .chats.find((c) => c.id === originId)
-                        ?.messages.find((m) => m.id === id);
-                      // Bail if the banner retired (or another event replaced
-                      // it) while the request was in flight.
-                      if (!cur?.retry || cur.retry.gaveUp === true) return;
-                      // The ladder answered: it consumed the click. Bumping the
-                      // attempt is the visible proof that something happened — a
-                      // click that left "6/10" untouched is exactly why this
-                      // button kept looking dead.
-                      // The attempt number is NOT touched here: the ladder emits
-                      // the real next attempt itself, and a local +1 raced it (the
-                      // two numbers were equal, so the confirmation below never
-                      // saw the badge move, retired the banner after 3s and the
-                      // click looked dead — it took a second one).
-                      ackedAttempt = cur.retry.attempt;
-                      useStore.getState().updateMessage(id, {
-                        retry: {
-                          ...cur.retry,
-                          delay: 0,
-                          reason: "retrying now (requested)",
-                          startedAt: Date.now(),
-                        },
-                      });
-                      // Confirmation window. A ladder that can genuinely act
-                      // starts the next attempt immediately (the nudge emits with
-                      // delay 0 and its select fires within 250 ms), so the badge
-                      // moves — or the banner retires — almost at once. If neither
-                      // happens, the click landed on a ladder that cannot act, and
-                      // leaving the banner up is what makes the button look dead.
-                      // Returning this promise is also what keeps the button in
-                      // its loading state until the click has really been handled.
-                      // The backend ALREADY said it consumed the click
-                      // (`listening`), so there is nothing left to second-guess:
-                      // the old 3s "did the badge move?" check retired a healthy
-                      // banner whenever the next attempt simply took longer than
-                      // that. Hold the button in its loading state just long
-                      // enough to read as acknowledged, or until the real next
-                      // attempt / recovery lands.
-                      const start = Date.now();
-                      return new Promise<void>((resolve) => {
-                        const tick = setInterval(() => {
-                          const r = useStore
-                            .getState()
-                            .chats.find((c) => c.id === originId)
-                            ?.messages.find((x) => x.id === id)?.retry;
-                          const settled =
-                            !r || r.gaveUp === true || r.attempt > ackedAttempt;
-                          if (!settled && Date.now() - start <= 1500) return;
-                          clearInterval(tick);
-                          resolve();
-                        }, 100);
-                      });
-                    });
-                  }
-                  resumeTurn();
-                }}
-                onCancel={dismissRetry}
-              />
-            );
-          })()}
-          {(cmdError ||
-            compactError ||
-            compactNotice ||
-            skillNotice ||
-            undoNotice ||
-            liveError ||
-            chat?.liveError ||
-            chat?.ttsError ||
-            compacting) && (
-              <div className="chat-notices">
-                {compacting && <CompactBanner progress={compactProgress} />}
-                {cmdError && (
-                  <div className="notice-banner notice-error" dir="ltr">
-                    <span className="notice-icon">⚠</span>
-                    <span className="notice-text">{cmdError}</span>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() =>
-                        useStore.getState().setChatCmdError(chat.id, null)
-                      }
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-                {compactError && (
-                  <div className="notice-banner notice-error" dir="ltr">
-                    <span className="notice-icon">⚠</span>
-                    <span className="notice-text">
-                      Compact failed — {compactError}
-                    </span>
-                    <button
-                      type="button"
-                      className="notice-btn"
-                      disabled={busy}
-                      onClick={() => void compactContext()}
-                    >
-                      Retry
-                    </button>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() =>
-                        useStore.getState().setChatCompactError(chat.id, null)
-                      }
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-                {compactNotice && (
-                  <div
-                    className={`notice-banner notice-info${noticeLeaving ? " notice-leaving" : ""}`}
-                    dir="ltr"
-                  >
-                    <span className="notice-icon">
-                      <svg
-                        width="12"
-                        height="12"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </span>
-                    <span className="notice-text">{compactNotice}</span>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() =>
-                        useStore.getState().setChatCompactNotice(chat.id, null)
-                      }
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-                {skillNotice && (
-                  <div className="notice-banner notice-error" dir="ltr">
-                    <span className="notice-icon">⚠</span>
-                    <span className="notice-text">{skillNotice}</span>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() =>
-                        useStore.getState().setChatSkillNotice(chat.id, null)
-                      }
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-                {undoNotice && (
-                  <div
-                    className={`notice-banner notice-info${undoNoticeLeaving ? " notice-leaving" : ""}`}
-                    dir="ltr"
-                  >
-                    <span className="notice-icon">
-                      <svg
-                        width="12"
-                        height="12"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </span>
-                    <span className="notice-text">{undoNotice}</span>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() =>
-                        useStore.getState().setChatUndoNotice(chat.id, null)
-                      }
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-                {(liveError || chat?.liveError) && (
-                  <div className="notice-banner notice-error" dir="ltr">
-                    <span className="notice-icon">⚠</span>
-                    <span className="notice-text">{liveError ?? chat?.liveError}</span>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() => {
-                        setLiveError(null);
-                        if (chat) useStore.getState().setChatLiveError(chat.id, null);
-                      }}
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-                {chat?.ttsError && (
-                  <div className="notice-banner notice-error" dir="ltr">
-                    <span className="notice-icon">⚠</span>
-                    <span className="notice-text">{chat.ttsError}</span>
-                    <button
-                      type="button"
-                      className="notice-dismiss"
-                      onClick={() =>
-                        useStore.getState().setChatTtsError(chat.id, null)
-                      }
-                      title="Dismiss"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
+          {/* Every notice (errors, compaction progress, skill/undo acks, TTS
+              and live errors) now lives in the MESSAGE FOOTER via the single
+              retry/status slot — there are no banners above the composer. */}
             </>
           )}
         </div>

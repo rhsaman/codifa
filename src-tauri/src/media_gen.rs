@@ -189,8 +189,8 @@ pub fn target_from_cfg(cfg: &Value, model: &str) -> Option<MediaTarget> {
 }
 
 /// Resolve one media slot into its ordered rung ladder: the primary target
-/// first (`model` overrides the slot default when the tool call passed one),
-/// then every configured fallback with its own model. A rung whose provider
+/// first (the slot's own default model — the model is a user setting, never a
+/// per-call argument), then every configured fallback with its own model. A rung whose provider
 /// id names nothing in `providers` is skipped — the caller fails with a
 /// "not configured" message only when the WHOLE ladder came out empty.
 pub fn media_ladder(

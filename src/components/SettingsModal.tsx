@@ -3993,8 +3993,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       OpenAI-compatible endpoints (<code>/images/generations</code>,{' '}
                       <code>/images/edits</code>), Google Gemini and OpenRouter are supported.
                       Generated files are saved under <code>~/.codifa/media</code> in the chat's
-                      own folder and deleted with the chat. The default — the agent may request
-                      a different model in the same request.
+                      own folder and deleted with the chat. Ordered fallbacks below are tried
+                      top-first when the primary fails.
                     </div>
                   </div>
 
@@ -4031,7 +4031,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       OpenAI-compatible Sora format (<code>/videos</code>), Google Veo (
                       <code>predictLongRunning</code>) and OpenRouter are supported. Local
                       trim/merge runs through ffmpeg (downloaded automatically on first use).
-                      The default — the agent may request a different model in the same request.
+                      Ordered fallbacks below are tried top-first when the primary fails.
                     </div>
                   </div>
 

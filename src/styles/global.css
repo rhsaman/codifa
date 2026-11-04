@@ -4611,24 +4611,124 @@ body.coder-dragging .chat-split-child {
   justify-content: flex-start;
   gap: 8px;
   padding: 0 4px;
+  /* Positioning context for the inline retry line, which is taken OUT of the
+     button flow so it can sit where the Working pill sits. */
+  position: relative;
+  /* Container context so the retry line wraps on the FOOTER's width, not the
+     window's — the sidebar changes one without the other. */
+  container-type: inline-size;
+  container-name: msg-actions;
 }
 
 /* خط ریترای inline — جایگزین جمع‌وجور بنر ریترای. هر ریترای خودکار (نردبان
    خطای چت، نردبان‌های ساب‌ایجنت، watchdog) کنار نشانگر Working در فوتر پیام
    رندر می‌شود؛ متن کامل خطا در tooltip است. کمرنگ و تک‌خطی تا فوتر را شلوغ
    نکند و مثل بقیه‌ی فوتر به عرض پیام محدود بماند. */
+/* ── Ordered groups of the retry line (see `.msg-retry-inline`) ─────────────
+   Each group carries its own `order`, so the optional Retry button can sit
+   between the dots and the reason without the DOM having to move. */
+.msg-retry-inline-head {
+  /* 0 — opens the sentence. The row runs `direction: ltr` for CONTENT order
+     only; parking is handled by the outer auto margin. */
+  order: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
 .msg-retry-inline {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 5px;
-  max-width: min(56ch, 100%);
+  flex: 0 1 auto;
   min-width: 0;
+  /* NO `direction` on this element: it is the PARKING box. It inherits the
+     footer's direction so `margin-inline-start: auto` absorbs free space on the
+     same side the Working pill occupies. Setting `direction: ltr` here flipped
+     that auto margin to the opposite physical side and parked the line beside
+     the buttons (552px from the left) instead of at the pill's spot (4px).
+     CONTENT order is pinned on `.msg-retry-inline-row` below instead. */
+  /* LAST in the row's visual order: in an RTL row a LARGER `order` sorts
+     toward the visual LEFT, which is exactly where the Working pill sits
+     (measured: pill left edge = 4px). This line takes the pill's place, so it
+     must sort past the clock/timer pair (order 2/3) to claim that edge.
+     It is also the ONLY item with an auto margin — two autos split the free
+     space and park both of them in the middle. */
+  order: 9;
+  margin-inline-start: auto;
+  /* The hover card is positioned against this box. */
+  position: relative;
+  /* Bounded so a 4-screen provider body cannot dominate the row; past that it
+     ellipsizes and the full text lives in the hover card. */
+  max-width: min(34rem, 100%);
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.4;
   color: var(--text-dim);
   white-space: nowrap;
-  overflow: hidden;
+}
+
+/* CONTENT row: forces LTR so the sentence reads
+   `↻ retry 4/10 → reason → dots → Retry` in BOTH locales, with each `order`
+   value meaning one physical side everywhere. Keeping this on its own element
+   is what lets the OUTER box still park via the footer's (RTL) axis. */
+.msg-retry-inline-row {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  /* A compaction row packs SIX pieces (phase, bar, %, time, budget, attempt).
+     At the shared 5px gap they all read as one mush. The row itself keeps 5px
+     for the plain retry sentence; the compaction groups below get explicit,
+     larger separation so the eye can split "what phase" / "how far" / "how
+     long". */
+  /* A compaction row is the one case with a bar in it: give the row a real
+     width budget (min(100%, 46ch)) so the bar's `flex: 1 1 90px` has space to
+     grow into instead of collapsing to its 60px floor. Plain text rows are
+     unaffected — they never ask for extra width. */
+  max-width: min(100%, 46ch);
+  direction: ltr;
+  flex-direction: row;
+}
+
+/* Narrow panes: there is no room beside the buttons, so the line takes the
+   whole row ABOVE them. Now that the line is a real flex item, this only needs
+   to force the wrap — no repositioning, so it cannot collide at any width.
+   The trigger is a CONTAINER query on the footer width (not the viewport): the
+   sidebar shrinks the chat pane without shrinking the window. */
+@container msg-actions (max-width: 34rem) {
+  .msg-actions {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .msg-retry-inline {
+    flex: 1 0 100%;
+    max-width: 100%;
+    order: -1;
+    /* Wrapped onto its own row: left-align it with the buttons instead of
+       keeping the auto margin, which would push it to the far edge of that
+       row for no reason. */
+    margin-inline-start: 0;
+  }
+}
+
+/* Fallback for engines without container queries: same rule on the viewport. */
+@supports not (container-type: inline-size) {
+  @media (max-width: 860px) {
+    .msg-actions {
+      flex-wrap: wrap;
+      row-gap: 2px;
+    }
+
+    .msg-retry-inline {
+      flex: 1 0 100%;
+      max-width: 100%;
+      order: -1;
+      margin-inline-start: 0;
+    }
+  }
 }
 
 .msg-retry-inline-icon {
@@ -4636,15 +4736,107 @@ body.coder-dragging .chat-split-child {
   color: var(--danger);
 }
 
-.msg-retry-inline-text {
+/* Inner text row: carries the `dir="ltr"` pin (so the counter/reason/countdown
+   order never flips) while the OUTER span stays direction-inheriting and
+   therefore positionable with `inset-inline-end`. */
+.msg-retry-inline-inner {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
   min-width: 0;
+  /* The Retry button carries order 0 and the dots live here; putting the text
+     wrapper after the button keeps the visual order "… [Retry] • • •". */
+  order: 1;
+}
+
+.msg-retry-inline-who,
+.msg-retry-inline-count,
+.msg-retry-inline-wait {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+
+/* The error text itself: red so it reads as a failure rather than as more
+   chrome, and ellipsized so it can never widen or wrap the footer. */
+.msg-retry-inline-pct {
+  flex-shrink: 0;
+  /* Lighter than the phase name but brighter than the old metadata: the
+     number is the whole point of a compaction row, so it carries the emphasis. */
+  color: var(--text);
+  opacity: 0.82;
+  font-variant-numeric: tabular-nums;
+}
+
+/* (`.msg-retry-inline-progress`, `-bar` and `-bar-fill` were REMOVED: the
+   compact row now shows the PERCENTAGE ONLY. A 92px bar plus "42%" stated the
+   same thing twice and widened the row enough to crowd the clock pair.) */
+
+.msg-retry-inline-reason {
+  /* `flex: 1 1 0` (not a fixed ch basis): the reason takes only the width left
+     over after the counter/countdown, so the LINE stays narrow and its auto
+     margin lands on the far end instead of the middle of the footer. The 34ch
+     max keeps one very long provider body from dominating the row; past that
+     it ellipsizes and the full text stays in the tooltip. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 22ch;
+  /* 10: after the head, before the trailing dots. */
+  order: 10;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--danger);
+}
+
+/* Instant hover card carrying the WHOLE error. Native `title` was the wrong
+   tool: 1s delay, dropped on pointer jitter, single line — so a long provider
+   body "did not show". This is pure CSS on the row's own data attribute. */
+.msg-retry-inline::after {
+  content: attr(data-full-error);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  /* Anchor to the same physical side the row parks on, whichever it is. */
+  inset-inline-end: 0;
+  z-index: 40;
+  display: none;
+  /* `max-content` used to be clipped by the row's `overflow: hidden`, which is
+     why hovering "did not show the full error" at all. The row no longer clips
+     (only the reason span does), and the card is bounded + scrollable so a
+     4-screen provider body stays inside the viewport. */
+  width: max-content;
+  max-width: min(46ch, 80vw);
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.5;
+  /* The card wraps: that is the whole point of replacing the native tooltip. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 28%);
+  pointer-events: none;
+}
+
+.msg-retry-inline:hover::after,
+.msg-retry-inline:has(.msg-retry-inline-reason:hover)::after {
+  display: block;
 }
 
 .msg-retry-inline-btn {
   flex-shrink: 0;
+  /* 30: after the dots — the button is the very last thing in the row. */
+  order: 30;
+  align-self: center;
+  /* Inline gap between the ↻ glyph and the "Retry" label. */
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
   background: transparent;
   color: var(--danger);
@@ -4657,6 +4849,88 @@ body.coder-dragging .chat-split-child {
 
 .msg-retry-inline-btn:hover {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+/* The ↻ carried by the Retry button, kept on the same optical baseline as the
+   label. */
+.msg-retry-inline-btn-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+/* Three retry dots — the SAME pulse as the Working pill, so a pending cycle
+   reads as "alive and coming back" instead of a frozen label. */
+.msg-retry-inline-wait {
+  /* 20: the dots TERMINATE the sentence, after the reason (10). Without this
+     declaration the group defaulted to `order: 0` and sat level with the head,
+     which is why it kept jumping to the sentence's start. */
+  order: 20;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+}
+
+/* NOTE: an older block above still lists `.msg-retry-inline-wait` in a shared
+   colour rule; it carries no `order`, so it does not conflict with the value
+   set here. */
+.msg-retry-inline-dots {
+  display: inline-flex;
+  align-items: center;
+  /* 5px between dots, not 3px: at 4px+3px the trio fused into one smudge and
+     the indicator was read as "2 dots" even though all three were painted. */
+  gap: 5px;
+  /* A hair of inline padding so the first/last dot never abuts the counter or
+     the sentence text and get clipped by the neighbours' antialiasing. */
+  padding-inline: 1px;
+}
+
+.msg-retry-inline-dots i {
+  /* Identical geometry to the Working pill's dots so the two indicators read as
+     the same kind of thing. */
+  width: 5px;
+  height: 5px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--text);
+  opacity: 0.2;
+  /* EXACTLY the Working pill's animation (`msg-thinking-dot`, 1.4s,
+     scale 0.7→1.3 with opacity 0.2→1). The previous bespoke `msg-retry-dot`
+     only shifted opacity at a 1.2s cadence, so the two loaders visibly
+     disagreed even though they represent the same "still working" state. */
+  animation: msg-thinking-dot 1.4s ease-in-out infinite;
+}
+
+.msg-retry-inline-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.msg-retry-inline-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes msg-retry-dot {
+  0%,
+  60%,
+  100% {
+    /* Floor 0.7 — high on purpose. Lower values made the "resting" dots
+       disappear at this size and the indicator was misread as 2 dots. The
+       wave is now driven mostly by the 1.0 peak + the 1.5px lift, which is
+       plenty of motion without ever hiding a dot. */
+    opacity: 0.7;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-1.5px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-retry-inline-dots i {
+    animation: none;
+    opacity: 0.75;
+  }
 }
 
 .msg-interrupted {
@@ -13263,48 +13537,77 @@ body.coder-dragging .chat-split-child {
   white-space: nowrap;
 }
 
-.msg-elapsed-far {
-  margin-inline-start: auto;
-}
-
-/* ساعت ارسال هر پیام — انتهای مخالف فوتر (روبه‌روی usage/دکمه‌ها)، همان‌جایی
-   که نشانگر live موقع استریم بود. عمداً ریزتر و کمرنگ‌تر از متن اصلی پیام.
-   مهم: این اسپن نباید dir="ltr" بگیرد — جهت منطقی margin باید از ردیف ارث
-   برسد، وگرنه در RTL ساعت به سمت دکمه‌ها می‌چسبد (متن داخلی dir جدا دارد).
-   فقط یکی از آیتم‌های ردیف باید auto داشته باشد (msg-thinking زنده،
-   msg-elapsed-far، یا msg-time-far) — دو auto فضا را نصف می‌کند و تایمر را
-   به وسط صفحه می‌برد. */
-.msg-time {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-dim);
-  opacity: 0.55;
-  white-space: nowrap;
-}
-
-.msg-time-far {
-  margin-inline-start: auto;
-}
-
-/* Footer duration/clock pair — a small glyph in front of each readout so the
-   two mono strings don't blur into one. The time keeps extra breathing room
-   only when it is NOT the far item (the auto margin covers that case). */
-.msg-elapsed,
-.msg-time {
+/* ── Clock + turn duration: ONE unit, parked where the Working pill sits ──
+   Measured target (RTL): `.msg-thinking` sits at footer-left + 4px. Earlier
+   versions gave the two readouts separate `order`s and separate auto margins,
+   so they fought over the row's single free space and drifted ~140px apart
+   (timer at 18px, clock at 208px) instead of sitting side by side. The wrapper
+   now owns the parking; the readouts inside are plain siblings with a fixed
+   gap, so they can never separate.
+   `margin-inline-start: auto` must resolve against the ROW's direction, so the
+   wrapper carries no `dir` (the digits pin LTR on the inner spans). */
+.msg-clocks {
   display: inline-flex;
   align-items: center;
+  gap: 10px;
+  /* Same slot the retry/status line and the Working pill occupy: the row's
+     far end, away from the usage badge + action buttons. */
+  margin-inline-start: auto;
+  order: 9;
+  flex-shrink: 0;
+}
+
+/* A live retry/status line owns that slot instead — the pair then tucks back
+   toward the buttons so the two never overlap. */
+.msg-actions:has(.msg-retry-inline) .msg-clocks {
+  margin-inline-start: 0;
+  order: 2;
+}
+
+.msg-elapsed,
+.msg-time {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+}
+
+.msg-elapsed {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.8;
   gap: 4px;
 }
 
-.msg-elapsed svg,
-.msg-time svg {
+/* The stopwatch glyph is the ONLY decoration in this pair — the sent-time
+   clock deliberately has none (it was removed on request), so the two readouts
+   stay visually distinct: glyph = duration, bare digits = when it was sent. */
+.msg-elapsed-icon {
   flex-shrink: 0;
   opacity: 0.65;
 }
 
-.msg-time:not(.msg-time-far) {
-  margin-inline-start: 10px;
+.msg-time {
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.55;
+  gap: 4px;
 }
+
+/* Month+day chip ahead of the clock: dimmer and slightly tracked-out so it
+   reads as CONTEXT, not as a second time. Same-day messages omit it entirely. */
+.msg-time-date {
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  opacity: 0.72;
+}
+
+.msg-time-hm {
+  font-variant-numeric: tabular-nums;
+}
+
+/* No glyphs: the user asked for the clock icon to go, and the mono digits
+   already read as a time without decoration. */
 
 /* ۳ نقطه لودینگ — از سمت راست شروع می‌کنند به پر شدن (نقطهٔ اول = سمت راست
    زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.

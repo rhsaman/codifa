@@ -3688,6 +3688,12 @@ Creating or editing one is not available in this mode.",
 /// contract: every result carries a `codifa-media://` markdown reference the
 /// renderer turns into an inline picture or player, and the model includes it
 /// VERBATIM so the user actually sees the file.
+///
+/// NOTE: no tool here exposes a per-call `model` argument. The agent must
+/// generate with whatever the user configured in Settings (slot default +
+/// ordered fallbacks); a tool-supplied override would let it silently pick
+/// other providers' models and spend the user's credit elsewhere. Model
+/// choice is a USER setting, never an agent lever.
 fn media_tool_schemas(image_default: &str, video_default: &str) -> Vec<Value> {
     let img = if image_default.trim().is_empty() {
         "(no default — the tool errors until one is set in Settings)"
@@ -3714,7 +3720,6 @@ fn media_tool_schemas(image_default: &str, video_default: &str) -> Vec<Value> {
                 "parameters": {"type": "object", "properties": json!({
                     "prompt": {"type": "string", "description": "What the image shows — be concrete (subject, style, lighting)"},
                     "size": {"type": "string", "description": "Optional WxH like 1024x1024; omit to let the provider default"},
-                    "model": {"type": "string", "description": "Override the default model for THIS call only"},
                     "output": {"type": "string", "description": "Optional workspace-relative save path; default media/<stamp>.png"}
                 })},
             },
@@ -3736,7 +3741,6 @@ fn media_tool_schemas(image_default: &str, video_default: &str) -> Vec<Value> {
                     "prompt": {"type": "string", "description": "What to change"},
                     "mask_region": {"type": "object", "description": "Optional {x,y,w,h} rectangle in source pixels to restrict the edit"},
                     "size": {"type": "string", "description": "Optional WxH output size"},
-                    "model": {"type": "string", "description": "Override the default model for THIS call only"},
                     "output": {"type": "string", "description": "Optional save path; default media/image-edit-<stamp>.png"}
                 })},
             },
@@ -3761,7 +3765,6 @@ fn media_tool_schemas(image_default: &str, video_default: &str) -> Vec<Value> {
                     "image": {"type": "string", "description": "Optional workspace-relative image to animate (image-to-video)"},
                     "seconds": {"type": "integer", "description": "Clip length in seconds (providers cap it, often 4-12)"},
                     "size": {"type": "string", "description": "Optional WxH or aspect like 1280x720"},
-                    "model": {"type": "string", "description": "Override the default model for THIS call only"},
                     "output": {"type": "string", "description": "Optional save path; default media/clip-<stamp>.mp4"}
                 })},
             },
@@ -7200,16 +7203,13 @@ call fetch_url again with offset={next} for the rest]",
                             "image",
                         )
                     };
-                    // A per-call `model` overrides the slot default on the
-                    // PRIMARY rung only — fallbacks keep their own models.
-                    let effective_model = args["model"]
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(slot_model);
+                    // The SLOT default model is the only model reachable here:
+                    // the schema exposes no per-call `model` argument, so a
+                    // tool-supplied override is impossible by construction
+                    // (model choice is a user setting, never an agent lever).
                     let ladder = crate::media_gen::media_ladder(
                         slot_provider,
-                        effective_model,
+                        slot_model,
                         &slot_fallbacks,
                         &req.providers,
                     );
@@ -7235,7 +7235,7 @@ call fetch_url again with offset={next} for the rest]",
                             req.data_root.trim().to_string()
                         };
                         let chat_id = req.chat_id.trim().to_string();
-                        let mut last_err = String::new();
+                        let mut rung_errors: Vec<String> = Vec::new();
                         let mut done: Option<crate::media_gen::GeneratedMedia> = None;
                         for rung in &ladder {
                             let attempt = if name == "generate_image" {
@@ -7289,10 +7289,10 @@ call fetch_url again with offset={next} for the rest]",
                                     break;
                                 }
                                 Err(e) => {
-                                    last_err = format!(
-                                        "{slot_word} generation failed on {} (model {}): {e}",
-                                        rung.kind, rung.model
-                                    );
+                                    rung_errors.push(format!(
+                                        "{} generation failed on {} (model {}): {e}",
+                                        slot_word, rung.kind, rung.model
+                                    ));
                                 }
                             }
                         }
@@ -7311,7 +7311,10 @@ call fetch_url again with offset={next} for the rest]",
                                     true,
                                 )
                             }
-                            None => (last_err, false),
+                            // Join EVERY rung's error: previously only the last
+                            // rung's failure survived, so earlier rungs that
+                            // were actually tried looked like they never ran.
+                            None => (rung_errors.join(" | "), false),
                         }
                     }
                 }
@@ -11599,6 +11602,39 @@ mod tests {
             &dir,
         )
         .is_none());
+    }
+
+    /// Model choice on media tools is a USER setting (Settings → Media
+    /// Providers), never an agent lever: no media schema may expose a
+    /// per-call `model` argument, otherwise the agent could silently pick
+    /// other providers' models and spend the user's credit elsewhere.
+    #[test]
+    fn media_tool_schemas_expose_no_per_call_model_override() {
+        let schemas = media_tool_schemas("ag/gemini-3.1-flash-image", "sora-2");
+        let by_name: std::collections::HashMap<&str, &Value> = schemas
+            .iter()
+            .map(|s| (s["function"]["name"].as_str().expect("tool name"), s))
+            .collect();
+        for tool in ["generate_image", "edit_image", "generate_video"] {
+            let schema = by_name
+                .get(tool)
+                .unwrap_or_else(|| panic!("{tool} schema missing"));
+            let props = &schema["function"]["parameters"]["properties"];
+            assert!(
+                !props.get("model").is_some(),
+                "{tool} must not expose a per-call `model` argument"
+            );
+            // The user-facing arguments that DO belong to the agent survive.
+            assert!(props.get("prompt").is_some(), "{tool} needs prompt");
+            assert!(props.get("output").is_some(), "{tool} needs output");
+        }
+        // The descriptions still name the slot defaults so the model knows
+        // what it will hit before the call costs anything.
+        let gen = by_name.get("generate_image").expect("generate_image");
+        assert!(gen["function"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ag/gemini-3.1-flash-image"));
     }
 
     /// Every delegation tool goes through ONE branch: the builtin `explore` and

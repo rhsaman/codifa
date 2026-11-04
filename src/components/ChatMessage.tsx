@@ -27,7 +27,7 @@ import { dedupDocPaths, extractInlinePathParts, filePathFromHref, isDocPath, loo
 import { editTargetOf } from "../lib/toolActivity";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
-import { fmtClock, fmtClockFull } from "../lib/time";
+import { fmtClock, fmtClockFull, fmtClockTime, fmtMonthDay, isToday } from "../lib/time";
 import { cancelSteer, ensureSidecar, peekSidecarUrl } from "../lib/api";
 import { resolveLocalMedia } from "../lib/mediaUrl";
 import { fallbackReason, humanizeError } from "../lib/errorText";
@@ -1137,347 +1137,25 @@ export function ThinkingBlock({ text }: { text: string }) {
   );
 }
 
-// Used by the RetryBanner countdown. Pure function so it can be called from
-// `useState` initializer AND from the effect that resets `left` when
-// `startedAt` changes mid-mount.
+
+/** Countdown seconds left in a retry delay. Pure so it can be called from the
+ *  `useState` initializer AND from the effect that re-arms the clock when
+ *  `startedAt` changes mid-mount (a cycle that ended at 0 must not pin the
+ *  next one at 0). */
 function computeLeft(delay: number, startedAt: number | undefined): number {
   // Backend backoff carries jitter as a float (e.g. 16.8277s) — ceil once
-  // here so the banner never renders a fractional "retry in 16.82…s".
+  // here so the line never renders a fractional "in 16.82…s".
   if (!startedAt || delay <= 0) return Math.ceil(delay);
   const elapsed = Math.floor((Date.now() - startedAt) / 1000);
   return Math.max(0, Math.ceil(delay) - elapsed);
 }
 
-export function RetryBanner({
-  attempt,
-  maxAttempts,
-  delay,
-  reason,
-  gaveUp,
-  watchdog,
-  model,
-  providerId,
-  agent,
-  tool,
-  fallback,
-  transient,
-  stalled,
-  startedAt,
-  onRetire,
-  onCancel,
-  onRetry,
-}: {
-  attempt: number;
-  maxAttempts: number;
-  delay: number;
-  reason: string;
-  gaveUp?: boolean;
-  watchdog?: boolean;
-  model?: string;
-  /** Provider ROW id the failing model is routed to. Resolved to the name the
-   *  user configured, so the banner reads `provider/model` — a bare model id
-   *  does not say which account or gateway is failing. */
-  providerId?: string;
-  agent?: string;
-  /** The tool that owns this retry (e.g. "explore"), when it is a sub-agent
-   *  retry — lets the banner name the tool, not just the agent. */
-  tool?: string;
-  fallback?: boolean;
-  stalled?: boolean;
-  startedAt?: number;
-  /** Informational banners (sub-agent fallback, exhausted retries) are silent,
-   *  here-to-tell-you notes — the turn keeps streaming and nothing needs a
-   *  click. Instead of pinning them at the end of the transcript, they read
-   *  (first ~4s) and then dissolve with `retry-fade-out`: visibility bounded,
-   *  attention cost bounded. When the fade ends the banner is retired by the
-   *  parent; a NEW failure replaces this one outright, so no action is lost. */
-  /** Fires once the fade-out is done. */
-  onRetire?: () => void;
-  transient?: boolean;
-  onCancel?: () => void;
-  /** May be async: the banner keeps the button in its loading state until the
-   *  click has actually been handled (see `pending` below). */
-  onRetry?: () => void | Promise<void>;
-}) {
-  // Recompute `left` from props on every render. The banner may receive a new
-  // `startedAt` (and a bumped `attempt`) on each retry cycle WITHOUT remounting
-  // — the previous version initialized `left` once via `useState` and only
-  // decremented it, so once a cycle ended at `left = 0` the next cycle
-  // inherited that 0 and the countdown never reset (the user reported
-  // "ریترای استپ زیاد میشه اما تایمر جدید نشون نمیده" — counter goes up but
-  // the new timer never shows).
-  const [left, setLeft] = useState(() => computeLeft(delay, startedAt));
-  // Keep the interval in sync with whichever prop changed: `delay` (backoff
-  // changed), `startedAt` (a new retry cycle started), or `attempt` (parent
-  // bumped it for any reason). When `startedAt` changes, force `left` back to
-  // its freshly-computed value before re-arming the interval.
-  const lastStartedAt = useRef<number | undefined>(startedAt);
-  // A click is an ASYNC round trip (POST /chat/retry_now, or a whole re-sent
-  // turn), and a button that looks identical before and after being pressed
-  // reads as broken — the user clicks again and again. While the request is in
-  // flight the button shows a spinner and refuses a second click.
-  const [pending, setPending] = useState(false);
-  // Number of clicks whose promise has not settled yet. `pending` alone is not
-  // enough: acknowledging a click immediately bumps `attempt`/`startedAt` on the
-  // banner, so the reset below would clear the spinner WHILE the click was still
-  // being handled. The button then flickered back to "Retry" mid-request, which
-  // is exactly how it kept reading as a dead button.
-  const inFlight = useRef(0);
-  // A NEW retry cycle (or a replaced banner) ends the previous click's loading
-  // state — but only once nothing is still in flight.
-  useEffect(() => {
-    if (inFlight.current === 0) setPending(false);
-  }, [attempt, startedAt]);
-  useEffect(() => {
-    if (!pending) return;
-    // Safety net: if nothing comes back (backend gone, banner about to retire),
-    // never leave the button spinning forever.
-    const t = setTimeout(() => {
-      inFlight.current = 0;
-      setPending(false);
-    }, 15_000);
-    return () => clearTimeout(t);
-  }, [pending]);
-  useEffect(() => {
-    if (delay <= 0) return;
-    if (lastStartedAt.current !== startedAt) {
-      lastStartedAt.current = startedAt;
-      setLeft(computeLeft(delay, startedAt));
-    }
-    const t = setInterval(() => {
-      setLeft((l) => {
-        if (l <= 1) {
-          clearInterval(t);
-          return 0;
-        }
-        return l - 1;
-      });
-    }, 1000);
-    return () => clearInterval(t);
-  }, [delay, startedAt, attempt]);
-  /** How long a transient banner is readable before it starts dissolving. */
-  const READ_MS = 4000;
-  /** How long the dissolve itself takes. MUST match the `.retry-banner--fading`
-   *  animation duration in styles/global.css — retiring earlier unmounts the
-   *  banner while it is still ~20% opaque, which reads as a flicker. */
-  const FADE_MS = 2000;
-  const unlimited = maxAttempts <= 0;
-  const isRateLimit =
-    reason?.toLowerCase().includes("rate limit") ||
-    reason?.toLowerCase().includes("quota");
-  const countdown =
-    delay > 0
-      ? left > 0
-        ? ` — retry in ${left}s`
-        : " — retrying…"
-      : " — retrying…";
-  // The tool that owns the retry (e.g. "explore") + the agent label, joined so
-  // the user can tell a main-agent retry from a specific tool's at a glance.
-  // Skipped when the agent label already names the tool ("explore subagent" vs
-  // "explore"): repeating it as "tool: explore, explore subagent" is noise.
-  const tags = agent
-    ? tool && !agent.toLowerCase().includes(tool.toLowerCase())
-      ? [`tool: ${tool}`, agent]
-      : [agent]
-    : tool
-      ? [`tool: ${tool}`]
-      : [];
-  // The provider as the user knows it (the row they configured), never its wire
-  // kind — several rows can share one kind and one model id.
-  const providerName = useStore((s) => {
-    if (!providerId) return "";
-    const row = s.settings.providers.find((p) => p.id === providerId);
-    return row ? providerDisplayName(row) : providerId;
-  });
-  // Provider + the model id IN FULL (never shortened): `provider/model`.
-  const fullModel = model ? `${providerName ? `${providerName}/` : ""}${model}` : "";
-  const who = fullModel
-    ? ` — ${fullModel}${tags.length ? ` (${tags.join(", ")})` : ""}`
-    : tags.length
-      ? ` — ${tags.join(", ")}`
-      : "";
-  // A sub-agent (explore/task/…) retry: it runs INSIDE the parent turn, so
-  // calling it a "provider" hiccup would be misleading — the wording names it.
-  const subAgent = !!agent && !fallback;
-  // Exhausted-retire: when the banner says the attempt count is at its cap.
-  // `unlimited` (maxAttempts <= 0) is the OPPOSITE of a cap: folding it in made
-  // every unlimited retry render the "still trying" line instead of its
-  // countdown, i.e. the banner hid the retry it was supposed to offer.
-  const atLimit = maxAttempts > 0 && attempt >= maxAttempts;
-  // Transient banners dissolve: a press-down period (READ_MS, fully readable),
-  // then the full fade-out (FADE_MS, timed to the CSS animation). Hooks above
-  // must stay unconditional — this is a prop, not a render-mode branch.
-  const [leaving, setLeaving] = useState(false);
-  useEffect(() => {
-    if (!transient) {
-      // A banner that STOPS being transient (the retry resolved, the turn
-      // resumed) must not stay stuck half-faded.
-      setLeaving(false);
-      return;
-    }
-    // A NEW notice — a second failure, a fresh cycle — starts fully readable
-    // again instead of inheriting the previous one's half-faded state.
-    setLeaving(false);
-    const a = setTimeout(() => setLeaving(true), READ_MS);
-    return () => clearTimeout(a);
-  }, [transient, reason, startedAt]);
-  useEffect(() => {
-    if (!transient || !leaving || !onRetire) return;
-    const t = setTimeout(onRetire, FADE_MS);
-    return () => clearTimeout(t);
-  }, [transient, leaving, onRetire]);
-  // Provider bodies arrive pasted in raw (escaped JSON and all) and can run to
-  // several screen lines. The banner shows the sentence inside them; the full
-  // text stays reachable through the tooltip (`title`).
-  const detail = fallback
-    ? fallbackReason(reason ?? "")
-    : humanizeError(reason ?? "");
-  // Label and suffix are computed BEFORE the early-return branches below: the
-  // capped branch renders the attempt suffix, and declaring it after that
-  // return put the variable in its temporal dead zone — every gave-up render
-  // threw `Cannot access 'suffix' before initialization` instead of showing a
-  // banner.
-  const label = subAgent
-    ? "Sub-agent retrying"
-    : isRateLimit
-      ? "Provider rate limit"
-      : "Provider hiccup";
-  const suffix = unlimited
-    ? ` (attempt ${attempt})${countdown}`
-    : ` (${attempt}/${maxAttempts})${countdown}`;
-  // A sub-agent model hard-failed and the tool fell back to the MAIN model.
-  // Distinct banner: no spinner, no retry button — the fallback already ran.
-  if (fallback) {
-    return (
-      <div
-        className={[
-          "retry-banner",
-          "retry-banner-fallback",
-          ...(transient && leaving ? ["retry-banner--fading"] : []),
-        ].join(" ")}
-        title={reason || undefined}
-      >
-        <span className="retry-fallback-icon" aria-hidden>
-          ⚠
-        </span>
-        <span className="retry-text">
-          {/* This banner is raised for EVERY rung of the ladder, not only the
-              last one — so it must not claim the MAIN model was chosen when
-              the next entry of the user's own fallback list was. `who` names
-              the model that is actually running, and `gaveUp` means the chain
-              was exhausted without ever producing a report. */}
-          {gaveUp
-            ? "Sub-agent failed — no models left to try"
-            : "Sub-agent hit a wall — switched to a different model"}
-          {who ? <span className="retry-who">{who}</span> : null}
-          {detail ? <span className="retry-reason"> — {detail}</span> : null}
-        </span>
-      </div>
-    );
-  }
-  // Attempt capped: nothing left to ride but pressure. One message, one line,
-  // no countdown — and transient: the turn has either already moved on or is
-  // about to surface its real error; lingering would stay unreadable noise.
-  if (gaveUp || atLimit) {
-    const ranOut = gaveUp === true;
-    return (
-      <div
-        className={[
-          "retry-banner",
-          ...(transient && leaving ? ["retry-banner--fading"] : []),
-        ].join(" ")}
-        title={reason || undefined}
-      >
-        {!ranOut && <span className="spinner" />}
-        <span className="retry-text">
-          {agent ? `${agent} — ` : ""}
-          {ranOut
-            ? "kept failing after retries"
-            : `still trying (${attempt}/${maxAttempts})`}
-          {who ? <span className="retry-who">{who}</span> : null}
-          {detail ? <span className="retry-reason"> — {detail}</span> : null}
-        </span>
-        {onRetry && (
-          <button className="retry-btn" onClick={() => void onRetry()}>
-            Retry
-          </button>
-        )}
-        {onCancel && (
-          <button
-            className="retry-cancel"
-            onClick={onCancel}
-            title="Dismiss"
-          >
-            ✕
-          </button>
-        )}
-      </div>
-    );
-  }
-  // gave-up/watchdog wording is handled by the early return above.
-  return (
-    <div className="retry-banner" title={reason || undefined}>
-      {!gaveUp && <span className="spinner" />}
-      <span className="retry-text">
-        {label}
-        {suffix}
-        {who ? <span className="retry-who">{who}</span> : null}
-        {detail ? <span className="retry-reason"> — {detail}</span> : null}
-        {stalled && !gaveUp ? (
-          <span className="retry-stalled">
-            {" "}
-            — still waiting for the provider
-          </span>
-        ) : null}
-      </span>
-      {onRetry && (
-        <button
-          className="retry-btn"
-          disabled={pending}
-          onClick={() => {
-            if (pending) return;
-            const out = onRetry();
-            // Async handler: hold the loading state until it settles. A sync
-            // one (resume the turn) restarts a stream, so the banner is about
-            // to be replaced anyway.
-            if (out && typeof (out as Promise<void>).then === "function") {
-              inFlight.current += 1;
-              setPending(true);
-              void (out as Promise<void>).finally(() => {
-                inFlight.current = Math.max(0, inFlight.current - 1);
-                if (inFlight.current === 0) setPending(false);
-              });
-            }
-          }}
-          title={
-            pending
-              ? "Retrying…"
-              : "Retry — resumes where it stopped without redoing completed work"
-          }
-        >
-          {pending ? <span className="spinner retry-btn-spinner" /> : null}
-          {pending ? "Retrying…" : "Retry"}
-        </button>
-      )}
-      {onCancel && (
-        <button
-          className="retry-cancel"
-          onClick={onCancel}
-          title="Cancel retry"
-        >
-          ✕
-        </button>
-      )}
-    </div>
-  );
-}
-
 /** The compact inline retry line — the message-footer replacement for the
- *  transcript-end RetryBanner. Every automatic retry marks itself `inline`
- *  (the chat-error ladder, the sub-agent ladders, the watchdog) and renders
- *  HERE instead: one muted line beside the Working pill, the full provider
- *  error reachable through the tooltip. A gave-up line keeps the manual
- *  one-click Retry. */
+ *  transcript-end RetryBanner (removed). Every automatic retry marks itself
+ *  `inline` (the chat-error ladder, the sub-agent ladders, the watchdog) and
+ *  renders HERE instead: one muted line beside the Working pill, the full
+ *  provider error reachable through the hover card. A gave-up line keeps the
+ *  manual one-click Retry. */
 function InlineRetryLine({
   retry,
   onManualRetry,
@@ -1498,11 +1176,31 @@ function InlineRetryLine({
     return () => clearInterval(t);
   }, [retry.delay, retry.startedAt, retry.attempt, retry.gaveUp]);
   const gaveUp = retry.gaveUp === true;
+  // A footer STATUS line (no ladder) rides through the same component: compact
+  // progress, an interrupted reply, and plain (non-retried) failures all use
+  // this one visual slot, so the footer is the single place state is reported.
+  const isStatus = retry.status === true;
+  // A compaction row is MEASURABLE: it carries a real 0-100 that advances with
+  // both the summarizer's own reporting and the backend's wall-clock budget, so
+  // it gets a determinate bar instead of dots. Every other status (an ack, an
+  // interruption) has no honest percentage and stays plain text.
+  const progressPct =
+    isStatus && typeof retry.percent === "number"
+      ? Math.max(0, Math.min(100, Math.round(retry.percent)))
+      : null;
   // Provider bodies arrive pasted in raw (escaped JSON, several screen lines)
   // — the line shows the humanized sentence; the tooltip carries everything.
   const detail = retry.fallback
     ? fallbackReason(retry.reason ?? "")
     : humanizeError(retry.reason ?? "");
+  // Hover must reveal the WHOLE error, readable — not the raw provider body.
+  // `retry.reason` is typically escaped JSON (`{"error":{"message":"…",
+  // "type":"tokens",…}}`), which a tooltip renders as unreadable noise; the
+  // same humanizer the line uses, called with no cap, yields the full sentence.
+  // Falling back to the raw text keeps plain reasons (no embedded JSON) intact.
+  const fullDetail = retry.fallback
+    ? fallbackReason(retry.reason ?? "", 100000)
+    : humanizeError(retry.reason ?? "", 100000);
   // Sub-agent retries name their owner ("explore") so a compact line still
   // says WHICH ladder is cycling. Same dedup rule as the banner: repeating
   // the tool inside an agent label that already names it is noise.
@@ -1517,37 +1215,128 @@ function InlineRetryLine({
     .filter(Boolean)
     .join(", ");
   const counting = !gaveUp && retry.delay > 0;
-  const countdown = counting
-    ? left > 0
-      ? ` — in ${left}s`
-      : " — retrying…"
-    : "";
+  // "retrying…" is GONE: the three pulsing dots already say "in progress", and
+  // the word next to them said it twice. So once the countdown hits zero the
+  // text part simply disappears and only the dots remain.
+  const countdown = counting ? (left > 0 ? `in ${left}s` : "") : "";
   const cap =
     retry.maxAttempts > 1 ? `${retry.attempt}/${retry.maxAttempts}` : `${retry.attempt}`;
+  // The reason is the part that explains WHY the turn is cycling, so it gets its
+  // own red span instead of being glued onto the counter in dim grey. It stays
+  // on ONE line and truncates (full text in the tooltip), so a 4-screen provider
+  // body never wraps the footer taller or pushes the Retry button out of view.
+  // A sub-agent model hard-failed and the tool FELL BACK to another model. That
+  // is not a "retry": nothing is being re-attempted, the ladder already moved
+  // on. It gets its own wording so the footer does not claim a cycle that is
+  // not happening — matching what the old (now removed) banner said.
+  const label = retry.fallback
+    ? gaveUp
+      ? "sub-agent failed"
+      : "switched model"
+    : isStatus
+      ? retry.reason ?? ""
+      : gaveUp
+        ? retry.maxAttempts > 1
+          ? `failed after ${retry.attempt} tries`
+          : "failed"
+        : `retry ${cap}`;
+  // A fallback notice is INFORMATION, not a failure of the parent turn, so the
+  // ↻ glyph would read wrong — a warning triangle says "something degraded".
+  // A status row (compact/interrupted) is neither, so it gets its own mark.
+  const icon = isStatus ? "·" : retry.fallback ? "⚠" : "↻";
+  // A LIVE cycle keeps the ↻ mark in the line; once the ladder gives up, the
+  // glyph moves INSIDE the Retry button (a lone ↻ floating next to a "Retry"
+  // button read as two unrelated things).
+  const showInlineIcon = !(gaveUp && onManualRetry);
   return (
-    <span className="msg-retry-inline" dir="ltr" title={retry.reason || undefined}>
-      <span className="msg-retry-inline-icon" aria-hidden>
-        ↻
+    // NO `dir` on this span: it is the ABSOLUTELY POSITIONED element, and a
+    // `dir` here would make `inset-inline-end` resolve against THAT direction
+    // instead of the footer's — in RTL the line then stayed pinned right.
+    // The LTR pin belongs on the inner wrapper, which is what keeps the
+    // "↻ retry 7/10 — reason — in 7s" order stable.
+    <span
+      className="msg-retry-inline"
+      title={fullDetail || retry.reason || undefined}
+      /* Custom hover card: the NATIVE `title` has a ~1s delay, gets dropped when
+         the pointer jitters, and cannot wrap a multi-sentence provider body —
+         which is why hovering "did not show the full error". The card below is
+         CSS-only (no portal, no JS), appears instantly, and wraps to 46ch. */
+      data-full-error={fullDetail || retry.reason || undefined}
+    >
+      {/* Mirrors the Working pill's proven structure (`.msg-thinking` →
+          `.msg-thinking-inner`): the OUTER span only parks the line — it inherits
+          the footer's direction so `margin-inline-start: auto` lands on the
+          same edge the pill occupies. The INNER span pins `dir="ltr"` and owns
+          the content, so the visual order is identical in LTR and RTL and has
+          nothing to do with the direction used for parking. */}
+      {/* PARKING vs CONTENT ORDER are two different axes and live on two
+          different elements, exactly like the Working pill
+          (`.msg-thinking` parks, `.msg-thinking-inner` orders):
+            - the OUTER span inherits the footer's direction, so its
+              `margin-inline-start: auto` lands on the pill's side;
+            - this INNER row forces LTR, so the sentence always reads
+              `↻ retry 4/10 → reason → dots → Retry` in both locales. */}
+      <span className="msg-retry-inline-row" dir="ltr">
+      <span className="msg-retry-inline-head" dir="ltr">
+        {showInlineIcon && (
+          <span className="msg-retry-inline-icon" aria-hidden>
+            {icon}
+          </span>
+        )}
+        {who && <span className="msg-retry-inline-who">{who}</span>}
+        <span className="msg-retry-inline-count">{label}</span>
+        {progressPct !== null && (
+          // PERCENTAGE ONLY. The bar was removed on request: it duplicated the
+          // number (a 92px bar and "42%" say exactly the same thing), and it
+          // made the row wide enough to crowd the clock/timer beside it.
+          <span className="msg-retry-inline-pct">{progressPct}%</span>
+        )}
       </span>
-      <span className="msg-retry-inline-text">
-        {who ? `${who} — ` : ""}
-        {gaveUp
-          ? retry.maxAttempts > 1
-            ? `failed after ${retry.attempt} tries`
-            : "failed"
-          : `retry ${cap}`}
-        {detail ? ` — ${detail}` : ""}
-        {countdown}
-      </span>
+      {counting && (
+        // Dots + countdown are their own group placed right after the counter.
+        // They used to live at the END of the line, which put them after the
+        // ellipsized reason ("…reached…  • • •") where they read as part of
+        // the sentence instead of as activity.
+        <span className="msg-retry-inline-wait" dir="ltr">
+          <span className="msg-retry-inline-dots" aria-hidden>
+            <i /><i /><i />
+          </span>
+          {countdown && (
+            <span className="msg-retry-inline-wait-label">{countdown}</span>
+          )}
+        </span>
+      )}
+      {/* A status row already puts the whole sentence in `label`, so echoing
+          `detail` printed it twice ("Undo applied — … Undo applied — …").
+          Only ladder/fallback rows carry a separate reason. */}
+      {detail && !isStatus && (
+        <span
+          className="msg-retry-inline-reason"
+          dir="ltr"
+          data-full-error={fullDetail || detail}
+        >
+          {detail}
+        </span>
+      )}
       {gaveUp && onManualRetry && (
         <button
           className="msg-retry-inline-btn"
           onClick={onManualRetry}
           title="Retry — resumes where it stopped without redoing completed work"
+          dir="ltr"
         >
+          {/* The ↻ lives INSIDE the button now: a bare glyph next to a "Retry"
+              label read as two separate controls. `dir="ltr"` above pins the
+              button's insides LTR so the glyph stays LEFT of the Latin label
+              even in an RTL footer (the outer line still inherits RTL, which it
+              needs for its own positioning). */}
+          <span className="msg-retry-inline-btn-icon" aria-hidden>
+            ↻
+          </span>
           Retry
         </button>
       )}
+      </span>
     </span>
   );
 }
@@ -2910,14 +2699,16 @@ export const ChatMessageView = memo(
       {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
 
 
-      {!isUser && message.interrupted && (
-        <div className="msg-interrupted" dir="auto">
-          ⚠️ Interrupted — this reply was cut off (e.g. power loss). Send
-          “continue” to resume.
-        </div>
-      )}
-
-      {!isUser && (message.content || message.usage || message.streaming || message.turnElapsedMs != null || message.retry) && (
+      {!isUser && (
+        message.content ||
+        message.usage ||
+        message.streaming ||
+        message.turnElapsedMs != null ||
+        message.retry ||
+        (message.error && !message.streaming) ||
+        message.interrupted ||
+        message.footerStatus
+      ) && (
         <div className="msg-actions">
           {message.usage && (
             <UsageBadge
@@ -3089,7 +2880,57 @@ export const ChatMessageView = memo(
                 )}
             </>
           )}
-          {message.streaming &&
+          {/* THE one notice slot — every notice that used to be a banner above
+              the composer ends up here: retry ladders, plain failures, an
+              interrupted reply, and chat-level footer status (compaction
+              progress). The pending notice TAKES THE PLACE of the Working pill
+              (showing both said the same thing twice). */}
+          {message.retry ||
+          (message.error && !message.streaming) ||
+          message.interrupted ||
+          message.footerStatus ? (
+            <InlineRetryLine
+              retry={
+                message.retry ??
+                (message.error && !message.streaming
+                  ? {
+                      // A FAILED turn that never entered a retry ladder
+                      // (deterministic 4xx, exhausted quota, user Stop) still has
+                      // an error to report — and it reports it HERE, in the footer.
+                      attempt: 1,
+                      maxAttempts: 1,
+                      delay: 0,
+                      reason: message.errorReason ?? "The turn failed.",
+                      gaveUp: true,
+                      inline: true,
+                    }
+                  : message.interrupted
+                    ? {
+                        attempt: 1,
+                        maxAttempts: 1,
+                        delay: 0,
+                        reason:
+                          "Interrupted — this reply was cut off. Send “continue” to resume.",
+                        gaveUp: true,
+                        inline: true,
+                      }
+                    : {
+                        attempt: message.footerStatus!.attempt ?? 1,
+                        maxAttempts: 1,
+                        delay: 0,
+                        reason: message.footerStatus!.text,
+                        gaveUp: message.footerStatus!.kind === "error",
+                        inline: true,
+                        status: message.footerStatus!.kind !== "error",
+                        // Progress field rides through so the row can render a
+                        // determinate bar instead of parsing the text back.
+                        percent: message.footerStatus!.percent,
+                      })
+              }
+              onManualRetry={onRetry ? () => onRetry(message.id) : undefined}
+            />
+          ) : (
+            message.streaming &&
             (message.thinkingActive ? (
               <ThinkingIndicator startedAt={message.thinkingStartedAt} />
             ) : (
@@ -3101,68 +2942,72 @@ export const ChatMessageView = memo(
                 })()}
                 startedAt={message.workingStartedAt}
               />
-            ))}
-          {/* Automatic retries (chat-error ladder, sub-agent ladders, watchdog)
-              report HERE — one compact line beside the Working pill — instead
-              of the transcript-end banner. A gave-up retry keeps its manual
-              one-click Retry in the same line. */}
-          {message.retry && (
-            <InlineRetryLine
-              retry={message.retry}
-              onManualRetry={onRetry ? () => onRetry(message.id) : undefined}
-            />
+            ))
           )}
-          {/* Turn duration + send clock share the far end of the footer,
-              opposite the usage/buttons cluster (same spot the live Working
-              indicator occupied while streaming). One auto margin on the
-              first item only — two autos would split the free space.
-              NOTE: no dir on the outer spans — margin-inline-start must
-              resolve against the row direction (a dir="ltr" here would flip
-              the margin side in RTL and glue the pair to the buttons). The
-              inner spans keep the digits LTR. */}
-          {!message.streaming && message.turnElapsedMs != null && (
+          {/* Turn duration + send clock are ONE unit that parks exactly where
+              the Working pill sat (measured: pill `left: 18` in RTL). They used
+              to be two independent row items each fighting for the footer's
+              single auto margin, which is why they drifted ~140px apart instead
+              of sitting side by side. The wrapper owns the parking; the two
+              readouts inside are plain siblings with a fixed gap.
+              Hidden while a compaction row is up: that row already reports
+              state, and a timer next to it read as a second, unrelated status. */}
+          {!message.streaming &&
+            message.footerStatus?.kind !== "compact" && (
             <span
-              className="msg-elapsed msg-elapsed-far"
-              title={`Working time for this turn: ${fmtElapsed(message.turnElapsedMs)}`}
+              className="msg-clocks"
+              title={
+                message.turnElapsedMs != null
+                  ? `${fmtClockFull(message.createdAt)} · worked ${fmtElapsed(message.turnElapsedMs)}`
+                  : fmtClockFull(message.createdAt)
+              }
             >
-              <span dir="ltr">{fmtElapsed(message.turnElapsedMs)}</span>
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <line x1="10" x2="14" y1="2" y2="2" />
-                <line x1="12" x2="15" y1="14" y2="11" />
-                <circle cx="12" cy="14" r="8" />
-              </svg>
-            </span>
-          )}
-          {!message.streaming && (
-            <span
-              className={`msg-time${message.turnElapsedMs == null ? " msg-time-far" : ""}`}
-              title={fmtClockFull(message.createdAt)}
-            >
-              <span dir="ltr">{fmtClock(message.createdAt)}</span>
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="10" />
-                <polyline points="12 6 12 12 16 14" />
-              </svg>
+              {message.turnElapsedMs != null && (
+                <span className="msg-elapsed" dir="ltr">
+                  {/* The STOPWATCH glyph stays: it is what distinguishes "how long
+                      the turn took" from the sent-time clock beside it. Only the
+                      CLOCK icon was meant to go — removing both lost the
+                      duration/time distinction at a glance. */}
+                  <svg
+                    className="msg-elapsed-icon"
+                    width="11"
+                    height="11"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M10 2h4" />
+                    <path d="M12 14l3-3" />
+                    <circle cx="12" cy="14" r="8" />
+                  </svg>
+                  {fmtElapsed(message.turnElapsedMs)}
+                </span>
+              )}
+              {/* Sent time, split so the DATE can be de-emphasised: the clock is
+                  what the user scans for, the month+day is context. Same-day
+                  messages omit the date entirely (fmtClock already does this), so
+                  the row never carries a redundant "today". */}
+              <span className="msg-time" dir="ltr">
+                {isToday(message.createdAt) ? (
+                  <span className="msg-time-hm">{fmtClock(message.createdAt)}</span>
+                ) : (
+                  <>
+                    <span className="msg-time-date">
+                      {fmtMonthDay(message.createdAt)}
+                    </span>
+                    {/* `fmtClock` already prefixes the date for non-today
+                        timestamps, so use the time-ONLY formatter here — using
+                        it again printed the date twice ("Nov 2 Nov 2 03:03"). */}
+                    <span className="msg-time-hm">
+                      {fmtClockTime(message.createdAt)}
+                    </span>
+                  </>
+                )}
+              </span>
             </span>
           )}
         </div>
@@ -3199,6 +3044,13 @@ export const ChatMessageView = memo(
       a.workingStartedAt === b.workingStartedAt &&
       a.turnElapsedMs === b.turnElapsedMs &&
       a.error === b.error &&
+      // `errorReason` and `footerStatus` decide whether the footer renders a
+      // notice at all. Without them here, the prop change created by
+      // `{ ...m, footerStatus }` in Chat.tsx compared EQUAL and the component
+      // skipped re-rendering — the footer notice never appeared.
+      a.errorReason === b.errorReason &&
+      a.footerStatus?.text === b.footerStatus?.text &&
+      a.footerStatus?.kind === b.footerStatus?.kind &&
       a.retry === b.retry &&
       a.toolActivity === b.toolActivity &&
       a.segments === b.segments &&

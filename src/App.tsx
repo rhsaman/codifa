@@ -785,8 +785,10 @@ export default function App() {
                 <UpdateButton />
                 {/* Empty stretch that carries the window drag region: the bar
                     itself must stay no-drag so its horizontal scrollbar stays
-                    draggable when the pills overflow. */}
-                <span className="titlebar-drag-spacer" aria-hidden="true" />
+                    draggable when the pills overflow. Tauri's injected drag
+                    script handles mousedown-dragging AND double-click
+                    toggle-maximize (restore = previous bounds) on every OS. */}
+                <span className="titlebar-drag-spacer" data-tauri-drag-region="deep" aria-hidden="true" />
                 {/* Right-side mount: the model-usage chip is a static child so
                     it sits LEFT of the wallet chip (portaled here from
                     ChatPanel right after it). */}

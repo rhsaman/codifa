@@ -17,16 +17,6 @@ const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// stack into ~15 minutes of waiting for a summary that was never coming.
 const COMPACT_TOTAL_BUDGET_SECS: u64 = 180;
 
-/// Attempts ONE rung may spend before the walk moves down to the next model.
-///
-/// A rung that fails NON-fatally — a genuine rate limit, a 5xx, a dropped
-/// stream — is worth one repeat on the SAME model. A model-side rejection (a
-/// refused key, a model the provider does not serve, an exhausted allowance)
-/// skips the rest of the rung's budget instead: asking that model again can
-/// only produce the same error. The same budget exists in the sub-agent ladder
-/// (`SUBAGENT_RUNG_ATTEMPTS`), so a tool behaves the same wherever it runs.
-const COMPACT_RUNG_ATTEMPTS: usize = 2;
-
 /// How many times the WHOLE model list is walked top to bottom. After the last
 /// fallback fails the walk starts over from the summariser's own model (a
 /// provider that was down a minute ago is often back), still inside the shared
@@ -35,8 +25,10 @@ const COMPACT_RUNG_ATTEMPTS: usize = 2;
 const COMPACT_MAX_CYCLES: usize = 3;
 
 /// Pause between two passes over the list, so a list of dead rungs is not
-/// hammered back to back.
-const COMPACT_CYCLE_PAUSE_SECS: u64 = 4;
+/// hammered back to back. The ONLY pause in the walk: a failing rung hands the
+/// call to the NEXT model immediately (no same-model retries), and this pause
+/// is what separates one full pass from the next.
+const COMPACT_CYCLE_PAUSE_SECS: u64 = 10;
 
 /// One progress tick from a running compaction.
 ///
@@ -475,7 +467,7 @@ pub async fn compact_history_with_progress(
     let chain_len = chain.len();
     let cycles = if chain_len > 1 { COMPACT_MAX_CYCLES } else { 1 };
     let walk: Vec<&LlmConfig> = (0..cycles).flat_map(|_| chain.iter().copied()).collect();
-    let attempts_total = walk.len().saturating_mul(COMPACT_RUNG_ATTEMPTS);
+    let attempts_total = walk.len();
     let mut attempt_no = 0usize;
     'rungs: for (pos, m) in walk.into_iter().enumerate() {
         if pos > 0 && pos % chain_len == 0 {
@@ -488,60 +480,44 @@ pub async fn compact_history_with_progress(
             }
             tokio::time::sleep(pause).await;
         }
-        // This rung's own failure. Kept per rung so the aggregated message can
-        // name WHICH model said what.
-        let mut rung_err = String::new();
-        for _attempt in 0..COMPACT_RUNG_ATTEMPTS {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
+        // ONE try per rung, whatever the failure: a rate limit, a 5xx or a
+        // dropped stream moves the walk to the NEXT model immediately — asking
+        // the same model again right away can only reproduce the same error,
+        // and the walk comes back to this rung on the next pass anyway.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break 'rungs;
+        }
+        attempt_no += 1;
+        progress_tick(on_progress, started, "summarizing", attempt_no, attempts_total, m);
+        let rung_err = match
+            tokio::time::timeout(remaining, llm::complete(client, m, SYSTEM, &user_prompt))
+                .await
+        {
+            Ok(Ok(r)) if !r.text.trim().is_empty() => {
+                // Attribute the answer to THIS rung, not to rung 0.
+                outcome = Some(CompactOutcome {
+                    summary: r.text.trim().to_string(),
+                    keep: recent.len(),
+                    usage: r.usage,
+                    provider_id: m.provider_id.clone(),
+                    model: m.model.clone(),
+                });
                 break 'rungs;
             }
-            attempt_no += 1;
-            progress_tick(
-                on_progress,
-                started,
-                "summarizing",
-                attempt_no,
-                attempts_total,
-                m,
-            );
-            match tokio::time::timeout(remaining, llm::complete(client, m, SYSTEM, &user_prompt))
-                .await
-            {
-                Ok(Ok(r)) if !r.text.trim().is_empty() => {
-                    // Attribute the answer to THIS rung, not to rung 0.
-                    outcome = Some(CompactOutcome {
-                        summary: r.text.trim().to_string(),
-                        keep: recent.len(),
-                        usage: r.usage,
-                        provider_id: m.provider_id.clone(),
-                        model: m.model.clone(),
-                    });
-                    break 'rungs;
-                }
-                Ok(Ok(_)) => rung_err = "returned an empty summary".into(),
-                Ok(Err(e)) => rung_err = e,
-                Err(_) => {
-                    rung_err =
-                        format!("gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s")
-                }
-            }
-            // A model-side rejection will not answer better on a repeat, so the
-            // rest of this rung's budget is skipped and the next model takes the
-            // call immediately.
-            if llm::should_fall_back(&rung_err) {
-                break;
-            }
-        }
+            Ok(Ok(_)) => "returned an empty summary".to_string(),
+            Ok(Err(e)) => e,
+            Err(_) => format!("gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s"),
+        };
         // Only the FIRST pass is reported: later passes repeat the same models,
         // and listing each one again would bury the reasons in the banner.
         if !rung_err.is_empty() && pos < chain_len {
             tried.push(format!("{}: {rung_err}", m.model));
-            // This rung spent its budget without an answer, so the walk moves on
-            // regardless of WHY it failed: a rate limit that never clears must
-            // not leave the user's own fallbacks unused, which is the entire
-            // point of the list. Only a success or the shared deadline ends the
-            // walk early.
+            // This rung spent its one try without an answer, so the walk moves
+            // on regardless of WHY it failed: the fallbacks sit on other
+            // providers with other endpoints, and one unreachable or
+            // rate-limited model must not strand the whole list. Only a success
+            // or the shared deadline ends the walk early.
         }
     }
     match outcome {

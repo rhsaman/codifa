@@ -1705,6 +1705,9 @@ interface State {
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
   setChatThinkingLevel: (id: string, level: ThinkingLevel) => void
+  /** Per-chat auto-compaction override (context popover slider). `null`
+   *  clears it — the chat follows Settings → General again. */
+  setChatCompactAtPercent: (id: string, value: number | null) => void
   setChatProvider: (id: string, providerId: string, model: string) => void
   renameChat: (id: string, title: string) => void
   /** Create a new chat pre-seeded with one section of a previous answer, so the
@@ -4572,6 +4575,21 @@ export const useStore = create<State>((set, get) => ({
   setChatThinkingLevel: (id, level) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, thinkingLevel: level, updatedAt: Date.now() } : c)),
+    }))
+    get().persist()
+  },
+  // Per-chat auto-compaction threshold override (the context popover's
+  // slider). `null` clears the override so the chat follows Settings →
+  // General again; a number is clamped to the backend's 1–99 range.
+  setChatCompactAtPercent: (id, value) => {
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        if (c.id !== id) return c
+        const next = { ...c, updatedAt: Date.now() } as Chat
+        if (value === null) delete next.compactAtPercent
+        else next.compactAtPercent = Math.round(Math.min(99, Math.max(1, value)))
+        return next
+      }),
     }))
     get().persist()
   },

@@ -141,14 +141,83 @@ fn catalog(all: &[Value]) -> String {
 }
 
 /// `catalog` with an explicit byte budget (the value Settings → Skills edits).
+///
+/// The catalog is a LADDER: the richest representation that fits the budget
+/// wins, and the model is always told how to reach what the rung had to give
+/// up. Every rung represents every non-empty bundle and keeps every skill
+/// reachable — by name at the top rungs, through `load_skill bundle=<slug>`
+/// plus `query=<words>` at the lower ones.
 fn catalog_at(all: &[Value], max: usize) -> String {
-    let rows: Vec<(&str, &str, Option<String>)> = all
-        .iter()
-        .filter_map(|s| {
+    // Group by bundle ONCE. Bundles sort by slug, skills by name — byte-stable
+    // output regardless of read_dir order, map iteration or timing.
+    let mut bundles: Vec<(String, String, Vec<&Value>)> = Vec::new();
+    for s in all {
+        if s["name"].as_str().unwrap_or_default().trim().is_empty() {
+            continue;
+        }
+        let slug = s["plugin_slug"].as_str().unwrap_or_default().trim().to_string();
+        let label = s["plugin"].as_str().unwrap_or_default().trim().to_string();
+        match bundles.iter_mut().find(|(bs, _, _)| *bs == slug) {
+            Some((_, _, rows)) => rows.push(s),
+            None => bundles.push((slug, label, vec![s])),
+        }
+    }
+    for (_, _, rows) in bundles.iter_mut() {
+        rows.sort_by(|a, b| {
+            let an = a["name"].as_str().unwrap_or_default();
+            let bn = b["name"].as_str().unwrap_or_default();
+            an.cmp(bn).then_with(|| {
+                a["slug"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(b["slug"].as_str().unwrap_or_default())
+            })
+        });
+    }
+    bundles.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Richest COMPLETE rung that fits. A rung that had to drop a name does
+    // not "fit" — hiding entries is what the ladder exists to avoid, so an
+    // overflowing rung moves DOWN a level, where every entry is a whole line
+    // that fits. Index is the floor: bare bundle lines, and only if even they
+    // overflow does its emit-until-full with the dropped-count note apply.
+    for rung in [Rung::Full, Rung::Hybrid, Rung::Bundles, Rung::Compact] {
+        let (text, complete) = render_rung(rung, &bundles, max);
+        if complete && text.len() + CATALOG_TRUNCATE_NOTE_RESERVE <= max {
+            return text;
+        }
+    }
+    render_rung(Rung::Index, &bundles, max).0
+}
+
+/// One rung of the catalog ladder.
+#[derive(Clone, Copy, PartialEq)]
+enum Rung {
+    /// `- name: full description` per skill.
+    Full,
+    /// Names for every skill, the leftover budget split evenly over the
+    /// descriptions (the pre-ladder shape).
+    Hybrid,
+    /// One line per bundle: label, command, skill count, the skill NAMES.
+    Bundles,
+    /// One line per bundle: label, command, count, the BUNDLE's description.
+    Compact,
+    /// One bare line per bundle: slug and count.
+    Index,
+}
+
+/// The per-skill `- name: description` line, shared by the Full and Hybrid
+/// rungs (`hybrid_per_row = 0` gives the Full form: the whole description).
+/// Returns (text, complete) — complete means every skill got its line.
+fn skill_rows(
+    bundles: &[(String, String, Vec<&Value>)],
+    hybrid_per_row: Option<usize>,
+    max: usize,
+) -> (String, bool) {
+    let mut rows: Vec<(&str, &str, Option<String>)> = Vec::new();
+    for (_, _, skills) in bundles {
+        for s in skills.iter() {
             let name = s["name"].as_str().unwrap_or_default().trim();
-            if name.is_empty() {
-                return None;
-            }
             let desc = s["description"].as_str().unwrap_or_default().trim();
             // A skill that ships inside a plugin is invocable as
             // `/<plugin-slug> <skill-slug>` in the composer: the command names
@@ -165,16 +234,9 @@ fn catalog_at(all: &[Value], max: usize) -> String {
                     Some(format!("{plugin_slug} {slug}"))
                 }
             });
-            Some((name, desc, command))
-        })
-        .collect();
-
-    // The bare name of EVERY skill is paid for first, and the leftover room is
-    // then split evenly. A catalog that silently dropped the tail made the last
-    // installed skills unreachable: with 25 installed skills their full-length
-    // descriptions overflowed the cap and three of them disappeared from the
-    // list — the model never learned they existed, so `load_skill` was never
-    // called for them. Detail is what gets sacrificed, never the entry itself.
+            rows.push((name, desc, command));
+        }
+    }
     let heads: Vec<String> = rows
         .iter()
         .map(|(name, _, command)| match command {
@@ -182,12 +244,30 @@ fn catalog_at(all: &[Value], max: usize) -> String {
             // line names the command: a bundle whose install output says "try
             // /ponytail" left the model unable to explain how to run it, and
             // the user got "Unknown command".
-            Some(cmd) => format!("- {name} (command: /{cmd})"),            None => format!("- {name}"),
+            Some(cmd) => format!("- {name} (command: /{cmd})"),
+            None => format!("- {name}"),
         })
         .collect();
-    let bare: usize = heads.iter().map(|h| h.len() + 1).sum();
-    let room = max.saturating_sub(bare + CATALOG_TRUNCATE_NOTE_RESERVE);
-    let per_row = if rows.is_empty() { 0 } else { (room / rows.len()).min(CATALOG_DETAIL_PER_ROW) };
+    let per_row = match hybrid_per_row {
+        // Full: the description is capped only by its own clip.
+        None => CATALOG_DETAIL_PER_ROW,
+        // Hybrid: the bare name of EVERY skill is paid for first, and the
+        // leftover room is then split evenly. A catalog that silently dropped
+        // the tail made the last installed skills unreachable: with 25
+        // installed skills their full-length descriptions overflowed the cap
+        // and three of them disappeared from the list — the model never
+        // learned they existed, so `load_skill` was never called for them.
+        // Detail is what gets sacrificed, never the entry itself.
+        Some(budget) => {
+            let bare: usize = heads.iter().map(|h| h.len() + 1).sum();
+            let room = budget.saturating_sub(bare + CATALOG_TRUNCATE_NOTE_RESERVE);
+            if rows.is_empty() {
+                0
+            } else {
+                (room / rows.len()).min(CATALOG_DETAIL_PER_ROW)
+            }
+        }
+    };
 
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
     let mut detail_clipped = false;
@@ -238,7 +318,118 @@ fn catalog_at(all: &[Value], max: usize) -> String {
         };
         out.push_str(&note);
     }
-    out
+    (out, dropped == 0)
+}
+
+/// Render one rung: the skill-line rungs (Full/Hybrid) or the bundle rungs.
+fn render_rung(
+    rung: Rung,
+    bundles: &[(String, String, Vec<&Value>)],
+    max: usize,
+) -> (String, bool) {
+    match rung {
+        Rung::Full => skill_rows(bundles, None, max),
+        Rung::Hybrid => skill_rows(bundles, Some(max), max),
+        Rung::Bundles | Rung::Compact | Rung::Index => bundle_lines(rung, bundles, max),
+    }
+}
+
+/// The bundle-shaped rungs: one line per NON-EMPTY bundle, every bundle
+/// present as a whole line (the fit-check in `catalog_at` moves down a rung
+/// rather than truncating a line mid-list — a half-listed bundle line would
+/// hide its skills exactly like the old dropped tail did).
+/// Returns (text, complete) — complete means every bundle got its whole line
+/// (and any bundle-less rows kept every name).
+fn bundle_lines(rung: Rung, bundles: &[(String, String, Vec<&Value>)], max: usize) -> (String, bool) {
+    let cap = max;
+    let mut complete = true;
+    let mut out = String::new();
+    // Skills with no bundle keep their PER-SKILL lines at the bundle rungs:
+    // a bundle-less store (only tests still build one) degenerates to the
+    // hybrid shape, which is the richest per-skill form that still fits —
+    // collapsing 500 bundle-less skills into one pseudo-bundle line would
+    // hide every name behind a clip.
+    if let Some((_, _, rows)) = bundles.iter().find(|(slug, _, _)| slug.is_empty()) {
+        let group = [(String::new(), String::new(), rows.clone())];
+        let (text, all_listed) = skill_rows(&group, Some(max), max);
+        out.push_str(&text);
+        complete = all_listed;
+    }
+    let mut note: Option<&str> = None;
+    for (slug, label, skills) in bundles.iter().filter(|(slug, _, _)| !slug.is_empty()) {
+        let (slug, label, skills) = (slug.as_str(), label.as_str(), skills);
+        let count = skills.len();
+        let command = if slug.is_empty() {
+            String::new()
+        } else {
+            format!(" (command: /{slug})")
+        };
+        let line = match rung {
+            // The names ride the bundle line, clipped to the line budget the
+            // WHOLE list still affords — every bundle keeps its line.
+            Rung::Bundles => {
+                let names: Vec<&str> = skills
+                    .iter()
+                    .map(|s| s["name"].as_str().unwrap_or_default().trim())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                let joined = names.join(", ");
+                let head = format!("- {label}{command} — {count} skill(s): ");
+                let room = cap
+                    .saturating_sub(out.len() + CATALOG_TRUNCATE_NOTE_RESERVE + head.len() + 1);
+                let clipped = clip_words(&joined, room);
+                let rest = if clipped.len() < joined.len() { " …" } else { "" };
+                format!("{head}{clipped}{rest}\n")
+            }
+            Rung::Compact => {
+                // The bundle's OWN description says what the group is for —
+                // the one line a lower cap can still afford per bundle.
+                let desc = skills
+                    .first()
+                    .map(|s| s["plugin_description"].as_str().unwrap_or_default().trim())
+                    .unwrap_or_default();
+                let head = format!("- {label}{command} — {count} skill(s): ");
+                let room = cap
+                    .saturating_sub(out.len() + CATALOG_TRUNCATE_NOTE_RESERVE + head.len() + 1);
+                format!("{head}{}\n", clip_words(desc, room))
+            }
+            Rung::Index => format!("- {slug} ({count} skills)\n"),
+            _ => unreachable!("skill rungs handled above"),
+        };
+        if out.len() + line.len() + CATALOG_TRUNCATE_NOTE_RESERVE > cap {
+            complete = false;
+            note = Some(match rung {
+                Rung::Bundles => "- …(more bundles are installed than fit here — load_skill \
+with bundle=<slug> lists one, query=<words> searches all)\n",
+                Rung::Compact => "- …(more bundles are installed than fit here — load_skill \
+with bundle=<slug> lists one, query=<words> searches all)\n",
+                _ => "- …(more bundles are installed than fit here — load_skill with \
+bundle=<slug> lists one)\n",
+            });
+            break;
+        }
+        out.push_str(&line);
+    }
+    // The per-rung how-to-reach note: names are only HALF listed here, so the
+    // model needs the drill-in spelled out.
+    let has_real = bundles.iter().any(|(slug, _, _)| !slug.is_empty());
+    if let Some(note) = note {
+        out.push_str(note);
+    } else if !has_real {
+        // Bundle-less rows only: their own note (emitted above) already says
+        // how to reach what was left out.
+    } else if rung != Rung::Index {
+        out.push_str(
+            "- …(skill names are grouped by bundle — load_skill with bundle=<slug> lists one \
+bundle's skills; query=<words> searches every installed skill)\n",
+        );
+    } else {
+        out.push_str(
+            "- …(load_skill with bundle=<slug> lists a bundle's skills; load_skill with \
+query=<words> searches every installed skill)\n",
+        );
+    }
+    (out, complete)
 }
 
 /// Load the skill store for a workspace root: the standalone `<root>/skills`
@@ -847,5 +1038,141 @@ mod tests {
             "note is {} bytes: {note}",
             note.len()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The representation ladder (Full → Hybrid → Bundles → Compact → Index)
+    // ------------------------------------------------------------------
+
+    /// A bundled skill row, the shape `enabled_plugin_skills` produces.
+    fn bundled(
+        bundle_slug: &str,
+        bundle_label: &str,
+        bundle_desc: &str,
+        name: &str,
+        desc: &str,
+    ) -> Value {
+        json!({
+            "name": name,
+            "slug": name.to_lowercase().replace(' ', "-"),
+            "description": desc,
+            "plugin": bundle_label,
+            "plugin_slug": bundle_slug,
+            "plugin_description": bundle_desc,
+        })
+    }
+
+    /// A store of `bundles × per` skills, the shape a real plugin library has.
+    fn bundled_store(bundles: usize, per: usize) -> Vec<Value> {
+        (0..bundles)
+            .flat_map(|b| {
+                let slug = format!("bundle-{b:02}");
+                (0..per)
+                    .map(move |s| {
+                        bundled(
+                            &slug,
+                            &format!("Bundle {b:02}"),
+                            &format!("what bundle {b} is for"),
+                            &format!("Bundle{b:02} Skill {s:02}"),
+                            &format!("a description long enough that {per} of them cannot fit \
+                                      the catalog cap with their descriptions attached"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ladder_represents_every_bundle_and_reaches_every_skill() {
+        // A store whose full descriptions cannot fit: the ladder must move DOWN
+        // a rung (not drop the tail), so every bundle keeps a line and every
+        // skill stays reachable — by name while names fit, otherwise through
+        // its bundle's drill-in (`load_skill bundle=<slug>`).
+        for cap in [CATALOG_MAX_MIN, 3_000, CATALOG_MAX_CHARS, CATALOG_MAX_LIMIT] {
+            let all = bundled_store(10, 30);
+            let listed = catalog_at(&all, cap);
+            assert!(
+                listed.len() + CATALOG_TRUNCATE_NOTE_RESERVE <= cap,
+                "cap {cap}: {} bytes over budget: {listed}",
+                listed.len()
+            );
+            for b in 0..10 {
+                let slug = format!("bundle-{b:02}");
+                assert!(
+                    listed.contains(&slug),
+                    "cap {cap}: bundle {slug} is not represented: {listed}"
+                );
+            }
+            for s in 0..30 {
+                let name = format!("Bundle00 Skill {s:02}");
+                // Reachable: named in the list, or inside its bundle's line
+                // (the drill-in lists it), which the bundle assertion above
+                // already proved present.
+                let named = listed.contains(&name);
+                let bundle_named = listed.contains("bundle-00");
+                assert!(
+                    named || bundle_named,
+                    "cap {cap}: skill {name} is unreachable: {listed}"
+                );
+            }
+            // The note always teaches the drill-in the rung relies on.
+            assert!(listed.contains("bundle=<slug>") || listed.contains("query=<words>"), "{listed}");
+        }
+    }
+
+    #[test]
+    fn a_500_skill_store_hides_no_bundle_and_is_byte_stable() {
+        // The acceptance store: 25 bundles × 20 skills. Every bundle appears at
+        // the 6K default, every skill is reachable, and the SAME content always
+        // renders to the SAME bytes — insertion order, filesystem order and
+        // timing must not leak into the prompt (a prompt that moves between
+        // rounds would collapse the prefix cache).
+        let all = bundled_store(25, 20);
+        let listed = catalog_at(&all, CATALOG_MAX_CHARS);
+        assert!(listed.len() <= CATALOG_MAX_CHARS, "{} bytes: {listed}", listed.len());
+        for b in 0..25 {
+            assert!(listed.contains(&format!("bundle-{b:02}")), "bundle {b} missing: {listed}");
+        }
+        for s in 0..20 {
+            assert!(
+                listed.contains(&format!("Bundle00 Skill {s:02}"))
+                    || listed.contains("bundle-00"),
+                "skill {s} unreachable: {listed}"
+            );
+        }
+        // Byte-stable across runs and across input order.
+        let mut shuffled = all.clone();
+        shuffled.reverse();
+        assert_eq!(catalog_at(&all, CATALOG_MAX_CHARS), catalog_at(&shuffled, CATALOG_MAX_CHARS));
+        assert_eq!(
+            catalog_at(&all, CATALOG_MAX_MIN),
+            catalog_at(&shuffled, CATALOG_MAX_MIN)
+        );
+    }
+
+    #[test]
+    fn a_rung_that_would_drop_names_never_wins_the_ladder() {
+        // The old emitter answered an overflowing cap by dropping the tail of
+        // the list; the ladder's contract is that a rung only wins when it
+        // named EVERYTHING it can name at that shape, so an overflowing rung
+        // hands over to a coarser one instead of going out half-listed.
+        // 60 long-description skills: Full would drop ~3 rows, Hybrid (names
+        // first, even detail share) fits — the output must be Hybrid's.
+        let all: Vec<Value> = (0..60)
+            .map(|i| {
+                json!({
+                    "name": format!("Skill {i}"),
+                    "description": "a long english description that would overflow the catalog cap on its own \
+                                    when sixty of them are listed one after another in the system prompt",
+                })
+            })
+            .collect();
+        let listed = catalog_at(&all, CATALOG_MAX_CHARS);
+        for i in 0..60 {
+            assert!(listed.contains(&format!("- Skill {i}")), "Skill {i} missing:\n{listed}");
+        }
+        // Hybrid's even-share note rides along.
+        assert!(listed.contains("descriptions are trimmed"), "{listed}");
     }
 }

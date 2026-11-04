@@ -61,14 +61,6 @@ const SKILL_LIST_MAX: usize = 30;
 /// name one.
 const SKILL_SEARCH_MAX: usize = 8;
 
-/// Score a hit must reach, and beat the runner-up by MORE THAN double, before
-/// `load_skill query=` answers with its body instead of a candidate list.
-///
-/// Traced (`mvyy1qf7`): a query that named the right skill in several words
-/// still listed it beside three skills matching one filler word, so the model
-/// spent a SECOND call naming what the first call already knew — twice in one
-/// turn. A strict 2× lead is what separates "this is the one" from "a tie".
-const SKILL_DOMINANT_MIN_SCORE: usize = 2;
 const MAX_GREP_ALTERNATIVES: usize = 3;
 
 /// Identifiers are what `find_symbol` takes; anything else is grep-only.
@@ -3010,49 +3002,174 @@ fn plugin_detached_path_warning(store: &Path, view: &Value) -> String {
     )
 }
 
+/// Function words that say nothing about WHICH skill applies: a query like
+/// "open website in browser instagram" must not score a skill for "open" or
+/// "in". Domain words stay out of this list on purpose — "browser", "create",
+/// "plugin", "script" are exactly the words that discriminate.
+const SKILL_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for", "from", "with",
+    "without", "by", "as", "is", "are", "be", "been", "was", "were", "am", "do", "does",
+    "did", "how", "what", "when", "where", "which", "who", "why", "i", "you", "my", "your",
+    "me", "it", "its", "this", "that", "these", "those", "there", "here", "can", "could",
+    "should", "would", "will", "shall", "may", "might", "must", "have", "has", "had", "not",
+    "no", "yes", "if", "then", "than", "so", "such", "own", "same", "also", "just", "about",
+    "into", "over", "under", "up", "down", "out", "off", "again", "once", "all", "any",
+    "both", "each", "few", "more", "most", "other", "some", "only", "very", "get", "let",
+    "us", "we", "he", "she", "they", "them", "their", "his", "her", "him",
+    // Persian function words — a Persian query must not score a skill for
+    // "را" or "برای" any more than an English one for "the" or "for".
+    "در", "به", "از", "که", "را", "با", "این", "برای", "است", "هست", "می",
+    "تا", "هم", "یا", "یک", "های", "شود", "کند", "باید", "روی",
+];
+
+/// How strongly one field of one skill matches one query term.
+///
+/// A whole-word hit scores 1.0 — including the cheap-stem case ("skill" vs
+/// "skills", "connector" vs "connectors": a shared prefix of 4+ chars), which
+/// is plain plural morphology and must count as the word itself. A term
+/// contained inside a LONGER token ("charting" inside "chartingview") scores
+/// 0.5; the REVERSE direction never matches — "site" inside the query word
+/// "website" once outranked the skill actually named "browser" by borrowing
+/// the whole term's weight for a three-letter fragment. Short terms (2-3
+/// chars: "ai", "ui") never substring-match either: "ai" sits inside
+/// "trading" and "ui" inside "guild", and a 2-letter term must not buy
+/// relevance from either. Unicode-aware, so Persian terms work both ways.
+fn term_in_field(field: &str, term: &str) -> f64 {
+    let lower = field.to_lowercase();
+    let tlen = term.chars().count();
+    let mut best: f64 = 0.0;
+    for tok in lower.split(|c: char| !c.is_alphanumeric()) {
+        if tok == term {
+            return 1.0;
+        }
+        let klen = tok.chars().count();
+        let stem = tlen.min(klen) >= 4 && (tok.starts_with(term) || term.starts_with(tok));
+        if stem {
+            best = best.max(1.0);
+        } else if tlen >= 4 && tok.contains(term) {
+            best = best.max(0.5);
+        }
+    }
+    best
+}
+
+/// The string of one skill field as the matcher sees it.
+fn skill_field<'a>(sk: &'a Value, key: &str) -> String {
+    match key {
+        "fa_keywords" => sk[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default(),
+        _ => sk[key].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+/// Field weights, strongest first: the name is the sharpest signal of WHAT a
+/// skill is, the slug says the same thing in URL form, `fa_keywords` is the
+/// user's own Persian trigger list, the description is prose that may mention
+/// many things, and the owning bundle is the weakest (a bundle name says
+/// little about one skill inside it).
+const SKILL_FIELD_WEIGHTS: [(&str, f64); 5] = [
+    ("name", 4.0),
+    ("slug", 3.0),
+    ("fa_keywords", 2.5),
+    ("description", 2.0),
+    ("plugin", 1.0),
+];
+
+/// A dominant best hit must clear this score: one weak substring hit of a
+/// common word is ~1.0, one real word match scores 4+, so 1.5 admits any real
+/// match while refusing "best" that matched one filler word loosely.
+const SKILL_CONFIDENT_MIN_SCORE: f64 = 1.5;
+
+/// How far the best hit must sit above the runner-up to answer on the first
+/// call (the confident-match rule): `best >= 1.6 × next`. Below that the query
+/// was genuinely ambiguous and listing candidates IS the right answer.
+const SKILL_DOMINANT_RATIO: f64 = 1.6;
+
 /// Find a skill by words when the prompt's catalog does not cover the task.
 ///
 /// The catalog is byte-capped, so a store with hundreds of skills cannot list
-/// them all — this is the way in for everything it had to leave out: every
-/// installed skill is scored against the query's words, and the best hit's body
-/// comes back, so the model spends one call instead of guessing a name it was
-/// never shown.
+/// them all — this is the way in for everything it had to leave out. Scoring:
+/// stopwords out, IDF over the installed store (a word every skill carries
+/// cannot discriminate), field weights (name > slug > fa_keywords >
+/// description > bundle), whole-word above substring. A confident top hit
+/// returns its body on the FIRST call — the second call naming it was a wasted
+/// round (traced `mvyy1qf7`: one query listed Test UI beside three skills that
+/// matched one filler word, and the model spent another round naming it).
+/// Otherwise the compact candidate list goes back, never a full catalog.
 fn search_skills(store_base: &str, query: &str) -> Result<String, String> {
     // Word-boundary split (`is_alphanumeric` is Unicode-aware, so Persian words
-    // survive whole). One-character words are dropped: they match everything.
+    // survive whole). One-character words and function words are dropped.
     let terms: Vec<String> = query
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() > 1)
+        .filter(|t| !SKILL_STOPWORDS.contains(t))
         .map(str::to_string)
         .collect();
     if terms.is_empty() {
         return Err(format!("load_skill query {query:?} has no word to search for"));
     }
     let all = crate::skill_router::load_skills(store_base);
-    let mut scored: Vec<(usize, &Value)> = all
+    if all.is_empty() {
+        return Err(format!("no skills are installed — nothing matches {query:?}"));
+    }
+
+    // IDF over THIS store: a term in every skill cannot help pick one, so its
+    // weight collapses toward ~1.0; a term only one skill carries weighs ln(N).
+    // The document frequency reads the skill's OWN fields (name, slug,
+    // description, fa_keywords) — the owning bundle's label is context for the
+    // score but not the skill's identity, and counting it once made every
+    // skill of a bundle named "Skills" dilute the very word "skills".
+    // Smoothed so a term in every row still counts a little.
+    let n = all.len() as f64;
+    let own_fields = |sk: &Value| -> Vec<String> {
+        ["name", "slug", "description", "fa_keywords"]
+            .iter()
+            .map(|k| skill_field(sk, k))
+            .collect()
+    };
+    let idfs: Vec<f64> = terms
         .iter()
-        .filter_map(|sk| {
-            let hay = skill_haystack(sk);
-            let score = terms.iter().filter(|t| hay.contains(t.as_str())).count();
-            (score > 0).then_some((score, sk))
+        .map(|t| {
+            let df = all
+                .iter()
+                .filter(|sk| own_fields(sk).iter().any(|f| term_in_field(f, t) > 0.0))
+                .count() as f64;
+            ((n + 1.0) / (df + 1.0)).ln() + 1.0
         })
+        .collect();
+
+    let score_of = |sk: &Value| -> f64 {
+        let fields: Vec<(f64, String)> = SKILL_FIELD_WEIGHTS
+            .iter()
+            .map(|(key, w)| (*w, skill_field(sk, key)))
+            .collect();
+        let mut score = 0.0;
+        for (t, idf) in terms.iter().zip(&idfs) {
+            for (w, field) in &fields {
+                score += idf * w * term_in_field(field, t);
+            }
+        }
+        score
+    };
+
+    let mut scored: Vec<(f64, &Value)> = all
+        .iter()
+        .map(|sk| (score_of(sk), sk))
+        .filter(|(s, _)| *s > 0.0)
         .collect();
     // Best hit first; `sort_by` is stable, so ties keep the store's own order
     // and the same query always answers the same thing.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    // A CLEARLY dominant hit answers here: when the best score beats the runner-up
-    // outright, listing candidates and waiting for a second call is a wasted
-    // round. Traced (`mvyy1qf7`): `load_skill(query:"Test UI live browser harness
-    // renderer")` listed Test UI beside three skills that matched one filler word,
-    // and the model then spent the SECOND call naming it — twice in one turn.
-    let dominant = scored
-        .first()
-        .map(|(best, _)| {
-            *best >= SKILL_DOMINANT_MIN_SCORE
-                && scored.get(1).map(|(next, _)| next * 2 < *best).unwrap_or(true)
-        })
-        .unwrap_or(false);
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best = scored.first().map(|(s, _)| *s).unwrap_or(0.0);
+    let dominant = best >= SKILL_CONFIDENT_MIN_SCORE
+        && scored
+            .get(1)
+            .map(|(next, _)| best >= next * SKILL_DOMINANT_RATIO)
+            .unwrap_or(true);
     match scored.len() {
         0 => Err(format!(
             "no skill matches {query:?}. Available: {}",
@@ -3076,6 +3193,38 @@ fn search_skills(store_base: &str, query: &str) -> Result<String, String> {
             Ok(out)
         }
     }
+}
+
+/// `load_skill bundle=<slug>`: the skills of ONE plugin bundle, one
+/// `- name: description` line each. The prompt catalog is byte-capped and can
+/// leave a whole bundle unnamed — this is the drill-in that keeps every skill
+/// of an installed bundle reachable without a second catalog in the prompt.
+fn list_bundle_skills(store_base: &str, slug: &str) -> Result<String, String> {
+    let rows: Vec<Value> = crate::skill_router::load_skills(store_base)
+        .into_iter()
+        .filter(|sk| {
+            sk["plugin_slug"]
+                .as_str()
+                .is_some_and(|p| p.eq_ignore_ascii_case(slug))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Err(format!(
+            "bundle {slug:?} has no skills (or is not enabled) — plugin action=list names the \
+bundles and their skill counts"
+        ));
+    }
+    let mut out = format!(
+        "Skills of bundle {slug} — load one with load_skill name=<name>:\n"
+    );
+    for sk in &rows {
+        out.push_str(&format!(
+            "- {}: {}\n",
+            sk["name"].as_str().unwrap_or_default(),
+            sk["description"].as_str().unwrap_or_default().trim()
+        ));
+    }
+    Ok(out)
 }
 
 pub fn dispatch_with_data_root(
@@ -3386,6 +3535,32 @@ into one union — those lines are all above; do NOT re-read them]"
             // the turn ran out. Refuse instead, and name the argument.
             // An EXPLICIT empty string stays legal (it empties a file on
             // purpose); only an ABSENT/short-circuited body is refused.
+            // A `files` ARRAY writes several files IN ORDER in this one call:
+            // the model answers with exactly one tool call per reply, so
+            // multi-file work otherwise costs one full-context round-trip per
+            // file. The single `path`/`content` form stays as-is.
+            let batch: Vec<(String, String)> = args["files"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|f| {
+                            let p = f["path"].as_str()?.trim();
+                            if p.is_empty() {
+                                return None;
+                            }
+                            Some((p.to_string(), f["content"].as_str().unwrap_or_default().to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !batch.is_empty() {
+                let mut out = String::new();
+                for (path, content) in &batch {
+                    write_file(root, path, content, permit)?;
+                    out.push_str(&format!("wrote {path} ({} bytes)\n", content.len()));
+                }
+                return Ok(out);
+            }
             let content = args["content"].as_str();
             let content = match content {
                 Some(c) => c,
@@ -3592,6 +3767,39 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             }
             // The ceiling is passed through explicitly so the inner clamp
             // cannot re-open a smaller bound than the one this dispatch chose.
+            // A `commands` ARRAY runs several commands IN ORDER in this one
+            // call, one result block each: the traced turns spent SIX model
+            // rounds on six inspection commands (every round re-sending the
+            // whole conversation), because the model answers with exactly one
+            // tool call per reply. Batching lives in the TOOL, not in a hint.
+            let batch: Vec<String> = args["commands"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if batch.len() > 1 || (batch.len() == 1 && s("command").trim().is_empty()) {
+                let mut out = String::new();
+                for (i, cmd) in batch.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str(&format!("$ {cmd}\n"));
+                    match run_terminal_bounded_with(root, cmd, timeout, ceiling, on_tail) {
+                        Ok(res) => out.push_str(&res),
+                        Err(e) => {
+                            out.push_str(&format!("(failed: {e})\n"));
+                            break;
+                        }
+                    }
+                }
+                return Ok(out);
+            }
             run_terminal_bounded_with(root, &s("command"), timeout, ceiling, on_tail)
         }
         "current_time" => {
@@ -3862,7 +4070,17 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
             let store = Path::new(store_base);
             match action.as_str() {
-                "list" => Ok(crate::plugins::list_plugins(store).to_string()),
+                // Compact by default: one line per bundle. One bundle's full
+                // manifest is a `slug` away — a model that asked "what plugins
+                // exist" should not pay every bundle's whole manifest for it.
+                "list" => {
+                    let slug = args["slug"].as_str().map(str::trim).unwrap_or_default();
+                    if slug.is_empty() {
+                        Ok(crate::plugins::list_plugins_summary(store))
+                    } else {
+                        crate::plugins::plugin_detail(store, slug).map(|v| v.to_string())
+                    }
+                }
                 "install" => crate::plugins::install_plugin(store, args).map(|v| {
                     let detached = plugin_detached_path_warning(store, &v["plugin"]);
                     format!("{v}{detached}")
@@ -3992,6 +4210,14 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
         "load_skill" => {
             let name = s("name");
             if name.trim().is_empty() {
+                // bundle=<slug> drills into one plugin bundle: the catalog cap
+                // can leave a whole bundle unnamed, and this is how its skills
+                // stay reachable. Checked before `query` so a call carrying
+                // both does the cheaper, more specific thing.
+                let bundle = s("bundle");
+                if !bundle.trim().is_empty() {
+                    return list_bundle_skills(store_base, bundle.trim());
+                }
                 let query = s("query");
                 if query.trim().is_empty() {
                     return Err(
@@ -4631,6 +4857,189 @@ pub fn find_symbol_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Absolute path of the sanitized skill-search fixture store
+    /// (`tests/fixtures/skill-store/`): 12 bundles whose descriptions are the
+    /// real store's own text, bodies replaced. The five traced queries and
+    /// their expectations below pin the ranking rules.
+    fn fixture_store() -> String {
+        format!("{}/tests/fixtures/skill-store", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn search_returns_the_test_ui_body_on_the_first_call() {
+        // Traced (`mvyy1qf7`): this query listed Test UI beside three skills
+        // that matched one filler word, and the model spent a SECOND call
+        // naming it. The confident-match rule (IDF + field weights) answers
+        // with the body instead.
+        let out = search_skills(&fixture_store(), "Test UI live browser harness renderer")
+            .unwrap();
+        assert!(out.contains("===== SKILL: Test UI ====="), "{out}");
+    }
+
+    #[test]
+    fn search_sends_a_browser_ask_to_browser_automation() {
+        // "open website in browser instagram": the old contains-count ranked
+        // alpha-cutout first (its description merely mentions a browser).
+        // Field weights put the NAME hit on top, and nothing else is close.
+        let out = search_skills(&fixture_store(), "open website in browser instagram")
+            .unwrap();
+        assert!(out.contains("===== SKILL: Browser Automation ====="), "{out}");
+    }
+
+    #[test]
+    fn search_sends_a_tradingview_question_to_the_datafeed_skill() {
+        // "tradingview charting library AI agent": the old scorer matched
+        // "agent" (a word in half the store) and ranked agent-discussion
+        // first. IDF collapses that word and lifts "tradingview"/"charting".
+        let out = search_skills(&fixture_store(), "tradingview charting library AI agent")
+            .unwrap();
+        assert!(out.contains("===== SKILL: charting-library-datafeed ====="), "{out}");
+    }
+
+    /// The authoring ask must rank skill-creator near the top and NOT let the
+    /// academy-guide keyword soup (skills/plugins/connectors/MCP in one line)
+    /// take the first candidate slot. Answered identically on every repeat.
+    #[test]
+    fn a_plugin_authoring_ask_ranks_the_creator_above_the_keyword_soup() {
+        for q in [
+            "create plugin bundle skills MCP connectors runnable scripts from URL",
+            "plugin create bundle skills scripts mcp connector",
+        ] {
+            for i in 0..3 {
+                let out = search_skills(&fixture_store(), q).unwrap();
+                if out.starts_with("=====") {
+                    // A confident hit IS acceptable — but then it must be the
+                    // creator itself.
+                    assert!(
+                        out.contains("===== SKILL: skill-creator ====="),
+                        "run {i} of {q:?} answered with the wrong skill: {out}"
+                    );
+                    continue;
+                }
+                let creator = out
+                    .lines()
+                    .position(|l| l.contains("skill-creator"))
+                    .unwrap_or_else(|| panic!("run {i} of {q:?} omitted skill-creator: {out}"));
+                assert!(creator <= 3, "run {i} of {q:?}: creator not in top 3: {out}");
+                // The keyword soup (skills/plugins/connectors/MCP in one
+                // description line) must not take the first candidate slot —
+                // whoever does outrank it (the plan only pins "not top 1")
+                // is fine, as long as the creator sits in the top 3.
+                let first_candidate = out.lines().nth(1).unwrap_or_default();
+                assert!(
+                    !first_candidate.contains("academy-guide"),
+                    "run {i} of {q:?}: academy-guide took the top slot: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bundle_drill_down_lists_its_skills() {
+        // load_skill bundle=<slug>: the catalog cap can leave a whole bundle
+        // unnamed; this is the way in, one `- name: description` per skill.
+        let root = fixture_store();
+        let out = search_skills(&root, "definitely-no-such-word-xyz").unwrap_err();
+        assert!(out.contains("Available:"), "{out}");
+
+        let out = crate::tools::dispatch_with_data_root(
+            &root,
+            "load_skill",
+            &json!({"bundle": "builtin-skills"}),
+            None,
+            Some(&root),
+        )
+        .unwrap();
+        assert!(out.contains("- Test UI:"), "{out}");
+        assert!(out.contains("- Browser Automation:"), "{out}");
+        assert!(!out.contains("Fixture body"), "a listing must not inline bodies: {out}");
+
+        let err = crate::tools::dispatch_with_data_root(
+            &root,
+            "load_skill",
+            &json!({"bundle": "no-such-bundle"}),
+            None,
+            Some(&root),
+        )
+        .unwrap_err();
+        assert!(err.contains("no skills"), "{err}");
+    }
+
+    #[test]
+    fn stopwords_and_the_store_itself_cannot_be_scored() {
+        // Function words alone must not rank anything, and an empty store
+        // answers with a plain error rather than a panic.
+        let err = search_skills(&fixture_store(), "the a an and or of to in on").unwrap_err();
+        assert!(err.contains("no word to search"), "{err}");
+    }
+
+    #[test]
+    fn plugin_list_answers_one_line_per_bundle_and_slug_drills_in() {
+        // "what plugins exist" used to pay every bundle's whole manifest
+        // (manifest + keywords + commands + agents + hooks + dir) as JSON. The
+        // compact list is one line per bundle; the full manifest of ONE bundle
+        // is a `slug` away.
+        let root = std::env::temp_dir().join(format!("codifa-plugin-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.to_str().unwrap();
+        for (name, on) in [("Trade Bundle", true), ("Docs Bundle", false)] {
+            dispatch_with_data_root(
+                base,
+                "plugin",
+                &json!({
+                    "action": "create",
+                    "name": name,
+                    "description": "fixture bundle",
+                    "enabled": on,
+                    "skills": [{"name": format!("{name} Skill"), "content": "BODY"}],
+                    "scripts": [{"name": "run-me", "content": "fn main() {}"}]
+                }),
+                None,
+                Some(base),
+            )
+            .unwrap();
+        }
+        let listed =
+            dispatch_with_data_root(base, "plugin", &json!({"action": "list"}), None, Some(base))
+                .unwrap();
+        let lines: Vec<&str> = listed.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(lines.len(), 2, "{listed}");
+        let trade = lines.iter().find(|l| l.contains("trade-bundle")).unwrap();
+        assert!(trade.contains("[on]"), "{trade}");
+        assert!(trade.contains("1 skill(s)"), "{trade}");
+        assert!(trade.contains("connectors: none"), "{trade}");
+        assert!(trade.contains("scripts: run-me"), "{trade}");
+        assert!(lines.iter().any(|l| l.contains("[off]")), "{listed}");
+        // No manifest noise rides on the compact line.
+        assert!(!listed.contains("created_at"), "{listed}");
+        assert!(!listed.contains("BODY"), "{listed}");
+
+        // The drill-in: one bundle's FULL manifest, still machine-readable.
+        let detail = dispatch_with_data_root(
+            base,
+            "plugin",
+            &json!({"action": "list", "slug": "trade-bundle"}),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(detail.trim()).expect("detail is JSON");
+        assert_eq!(parsed["slug"], json!("trade-bundle"));
+        assert_eq!(parsed["scripts"][0], json!("run-me"));
+        // Unknown slug: a plain error naming the way out.
+        let err = dispatch_with_data_root(
+            base,
+            "plugin",
+            &json!({"action": "list", "slug": "ghost"}),
+            None,
+            Some(base),
+        )
+        .unwrap_err();
+        assert!(err.contains("not found") && err.contains("action=list"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn terminal_timeout_is_clamped_to_the_ceiling() {

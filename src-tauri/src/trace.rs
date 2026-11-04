@@ -22,12 +22,24 @@ pub struct TraceEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct Tokens {
+    /// INCLUSIVE billed input: the provider's whole input footprint with the
+    /// cache share inside it (`llm::NormalizedUsage::input_total`), so a call's
+    /// cost math and cold/warm split need no per-provider cases.
     pub input: u64,
     pub output: u64,
     /// The part of `input` the provider served from its prefix cache. Already
     /// counted inside `input`; recorded separately so the ruler can report a
     /// cache-hit rate instead of a guess.
     pub cache_read: u64,
+    /// The part of the input that FILLED the cache this call (Anthropic
+    /// `cache_creation_input_tokens` — a cold call is all write). Already
+    /// counted inside `input`; a warm call reports reads instead.
+    pub cache_write: u64,
+    /// The usage payload carried a cache field at all — a gateway that reports
+    /// nothing must stay "not reported" (the ruler prints the state) instead
+    /// of masquerading as a genuine 0% hit rate.
+    pub cache_read_reported: bool,
+    pub cache_write_reported: bool,
     pub total: u64,
 }
 
@@ -207,7 +219,10 @@ impl TraceStore {
             "model": entry.model,
             "tokens": entry.tokens.map(|t| json!({
                 "input": t.input, "output": t.output,
-                "cache_read": t.cache_read, "total": t.total,
+                "cache_read": t.cache_read, "cache_write": t.cache_write,
+                "cache_read_reported": t.cache_read_reported,
+                "cache_write_reported": t.cache_write_reported,
+                "total": t.total,
             })),
             "error": entry.error,
             "prompt": entry.prompt,
@@ -606,7 +621,15 @@ mod tests {
             kind: "llm".into(),
             summary: "m · 10 tokens".into(),
             model: Some("m".into()),
-            tokens: Some(Tokens { input: 7, output: 3, cache_read: 4, total: 10 }),
+            tokens: Some(Tokens {
+                input: 7,
+                output: 3,
+                cache_read: 4,
+                cache_write: 0,
+                cache_read_reported: true,
+                cache_write_reported: false,
+                total: 10,
+            }),
             ..Default::default()
         });
         store.record(TraceEntry {

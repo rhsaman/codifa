@@ -42,13 +42,29 @@ const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const NAV_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many past snapshots keep their refs resolvable.
 const MAX_SNAPSHOTS: usize = 24;
-/// Cap on the text handed back to the model for one snapshot.
+/// Cap on the text handed back to the model for a FULL snapshot (`full=true`).
 const SNAPSHOT_MAX_CHARS: usize = 12_000;
+/// Budget for the default `browser_snapshot` summary: main text, headings and
+/// the important (main/dialog) interactive entries first — a page's nav/footer
+/// links and the tail of its body text are what a summary gives up, and
+/// `full=true` brings them back.
+const SNAPSHOT_SUMMARY_CHARS: usize = 6_000;
+/// Budget for the summary that `navigate`/`navigate_back` return INLINE, so
+/// "open X" costs ONE tool call instead of navigate + snapshot. Started at
+/// 2_500, but the trace showed the model following EVERY navigate with a full
+/// browser_snapshot round anyway (the interactive page needed refs the short
+/// summary had dropped) — the "one call" win never landed while the budget
+/// was tighter than the snapshot's. Same budget, no follow-up round.
+const SNAPSHOT_NAV_CHARS: usize = SNAPSHOT_SUMMARY_CHARS;
 /// Cap on the captured console / network buffers (per chat).
 const LOG_CAP: usize = 200;
 const NET_CAP: usize = 300;
 /// Fire-and-forget CDP id: replies to it are dropped on the floor.
 const NO_REPLY_ID: u64 = 0;
+/// Actions that CHANGE the page, so the result carries the page summary with
+/// fresh refs (see the post-action block in `run`).
+const POST_ACTION_SNAPSHOT_OPS: &[&str] =
+    &["click", "type", "select_option", "press_key", "file_upload", "drag"];
 
 // ---------------------------------------------------------------------------
 // Injected page helpers
@@ -96,6 +112,41 @@ function __cfVisible(el){
   if(st.opacity==='0') return false;
   return true;
 }
+function __cfSqueeze(t){
+  return (t||'').replace(/[ \t]+/g,' ').replace(/\n{3,}/g,'\n\n').trim();
+}
+function __cfRegion(el){
+  var n=el,i;
+  for(i=0;n&&i<40;i++){
+    if(!n.tagName) break;
+    var tag=n.tagName;
+    var role=((n.getAttribute&&n.getAttribute('role'))||'').toLowerCase();
+    if(tag==='DIALOG'||role==='dialog'||role==='alertdialog') return 'dialog';
+    if(tag==='NAV') return 'nav';
+    if(tag==='HEADER') return 'header';
+    if(tag==='FOOTER') return 'footer';
+    if(tag==='ASIDE') return 'aside';
+    if(tag==='MAIN'||tag==='ARTICLE'||role==='main') return 'main';
+    n=n.parentElement;
+  }
+  return 'other';
+}
+function __cfMainText(){
+  var m=document.querySelector('main,article,[role=main]');
+  if(m){ var t=__cfSqueeze(m.innerText); if(t) return t.slice(0,8000); }
+  var best='',bestLen=0,kids=document.body?document.body.children:[];
+  for(var i=0;i<kids.length;i++){
+    var el=kids[i];
+    if(!__cfVisible(el)) continue;
+    var full=el.innerText||''; if(full.length<40) continue;
+    var links=0,a=el.getElementsByTagName('a');
+    for(var j=0;j<a.length;j++){ links+=((a[j].innerText)||'').length; }
+    var density=links/Math.max(1,full.replace(/\s+/g,'').length);
+    if(density>0.4) continue;
+    if(full.length>bestLen){ bestLen=full.length; best=full; }
+  }
+  return __cfSqueeze(best).slice(0,8000);
+}
 var __CF_SEL='a,button,input,textarea,select,summary,[role],[onclick],[contenteditable="true"],[tabindex]';
 function __cfCandidates(){
   var out=[],seen={},list=document.querySelectorAll(__CF_SEL),i;
@@ -109,7 +160,7 @@ function __cfCandidates(){
     var key=role+'\u0000'+name+'\u0000'+Math.round(r.left)+','+Math.round(r.top);
     if(seen[key]) continue;
     seen[key]=1;
-    out.push({el:el,role:role,name:name,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});
+    out.push({el:el,role:role,name:name,region:__cfRegion(el),x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});
   }
   return out;
 }
@@ -135,13 +186,14 @@ fn js(expr: &str) -> String {
     format!("(function(){{{JS_HELPERS}\nreturn ({expr});}})()")
 }
 
-/// Snapshot expression: the interactive entries, the headings, and the page text.
+/// Snapshot expression: the interactive entries (with their page region), the
+/// headings, the MAIN text and the body text.
 fn js_snapshot() -> String {
     format!(
         r#"(function(){{{JS_HELPERS}
 var cands=__cfCandidates(),entries=[],i;
 for(i=0;i<cands.length&&entries.length<400;i++){{
-  entries.push({{role:cands[i].role,name:cands[i].name,x:cands[i].x,y:cands[i].y}});
+  entries.push({{role:cands[i].role,name:cands[i].name,region:cands[i].region,x:cands[i].x,y:cands[i].y}});
 }}
 var heads=document.querySelectorAll('h1,h2,h3,h4,h5,h6'),h=[],hc=0;
 for(i=0;i<heads.length&&hc<100;i++){{
@@ -151,9 +203,10 @@ for(i=0;i<heads.length&&hc<100;i++){{
   h.push({{role:heads[i].tagName.toLowerCase(),name:t}});
   hc++;
 }}
+var mainText=__cfMainText();
 var body=document.body?((document.body.innerText||'')):'';
-body=body.replace(/[ \t]+/g,' ').replace(/\n{{3,}}/g,'\n\n').trim();
-return {{url:location.href,title:document.title,entries:entries,headings:h,text:body}};
+body=__cfSqueeze(body).slice(0,12000);
+return {{url:location.href,title:document.title,entries:entries,headings:h,main_text:mainText,text:body}};
 }})()"#
     )
 }
@@ -163,21 +216,52 @@ return {{url:location.href,title:document.title,entries:entries,headings:h,text:
 struct SnapEntry {
     role: String,
     name: String,
+    /// Which page region the element lives in (main, dialog, nav, header,
+    /// footer, aside, other) — decided by its closest landmark ancestor.
+    region: String,
     /// Which occurrence of `(role, name)` this is (0-based).
     nth: usize,
 }
 
 /// The refs one snapshot handed out. Kept per chat by version so a ref printed
 /// three turns ago still resolves as long as the element is still on the page.
+///
+/// The TEXT is not stored — it is rendered on demand with a budget (see
+/// `render_snapshot`), so the navigate summary, the default snapshot summary
+/// and the full snapshot all come from ONE stored page reading and a ref shown
+/// in one render points at exactly the same element in every other.
 struct Snapshot {
-    text: String,
+    url: String,
+    title: String,
     entries: Vec<SnapEntry>,
+    /// Indices into `entries`, in DISPLAY order: main/dialog first, then
+    /// other, then nav/header/footer. Refs themselves stay DOM-order (the
+    /// assignment order `ref_index`/`entry_for` depend on); only the print
+    /// order differs, and every line carries its own ref.
+    display_order: Vec<usize>,
+    headings: Vec<(String, String)>,
+    /// Text of main/article/[role=main] (or the best non-link-dominated body
+    /// child) — the summary leads with it.
+    main_text: String,
+    /// Whole body text: only the full render carries it.
+    body_text: String,
     /// Ref number of `entries[0]`. Refs are MONOTONIC across snapshots and are
     /// never reset, so a printed ref is NOT an index into `entries`: the offset
     /// has to be subtracted before looking up (see `entry_for`).
     base_ref: usize,
     /// Signature of the page when this snapshot was taken (cheap "unchanged").
     sig: u64,
+}
+
+/// Display rank of one region: the content the model is usually there for
+/// (main, dialog) first, generic content next, page furniture last. Ties keep
+/// DOM order (stable sort).
+fn region_rank(region: &str) -> u8 {
+    match region {
+        "main" | "dialog" => 0,
+        "other" => 1,
+        _ => 2, // nav, header, footer, aside — and any future tag
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1037,7 @@ fn signature(v: &Value) -> u64 {
     }
     let text = v["text"].as_str().unwrap_or_default();
     text.len().hash(&mut h);
+    v["main_text"].as_str().unwrap_or_default().len().hash(&mut h);
     h.finish()
 }
 
@@ -960,7 +1045,129 @@ fn signature(v: &Value) -> u64 {
 // Operations
 // ---------------------------------------------------------------------------
 
-fn op_snapshot(d: &mut Driver) -> Result<Value, String> {
+/// Render a stored snapshot at a character budget.
+///
+/// Fill order is the display priority: header, main text, headings, then the
+/// interactive entries in `display_order` (main/dialog first, nav/footer
+/// last), then — full renders only — the whole body text with what is left.
+/// The main text is capped at ~45% of the budget so a wall of prose can never
+/// push every ref out of the summary. Every render of the same snapshot prints
+/// the same ref for the same element, so a ref the model saw in a navigate
+/// summary resolves exactly in a later full snapshot.
+fn render_snapshot(snap: &Snapshot, budget: usize, full: bool) -> String {
+    let mut out = format!("Page: {}\nURL: {}\n", snap.title, snap.url);
+    if snap.entries.is_empty() {
+        out.push_str("\n(no interactive elements found)\n");
+    }
+
+    let mut room = budget.saturating_sub(out.len());
+
+    // Main text — the summary's headline content.
+    if !snap.main_text.is_empty() && room > 80 {
+        let cap = (budget * 45 / 100).max(400);
+        let clip: String = snap.main_text.chars().take(cap).collect();
+        let piece = if snap.main_text.chars().count() > cap {
+            format!("\nMain text:\n{clip}…")
+        } else {
+            format!("\nMain text:\n{clip}")
+        };
+        out.push_str(&piece);
+        room = room.saturating_sub(piece.len());
+    }
+
+    // Headings — the page's structure, one line each.
+    if !snap.headings.is_empty() && room > 80 {
+        let mut hs = String::from("\nHeadings:\n");
+        for (role, name) in &snap.headings {
+            let line = format!("- {role} \"{name}\"\n");
+            if hs.len() + line.len() > room {
+                break;
+            }
+            hs.push_str(&line);
+        }
+        out.push_str(&hs);
+        room = room.saturating_sub(hs.len());
+    }
+
+    // Interactive entries — refs stay DOM-order (the assignment
+    // `ref_index`/`entry_for` depend on); the PRINT order is display_order.
+    // The region tag is shown on non-main entries only: main is where the
+    // summary already started, and the bytes are better spent on names.
+    // The section head and the "N more" note are reserved UP FRONT at their
+    // worst-case length, so the lines that fit are what the budget actually
+    // has left and the assembled text never crosses it (a clamp cutting the
+    // note off would hide from the model exactly what it was told to fetch).
+    if !snap.entries.is_empty() {
+        let total = snap.entries.len();
+        let head_max = format!("\nInteractive ({total} of {total} shown; main/dialog first):\n").len();
+        let note_max = format!(
+            "…[{total} more interactive elements — browser_snapshot with full=true]\n"
+        )
+        .len();
+        room = room.saturating_sub(head_max + note_max);
+        let mut list = String::new();
+        let mut shown = 0usize;
+        for &i in &snap.display_order {
+            let e = &snap.entries[i];
+            let label = if e.name.is_empty() {
+                e.role.clone()
+            } else {
+                format!("{} \"{}\"", e.role, e.name)
+            };
+            let tag = if e.region == "main" {
+                String::new()
+            } else {
+                format!(" ({})", e.region)
+            };
+            let line = format!("- [{}] {label}{tag}\n", snap.base_ref + i);
+            if list.len() + line.len() > room {
+                break;
+            }
+            list.push_str(&line);
+            shown += 1;
+        }
+        if shown > 0 {
+            let head = if shown < total {
+                format!("\nInteractive ({shown} of {total} shown; main/dialog first):\n")
+            } else {
+                format!("\nInteractive ({total}):\n")
+            };
+            out.push_str(&head);
+            out.push_str(&list);
+        }
+        if shown < total {
+            out.push_str(&format!(
+                "…[{} more interactive elements — browser_snapshot with full=true]\n",
+                total - shown
+            ));
+        }
+        room = room.saturating_sub(list.len());
+    }
+
+    // Whole body text — full renders only, with whatever budget is left, and
+    // only when it adds something: a page whose body text IS its main text
+    // (the common case for a <main>-bearing page) would print itself twice.
+    if full && !snap.body_text.is_empty() && snap.body_text != snap.main_text && room > 80 {
+        let clip: String = snap.body_text.chars().take(room - 32).collect();
+        out.push_str(&format!("\nPage text:\n{clip}"));
+        if clip.len() < snap.body_text.len() {
+            out.push_str(&format!(
+                "\n…[page text truncated — use browser_find or browser_evaluate for the rest]"
+            ));
+        }
+    }
+
+    if out.len() > budget {
+        let kept: String = out.chars().take(budget).collect();
+        out = format!(
+            "{kept}\n…[snapshot truncated at {budget} chars — \
+             use browser_find or browser_evaluate for the rest]"
+        );
+    }
+    out
+}
+
+fn op_snapshot(d: &mut Driver, budget: usize, full: bool) -> Result<Value, String> {
     let raw = {
         let conn = &d.conn;
         let res = conn.call(
@@ -989,11 +1196,15 @@ fn op_snapshot(d: &mut Driver) -> Result<Value, String> {
     if let Some(version) = d.current {
         if let Some((_, snap)) = d.snapshots.iter().find(|(v, _)| *v == version) {
             if snap.sig == sig {
+                // Unchanged page: the note says the refs still stand, and the
+                // same render (at the caller's budget) goes back — the model
+                // asked to see the page, and the page it has is this one.
+                let text = format!(
+                    "[unchanged since refs v{version} — the refs below are still valid]\n{}",
+                    render_snapshot(snap, budget, full)
+                );
                 return Ok(json!({
-                    "text": format!(
-                        "[unchanged since refs v{version} — the refs below are still valid]\n{}",
-                        snap.text
-                    ),
+                    "text": text,
                     "version": version,
                     "unchanged": true,
                 }));
@@ -1006,13 +1217,13 @@ fn op_snapshot(d: &mut Driver) -> Result<Value, String> {
 
     let mut entries: Vec<SnapEntry> = Vec::new();
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
-    let mut body = String::new();
     // The ref printed for `entries[0]`: refs are monotonic across snapshots, so
     // the offset between the printed number and the array index has to be kept.
     let base_ref = d.next_ref;
     for e in raw["entries"].as_array().cloned().unwrap_or_default() {
         let role = e["role"].as_str().unwrap_or("element").to_string();
         let name = e["name"].as_str().unwrap_or_default().to_string();
+        let region = e["region"].as_str().unwrap_or("other").to_string();
         let nth = {
             let slot = seen.entry((role.clone(), name.clone())).or_insert(0);
             let n = *slot;
@@ -1020,54 +1231,41 @@ fn op_snapshot(d: &mut Driver) -> Result<Value, String> {
             n
         };
         entries.push(SnapEntry {
-            role: role.clone(),
-            name: name.clone(),
+            role,
+            name,
+            region,
             nth,
         });
-        let label = if name.is_empty() {
-            role.clone()
-        } else {
-            format!("{role} \"{name}\"")
-        };
-        body.push_str(&format!("- [{}] {label}\n", d.next_ref));
         d.next_ref += 1;
     }
+    // Display order: main/dialog first, other next, page furniture last —
+    // a stable sort, so DOM order survives inside each band.
+    let mut display_order: Vec<usize> = (0..entries.len()).collect();
+    display_order.sort_by_key(|&i| region_rank(&entries[i].region));
 
-    let mut text = format!("Page: {title}\nURL: {url}\n");
-    if entries.is_empty() {
-        text.push_str("\n(no interactive elements found)\n");
-    } else {
-        text.push_str(&format!("\nInteractive ({}):\n{body}", entries.len()));
-    }
-    let headings = raw["headings"].as_array().cloned().unwrap_or_default();
-    if !headings.is_empty() {
-        text.push_str("\nHeadings:\n");
-        for h in headings {
-            text.push_str(&format!(
-                "- {} \"{}\"\n",
-                h["role"].as_str().unwrap_or("h"),
-                h["name"].as_str().unwrap_or_default()
-            ));
-        }
-    }
-    let page_text = raw["text"].as_str().unwrap_or_default();
-    if !page_text.is_empty() {
-        text.push_str("\nPage text:\n");
-        text.push_str(page_text);
-    }
-    if text.chars().count() > SNAPSHOT_MAX_CHARS {
-        let kept: String = text.chars().take(SNAPSHOT_MAX_CHARS).collect();
-        text = format!(
-            "{kept}\n…[snapshot truncated at {SNAPSHOT_MAX_CHARS} chars — \
-             use browser_find or browser_evaluate for the rest]"
-        );
-    }
+    let headings: Vec<(String, String)> = raw["headings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|h| {
+            (
+                h["role"].as_str().unwrap_or("h").to_string(),
+                h["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
 
     d.seq += 1;
     let version = d.seq;
     let snap = Snapshot {
-        text: text.clone(),
+        url,
+        title,
+        display_order,
         entries,
+        headings,
+        main_text: raw["main_text"].as_str().unwrap_or_default().to_string(),
+        body_text: raw["text"].as_str().unwrap_or_default().to_string(),
         base_ref,
         sig,
     };
@@ -1077,8 +1275,11 @@ fn op_snapshot(d: &mut Driver) -> Result<Value, String> {
     }
     d.current = Some(version);
 
+    let stored = &d.snapshots.last().expect("just pushed").1;
+    let text = format!("refs v{version}\n\n{}", render_snapshot(stored, budget, full));
+
     Ok(json!({
-        "text": format!("refs v{version}\n\n{text}"),
+        "text": text,
         "version": version,
         "unchanged": false,
     }))
@@ -1100,13 +1301,16 @@ fn op_navigate(d: &mut Driver, url: &str) -> Result<Value, String> {
         }
     }
     wait_load(d, before, NAV_TIMEOUT)?;
+    // The snapshot rides IN the navigate result: "open X and look at it" costs
+    // ONE tool call instead of navigate + browser_snapshot, and every ref the
+    // summary prints is already registered (the call above stored the
+    // snapshot), so a click on it resolves without re-snapshotting.
+    let snap = op_snapshot(d, SNAPSHOT_NAV_CHARS, false)?;
     Ok(json!({
-        "text": format!(
-            "Navigated to {}\nTitle: {}\nNext: browser_snapshot to see the page.",
-            d.url(), d.title()
-        ),
+        "text": format!("Navigated to {}\n\n{}", d.url(), snap["text"].as_str().unwrap_or_default()),
         "url": d.url(),
         "title": d.title(),
+        "version": snap["version"].clone(),
     }))
 }
 
@@ -1120,9 +1324,12 @@ fn op_navigate_back(d: &mut Driver) -> Result<Value, String> {
         )?;
     }
     wait_load(d, before, Duration::from_secs(15))?;
+    // Same one-call contract as navigate: the page comes back WITH its summary.
+    let snap = op_snapshot(d, SNAPSHOT_NAV_CHARS, false)?;
     Ok(json!({
-        "text": format!("Went back to {}\nTitle: {}", d.url(), d.title()),
+        "text": format!("Went back to {}\n\n{}", d.url(), snap["text"].as_str().unwrap_or_default()),
         "url": d.url(),
+        "version": snap["version"].clone(),
     }))
 }
 
@@ -1936,11 +2143,25 @@ pub fn run(op: &str, args: &Value, chat_id: &str) -> Result<String, String> {
         return Err(format!("unknown browser action: {op}"));
     }
     let chat = chat_key(chat_id);
+    // A mutating action may start a navigation; the post-action snapshot below
+    // must describe the page AFTER it settles. Captured before the dispatch.
+    let before_load = with_driver(&chat, |d| {
+        Ok(d.conn.load_count.load(Ordering::Relaxed))
+    })
+    .unwrap_or(0);
     let value = with_driver(&chat, |d| match op {
         "status" => op_status(d),
         "navigate" => op_navigate(d, args["url"].as_str().unwrap_or_default()),
         "navigate_back" => op_navigate_back(d),
-        "snapshot" => op_snapshot(d),
+        "snapshot" => op_snapshot(
+            d,
+            if args["full"].as_bool().unwrap_or(false) {
+                SNAPSHOT_MAX_CHARS
+            } else {
+                SNAPSHOT_SUMMARY_CHARS
+            },
+            args["full"].as_bool().unwrap_or(false),
+        ),
         "click" => op_click(d, args),
         "hover" => op_hover(d, args),
         "type" => op_type(d, args),
@@ -1961,6 +2182,22 @@ pub fn run(op: &str, args: &Value, chat_id: &str) -> Result<String, String> {
         "tabs" => op_tabs(d, args),
         other => Err(format!("unknown browser action: {other}")),
     })?;
+    // A mutating action RETURNS THE PAGE AFTER THE ACTION: the traced pattern
+    // `click → wait_for → snapshot` cost THREE model rounds per interaction
+    // (five times in one traced turn — 29 model calls, 954K input tokens),
+    // because a bare "clicked" left the model blind and a snapshot round had
+    // to follow. The summary rides in the same result, refs already
+    // registered, so the next action can target the new page directly.
+    if POST_ACTION_SNAPSHOT_OPS.contains(&op) {
+        let _ = with_driver(&chat, |d| wait_load(d, before_load, Duration::from_secs(3)));
+        if let Ok(snap) = with_driver(&chat, |d| op_snapshot(d, SNAPSHOT_SUMMARY_CHARS, false)) {
+            let action_text = value["text"].as_str().unwrap_or_default().to_string();
+            let summary = snap["text"].as_str().unwrap_or_default();
+            return Ok(format!(
+                "{action_text}\n\n--- Page after {op} (fresh refs) ---\n{summary}"
+            ));
+        }
+    }
     let text = value["text"].as_str().unwrap_or_default().to_string();
     Ok(if text.is_empty() {
         serde_json::to_string_pretty(&value).unwrap_or_default()
@@ -1974,18 +2211,30 @@ pub fn run(op: &str, args: &Value, chat_id: &str) -> Result<String, String> {
 /// apart. Names are the full `browser_*` tool names the model calls.
 pub const ACTIONS: &[(&str, &str)] = &[
     ("browser_status", "Current page URL and title."),
-    ("browser_navigate", "Open a URL in the agent's tab and wait for it to load."),
-    ("browser_navigate_back", "Go back in the page's history."),
+    (
+        "browser_navigate",
+        "Open a URL in the agent's tab, wait for it to load, and return the page's summary (main text + key interactive elements with refs) — no separate snapshot call needed.",
+    ),
+    (
+        "browser_navigate_back",
+        "Go back in the page's history and return the page's summary with fresh refs.",
+    ),
     (
         "browser_snapshot",
-        "Page as a compact list of `[ref] role \"name\"` entries plus its text. Run this before any element action.",
+        "Page as a summary: main text, headings and `[ref] role \"name\"` entries (main/dialog first, nav/footer last). Run this before any element action. full=true adds the whole body text and every entry (12K chars).",
     ),
-    ("browser_click", "Click an element by `ref` from a snapshot."),
+    (
+        "browser_click",
+        "Click an element by `ref` from a snapshot. The result carries the page AFTER the click (fresh refs) — no separate snapshot call needed.",
+    ),
     ("browser_hover", "Hover an element by `ref`."),
-    ("browser_type", "Type text into a field (focus it by `ref`, or the focused element)."),
+    (
+        "browser_type",
+        "Type text into a field (focus it by `ref`, or the focused element). The result carries the page afterwards with fresh refs.",
+    ),
     ("browser_fill_form", "Fill several fields in one call: `fields: [{ref, value}]`."),
-    ("browser_select_option", "Pick an option in a `<select>` by `ref` and `value`."),
-    ("browser_press_key", "Press a key or combo, e.g. `Enter`, `Tab`, `Meta+A`."),
+    ("browser_select_option", "Pick an option in a `<select>` by `ref` and `value`. The result carries the page afterwards with fresh refs."),
+    ("browser_press_key", "Press a key or combo, e.g. `Enter`, `Tab`, `Meta+A`. The result carries the page afterwards with fresh refs."),
     (
         "browser_evaluate",
         // Page scope, NOT a module scope: a `React is not defined` / `h is not a
@@ -2003,8 +2252,8 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("browser_resize", "Set the emulated viewport size."),
     ("browser_emulate_media", "Emulate dark mode / reduced motion / forced colors."),
     ("browser_handle_dialog", "Accept or dismiss the page's next alert/confirm/prompt."),
-    ("browser_file_upload", "Attach local files to a file input by `ref`."),
-    ("browser_drag", "Drag from `ref` to `to_ref`."),
+    ("browser_file_upload", "Attach local files to a file input by `ref`. The result carries the page afterwards with fresh refs."),
+    ("browser_drag", "Drag from `ref` to `to_ref`. The result carries the page afterwards with fresh refs."),
     ("browser_tabs", "List, open, switch or close tabs."),
 ];
 
@@ -2035,6 +2284,9 @@ fn is_known(op: &str) -> bool {
 fn action_props(action: &str) -> Value {
     match action {
         "navigate" => json!({"url": {"type": "string"}}),
+        "snapshot" => json!({
+            "full": {"type": "boolean", "description": "true: the whole page text and every entry (12K chars). Default: a ~6K summary (main text, headings, main/dialog entries first)."}
+        }),
         "click" | "hover" => json!({
             "ref": {"type": "integer"},
             "selector": {"type": "string"},
@@ -2373,5 +2625,201 @@ mod tests {
         )
         .expect("read back");
         assert!(value.contains("hello"), "typed text did not land: {value}");
+    }
+
+    /// `- [ref] label (region)` rows of a rendered snapshot, in print order —
+    /// the map the acceptance gate compares between the summary and the full
+    /// render of the same snapshot.
+    fn ref_label_map(text: &str) -> Vec<(usize, String)> {
+        text.lines()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("- [")?;
+                let close = rest.find(']')?;
+                let r: usize = rest[..close].trim().parse().ok()?;
+                Some((r, rest[close + 2..].trim().to_string()))
+            })
+            .collect()
+    }
+
+    fn fixture_snapshot() -> Snapshot {
+        // DOM order — what querySelectorAll returned: nav links first, then
+        // the main content, then the footer. Refs are assigned in THIS order;
+        // only the print order differs.
+        let entries = vec![
+            SnapEntry { role: "link".into(), name: "Menu Alpha".into(), region: "nav".into(), nth: 0 },
+            SnapEntry { role: "link".into(), name: "Menu Beta".into(), region: "nav".into(), nth: 0 },
+            SnapEntry { role: "heading".into(), name: "Sign in".into(), region: "dialog".into(), nth: 0 },
+            SnapEntry { role: "button".into(), name: "Main Button".into(), region: "main".into(), nth: 0 },
+            SnapEntry { role: "textbox".into(), name: "Search".into(), region: "main".into(), nth: 0 },
+            SnapEntry { role: "link".into(), name: "Footer Link".into(), region: "footer".into(), nth: 0 },
+        ];
+        let mut display_order: Vec<usize> = (0..entries.len()).collect();
+        display_order.sort_by_key(|&i| region_rank(&entries[i].region));
+        Snapshot {
+            url: "http://fixture.test/page".into(),
+            title: "Fixture".into(),
+            entries,
+            display_order,
+            headings: vec![("h1".into(), "Main Title".into())],
+            main_text: "Unique main paragraph the summary must lead with.".into(),
+            body_text: "Unique main paragraph the summary must lead with. Menu Alpha Menu Beta Footer Link".into(),
+            base_ref: 10,
+            sig: 0,
+        }
+    }
+
+    #[test]
+    fn render_puts_main_and_dialog_before_page_furniture() {
+        let snap = fixture_snapshot();
+        let text = render_snapshot(&snap, SNAPSHOT_SUMMARY_CHARS, false);
+        let order: Vec<String> = ref_label_map(&text)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        // main/dialog first (in DOM order among themselves), nav last.
+        let at = |name: &str| order.iter().position(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} missing: {text}"));
+        assert!(at("Main Button") < at("Menu Alpha"), "{text}");
+        assert!(at("Sign in") < at("Menu Alpha"), "{text}");
+        assert!(at("Footer Link") > at("Menu Beta"), "{text}");
+        // The main TEXT leads the whole render, before any entry.
+        assert!(
+            text.find("Unique main paragraph").unwrap() < text.find("Main Button").unwrap(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn every_render_prints_the_same_ref_for_the_same_element() {
+        // THE contract: a ref the model saw in a navigate summary resolves to
+        // the same element in the full snapshot. All three budgets render the
+        // same base_ref + index for every entry they share.
+        let snap = fixture_snapshot();
+        let nav = render_snapshot(&snap, SNAPSHOT_NAV_CHARS, false);
+        let summary = render_snapshot(&snap, SNAPSHOT_SUMMARY_CHARS, false);
+        let full = render_snapshot(&snap, SNAPSHOT_MAX_CHARS, true);
+        let nav_map = ref_label_map(&nav);
+        let summary_map = ref_label_map(&summary);
+        let full_map = ref_label_map(&full);
+        assert!(!nav_map.is_empty() && !summary_map.is_empty() && !full_map.is_empty());
+        for (r, label) in nav_map.iter().chain(&summary_map) {
+            let same = full_map
+                .iter()
+                .find(|(fr, _)| fr == r)
+                .unwrap_or_else(|| panic!("ref {r} from a smaller render is missing in full"));
+            assert_eq!(label, &same.1, "ref {r} means different things across renders");
+        }
+        // And a smaller render never INVENTS a label for a ref.
+        assert!(nav_map.len() <= summary_map.len());
+        assert!(summary_map.len() <= full_map.len());
+    }
+
+    #[test]
+    fn a_tight_budget_drops_the_furniture_and_says_so() {
+        let snap = fixture_snapshot();
+        // Small but livable: the header and main text fit, the nav/footer
+        // entries are what goes first, and the model is told how many more
+        // exist and how to get them.
+        let tight = render_snapshot(&snap, SNAPSHOT_SUMMARY_CHARS.min(420), false);
+        assert!(tight.contains("Main Button"), "{tight}");
+        assert!(tight.contains("Unique main paragraph"), "{tight}");
+        assert!(!tight.contains("Footer Link"), "{tight}");
+        assert!(tight.contains("more interactive elements"), "{tight}");
+        assert!(tight.contains("full=true"), "{tight}");
+        assert!(tight.len() <= 480, "render blew its budget: {}", tight.len());
+        // Full keeps everything and carries the body text.
+        let full = render_snapshot(&snap, SNAPSHOT_MAX_CHARS, true);
+        assert!(full.contains("Footer Link"), "{full}");
+        assert!(full.contains("Page text:"), "{full}");
+        // A page whose body text IS its main text must not print itself twice.
+        let flat = Snapshot { body_text: snap.main_text.clone(), ..snap };
+        let full_flat = render_snapshot(&flat, SNAPSHOT_MAX_CHARS, true);
+        assert_eq!(full_flat.matches("Unique main paragraph").count(), 1, "{full_flat}");
+    }
+
+    /// The REAL-page gate (plan §1): a local HTTP fixture with nav before
+    /// main, real Chromium, summary and full must agree on refs, clicking a
+    /// summary ref must hit the intended element, and the main text must
+    /// appear before the menu. Ignored by default; run with
+    /// `CODIFA_BROWSER_TESTS=1 cargo test --bin codifa -- --ignored real_page_summary_and_full_agree_on_refs`.
+    #[test]
+    #[ignore]
+    fn real_page_summary_and_full_agree_on_refs() {
+        if std::env::var("CODIFA_BROWSER_TESTS").is_err() {
+            eprintln!("skipping: set CODIFA_BROWSER_TESTS=1 to run the real-page browser gate");
+            return;
+        }
+        let page = r##"<!doctype html><html><head><title>Fixture</title></head><body>
+<nav><a href="#a">Menu Alpha</a><a href="#b">Menu Beta</a></nav>
+<main><h1>Main Title</h1>
+<p>Unique main paragraph for the summary ordering check.</p>
+<button id="counter" onclick="document.getElementById('out').textContent='clicked '+(++n)">Main Button</button>
+<span id="out">unclicked</span></main>
+<footer><a href="#f">Footer Link</a></footer>
+<script>var n=0;</script>
+</body></html>"##;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // Serve until the process ends; the test outlives a handful of
+            // requests (navigate + two snapshots + evaluate) and no more.
+            let body = page.as_bytes();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
+                let _ = std::io::Write::write_all(&mut stream, body);
+            }
+        });
+
+        let chat = format!("real-page-{}", std::process::id());
+        let url = format!("http://127.0.0.1:{port}/");
+        // ONE call: navigate must come back with the page's summary already.
+        let nav = run("navigate", &json!({"url": url}), &chat).expect("navigate");
+        assert!(nav.contains("Main Button"), "navigate carried no summary: {nav}");
+        assert!(nav.contains("Unique main paragraph"), "{nav}");
+
+        let summary = run("snapshot", &json!({}), &chat).expect("snapshot");
+        let full = run("snapshot", &json!({"full": true}), &chat).expect("full snapshot");
+        let summary_map = ref_label_map(&summary);
+        let full_map = ref_label_map(&full);
+        assert!(!summary_map.is_empty(), "no refs in summary: {summary}");
+        // Same ref → same element in both renders (the unchanged-page note
+        // rides along; the maps below it are what matters).
+        for (r, label) in &summary_map {
+            let same = full_map
+                .iter()
+                .find(|(fr, _)| fr == r)
+                .unwrap_or_else(|| panic!("summary ref {r} missing in full: {full}"));
+            assert_eq!(label, &same.1, "ref {r} disagrees between summary and full");
+        }
+        // Main text before menu text.
+        let main_at = summary.find("Unique main paragraph").expect("main text");
+        let menu_at = summary.find("Menu Alpha").expect("menu");
+        assert!(main_at < menu_at, "menu outranked the main text: {summary}");
+
+        // Clicking the summary's ref hits the intended element.
+        let button_ref = summary_map
+            .iter()
+            .find(|(_, l)| l.contains("Main Button"))
+            .expect("no ref for Main Button")
+            .0 as i64;
+        run("click", &json!({"ref": button_ref}), &chat).expect("click");
+        let out = run(
+            "evaluate",
+            &json!({"expression": "document.getElementById('out').textContent"}),
+            &chat,
+        )
+        .expect("evaluate");
+        assert!(
+            out.contains("clicked 1"),
+            "the summary ref did not hit the main button: {out}"
+        );
+
+        drop(server);
     }
 }

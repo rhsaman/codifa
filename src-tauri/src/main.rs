@@ -316,6 +316,16 @@ fn main() {
                 if pruned > 0 {
                     println!("[plugins] removed {pruned} leftover store entr(ies) now in bundles");
                 }
+                // Repair the heading stack the old writer left: every editor
+                // save used to prepend one more `# {name}`, and installing a
+                // body that carries its own title opened the file with two H1s
+                // (real stores grew to 133 stacked copies on one skill). One
+                // pass, idempotent, BEFORE the seeder reads the files so its
+                // user-edit decisions land on the repaired shapes.
+                let deduped = skills::dedupe_skill_headings(&root);
+                if deduped > 0 {
+                    println!("[skills] deduped stacked headings in {deduped} skill file(s)");
+                }
                 // Collect the shipped library into ONE bundle: the per-skill
                 // folders an older seeder made are folded together when the user
                 // has not touched them, so Settings shows one card for the

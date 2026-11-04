@@ -159,6 +159,46 @@ export function isKeepTextRetry(reconnecting: boolean | undefined, fallback: boo
   return reconnecting === true || fallback === true
 }
 
+/** Whether a message's retry info renders as the compact footer line instead
+ *  of the transcript-end banner. The chat-error ladder, the sub-agent ladders
+ *  and the watchdog all mark their retry `inline` — the banner slot stays
+ *  reserved for the stall hint. */
+export function isInlineRetry(retry: unknown): boolean {
+  return !!retry && typeof retry === 'object' && (retry as { inline?: boolean }).inline === true
+}
+
+/**
+ * Whether a failed turn's error is DETERMINISTIC — re-sending the same bytes
+ * cannot change the answer — so the automatic 10s re-send ladder must not run.
+ *
+ * Retryable (ladder keeps going): transport drops, timeouts, 5xx and a genuine
+ * 429 rate limit. Deterministic (ladder stops, manual Retry stays): request or
+ * account rejections — 400/401/402/403/404 on either error naming convention,
+ * a missing key, and exhausted allowance/quota bodies (a 429 that says the
+ * account is OUT is not "come back later", it is "this will never answer").
+ */
+export function isDeterministicTurnError(reason: string): boolean {
+  const e = (reason || '').toLowerCase()
+  if (!e) return false
+  if (e.includes('no api key configured') || e.includes('invalid api key') || e.includes('invalid_api_key')) {
+    return true
+  }
+  // A 429 must be judged by its BODY first: "usage limit reached" /
+  // "insufficient_quota" carried on a 429 is exhaustion, not a pace limit.
+  if (e.includes('usage limit') || e.includes('insufficient_quota') || e.includes('exceeded your current quota')) {
+    return true
+  }
+  if (e.includes('rate limit') || e.includes('too many requests')) return false
+  // Both error naming conventions carry the status: `key rejected (402): …`
+  // and `… upstream HTTP 402 (empty body)`. Retrying the SAME bytes of a
+  // 4xx request rejection cannot change the answer.
+  for (const m of e.matchAll(/(?:upstream http|key rejected)\s*\(?\s*(\d{3})\s*\)?/g)) {
+    const status = Number(m[1])
+    if (status >= 400 && status < 500 && status !== 429) return true
+  }
+  return false
+}
+
 /**
  * Epoch-guarded scheduler for automatic retries (watchdog stall resends,
  * banner resends, post-turn drains).
@@ -313,7 +353,14 @@ export function findRetryBannerMessage<
   return (
     [...messages]
       .reverse()
-      .find((m) => m.retry && !retiring.has(m.id) && !dismissed.has(m.id)) ??
-    null
+      .find(
+        (m) =>
+          m.retry &&
+          // Inline retries render on the message itself (the compact footer
+          // line); the banner slot must stay free for them.
+          !isInlineRetry(m.retry) &&
+          !retiring.has(m.id) &&
+          !dismissed.has(m.id),
+      ) ?? null
   )
 }

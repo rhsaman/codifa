@@ -1,18 +1,17 @@
 // Notification alarm sounds, played from the renderer via HTMLAudioElement.
-// The mp3 files live in /sounds at the project root and are imported as URLs,
-// so Vite bundles them for both the dev server and the packaged app
+// The sound files live in /sounds at the project root and are imported as
+// URLs, so Vite bundles them for both the dev server and the packaged app
 // (dist/index.html loaded via file:// uses relative asset paths).
 
-import alertUrl from "../../sounds/alert.mp3";
-import errorUrl from "../../sounds/error.mp3";
+// ZCode's task-notification pop (zai-org/ZCode, packages/ui/src/assets).
+import alertUrl from "../../sounds/zcode-pop.mp3";
 
 /** alert: the agent needs the user (ask prompt) or a turn/run finished OK.
- *  error: the turn/run failed. */
-export type AlarmKind = "alert" | "error";
+ *  There is deliberately no error alarm: failed turns/runs stay silent. */
+export type AlarmKind = "alert";
 
 const ALARM_URLS: Record<AlarmKind, string> = {
   alert: alertUrl,
-  error: errorUrl,
 };
 
 // Keep playing elements referenced until they end: a garbage-collected Audio

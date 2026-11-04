@@ -609,28 +609,34 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     if !body.get("fa_keywords").is_some_and(|v| !v.is_null()) {
         fa_keywords = existing_fa;
     }
-    // An EMPTY body follows the same rule: keep the stored text. A caller that
-    // only adds/removes an extra file, renames, or edits the frontmatter must
-    // not have to resend the whole markdown (the model routinely calls
-    // `create_skill` exactly that way). Creating a NEW skill still requires a
-    // body, so we never write an empty skill.md.
-    let mut content = content;
-    if content.is_empty() {
+    // The heading stack an OLDER save left behind: this writer used to prepend
+    // `# {name}` on every write while the Settings editor sends the whole stored
+    // body back, so every save stacked one more identical heading on top of the
+    // previous ones (a real store grew to 133 copies of `# pdf`), and an install
+    // of a body that carries its own title opened with two H1s. Strip the whole
+    // leading run — by the new name, the stored one and the previous one, since
+    // a rename can sit in between — before deciding what the file opens with.
+    let heading_names: Vec<&str> = [name.as_str(), existing_name.trim(), prev.as_str()]
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .collect();
+    let incoming = content;
+    let mut content = strip_leading_name_headings(&incoming, &heading_names);
+    if content.is_empty() && incoming.is_empty() {
+        // NOTHING came in: keep the stored text (minus its own stack) — a
+        // caller that only adds/removes an extra file, renames, or edits the
+        // frontmatter must not have to resend the whole markdown (the model
+        // routinely calls `create_skill` exactly that way). Creating a NEW
+        // skill still requires a body, so an empty store plus an empty body is
+        // an error, never an empty skill.md.
         let stored = strip_frontmatter(&existing_raw).trim().to_string();
-        // Strip the heading by the OLD name: after a rename the stored body
-        // still starts with `# Old Name`, and leaving it in would make the
-        // rewritten file carry a second (stale) heading under the new one.
-        let old_name = if existing_name.trim().is_empty() {
-            name.as_str()
-        } else {
-            existing_name.as_str()
-        };
-        content = strip_heading(&stored, old_name).trim().to_string();
-        content = strip_heading(&content, &name).trim().to_string();
+        content = strip_leading_name_headings(&stored, &heading_names);
         if content.is_empty() {
             return Err("skill content is required".into());
         }
     }
+    // A body that strips down to NOTHING but was not empty to begin with was
+    // only its own (stacked) name heading; the write below keeps exactly one.
     // Dedupe case-insensitively, keeping the author's order: a repeated phrase
     // only bloats the catalog line the model has to read.
     {
@@ -644,7 +650,20 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     if !fa_keywords.is_empty() {
         markdown.push_str(&format!("fa_keywords: {}\n", fa_keywords.join(", ")));
     }
-    markdown.push_str(&format!("---\n\n# {name}\n\n{content}\n"));
+    markdown.push_str("---\n\n");
+    if starts_with_h1(&content) {
+        // The body opens with its own title — the standard SKILL.md shape a
+        // marketplace ships and a model writes. That heading IS the file's one
+        // title: stacking `# {name}` above it is what produced the two-title
+        // files, so it is kept as written.
+        markdown.push_str(&content);
+    } else if content.is_empty() {
+        // The incoming body was only its own (stacked) name heading: keep one.
+        markdown.push_str(&format!("# {name}\n"));
+    } else {
+        markdown.push_str(&format!("# {name}\n\n{content}"));
+    }
+    markdown.push('\n');
     let md_path = dir.join("skill.md");
     fs::write(&md_path, &markdown).map_err(|e| e.to_string())?;
 
@@ -725,6 +744,136 @@ fn strip_heading(s: &str, name: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// True when the body opens with its own H1 title (`# `, `#\t` or a bare `#`
+/// as the first non-blank line) — the shape that must not gain a second title.
+fn starts_with_h1(s: &str) -> bool {
+    let mut chars = s.trim_start().chars();
+    if chars.next() != Some('#') {
+        return false;
+    }
+    matches!(chars.next(), None | Some(' ') | Some('\t'))
+}
+
+/// Remove EVERY leading `# <name>` heading, matching any of `names`.
+///
+/// One `strip_heading` call drops one copy; the unconditional prepend this
+/// module used to do stacked one identical copy per save on top of the previous
+/// ones (a store file grew to 133 `# pdf` lines), so the cleanup runs to a
+/// fixpoint. Returns the body with the whole heading run — and the blank lines
+/// around it — gone, trimmed.
+fn strip_leading_name_headings(s: &str, names: &[&str]) -> String {
+    let mut out = s.trim().to_string();
+    loop {
+        let mut next = out.clone();
+        for n in names {
+            next = strip_heading(&next, n).trim().to_string();
+        }
+        if next == out {
+            return out;
+        }
+        out = next;
+    }
+}
+
+/// Split a skill.md into its `---…---` frontmatter (kept VERBATIM, ending at
+/// the closing dashes) and the body after it — the split `strip_frontmatter`
+/// makes, without throwing the frontmatter away.
+fn split_off_frontmatter(raw: &str) -> (&str, &str) {
+    if !raw.starts_with("---") {
+        return ("", raw);
+    }
+    match raw.find("\n---") {
+        Some(i) => {
+            let fm_end = i + 4; // just past the closing `---`
+            (&raw[..fm_end], &raw[fm_end..])
+        }
+        None => ("", raw),
+    }
+}
+
+/// One-pass repair of the heading stack the old unconditional prepend wrote.
+///
+/// `sync_skill` used to open every rewritten file with `# {name}` even when the
+/// body carried its own title, and the Settings editor sends the whole stored
+/// body back on save — so installs opened with two H1s and every editor save
+/// stacked one more `# {name}` (real stores grew to 133 copies on one skill).
+/// This walks every bundle's `skills/*/skill.md`, strips the stack, and leaves
+/// exactly one title: the body's own H1 when it has one, `# {name}` otherwise.
+///
+/// Idempotent — a file without a leading name-heading run is not rewritten, so
+/// a second run touches nothing. Frontmatter, extra files and `.shipped`
+/// markers are left alone: an edit that only removed the stack must not read
+/// as a content change. Returns the number of files rewritten.
+pub fn dedupe_skill_headings(root: &Path) -> usize {
+    let Ok(bundles) = fs::read_dir(root.join("plugins")) else {
+        return 0;
+    };
+    let mut rewritten = 0;
+    for bundle in bundles.flatten() {
+        let Ok(skills) = fs::read_dir(bundle.path().join("skills")) else {
+            continue;
+        };
+        for skill in skills.flatten() {
+            let md = skill.path().join("skill.md");
+            if md.is_file() && repair_skill_file(&md) {
+                rewritten += 1;
+            }
+        }
+    }
+    rewritten
+}
+
+/// Rewrite one skill.md down to a single opening title. True when it changed.
+fn repair_skill_file(md: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(md) else {
+        return false;
+    };
+    // Without an explicit `name:` there is nothing to match the stack against,
+    // so a hand-written file with its own heading style is not touched.
+    let name = frontmatter_name_pub(&raw);
+    if name.is_empty() {
+        return false;
+    }
+    let (frontmatter, body) = split_off_frontmatter(&raw);
+    let cleaned = strip_leading_name_headings(body, &[name.as_str()]);
+    if cleaned == body.trim() {
+        // The body does not open with the name heading: nothing the bug wrote
+        // is at the top, so this file is not part of the damage.
+        return false;
+    }
+    let next = if cleaned.is_empty() {
+        // The body was nothing but the stack: keep exactly one title so the
+        // skill does not come out blank.
+        format!("{frontmatter}\n\n# {name}\n")
+    } else if starts_with_h1(&cleaned) {
+        format!("{frontmatter}\n\n{cleaned}\n")
+    } else {
+        format!("{frontmatter}\n\n# {name}\n\n{cleaned}\n")
+    };
+    rewrite_skill_file(md, &next, &raw)
+}
+
+/// Write `next` over `md` only when it differs from `current`, through a
+/// dot-prefixed temp file + rename so a concurrent reader never sees a torn
+/// file (the store signature is mtime-based, so readers re-read mid-sweep).
+/// The dot prefix keeps an interrupted temp out of the skill's file list.
+fn rewrite_skill_file(md: &Path, next: &str, current: &str) -> bool {
+    if next == current {
+        return false;
+    }
+    let tmp = md.with_file_name(".skill.md.dedupe-tmp");
+    if fs::write(&tmp, next).is_err() {
+        return false;
+    }
+    match fs::rename(&tmp, md) {
+        Ok(()) => true,
+        Err(_) => {
+            let _ = fs::remove_file(&tmp);
+            false
+        }
+    }
 }
 
 /// Stable 16-hex fingerprint of a skill's shipped form.
@@ -1053,6 +1202,142 @@ mod tests {
         assert_eq!(sanitize_extra_filename("../evil"), None);
         assert_eq!(sanitize_extra_filename(".hidden"), None);
         assert_eq!(sanitize_extra_filename("no space.txt"), None);
+    }
+
+    /// A plugin-folder root (manifest beside an empty skills/), so `sync_skill`
+    /// takes the direct writer path — a data root would route through the
+    /// bundle writer first.
+    fn bundle_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("codifa-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            json!({ "name": "B", "slug": "b", "enabled": true }).to_string(),
+        )
+        .unwrap();
+        root
+    }
+
+    /// The stored body the way the Settings editor sends it back: whole file,
+    /// frontmatter stripped.
+    fn stored_body(md: &Path) -> String {
+        strip_frontmatter_pub(&fs::read_to_string(md).unwrap())
+    }
+
+    #[test]
+    fn sync_skill_saving_the_saved_body_is_a_fixpoint() {
+        // The editor sends the whole stored body back on save, and this writer
+        // used to prepend `# {name}` on EVERY write: each save stacked one more
+        // identical heading on top of the previous ones (a real store grew to
+        // 133 copies of `# pdf`). The write must be a fixpoint instead:
+        // save(save(x)) == save(x).
+        let root = bundle_root("fixpoint");
+        let md = root.join("skills").join("pdf").join("skill.md");
+        sync_skill(
+            &root,
+            &json!({ "name": "pdf", "description": "d", "content": "# PDF Guide\n\nreal body" }),
+        )
+        .unwrap();
+        let first = fs::read_to_string(&md).unwrap();
+        // The body's own title IS the title — nothing stacked above it.
+        assert!(first.contains("---\n\n# PDF Guide\n\nreal body\n"), "{first}");
+        assert!(!first.contains("# pdf"), "{first}");
+
+        sync_skill(&root, &json!({ "name": "pdf", "content": stored_body(&md) })).unwrap();
+        assert_eq!(
+            fs::read_to_string(&md).unwrap(),
+            first,
+            "a second save must not change the file"
+        );
+
+        // A body WITHOUT its own title still gets the name as its heading, and
+        // that prepended heading is stable across saves too.
+        let bare_md = root.join("skills").join("bare").join("skill.md");
+        sync_skill(&root, &json!({ "name": "bare", "content": "just prose" })).unwrap();
+        let bare = fs::read_to_string(&bare_md).unwrap();
+        assert!(bare.contains("---\n\n# bare\n\njust prose\n"), "{bare}");
+        sync_skill(&root, &json!({ "name": "bare", "content": stored_body(&bare_md) })).unwrap();
+        assert_eq!(
+            fs::read_to_string(&bare_md).unwrap(),
+            bare,
+            "the prepended heading must survive a save round-trip unchanged"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_skill_heals_a_legacy_heading_stack_on_save() {
+        // A body that arrives already carrying the stack an older save wrote
+        // must come out with exactly one heading — not four.
+        let root = bundle_root("heal");
+        sync_skill(
+            &root,
+            &json!({ "name": "pdf", "content": "# pdf\n\n# pdf\n\n# pdf\n\nreal body" }),
+        )
+        .unwrap();
+        let md = fs::read_to_string(root.join("skills").join("pdf").join("skill.md")).unwrap();
+        assert_eq!(md.matches("# pdf").count(), 1, "{md}");
+        assert!(md.contains("real body"), "{md}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dedupe_skill_headings_repairs_a_stacked_store_once() {
+        // The startup repair: a store written by the old unconditional prepend
+        // comes out with one title per file, files the bug never touched stay
+        // byte-identical, and a second run finds nothing left to do.
+        let root = std::env::temp_dir().join(format!("codifa-dedupe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let bundle = root.join("plugins").join("pack");
+        fs::create_dir_all(bundle.join("skills")).unwrap();
+        fs::write(
+            bundle.join("plugin.json"),
+            json!({ "name": "Pack", "slug": "pack", "enabled": true }).to_string(),
+        )
+        .unwrap();
+        let write_skill = |name: &str, body: &str| {
+            let dir = bundle.join("skills").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("skill.md"), format!("---\nname: {name}\ndescription: d\n---\n{body}"))
+                .unwrap();
+        };
+        // The ×N shape the old writer produced, over a body with its own title.
+        write_skill(
+            "report",
+            "\n# report\n\n# report\n\n# report\n\n# Report Format\nprose\n",
+        );
+        // A body that was nothing but the stack keeps exactly one title.
+        write_skill("blank", "\n# blank\n\n# blank\n\n");
+        // Shapes the bug did not produce: a canonical heading, and a body whose
+        // first heading is not the name at all.
+        write_skill("healthy", "\n# healthy\n\nbody\n");
+        write_skill("other", "\n# Other Title\nprose\n");
+
+        assert_eq!(dedupe_skill_headings(&root), 2, "two damaged files");
+        let read = |name: &str| {
+            fs::read_to_string(bundle.join("skills").join(name).join("skill.md")).unwrap()
+        };
+        assert!(read("report").contains("---\n\n# Report Format\nprose\n"), "{}", read("report"));
+        assert!(!read("report").contains("# report"), "{}", read("report"));
+        assert_eq!(read("blank").matches("# blank").count(), 1, "{}", read("blank"));
+        assert_eq!(
+            read("healthy"),
+            "---\nname: healthy\ndescription: d\n---\n\n# healthy\n\nbody\n",
+            "a file the bug never touched stays byte-identical"
+        );
+        assert_eq!(
+            read("other"),
+            "---\nname: other\ndescription: d\n---\n\n# Other Title\nprose\n",
+            "a foreign title is not the stack"
+        );
+
+        assert_eq!(
+            dedupe_skill_headings(&root),
+            0,
+            "a second run must find nothing to rewrite"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

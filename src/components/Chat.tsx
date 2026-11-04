@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { RangeSlider } from "./RangeSlider";
 import { getActiveProvider, getChatProvider, ensureChatHydrated, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { useVimScroll } from "../lib/useVimScroll";
@@ -15,7 +16,7 @@ import { shouldEnterInsert, shouldLeaveInsert } from "../lib/chatNormalMode";
 import { isPrefixArmed } from "../lib/prefixState";
 import { isEditableTarget, paneOwner } from "../lib/panePointer";
 import { physicalKey } from "../lib/shortcuts";
-import { AutoRetryScheduler, findRetryBannerMessage, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
+import { AutoRetryScheduler, findRetryBannerMessage, isDeterministicTurnError, isKeepTextRetry, planRetry, resetStreamForRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
   isSlashCommand,
   parseSlashInput,
@@ -186,7 +187,6 @@ import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget, shouldTrimMountedWindow
 import { RENDER_CAP, PASTE_MAX, fmtSize } from "../lib/renderCap";
 import {
   GLOBAL_SHORTCUTS,
-  PREFIX_LABEL,
   PREFIX_SHORTCUTS,
   formatGlobalShortcut,
   formatShortcut,
@@ -1705,8 +1705,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   useEffect(() => {
     liveActiveRef.current = liveHere;
   }, [liveHere]);
-  /** Ring the turn/ask/error alarm, except while live voice owns the audio. */
-  const ringTurnAlarm = (kind: "alert" | "error") => {
+  /** Ring the turn/ask alarm, except while live voice owns the audio. */
+  const ringTurnAlarm = (kind: "alert") => {
     if (liveActiveRef.current) return;
     playAlarm(kind);
   };
@@ -2370,11 +2370,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const skillNotice = chat?.skillNotice ?? null;
   const undoNotice = chat?.undoNotice ?? null;
   const stalled = chat?.stalled ?? false;
-  /** The Ctrl+X prefix is app-wide (managed in App.tsx), so its hint lives at
-   *  the store root — it survives chat switches too. Rendered only in the
-   *  focused panel so one Ctrl+X does not banner every visible window. */
-  const rawPrefixNotice = useStore((s) => s.prefixNotice ?? null);
-  const prefixNotice = rawPrefixNotice && isActive ? rawPrefixNotice : null;
+  /** The Ctrl+X prefix is app-wide (managed in App.tsx) with NO in-chat
+   *  banner: the user asked for it removed (the chord is feedback enough). */
   const thinkingLevel = chat?.thinkingLevel ?? "xhigh";
   const setThinkingLevel = (lv: ThinkingLevel) => {
     if (chat) useStore.getState().setChatThinkingLevel(chat.id, lv);
@@ -2537,17 +2534,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const cmd = (e as CustomEvent<string>).detail;
       if (typeof cmd === "string") void handleCommandRef.current(cmd);
     };
-    const onPrefix = (e: Event) => {
-      const active = (e as CustomEvent<boolean>).detail === true;
-      useStore.getState().setPrefixNotice(
-        active
-          ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(
-            PREFIX_SHORTCUTS,
-          )
-            .map((k) => (k === " " ? "Space" : k))
-            .join(" / ")}`
-          : null,
-      );
+    const onPrefix = () => {
+      // Prefix-arm feedback deliberately renders nothing (the banner the user
+      // saw on every Ctrl+X was removed); the chord state is consumed by
+      // App.tsx's dispatcher and shouldEnterInsert.
     };
     window.addEventListener("coder:cmd", onCmd);
     window.addEventListener("coder:prefix", onPrefix);
@@ -3377,9 +3367,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   // Warn (yellow) when used context reaches the auto-compaction threshold
   // (compactAtPercent% of the raw window) — the same point where backend
-  // auto-compaction fires.
-  const compactAtPercent = settings.compactAtPercent ?? 80;
+  // auto-compaction fires. The context popover's slider can override the
+  // General default for THIS chat only.
+  const compactAtPercent =
+    chat?.compactAtPercent ?? settings.compactAtPercent ?? 80;
   const usable = Math.round(ctxWindow * (compactAtPercent / 100));
+  /** Same pair, for the context popover's slider: the effective per-chat
+   *  value (override or General default) and the General default itself. */
+  const chatCompactPercent = compactAtPercent;
+  const defaultCompactPercent = settings.compactAtPercent ?? 80;
 
   // Ring progress is measured against the usable window (auto-compaction
   // threshold), not the raw window: 100% means compaction fires. E.g. with a
@@ -4474,7 +4470,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         assistantMsg = existing;
         s.updateMessage(existing.id, {
           streaming: true,
-          retry: null,
+          // Keep an INLINE retry line across the resend: the ladder's compact
+          // footer line (attempt counter + last error) is the only place the
+          // user sees WHY the turn is cycling — wiping it here made the pill
+          // flip between "Contacting model" and "waiting for model" with no
+          // visible reason. The line clears itself on success (done handler)
+          // or when a newer failure replaces it.
+          ...(existing.retry?.inline
+            ? {}
+            : { retry: null }),
           // Base for the "Working" elapsed timer — stored on the message so
           // switching chats (unmount/remount) doesn't reset it to zero. Kept
           // from the original turn start on continuations so the finished
@@ -4759,7 +4763,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           .getState()
           .chats.find((c) => c.id === chat.id)
           ?.messages.find((m) => m.id === assistantMsg.id);
-        if (cur && !cur.retry) {
+        if (cur && !cur.retry && !cur.statusText) {
+          // Only fill when the backend has not named a phase itself: a
+          // backend status ("Contacting model") must not be stomped by the
+          // ticking fallback 25s later, or the pill flickers between the two
+          // every ladder cycle. The elapsed timer next to it keeps ticking.
           const secs = Math.floor(contentElapsed / 1000);
           const label = isToolRunning(toolRunning)
             ? `tool running (${secs}s)`
@@ -4806,6 +4814,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               model: activeProvider.model,
               providerId: activeProvider.id,
               reconnecting: true,
+              // Compact footer line on the message, never the transcript banner.
+              inline: true,
             },
           });
           // RESUME the same user turn WITHOUT truncating: retryMessage() would
@@ -5159,6 +5169,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           fallback: event.fallback,
           reconnecting: event.reconnecting,
           startedAt: Date.now(),
+          // Compact footer line on the message, never the transcript banner.
+          inline: true,
         };        if (isKeepTextRetry(event.reconnecting, event.fallback)) {
           // Backend automatic retry, client self-heal reconnect, OR a
           // sub-agent fallback notice: keep the already-streamed text and
@@ -5205,6 +5217,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             agent: event.agent ?? "",
             tool: event.tool ?? "",
             fallback: event.fallback,
+            // Compact footer line on the message, never the transcript banner.
+            inline: true,
           },
         });
       } else if (event.kind === "tool_result") {
@@ -5554,9 +5568,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // banner stuck next to the error. Clear it defensively (the backend's
         // own compact_failed event already does this on its normal path).
         useStore.getState().setChatCompacting(chat.id, false);
+        const errorReason = event.content ?? "The backend returned an error.";
+        // A DETERMINISTIC failure (4xx request/account rejection, exhausted
+        // quota) cannot be fixed by re-sending the same bytes: the automatic
+        // ladder below must not run, or a broken provider row costs 10 silent
+        // re-sends × 10s of "Working" before the same rejection repeats.
+        const deterministic = isDeterministicTurnError(errorReason);
         // Do NOT append the error text to the message content — errors are
-        // shown only in the notification banner (RetryBanner), not as inline
-        // chat bubbles. The `retry` object below is what triggers the banner;
+        // shown as the compact inline retry line in the message footer, not
+        // as inline chat bubbles. The `retry` object carries it there;
         // `error: true` keeps the failed-turn styling without rendering text.
         store.updateMessage(assistantMsg.id, {
           error: true,
@@ -5564,16 +5584,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // inflated to ~100% (the reason the provider cut the stream). Don't
           // persist it: the meter must fall back to the last completed turn.
           usage: undefined,
-          // Surface a Retry banner for plain backend errors too (not just
-          // retry_giveup/watchdog) so there's a one-click resume path.
+          // Compact inline line (never the banner) with a one-click resume.
           // retryMessage treats `error` as a failed turn, so the partial
           // stream + completed tools are kept instead of truncate-and-restart.
           retry: {
             attempt: 1,
             maxAttempts: 1,
             delay: 0,
-            reason: event.content ?? "The backend returned an error.",
+            reason: errorReason,
             gaveUp: true,
+            inline: true,
             model: activeProvider.model,
             providerId: activeProvider.id,
           },
@@ -5581,18 +5601,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // Fold the completed tool calls into content too — the backend fatal
         // arrives as an inline event, not a throw, so the catch path won't run.
         preserveToolActivity();
+        if (deterministic) return;
         // Recover from a transient provider failure WITHOUT making the user
         // click Retry: re-send the last user turn on a fixed 10s ladder, at most
         // 10 times, resuming into this same assistant bubble so the partial
         // reply and the completed tool calls are kept (restart=false → the
         // backend continues from its checkpoint instead of redoing the work).
-        // Once the ladder is exhausted the static banner above stays, so there
-        // is always a one-click manual path left.
+        // Once the ladder is exhausted the inline line switches to its
+        // kept-failing state, so there is always a one-click manual path left.
         const liveChat = useStore.getState().chats.find((c) => c.id === chat.id);
         const liveMsgs = liveChat?.messages ?? [];
         const lastUserMsg = [...liveMsgs].reverse().find((m) => m.role === "user");
         // Count from the per-chat REF, never from the message: the resend clears
-        // `retry` on the continuation bubble and the static give-up banner
+        // `retry` on the continuation bubble and the static give-up line
         // written just above reports `attempt: 1`, so a message-derived count
         // always re-read 1 and the ladder re-armed at "2/10" on every cycle —
         // the turn restarted every 10s forever and never reached its cap.
@@ -5604,10 +5625,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               attempt: spent + 1,
               maxAttempts: CHAT_ERROR_MAX_RETRIES,
               delay: CHAT_ERROR_RETRY_DELAY_MS / 1000,
-              reason: event.content ?? "The backend returned an error.",
+              reason: errorReason,
               model: activeProvider.model,
               providerId: activeProvider.id,
               reconnecting: true,
+              inline: true,
             },
           });
           const originId = chat.id;
@@ -5776,6 +5798,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               reasoningTokens: event.reasoning_tokens ?? 0,
               cacheReadTokens: event.cache_read_tokens ?? 0,
               cacheWriteTokens: event.cache_write_tokens ?? 0,
+              cacheReadReported: event.cache_read_reported ?? undefined,
+              cacheWriteReported: event.cache_write_reported ?? undefined,
             },
           });
         }
@@ -5790,6 +5814,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         flushPendingText();
         resolveStuckCards();
         useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined, lspStatus: undefined });
+        // The turn ENDED. A reconnecting inline retry line on this bubble has
+        // served its purpose (the turn either recovered or was ended by the
+        // backend) — clear it so a recovered turn does not keep showing a
+        // stale "retry 4/10" footer. A gaveUp line stays: it carries the
+        // manual Retry button for the failed turn.
+        {
+          const cur = useStore
+            .getState()
+            .chats.find((c) => c.id === chat.id)
+            ?.messages.find((m) => m.id === assistantMsg.id);
+          if (cur?.retry?.inline && cur.retry.reconnecting && !cur.retry.gaveUp) {
+            useStore.getState().updateMessage(assistantMsg.id, { retry: null });
+          }
+        }
         // Backend reports steers it discarded without injecting
         // (dropped_steer_ids). Keep them pending/visible so the auto-drain
         // below re-sends them as the next turn instead of losing them.
@@ -5839,12 +5877,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             useStore.getState().updateMessage(assistantMsg.id, { retry: null });
           }
         }
-        // Turn-finished alarm: the error sound when the turn ended in a backend
-        // failure (an inline `error` event always precedes this `done`
-        // sentinel), the alert sound on a successful completion. Silent in
-        // live voice: the answer is spoken, and an open mic would hear a chime
-        // as the user talking.
-        ringTurnAlarm(curMsg?.error === true ? "error" : "alert");
+        // Turn-finished alarm: the alert sound only on a successful
+        // completion — a turn that ended in a backend failure (an inline
+        // `error` event always precedes this `done` sentinel) stays silent,
+        // as does live voice (the answer is spoken, and an open mic would
+        // hear a chime as the user talking).
+        if (curMsg?.error !== true) ringTurnAlarm("alert");
       }
     };
 
@@ -5942,7 +5980,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           providers: Object.fromEntries(
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
-          compactAtPercent: s.settings.compactAtPercent ?? 80,
+          compactAtPercent:
+            chat.compactAtPercent ?? s.settings.compactAtPercent ?? 80,
           restart: overrides?.restart ?? false,
           goal: activeGoalForSend?.condition ?? null,
           goalTurns: typeof activeGoalForSend?.turns === "number" ? activeGoalForSend.turns : 0,
@@ -5957,9 +5996,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // knows what this turn already did instead of redoing it from scratch.
       if (watchdogAborted) {
         // Forced by the stall watchdog, not the user clicking Stop — the
-        // connection was silent for minutes straight. Surface a RETRY banner
-        // (with a Retry button that re-sends the same message) instead of a
-        // plain inline error, so the user has a one-click way to try again.
+        // connection was silent for minutes straight. Surface the compact
+        // inline retry line (with a Retry button that re-sends the same
+        // message) instead of a banner, so the user still has a one-click way
+        // to try again.
         useStore.getState().updateMessage(assistantMsg.id, {
           retry: {
             attempt: 1,
@@ -5969,16 +6009,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               "The connection went silent for too long and was closed automatically — the backend may have crashed or lost connectivity. Tap Retry to try again.",
             gaveUp: true,
             watchdog: true,
+            inline: true,
             model: activeProvider.model,
             providerId: activeProvider.id,
           },
         });
         preserveToolActivity();
-        ringTurnAlarm("error");
       } else if ((err as Error).name !== "AbortError") {
         handleEvent({ kind: "error", content: (err as Error).message });
         preserveToolActivity();
-        ringTurnAlarm("error");
       } else {
         // User-initiated Stop: the request was simply cancelled (no
         // retry/resume loop). Folding the completed tool calls into content is
@@ -6297,7 +6336,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         fallback: activeProvider,
         history,
         contextWindow: modelContextWindow(activeProvider, activeProvider.model),
-        compactAtPercent: useStore.getState().settings.compactAtPercent ?? 80,
+        compactAtPercent:
+          ch.compactAtPercent ?? useStore.getState().settings.compactAtPercent ?? 80,
         subagentThinking: s.subagentThinking,
         // The "Other" slot's own model may live on a DIFFERENT provider than
         // the chat. Sending the slot picks plus every provider config lets the
@@ -10855,7 +10895,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             liveError ||
             chat?.liveError ||
             chat?.ttsError ||
-            prefixNotice ||
             compacting) && (
               <div className="chat-notices">
                 {compacting && <CompactBanner progress={compactProgress} />}
@@ -11014,12 +11053,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     >
                       ✕
                     </button>
-                  </div>
-                )}
-                {prefixNotice && (
-                  <div className="notice-banner notice-prefix" dir="ltr">
-                    <span className="notice-icon">⌨</span>
-                    <span className="notice-text">{prefixNotice}</span>
                   </div>
                 )}
               </div>
@@ -12283,6 +12316,48 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                                 )
                               : "—"}
                           </span>
+                        </div>
+                        {/* Per-chat auto-compaction threshold: defaults to
+                            Settings → General; moving the slider overrides
+                            it for THIS chat only, reset restores the default. */}
+                        <div className="ctx-pop-compact-ctl">
+                          <div className="ctx-pop-compact-head">
+                            <span>Auto-compact at</span>
+                            <span className="ctx-pop-compact-pct">
+                              {chatCompactPercent}%
+                            </span>
+                          </div>
+                          <RangeSlider
+                            min={1}
+                            max={99}
+                            step={1}
+                            value={chatCompactPercent}
+                            onChange={(v) => {
+                              if (chat) useStore.getState().setChatCompactAtPercent(chat.id, v);
+                            }}
+                            ariaLabel="Auto-compaction threshold for this chat"
+                          />
+                          <div className="ctx-pop-compact-meta">
+                            {chat?.compactAtPercent != null ? (
+                              <>
+                                <span className="ctx-pop-override-tag">this chat only</span>
+                                <button
+                                  type="button"
+                                  className="ctx-pop-compact-reset"
+                                  onClick={() => {
+                                    if (chat)
+                                      useStore.getState().setChatCompactAtPercent(chat.id, null);
+                                  }}
+                                >
+                                  Reset to default {defaultCompactPercent}%
+                                </button>
+                              </>
+                            ) : (
+                              <span className="ctx-pop-compact-hint">
+                                Default (Settings → General) — drag to override for this chat
+                              </span>
+                            )}
+                          </div>
                         </div>
                         <button
                           type="button"

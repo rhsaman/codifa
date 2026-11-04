@@ -60,10 +60,13 @@ console.log('1) the General tab renders the Keyboard suggestions toggle:')
     check('renders without throwing', false, e)
   }
   check('shows the row label', html.includes('Keyboard suggestions'))
-  check('exposes the switch to assistive tech', html.includes('aria-label="Suppress keyboard suggestions"'))
+  // The label was renamed from "Suppress keyboard suggestions" (and the switch
+  // inverted to "suggestions on = checked") in the same change that moved the
+  // hint to "Off (default) is what a coding tool wants".
+  check('exposes the switch to assistive tech', html.includes('aria-label="Keyboard suggestions"'))
   check('uses the app switch markup', html.includes('plugin-switch') && html.includes('plugin-switch-track'))
   check('explains what it turns off', html.includes('autocorrect') && html.includes('inline predictions'))
-  check('is on for a fresh install', /Suppress keyboard suggestions"[^>]*checked/.test(html))
+  check('is off for a fresh install', !/aria-label="Keyboard suggestions"[^>]*checked/.test(html))
   // The neighbouring General settings must survive the insertion.
   check('kept the auto-compaction threshold row', html.includes('Auto-compaction threshold'))
   check('kept the history turn limit row', html.includes('History turn limit'))

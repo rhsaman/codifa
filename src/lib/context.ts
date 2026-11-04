@@ -378,12 +378,12 @@ export function priceForModel(
 /**
  * Billed cost (USD) for one model's accumulated usage.
  *
- * `input` already INCLUDES the cached portion for subset-convention providers
- * (OpenAI / OpenRouter / Google: `cache_read` is a subset of `input_tokens`),
- * so the cached tokens are split out and billed at their own (usually cheaper)
- * rate. The provider never reports a usage event with an `additive` cache flag
- * to the frontend, and every provider the app talks to uses the subset
- * convention, so this is the only correct formula here.
+ * `input` arrives INCLUSIVE of the cache share for EVERY provider — the
+ * backend normalizes additive (Anthropic-style) and subset (OpenAI-style)
+ * payloads to one inclusive number (see llm::NormalizedUsage) — so the cached
+ * tokens are split out and billed at their own (usually cheaper) rate here.
+ * Before that normalization an additive payload arrived with its exclusive
+ * input, and `input - read - write` clamped to 0 and undercounted the call.
  */
 export function computeUsageCost(
   price: ModelPricing | null,
@@ -477,10 +477,11 @@ const CONTEXT_BREAKDOWN_ORDER: ContextBreakdownKey[] = [
 /** Weighted average prompt-cache hit rate (0-100) across per-turn usages.
  *  Only cache READS are hits — cache WRITES are misses that fill the cache, so
  *  a cold turn (all writes, no reads) correctly rates 0%. Each turn contributes
- *  reads / denominator where the denominator is the full input footprint:
- *  subset-convention providers fold cache into input, so the denominator is
- *  input; additive providers keep cache outside input, so the denominator is
- *  input + reads + writes. Distinguish by whether input covers the cache. */
+ *  reads / denominator where the denominator is the full input footprint. The
+ *  backend now ships `input` INCLUSIVE of the cache share for every provider
+ *  (llm::NormalizedUsage), so the denominator is simply the input; the old
+ *  `input >= cache` shape-guess below remains as a belt for legacy events that
+ *  predate the normalization. */
 export function averageCacheHitRate(usages: TokenUsage[]): number | null {
   let hit = 0
   let denom = 0

@@ -1377,6 +1377,63 @@ pub fn list_plugins(root: &Path) -> Value {
     json!({ "plugins": plugins })
 }
 
+/// `plugin action=list` for the AGENT: one line per bundle — slug, display
+/// name, enabled state, skill count, connector and script names.
+///
+/// The full `plugin_view` JSON (manifest, keywords, commands, agents, hooks,
+/// absolute dir…) is what the Settings page needs; a model that only asked
+/// what is installed paid every bundle's whole manifest for it, and a store of
+/// ten bundles flooded the turn with JSON nothing read. The detail stays one
+/// call away: `plugin action=list slug=<slug>` (see [`plugin_detail`]).
+pub fn list_plugins_summary(root: &Path) -> String {
+    let plugins = list_plugins(root)["plugins"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if plugins.is_empty() {
+        return "(no plugin bundles installed)".to_string();
+    }
+    let mut out = String::new();
+    for p in plugins {
+        let slug = p["slug"].as_str().unwrap_or_default();
+        let name = p["name"].as_str().unwrap_or(slug);
+        let enabled = if p["enabled"].as_bool().unwrap_or(false) { "on" } else { "off" };
+        let skills = p["skills"].as_array().map(|a| a.len()).unwrap_or(0);
+        out.push_str(&format!(
+            "- {slug} — {name} [{enabled}] — {skills} skill(s); connectors: {}; scripts: {}\n",
+            name_list(&p["mcp"]),
+            name_list(&p["scripts"]),
+        ));
+    }
+    out
+}
+
+/// A JSON array of strings as a comma list, `none` when empty.
+fn name_list(v: &Value) -> String {
+    let names: Vec<&str> = v
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// One bundle's FULL manifest — what `plugin action=list slug=<slug>` returns.
+///
+/// The compact list names the slugs; this is the drill-in, so the model pays a
+/// bundle's whole manifest only when it is about to work with that bundle.
+pub fn plugin_detail(root: &Path, slug: &str) -> Result<Value, String> {
+    if read_manifest(root, slug).is_none() {
+        return Err(format!(
+            "plugin not found: {slug} — action=list names the installed slugs"
+        ));
+    }
+    Ok(plugin_view(root, slug))
+}
+
 /// Create a plugin. Fails on an existing slug so an accidental create can never
 /// overwrite a bundle the user already has (that is `update_plugin`'s job).
 pub fn create_plugin(root: &Path, body: &Value) -> Result<Value, String> {
@@ -2965,6 +3022,7 @@ fn plugin_skills(root: &Path, include_disabled: bool) -> Vec<Value> {
             continue;
         }
         let label = manifest["name"].as_str().unwrap_or(&slug).to_string();
+        let description = manifest["description"].as_str().unwrap_or_default().to_string();
         let listed = crate::skills::list_skills(&plugin_dir(root, &slug));
         for mut row in listed["skills"]
             .as_array()
@@ -2975,6 +3033,10 @@ fn plugin_skills(root: &Path, include_disabled: bool) -> Vec<Value> {
             // A skill's keywords are its OWN, never the bundle's, and they are
             // data only now — selection runs off the description in the catalog.
             row["plugin"] = json!(label);
+            // The bundle's own description rides along (read-only data, like
+            // the label): the catalog's bundle rungs describe a group with the
+            // bundle's own line instead of inventing one from its skills.
+            row["plugin_description"] = json!(description);
             row["plugin_slug"] = json!(slug);
             row["plugin_enabled"] = json!(enabled);
             out.push(row);

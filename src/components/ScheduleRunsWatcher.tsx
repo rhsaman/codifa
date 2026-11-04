@@ -28,7 +28,8 @@ function openInbox(): void {
  * It owns the two things that must work while the inbox page is CLOSED:
  *  - it publishes the polled run rows (`useScheduleRunsLive`), which the
  *    dock's Inbox icon turns into its unread badge;
- *  - it raises the OS notification + alarm when a run FINISHES.
+ *  - it raises the OS notification when a run FINISHES, plus the alarm
+ *    chime on a successful run (errored runs notify silently).
  *
  * A run that is still `running` never notifies and never counts toward the
  * badge — only the transition to done/error does (`findFinishedScheduleRuns`
@@ -54,7 +55,9 @@ export function ScheduleRunsWatcher(): null {
         if (prev !== null) {
           const finished = findFinishedScheduleRuns(prev, out);
           for (const r of finished) {
-            playAlarm(r.status === "error" ? "error" : "alert");
+            // Errored runs stay silent (the error alarm was removed); the
+            // OS notification below still announces them.
+            if (r.status !== "error") playAlarm("alert");
           }
           if (finished.length > 0 && (await ensureScheduleNotificationPermission())) {
             if (finished.length === 1) {

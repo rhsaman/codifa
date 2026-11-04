@@ -1030,7 +1030,7 @@ pub async fn generate_image(
     let payload = if google {
         let url = gemini_media_url(
             &target.base_url,
-            &format!("models/{}:generateContent", target.model),
+            &format!("models/{}:generateContent", crate::llm::google_model_name(&target.model)),
         );
         let body = gemini_image_body(prompt, None);
         let resp = post_json(&url, &target.keys, &body, true, timeout).await?;
@@ -1236,7 +1236,7 @@ pub async fn edit_image(
     if google {
         let url = gemini_media_url(
             &target.base_url,
-            &format!("models/{}:generateContent", target.model),
+            &format!("models/{}:generateContent", crate::llm::google_model_name(&target.model)),
         );
         let reference = match &composite {
             Some((_, crop, _, _)) => Some((crop.as_raw().as_slice(), "image/png")),
@@ -1415,7 +1415,7 @@ pub async fn generate_video(
     let (video_bytes, mime) = if is_google(&target.kind) {
         let url = gemini_media_url(
             &target.base_url,
-            &format!("models/{}:predictLongRunning", target.model),
+            &format!("models/{}:predictLongRunning", crate::llm::google_model_name(&target.model)),
         );
         let body = {
             let reference_ref = reference.as_ref().map(|(b, m)| (b.as_slice(), *m));

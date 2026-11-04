@@ -381,7 +381,9 @@ pub struct GitAutoCommitBody {
 const COMMIT_MAX_CYCLES: usize = 3;
 
 /// Pause between two passes over the list, so dead rungs are not hammered.
-const COMMIT_CYCLE_PAUSE_SECS: u64 = 4;
+/// The ONLY pause in the walk — a failing rung hands the call to the next
+/// model immediately.
+const COMMIT_CYCLE_PAUSE_SECS: u64 = 10;
 
 /// Stage everything, ask the model for a Conventional-Commits message from the
 /// real diff, and commit with it. Runs natively: the renderer's Commit button
@@ -1608,25 +1610,21 @@ fn normalize_compact_usage(
     model: &str,
     provider_id: &str,
 ) -> Option<Value> {
-    let obj = raw?.as_object()?.clone();
-    let num = |k: &str| obj.get(k).and_then(|v| v.as_u64());
-    let input = num("input_tokens")
-        .or_else(|| num("prompt_tokens"))
-        .or_else(|| num("promptTokenCount"));
-    let output = num("output_tokens")
-        .or_else(|| num("completion_tokens"))
-        .or_else(|| num("candidatesTokenCount"));
-    let cache_read = num("cache_read_tokens").or_else(|| num("cache_read_input_tokens"));
-    let cache_write =
-        num("cache_write_tokens").or_else(|| num("cache_creation_input_tokens"));
+    // The shared shape-based normalizer (see `llm::NormalizedUsage`):
+    // `input_tokens` leaves here INCLUSIVE of the cache share, so the
+    // frontend's cost math (fresh = input − read − write) and its cache-hit
+    // denominator are right for additive (Anthropic-style) payloads too —
+    // passing the raw exclusive input through made every Anthropic-shaped
+    // call undercount its real footprint.
+    let u = crate::llm::NormalizedUsage::from_payload(raw.as_ref().unwrap_or(&Value::Null))?;
     let mut norm = serde_json::Map::new();
-    norm.insert("input_tokens".into(), json!(input.unwrap_or(0)));
-    norm.insert("output_tokens".into(), json!(output.unwrap_or(0)));
-    if let Some(v) = cache_read {
-        norm.insert("cache_read_tokens".into(), json!(v));
+    norm.insert("input_tokens".into(), json!(u.input_total));
+    norm.insert("output_tokens".into(), json!(u.output_tokens));
+    if u.cache_read_reported {
+        norm.insert("cache_read_tokens".into(), json!(u.cache_read));
     }
-    if let Some(v) = cache_write {
-        norm.insert("cache_write_tokens".into(), json!(v));
+    if u.cache_write_reported {
+        norm.insert("cache_write_tokens".into(), json!(u.cache_write));
     }
     // The model that ACTUALLY ran the summarizer (the compact slot may
     // route cross-provider) — the frontend groups usage under it. The
@@ -3445,8 +3443,31 @@ mod tests {
         .unwrap();
         assert_eq!(u["input_tokens"], 9);
         assert_eq!(u["output_tokens"], 2);
+        // An ANTHROPIC-SHAPED payload leaves INCLUSIVE: the frontend's cost
+        // math subtracts read+write from input, so the raw exclusive number
+        // used to undercount every Anthropic call.
+        let u = normalize_compact_usage(
+            Some(json!({
+                "input_tokens": 2_000u64,
+                "output_tokens": 3u64,
+                "cache_read_input_tokens": 18_000u64,
+                "cache_creation_input_tokens": 1_000u64,
+            })),
+            "m",
+            "p",
+        )
+        .unwrap();
+        assert_eq!(u["input_tokens"], 21_000);
+        assert_eq!(u["cache_read_tokens"], 18_000);
+        assert_eq!(u["cache_write_tokens"], 1_000);
         // An empty provider id is omitted, never stored as "".
-        assert!(u.get("provider_id").is_none());
+        let no_provider = normalize_compact_usage(
+            Some(json!({ "promptTokenCount": 9, "candidatesTokenCount": 2 })),
+            "m",
+            "",
+        )
+        .unwrap();
+        assert!(no_provider.get("provider_id").is_none());
 
         // Missing/empty usage -> None (frontend skips accrual entirely).
         assert!(normalize_compact_usage(None, "m", "p").is_none());

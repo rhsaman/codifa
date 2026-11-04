@@ -36,7 +36,8 @@ import { RangeSlider } from './RangeSlider'
 import { ProviderModelSelect } from './ProviderModelSelect'
 import { supportsReasoning } from '../lib/thinking'
 import { STT_LANGUAGES } from '../lib/stt'
-import { OTHER_SLOTS, moveFallback, otherSlotFallbacks, otherSlotLevel, otherSlotModel, resolveSlotEntry, splitSlotEntry, toolChainRows, toolChainSet, toolFallbackToModel, toolFallbackValue } from '../lib/toolSlots'
+import { OTHER_SLOTS, otherSlotFallbacks, otherSlotLevel, otherSlotModel, resolveSlotEntry, splitSlotEntry, toolChainRows, toolChainSet, toolFallbackToModel, toolFallbackValue } from '../lib/toolSlots'
+import { moveAt, useDragReorder } from '../lib/useDragReorder'
 import { modelReasoning } from '../lib/context'
 import {
   THINKING_OPTIONS,
@@ -48,6 +49,113 @@ const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .filter((m) => m.builtin)
   .map((m) => m.kind)
 const NEW_SKILL_KEY = '__new_skill__'
+
+/** The drag affordance shared by every reorderable Settings list (Tools
+ *  fallback chains, Web Provider engines, Media Provider ladders): six dots
+ *  at the row's start. Draggability comes from useDragReorder's handleProps. */
+function GripDots() {
+  return (
+    <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden="true">
+      <circle cx="2.8" cy="2" r="1.4" />
+      <circle cx="7.2" cy="2" r="1.4" />
+      <circle cx="2.8" cy="7" r="1.4" />
+      <circle cx="7.2" cy="7" r="1.4" />
+      <circle cx="2.8" cy="12" r="1.4" />
+      <circle cx="7.2" cy="12" r="1.4" />
+    </svg>
+  )
+}
+
+/** Human-scaled stops for the context-window picker — powers of two plus the
+ *  two market outliers everyone actually hits (Claude's 200K, GPT-5's 400K).
+ *  Custom providers whose /models reports no window need this typed by hand
+ *  today; the slider snaps to these, the exact field takes anything else. */
+const CTX_STEPS = [
+  4096, 8192, 16384, 32768, 65536, 131072, 200000, 262144, 400000, 524288, 1048576, 2097152,
+]
+
+function formatCtxTokens(n: number): string {
+  if (n >= 1048576) {
+    const m = n / 1048576
+    return `${Number.isInteger(m) ? m : m.toFixed(1).replace(/\.0$/, '')}M`
+  }
+  return `${Math.round(n / 1024)}K`
+}
+
+/** Nearest picker stop for an arbitrary fetched/typed window. */
+function nearestCtxStep(n: number): number {
+  let best = 0
+  let bestDist = Infinity
+  for (let i = 0; i < CTX_STEPS.length; i++) {
+    const d = Math.abs(CTX_STEPS[i] - n)
+    if (d < bestDist) {
+      bestDist = d
+      best = i
+    }
+  }
+  return best
+}
+
+/** The context-window picker for custom providers: a snapping slider over
+ *  CTX_STEPS with tick labels, a live formatted readout, and an exact-value
+ *  field for windows off the scale (the thumb parks on the nearest stop). */
+function ContextSizeSlider({
+  value,
+  onChange,
+}: {
+  value: number | null
+  onChange: (n: number | null) => void
+}) {
+  const idx = value ? nearestCtxStep(value) : 0
+  return (
+    <div className="ctx-picker">
+      <div className="ctx-picker-head">
+        <span className="field-label">Context window</span>
+        <span className={`ctx-picker-value${value ? '' : ' unset'}`}>
+          {value ? `${formatCtxTokens(value)} tokens` : 'not set'}
+        </span>
+      </div>
+      <div className="ctx-picker-row">
+        <div className="ctx-picker-slider">
+          <RangeSlider
+            min={0}
+            max={CTX_STEPS.length - 1}
+            step={1}
+            value={idx}
+            onChange={(i) => onChange(CTX_STEPS[i])}
+            ariaLabel="Context window size"
+          />
+          <div className="ctx-picker-ticks" aria-hidden="true">
+            {CTX_STEPS.map((s, i) => (
+              <span
+                key={s}
+                className={`ctx-tick${i === idx ? ' on' : ''}`}
+                style={{ left: `${(i / (CTX_STEPS.length - 1)) * 100}%` }}
+              >
+                {formatCtxTokens(s)}
+              </span>
+            ))}
+          </div>
+        </div>
+        <input
+          className="ctx-picker-exact"
+          type="number"
+          min={1024}
+          step={1024}
+          value={value ?? ''}
+          onChange={(e) => {
+            const n = parseInt(e.target.value, 10)
+            onChange(Number.isFinite(n) && n > 0 ? n : null)
+          }}
+          placeholder="exact"
+          title="Exact context window in tokens — overrides the slider"
+          dir="ltr"
+          aria-label="Exact context window in tokens"
+        />
+      </div>
+    </div>
+  )
+}
 
 /** Row key for a skill: a plugin's skills are scoped by their bundle, because
  *  two bundles (or a bundle and the user's own store) may ship the same name. */
@@ -1094,15 +1202,17 @@ function PluginEditor() {
     ? searchPlugins
     : [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }]
 
-  const move = (index: number, dir: -1 | 1) => {
-    const next = [...plugins]
-    const target = index + dir
-    if (target < 0 || target >= next.length) return
-    const [a, b] = [next[index], next[target]]
-    next[index] = { ...b, order: index }
-    next[target] = { ...a, order: target }
-    setSearchPlugins(next)
-  }
+  // Drag-to-reorder replaces the up/down arrows: the top engine is the
+  // primary, so a drop above row 1 promotes its target. Renumber `order`
+  // after every move so the stored list never carries stale positions.
+  const { dragIndex, shiftStyle, handleProps, rowProps } = useDragReorder(
+    'web-engines',
+    plugins.length,
+    (from, insertAt) => {
+      const next = moveAt(plugins, from, insertAt).map((p, i) => ({ ...p, order: i }))
+      setSearchPlugins(next)
+    },
+  )
 
   const toggle = (index: number, enabled: boolean) => {
     setSearchPlugins(plugins.map((p, i) => (i === index ? { ...p, enabled } : p)))
@@ -1140,8 +1250,19 @@ function PluginEditor() {
           {plugins.map((p, i) => {
             const meta = SEARCH_ENGINE_KINDS.find((k) => k.kind === p.kind)
             return (
-              <div className={`plugin-row${p.enabled ? '' : ' off'}`} key={p.kind}>
+              <div
+                className={`plugin-row${p.enabled ? '' : ' off'}${
+                  dragIndex !== null ? ' dnd-shifting' : ''
+                }${dragIndex === i ? ' dnd-dragging' : ''}`}
+                key={p.kind}
+                data-drag-row
+                {...rowProps(i)}
+                style={shiftStyle(i)}
+              >
                 <div className="plugin-row-head">
+                  <span className="dnd-grip" title="Drag to reorder" {...handleProps(i)}>
+                    <GripDots />
+                  </span>
                   <span className="plugin-kind">{p.label}</span>
                   {i === 0 ? (
                     <span className="plugin-badge primary">Primary</span>
@@ -1152,31 +1273,13 @@ function PluginEditor() {
                     {p.enabled ? (i === 0 ? 'used first' : 'tried next') : 'disabled'}
                   </span>
                   <span className="plugin-spacer" />
-                  <span className="plugin-arrows">
-                    <button
-                      className="btn tiny icon"
-                      title="Move up"
-                      disabled={i === 0}
-                      onClick={() => move(i, -1)}
-                    >
-                      ↑
-                    </button>
-                    <button
-                      className="btn tiny icon"
-                      title="Move down"
-                      disabled={i === plugins.length - 1}
-                      onClick={() => move(i, 1)}
-                    >
-                      ↓
-                    </button>
-                    <button
-                      className="btn tiny icon danger"
-                      title="Remove"
-                      onClick={() => removeEngine(i)}
-                    >
-                      ×
-                    </button>
-                  </span>
+                  <button
+                    className="btn tiny icon danger plugin-remove"
+                    title="Remove"
+                    onClick={() => removeEngine(i)}
+                  >
+                    ×
+                  </button>
                   <label className="plugin-switch" title={p.enabled ? 'Disable' : 'Enable'}>
                     <input
                       type="checkbox"
@@ -1329,6 +1432,19 @@ function FallbackRows({
     if (split.own !== own) onOwn(split.own)
     if (!sameRows(split.fallbacks, rows)) onChange(split.fallbacks)
   }
+  // Drag-to-reorder replaces the up/down arrows: the try order IS the list
+  // order, so dropping a rung above/below another one rewrites the chain,
+  // and row 1 (the tool's OWN model) is just wherever the drop lands.
+  // Tab-bar drag feel: rows slide into their previewed slots while dragging.
+  const { dragIndex, shiftStyle, handleProps, rowProps } = useDragReorder(
+    `tools-${label}`,
+    chain.length,
+    (from, insertAt) => commit(moveAt(chain, from, insertAt)),
+  )
+  const rowClass = (i: number, isOwn: boolean) =>
+    `slot-fallback-row${isOwn ? ' slot-fallback-row-own' : ''}${
+      dragIndex !== null ? ' dnd-shifting' : ''
+    }${dragIndex === i ? ' dnd-dragging' : ''}`
   return (
     <div className="slot-fallbacks">
       {chain.map((fb, i) => {
@@ -1336,8 +1452,16 @@ function FallbackRows({
         return (
           <div
             key={isOwn ? 'own' : i}
-            className={`slot-fallback-row${isOwn ? ' slot-fallback-row-own' : ''}`}
+            data-drag-row
+            {...rowProps(i)}
+            style={shiftStyle(i)}
+            className={rowClass(i, isOwn)}
           >
+            {/* Grip starts the drag; the rest of the row stays interactive
+                (the model picker must keep its dropdown). */}
+            <span className="dnd-grip" title="Drag to reorder" {...handleProps(i)}>
+              <GripDots />
+            </span>
             {/* The position in the try order, so a long list stays readable at
                 a glance. aria-hidden: the buttons already announce it. */}
             <span className="slot-fallback-order" aria-hidden="true">
@@ -1367,28 +1491,10 @@ function FallbackRows({
               />
             </div>
             <div className="slot-fallback-actions">
-              <button
-                type="button"
-                className="icon-btn"
-                title="Move up — tried earlier"
-                aria-label={`Move ${label} model ${i + 1} up`}
-                disabled={i === 0}
-                onClick={() => commit(moveFallback(chain, i, -1))}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6" /></svg>
-              </button>
-              <button
-                type="button"
-                className="icon-btn"
-                title="Move down — tried later"
-                aria-label={`Move ${label} model ${i + 1} down`}
-                disabled={i === chain.length - 1}
-                onClick={() => commit(moveFallback(chain, i, 1))}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-              </button>
-              {/* Row 1 always exists: dropping the tool's model is done by
-                  pointing it at the composer's model, not by deleting a row. */}
+              {/* Reordering is drag-only now (grip on the row's start), so
+                  the arrows are gone; row 1 always exists — dropping the
+                  tool's model is done by pointing it at the composer's
+                  model, not by deleting a row. */}
               {!isOwn && (
                 <button
                   type="button"
@@ -1493,18 +1599,38 @@ function MediaFallbackList<R extends { providerId: string; model: string; voice?
     const row = { providerId: firstRoutable, model: '', ...(withVoice ? { voice: '' } : {}) }
     onChange([...rows, row as R])
   }
+  // Drag-to-reorder: "tried in order" is the row order, so the grip at each
+  // card's start rewrites it — no arrows needed. Tab-bar drag feel: rows
+  // slide into their previewed slots while dragging.
+  const { dragIndex, shiftStyle, handleProps, rowProps } = useDragReorder(
+    `media-${label}`,
+    rows.length,
+    (from, insertAt) => onChange(moveAt(rows, from, insertAt)),
+  )
   return (
     <div className="voice-fallbacks">
       <label className="field-label">{label}</label>
-      <div className="hint">Tried in order when the primary fails — top first.</div>
+      <div className="hint">Tried in order when the primary fails — top first. Drag a row to reorder.</div>
       <div className="voice-fallback-head" aria-hidden="true">
+        <span className="voice-col-drag" />
         <span className="voice-col-provider">Provider</span>
         <span className="voice-col-model">Model</span>
         {withVoice && <span className="voice-col-voice">Voice</span>}
         <span className="voice-head-remove" />
       </div>
       {rows.map((fb, i) => (
-        <div key={i} className="voice-fallback-card">
+        <div
+          key={i}
+          className={`voice-fallback-card${
+            dragIndex !== null ? ' dnd-shifting' : ''
+          }${dragIndex === i ? ' dnd-dragging' : ''}`}
+          data-drag-row
+          {...rowProps(i)}
+          style={shiftStyle(i)}
+        >
+          <span className="dnd-grip voice-col-drag" title="Drag to reorder" {...handleProps(i)}>
+            <GripDots />
+          </span>
           <div className="voice-col-provider">
             <MediaProviderSelect
               value={fb.providerId}
@@ -2443,14 +2569,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const removeKey = (idx: number) => {
     setCfg({ ...cfg, apiKeys: cfgKeys.filter((_, i) => i !== idx) })
   }
-  const moveKey = (idx: number, dir: -1 | 1) => {
-    const j = idx + dir
-    if (j < 0 || j >= cfgKeys.length) return
-    const next = [...cfgKeys]
-    const [k] = next.splice(idx, 1)
-    next.splice(j, 0, k)
-    setCfg({ ...cfg, apiKeys: next })
-  }
+  // Drag-to-reorder replaces the up/down arrows: the try order IS the list
+  // order (top key first, next key on key errors), so the grip rewrites it.
+  const keyDnd = useDragReorder(
+    'api-keys',
+    cfgKeys.length,
+    (from, insertAt) => setCfg({ ...cfg, apiKeys: moveAt(cfgKeys, from, insertAt) }),
+  )
 
   // Extra request headers. Sent verbatim with every call to this provider, which
   // is how a gateway that only answers its own client (OpenCode Zen's
@@ -2700,7 +2825,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   return (
     <div className="modal-overlay">
       <div className="modal modal-wide settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
-        <div className="settings-header">
+        {/* deep drag region: mousedown drags the window, double-click
+            maximizes/restores it — while Settings covers the whole window
+            these are the only handles left. The close button below is a
+            clickable element, so Tauri's drag script leaves it alone. */}
+        <div className="settings-header" data-tauri-drag-region="deep">
           <div className="settings-header-title">
             <h2>Settings</h2>
             <span className="settings-header-tab">{TABS.find((t) => t.id === tab)?.label}</span>
@@ -2899,7 +3028,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
                 <div className="api-key-list">
                   {cfgKeys.map((k, i) => (
-                    <div key={i} className="api-key-row">
+                    <div
+                      key={i}
+                      className={`api-key-row${
+                        keyDnd.dragIndex !== null ? ' dnd-shifting' : ''
+                      }${keyDnd.dragIndex === i ? ' dnd-dragging' : ''}`}
+                      data-drag-row
+                      {...keyDnd.rowProps(i)}
+                      style={keyDnd.shiftStyle(i)}
+                    >
+                      <span className="dnd-grip" title="Drag to reorder" {...keyDnd.handleProps(i)}>
+                        <GripDots />
+                      </span>
                       <span className="api-key-order" title={i === 0 ? 'Tried first' : `Fallback #${i + 1} — tried after key ${i}`}>{i + 1}</span>
                       <input
                         className="api-key-input"
@@ -2922,13 +3062,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                           ) : (
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
                           )}
-                        </button>
-                        <span className="api-key-sep" aria-hidden="true" />
-                        <button type="button" className="icon-btn" title="Move up" aria-label="Move key up" disabled={i === 0} onClick={() => moveKey(i, -1)}>
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6" /></svg>
-                        </button>
-                        <button type="button" className="icon-btn" title="Move down" aria-label="Move key down" disabled={i === cfgKeys.length - 1} onClick={() => moveKey(i, 1)}>
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
                         </button>
                         <span className="api-key-sep" aria-hidden="true" />
                         <button type="button" className="icon-btn danger" title="Remove key" aria-label="Remove key" onClick={() => removeKey(i)}>
@@ -2981,28 +3114,76 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 signature. An <code>Authorization</code> header here replaces the API-key one. Values are
                 encrypted when you press Save.
               </div>
-              {cfgHeaders.map((h, i) => (
-                <div key={`${h.key}-${i}`} className="api-key-row">
+              {/* Same gap container as the API-key list — previously the header
+                  rows rendered bare, so they stacked flush with no spacing. */}
+              <div className="api-key-list">
+                {cfgHeaders.map((h, i) => (
+                  <div key={`${h.key}-${i}`} className="api-key-row api-header-row">
+                    <input
+                      className="api-key-input"
+                      value={h.key}
+                      onChange={(e) => {
+                        const next = [...cfgHeaders]
+                        next[i] = { ...next[i], key: e.target.value }
+                        setHeaders(next)
+                      }}
+                      placeholder="Header name"
+                      dir="ltr"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <input
+                      className="api-key-input"
+                      value={h.value}
+                      onChange={(e) => {
+                        const next = [...cfgHeaders]
+                        next[i] = { ...next[i], value: e.target.value }
+                        setHeaders(next)
+                      }}
+                      placeholder="Value"
+                      dir="ltr"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <div className="api-key-actions">
+                      <button
+                        type="button"
+                        className="icon-btn danger"
+                        title="Remove header"
+                        aria-label="Remove header"
+                        onClick={() => setHeaders(cfgHeaders.filter((_, j) => j !== i))}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                      </button>
+                    </div>
+                  </div>
+                 ))}
+                <div className="api-key-row add">
+                  <span className="api-key-order new" title="New header">+</span>
                   <input
                     className="api-key-input"
-                    value={h.key}
-                    onChange={(e) => {
-                      const next = [...cfgHeaders]
-                      next[i] = { ...next[i], key: e.target.value }
-                      setHeaders(next)
+                    value={newHeader.key}
+                    onChange={(e) => setNewHeader((h) => ({ ...h, key: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        addHeader()
+                      }
                     }}
-                    placeholder="Header name"
+                    placeholder="Header name — e.g. x-opencode-client"
                     dir="ltr"
                     autoComplete="off"
                     spellCheck={false}
                   />
                   <input
                     className="api-key-input"
-                    value={h.value}
-                    onChange={(e) => {
-                      const next = [...cfgHeaders]
-                      next[i] = { ...next[i], value: e.target.value }
-                      setHeaders(next)
+                    value={newHeader.value}
+                    onChange={(e) => setNewHeader((h) => ({ ...h, value: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        addHeader()
+                      }
                     }}
                     placeholder="Value"
                     dir="ltr"
@@ -3010,54 +3191,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     spellCheck={false}
                   />
                   <div className="api-key-actions">
-                    <button
-                      type="button"
-                      className="icon-btn danger"
-                      title="Remove header"
-                      aria-label="Remove header"
-                      onClick={() => setHeaders(cfgHeaders.filter((_, j) => j !== i))}
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                    <button type="button" className="btn tiny primary" disabled={!newHeader.key.trim()} onClick={addHeader}>
+                      Add
                     </button>
                   </div>
-                </div>
-              ))}
-              <div className="api-key-row add">
-                <span className="api-key-order new" title="New header">+</span>
-                <input
-                  className="api-key-input"
-                  value={newHeader.key}
-                  onChange={(e) => setNewHeader((h) => ({ ...h, key: e.target.value }))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      addHeader()
-                    }
-                  }}
-                  placeholder="Header name — e.g. x-opencode-client"
-                  dir="ltr"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <input
-                  className="api-key-input"
-                  value={newHeader.value}
-                  onChange={(e) => setNewHeader((h) => ({ ...h, value: e.target.value }))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      addHeader()
-                    }
-                  }}
-                  placeholder="Value"
-                  dir="ltr"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <div className="api-key-actions">
-                  <button type="button" className="btn tiny primary" disabled={!newHeader.key.trim()} onClick={addHeader}>
-                    Add
-                  </button>
                 </div>
               </div>
             </div>
@@ -3101,25 +3238,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   autoComplete="off"
                   spellCheck={false}
                 />
-                {isCustomKind && (
-                  <input
-                    className="manual-model-ctx"
-                    type="number"
-                    min={1024}
-                    step={1024}
-                    value={manualContext}
-                    onChange={(e) => setManualContext(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault()
-                        commitManualModel()
-                      }
-                    }}
-                    placeholder="context (tokens)"
-                    title="Context window in tokens for this custom model"
-                    dir="ltr"
-                  />
-                )}
                 <button
                   type="button"
                   className="btn tiny"
@@ -3129,10 +3247,16 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   Add
                 </button>
               </div>
+              {isCustomKind && (
+                <ContextSizeSlider
+                  value={manualContext === '' ? null : Number(manualContext) || null}
+                  onChange={(n) => setManualContext(n === null ? '' : String(n))}
+                />
+              )}
               <div className="hint">
                 For gateways that don’t list their models (or the fetch fails). The model is kept even
                 when the live catalog is unreachable, and can be picked in the composer.
-                {isCustomKind && ' Enter the context window (tokens) next to the id — it overrides the value fetched from /models.'}
+                {isCustomKind && ' Pick the context window below the id — it overrides the value fetched from /models.'}
               </div>
               {(() => {
                 const live = useStore.getState().settings.providers.find((p) => p.id === active.id)
@@ -3775,27 +3899,29 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
-                    <div className="voice-field">
-                      <label className="field-label">STT provider</label>
-                    <MediaProviderSelect value={sttProviderId} onChange={setSttProviderId} emptyLabel="Not selected" />
+                    <div className="voice-fields-row">
+                      <div className="voice-field">
+                        <label className="field-label">STT provider</label>
+                        <MediaProviderSelect value={sttProviderId} onChange={setSttProviderId} emptyLabel="Not selected" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">STT model</label>
+                        <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">STT language</label>
+                        <select value={sttLanguage ?? ''} onChange={(e) => setSttLanguage(e.target.value)} dir="ltr">
+                          {STT_LANGUAGES.map((l) => (
+                            <option key={l.code || 'auto'} value={l.code}>
+                              {l.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
-                    <div className="voice-field">
-                      <label className="field-label">STT model</label>
-                    <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">STT language</label>
-                    <select value={sttLanguage ?? ''} onChange={(e) => setSttLanguage(e.target.value)} dir="ltr">
-                      {STT_LANGUAGES.map((l) => (
-                        <option key={l.code || 'auto'} value={l.code}>
-                          {l.label}
-                        </option>
-                      ))}
-                    </select>
                     <div className="hint">
                       Without an explicit language, Whisper mis-detects the language on short
                       clips and Persian words come out garbled.
-                    </div>
                     </div>
                   </div>
                   <MediaFallbackList
@@ -3817,17 +3943,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
-                    <div className="voice-field">
-                      <label className="field-label">TTS provider</label>
-                    <MediaProviderSelect value={ttsProviderId} onChange={setTtsProviderId} emptyLabel="Not selected" />
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">TTS model</label>
-                    <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" />
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">TTS voice</label>
-                    <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
+                    <div className="voice-fields-row">
+                      <div className="voice-field">
+                        <label className="field-label">TTS provider</label>
+                        <MediaProviderSelect value={ttsProviderId} onChange={setTtsProviderId} emptyLabel="Not selected" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">TTS model</label>
+                        <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">TTS voice</label>
+                        <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
+                      </div>
                     </div>
                   </div>
 
@@ -3851,22 +3979,22 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
-                    <div className="voice-field">
-                      <label className="field-label">Image provider</label>
-                    <MediaProviderSelect value={imageProviderId} onChange={setImageProviderId} emptyLabel="Not selected" />
+                    <div className="voice-fields-row">
+                      <div className="voice-field">
+                        <label className="field-label">Image provider</label>
+                        <MediaProviderSelect value={imageProviderId} onChange={setImageProviderId} emptyLabel="Not selected" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">Image model</label>
+                        <input value={imageModel} onChange={(e) => setImageModel(e.target.value)} dir="ltr" placeholder="gpt-image-1" />
+                      </div>
+                    </div>
                     <div className="hint">
                       OpenAI-compatible endpoints (<code>/images/generations</code>,{' '}
                       <code>/images/edits</code>), Google Gemini and OpenRouter are supported.
                       Generated files are saved under <code>~/.codifa/media</code> in the chat's
-                      own folder and deleted with the chat.
-                    </div>
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">Image model</label>
-                    <input value={imageModel} onChange={(e) => setImageModel(e.target.value)} dir="ltr" placeholder="gpt-image-1" />
-                    <div className="hint">
-                      The default — the agent may request a different model in the same request.
-                    </div>
+                      own folder and deleted with the chat. The default — the agent may request
+                      a different model in the same request.
                     </div>
                   </div>
 
@@ -3889,21 +4017,21 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
-                    <div className="voice-field">
-                      <label className="field-label">Video provider</label>
-                    <MediaProviderSelect value={videoProviderId} onChange={setVideoProviderId} emptyLabel="Not selected" />
+                    <div className="voice-fields-row">
+                      <div className="voice-field">
+                        <label className="field-label">Video provider</label>
+                        <MediaProviderSelect value={videoProviderId} onChange={setVideoProviderId} emptyLabel="Not selected" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">Video model</label>
+                        <input value={videoModel} onChange={(e) => setVideoModel(e.target.value)} dir="ltr" placeholder="sora-2" />
+                      </div>
+                    </div>
                     <div className="hint">
                       OpenAI-compatible Sora format (<code>/videos</code>), Google Veo (
                       <code>predictLongRunning</code>) and OpenRouter are supported. Local
                       trim/merge runs through ffmpeg (downloaded automatically on first use).
-                    </div>
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">Video model</label>
-                    <input value={videoModel} onChange={(e) => setVideoModel(e.target.value)} dir="ltr" placeholder="sora-2" />
-                    <div className="hint">
                       The default — the agent may request a different model in the same request.
-                    </div>
                     </div>
                   </div>
 
@@ -3926,26 +4054,28 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
-                    <div className="voice-field">
-                      <label className="field-label">Realtime provider (optional)</label>
-                    <MediaProviderSelect
-                      value={liveProviderId}
-                      onChange={setLiveProviderId}
-                      emptyLabel="Not selected — chunked STT + TTS"
-                    />
+                    <div className="voice-fields-row">
+                      <div className="voice-field">
+                        <label className="field-label">Realtime provider (optional)</label>
+                        <MediaProviderSelect
+                          value={liveProviderId}
+                          onChange={setLiveProviderId}
+                          emptyLabel="Not selected — chunked STT + TTS"
+                        />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">Realtime model</label>
+                        <input value={liveModel} onChange={(e) => setLiveModel(e.target.value)} dir="ltr" placeholder="gpt-realtime" />
+                      </div>
+                      <div className="voice-field">
+                        <label className="field-label">Realtime voice</label>
+                        <input value={liveVoice} onChange={(e) => setLiveVoice(e.target.value)} dir="ltr" placeholder="alloy" />
+                      </div>
+                    </div>
                     <div className="hint">
                       With a provider selected, live voice runs as full-duplex realtime on that
                       provider — any OpenAI-realtime-compatible endpoint, not just OpenAI. Leave
                       empty for the chunked mode, which works with any STT/TTS provider.
-                    </div>
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">Realtime model</label>
-                    <input value={liveModel} onChange={(e) => setLiveModel(e.target.value)} dir="ltr" placeholder="gpt-realtime" />
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">Realtime voice</label>
-                    <input value={liveVoice} onChange={(e) => setLiveVoice(e.target.value)} dir="ltr" placeholder="alloy" />
                     </div>
                   </div>
                 </div>
@@ -3990,7 +4120,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 number the context meter shows). The remaining <code>{100 - compactAtPercent}%</code> is
                 left as headroom. 80 = compact at 80% of the window. Lower = compact sooner
                 (safer for huge contexts); higher = compact later (more recent turns kept in
-                full). Range 1–99. Applies on the next message. Default: 80.
+                full). Range 1–99. Applies on the next message. Default: 80. This is the
+                global default — the chat's context popover can override it for a single chat.
               </div>
               <div className="font-size-row">
                 <span className="font-size-label">1%</span>
@@ -4042,20 +4173,24 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 >
                   <input
                     type="checkbox"
-                    checked={disableTextSuggestions}
-                    onChange={(e) => setDisableTextSuggestions(e.target.checked)}
-                    aria-label="Suppress keyboard suggestions"
+                    /* سوییچ با لیبل هم‌جهت است: روشن = پیشنهادهای کیبورد فعال،
+                       خاموش = suppress (همان disableTextSuggestions معکوس‌شده).
+                       قبلاً checked مستقیم به disableTextSuggestions وصل بود و
+                       «خاموش‌کردن» پیشنهادها را روشن می‌کرد. */
+                    checked={!disableTextSuggestions}
+                    onChange={(e) => setDisableTextSuggestions(!e.target.checked)}
+                    aria-label="Keyboard suggestions"
                   />
                   <span className="plugin-switch-track" />
                 </label>
               </div>
               <div className="hint">
-                Turns off the system's <b>autocomplete</b>, <b>autocorrect</b>,{' '}
-                <b>inline predictions</b> and <b>spell-check</b> marks in every text field —
-                the chat composer, search boxes, comment boxes and the terminal. The platform
-                defaults are wrong for a coding tool: they rewrite identifiers, file paths and
-                commands while you type. Applies immediately, no Save needed. Default: on
-                (suggestions off).
+                The system's <b>autocomplete</b>, <b>autocorrect</b>,{' '}
+                <b>inline predictions</b> and <b>spell-check</b> marks, in every free-text
+                field — the chat composer, comment boxes, the terminal and the model-picker
+                search. Off (default) is what a coding tool wants: those helpers rewrite
+                identifiers, file paths and commands while you type. Applies immediately,
+                no Save needed.
               </div>
             </div>
         </>

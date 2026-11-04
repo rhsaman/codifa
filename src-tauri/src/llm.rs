@@ -642,8 +642,21 @@ pub fn http_client() -> Client {
                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                 // Hold idle sockets open between steps and turns so a follow-up
                 // call reuses the established connection instead of re-dialing.
-                .pool_idle_timeout(std::time::Duration::from_secs(90))
-                .pool_max_idle_per_host(16)
+                // The idle cap MUST stay below the SERVER's own keep-alive
+                // window (node's http server closes idle sockets after ~5s,
+                // nginx after 75s): a reused socket the server already closed
+                // is a black hole — the request is written into the void and
+                // sits until the header budget expires. Measured on the local
+                // 9router gateway: the first turn after a pause paid a ~50s
+                // dead wait, then the retry on a fresh connection answered in
+                // 4s. Re-dialing costs ~0ms on a localhost gateway, so a short
+                // idle window keeps the reuse benefit and never hands a request
+                // a corpse. 4s sits strictly BELOW node's default
+                // keepAliveTimeout (5s) — the 9router gateway closes idle
+                // sockets there, and a socket idle 5-8s was still being reused
+                // and hung.
+                .pool_idle_timeout(std::time::Duration::from_secs(4))
+                .pool_max_idle_per_host(4)
                 .build()
                 .expect("reqwest client")
         })
@@ -697,6 +710,29 @@ pub fn gemini_native_api(base: &str) -> String {
     format!("{}/v1beta", gemini_native_root(base))
 }
 
+/// The bare model id every Gemini URL path expects.
+///
+/// Google's own `/v1beta/models` listing (and older saved selections) hands
+/// out ids prefixed `models/` (`models/gemini-flash-latest`), while every URL
+/// builder already interpolates into a literal `models/…` segment — the verbatim
+/// id produced `…/v1beta/models/models/gemini-flash-latest:generateContent`,
+/// a 404 with an EMPTY body, so every Google call failed without saying why.
+/// Stripping any number of leading `models/` segments (and stray slashes) here
+/// makes chat, one-shot and media URLs agree whatever spelling was saved —
+/// the same normalization `models.rs` already applies for the catalog lookup.
+pub fn google_model_name(model: &str) -> &str {
+    let mut name = model.trim();
+    loop {
+        if let Some(rest) = name.strip_prefix("models/") {
+            name = rest;
+        } else if let Some(rest) = name.strip_prefix('/') {
+            name = rest;
+        } else {
+            return name;
+        }
+    }
+}
+
 /// Resolve the chat-completions endpoint + auth header style for a kind.
 /// Returns (url, header_name, header_value_prefix). An empty header_name
 /// means "send no auth header" — the keyless local-endpoint case.
@@ -724,7 +760,7 @@ fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, Strin
             format!(
                 "{}/models/{model}:generateContent",
                 gemini_native_api(&cfg.base_url),
-                model = cfg.model
+                model = google_model_name(&cfg.model)
             ),
             "x-goog-api-key",
             key.clone(),
@@ -783,6 +819,19 @@ fn is_key_error(status: u16, body: &str) -> bool {
         || body.to_ascii_lowercase().contains("invalid api key")
         || body.to_ascii_lowercase().contains("unauthorized")
         || body.to_ascii_lowercase().contains("quota")
+}
+
+/// An error body that always SAYS something. A rejected request can come back
+/// with a status and no body at all (a Google 404 for a malformed model path
+/// is empty) — surfacing the bare string then read as `failed: ` with nothing
+/// after it, and the user saw a failure with no reason. The synthetic text is
+/// status-only, so it cannot flip `is_key_error` or `upstream_is_down`.
+fn nonempty_error_body(status: u16, text: String) -> String {
+    if text.trim().is_empty() {
+        format!("HTTP {status} (empty body)")
+    } else {
+        text
+    }
 }
 
 // ---------- per-key cooldowns ----------
@@ -1195,7 +1244,7 @@ async fn complete_with_key(
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| (status, e.to_string()))?;
         if !(200..300).contains(&status) {
-            return Err((status, text));
+            return Err((status, nonempty_error_body(status, text)));
         }
         let v: Value = serde_json::from_str(&text).map_err(|e| (status, e.to_string()))?;
         extract_completion(&cfg.provider, &v)
@@ -1209,6 +1258,101 @@ async fn complete_with_key(
                 cfg.timeout_secs.max(1)
             ),
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Usage normalization — one vocabulary for every provider, by PAYLOAD SHAPE
+// ---------------------------------------------------------------------------
+
+/// One provider usage payload, normalized to ONE vocabulary.
+///
+/// The two conventions a usage object can follow, told apart by the fields the
+/// payload itself carries (never by the provider's NAME — a custom gateway that
+/// speaks Anthropic's wire format is caught by its shape):
+///
+/// - **Additive** (Anthropic and Anthropic-compatible endpoints): the cache
+///   fields sit BESIDE `input_tokens`, so the input the provider actually
+///   processed is `input + cache_read + cache_creation`.
+/// - **Subset** (OpenAI / DeepSeek / Google / OpenAI-compatible gateways): the
+///   reported input ALREADY covers the cached part
+///   (`prompt_tokens_details.cached_tokens`, `prompt_cache_hit_tokens`,
+///   `cachedContentTokenCount`), so adding it would double-count.
+///
+/// `input_total` is the one inclusive number every consumer wants: the
+/// compaction trigger's baseline, the context meter and the cost math all
+/// treat input as "everything the model read this call".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NormalizedUsage {
+    /// Inclusive billed input (see the type doc).
+    pub input_total: u64,
+    pub output_tokens: u64,
+    /// The reported cache read, 0 when absent.
+    pub cache_read: u64,
+    /// The reported cache write (Anthropic `cache_creation_input_tokens`), 0
+    /// when absent — OpenAI-style payloads have no such field.
+    pub cache_write: u64,
+    /// The payload carried a cache-read field at all. "Unknown" (a gateway
+    /// that reports nothing) must stay distinguishable from a REAL zero (the
+    /// cache genuinely missed), or the ruler's hit rate lies.
+    pub cache_read_reported: bool,
+    pub cache_write_reported: bool,
+    /// The provider's own input number, BEFORE normalization — exclusive for
+    /// additive payloads. Kept for consumers that echo the raw figure.
+    pub reported_input: u64,
+}
+
+impl NormalizedUsage {
+    /// `None` when the payload is not an object or carries no recognizable
+    /// input field at all.
+    pub fn from_payload(u: &Value) -> Option<NormalizedUsage> {
+        let obj = u.as_object()?;
+        let num = |keys: &[&str]| -> Option<u64> {
+            keys.iter()
+                .find_map(|k| obj.get(*k).and_then(Value::as_u64))
+        };
+        let output =
+            num(&["output_tokens", "completion_tokens", "candidatesTokenCount"]).unwrap_or(0);
+        // ADDITIVE shape: the Anthropic cache fields beside the input.
+        let a_read = obj.get("cache_read_input_tokens").and_then(Value::as_u64);
+        let a_write = obj
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64);
+        if a_read.is_some() || a_write.is_some() {
+            let input = num(&["input_tokens", "prompt_tokens"]).unwrap_or(0);
+            let read = a_read.unwrap_or(0);
+            let write = a_write.unwrap_or(0);
+            return Some(NormalizedUsage {
+                input_total: input + read + write,
+                output_tokens: output,
+                cache_read: read,
+                cache_write: write,
+                cache_read_reported: a_read.is_some(),
+                cache_write_reported: a_write.is_some(),
+                reported_input: input,
+            });
+        }
+        // SUBSET shape: the reported input already includes the cached part.
+        let input = num(&["prompt_tokens", "input_tokens", "promptTokenCount"])?;
+        let read_direct = num(&[
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+            "cachedContentTokenCount",
+        ]);
+        let read_nested = obj
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        let read = read_direct.or(read_nested).unwrap_or(0);
+        Some(NormalizedUsage {
+            input_total: input,
+            output_tokens: output,
+            cache_read: read,
+            cache_write: 0,
+            cache_read_reported: read_direct.is_some() || read_nested.is_some(),
+            cache_write_reported: false,
+            reported_input: input,
+        })
     }
 }
 
@@ -1660,7 +1804,7 @@ async fn stream_with_key(
             format!(
                 "{}/models/{model}:streamGenerateContent?alt=sse",
                 gemini_native_api(&cfg.base_url),
-                model = cfg.model
+                model = google_model_name(&cfg.model)
             ),
             "x-goog-api-key",
             key.to_string(),
@@ -1748,7 +1892,7 @@ async fn stream_with_key(
                 continue;
             }
         }
-        return Err((status, text));
+        return Err((status, nonempty_error_body(status, text)));
     };
 
     let mut acc = StreamAcc::default();
@@ -2148,6 +2292,55 @@ mod tests {
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
         assert!(body["contents"].is_array());
         assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn google_model_name_strips_the_models_prefix() {
+        // Google's own model listing hands out `models/…` ids; saved selections
+        // carry them verbatim. The URL builders add `models/` themselves, so the
+        // prefix MUST be stripped here — repeated prefixes included.
+        assert_eq!(google_model_name("models/gemini-flash-latest"), "gemini-flash-latest");
+        assert_eq!(google_model_name("models/models/gemini-2.5-pro"), "gemini-2.5-pro");
+        assert_eq!(google_model_name(" gemini-3.5-flash "), "gemini-3.5-flash");
+        assert_eq!(google_model_name("/models/gemini-3.5-flash"), "gemini-3.5-flash");
+        // Bare ids (the catalog's spelling) pass through untouched.
+        assert_eq!(google_model_name("gemini-2.5-flash"), "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn google_urls_do_not_double_the_models_segment() {
+        // The saved id `models/gemini-flash-latest` used to interpolate verbatim
+        // into `…/v1beta/models/models/…:generateContent` — a 404 with an EMPTY
+        // body, which surfaced as `failed: ` with no reason at all.
+        let mut c = cfg("google", "https://generativelanguage.googleapis.com/v1beta/openai", &["k"]);
+        c.model = "models/gemini-flash-latest".into();
+        let (url, header, _) = endpoint_and_auth(&c, "k");
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+        );
+        assert_eq!(header, "x-goog-api-key");
+    }
+
+    #[test]
+    fn an_empty_error_body_still_names_the_status() {
+        // A Google 404 arrives with zero bytes; the old raw passthrough turned
+        // that into an empty error string (`failed: `), hiding the cause.
+        assert_eq!(
+            nonempty_error_body(404, String::new()),
+            "HTTP 404 (empty body)"
+        );
+        // A body that only carries whitespace is equally silent.
+        assert_eq!(
+            nonempty_error_body(502, "  \n".into()),
+            "HTTP 502 (empty body)"
+        );
+        // A real body passes through untouched — key-error classification and
+        // upstream-down detection read it verbatim.
+        assert_eq!(
+            nonempty_error_body(429, r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#.into()),
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#
+        );
     }
 
     #[test]
@@ -3114,5 +3307,192 @@ mod tests {
         // quota signal in it, so it must keep the same model.
         assert!(!should_fall_back("key rejected (429): Rate limit reached for gpt-x"));
         assert!(!should_fall_back("key rejected (429): too many requests"));
+    }
+
+    // ------------------------------------------------------------------
+    // NormalizedUsage: provider usage by PAYLOAD SHAPE, not provider name
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_anthropic_payload_is_additive_and_includes_the_write() {
+        // Raw Anthropic usage: input EXCLUDES the cache fields. The inclusive
+        // billed input is input + read + write — the plan's own fixture
+        // (2_000 + 18_000 + 1_000 = 21_000) is what the compaction trigger
+        // must compare against MAIN_FOLD_MIN_TOKENS.
+        let u = NormalizedUsage::from_payload(&json!({
+            "input_tokens": 2_000u64,
+            "output_tokens": 150u64,
+            "cache_read_input_tokens": 18_000u64,
+            "cache_creation_input_tokens": 1_000u64,
+        }))
+        .unwrap();
+        assert_eq!(u.input_total, 21_000);
+        assert_eq!(u.output_tokens, 150);
+        assert_eq!(u.cache_read, 18_000);
+        assert_eq!(u.cache_write, 1_000);
+        assert!(u.cache_read_reported && u.cache_write_reported);
+        assert_eq!(u.reported_input, 2_000, "the raw figure stays available");
+    }
+
+    #[test]
+    fn an_anthropic_compatible_gateway_is_caught_by_shape_not_name() {
+        // A custom endpoint speaking Anthropic's wire format: the normalizer
+        // never sees a provider name — the cache field names ARE the shape.
+        let u = NormalizedUsage::from_payload(&json!({
+            "input_tokens": 900u64,
+            "output_tokens": 40u64,
+            "cache_read_input_tokens": 12_000u64,
+        }))
+        .unwrap();
+        assert_eq!(u.input_total, 12_900);
+        assert_eq!(u.cache_read, 12_000);
+        assert!(u.cache_read_reported);
+        assert!(!u.cache_write_reported, "write absent stays not-reported");
+        assert_eq!(u.cache_write, 0);
+    }
+
+    #[test]
+    fn openai_style_subset_payloads_never_double_count() {
+        // prompt_tokens already covers the cached part: input_total is the
+        // reported input itself, and read is a SLICE of it, never added on.
+        let u = NormalizedUsage::from_payload(&json!({
+            "prompt_tokens": 21_000u64,
+            "completion_tokens": 88u64,
+            "prompt_tokens_details": { "cached_tokens": 18_000u64 },
+        }))
+        .unwrap();
+        assert_eq!(u.input_total, 21_000, "subset: the reported input IS the total");
+        assert_eq!(u.cache_read, 18_000);
+        assert_eq!(u.cache_write, 0);
+        assert!(u.cache_read_reported);
+        assert!(!u.cache_write_reported);
+    }
+
+    #[test]
+    fn deepseek_and_google_vocabularies_map_to_the_subset_shape() {
+        let ds = NormalizedUsage::from_payload(&json!({
+            "prompt_tokens": 21_000u64,
+            "prompt_cache_hit_tokens": 18_000u64,
+            "completion_tokens": 10u64,
+        }))
+        .unwrap();
+        assert_eq!(ds.input_total, 21_000);
+        assert_eq!(ds.cache_read, 18_000);
+        let g = NormalizedUsage::from_payload(&json!({
+            "promptTokenCount": 21_000u64,
+            "candidatesTokenCount": 10u64,
+            "cachedContentTokenCount": 18_000u64,
+        }))
+        .unwrap();
+        assert_eq!(g.input_total, 21_000);
+        assert_eq!(g.cache_read, 18_000);
+        assert_eq!(g.output_tokens, 10);
+    }
+
+    #[test]
+    fn unknown_cache_state_stays_unknown_and_zero_stays_zero() {
+        // A gateway that reports no cache field at all: NOT reported — a
+        // ruler must print "not reported", never a fabricated 0% hit rate.
+        let none = NormalizedUsage::from_payload(&json!({
+            "prompt_tokens": 5_000u64, "completion_tokens": 7u64,
+        }))
+        .unwrap();
+        assert_eq!(none.cache_read, 0);
+        assert!(!none.cache_read_reported);
+        // A REAL zero (the cache genuinely missed) is distinguishable.
+        let zero = NormalizedUsage::from_payload(&json!({
+            "prompt_tokens": 5_000u64,
+            "completion_tokens": 7u64,
+            "prompt_tokens_details": { "cached_tokens": 0u64 },
+        }))
+        .unwrap();
+        assert_eq!(zero.cache_read, 0);
+        assert!(zero.cache_read_reported, "reported 0 stays a real zero");
+        // No recognizable input field: not a usage payload at all.
+        assert!(NormalizedUsage::from_payload(&json!({ "foo": 1 })).is_none());
+        assert!(NormalizedUsage::from_payload(&Value::Null).is_none());
+    }
+
+    /// Every sanitized usage fixture under tests/fixtures/usage — the five
+    /// provider shapes the plan pinned, hand-calculated expectations each.
+    fn usage_fixtures() -> Vec<(String, Value)> {
+        let dir = format!("{}/tests/fixtures/usage", env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("usage fixtures dir") {
+            let p = entry.unwrap().path();
+            if p.extension().is_some_and(|e| e == "json") {
+                let text = std::fs::read_to_string(&p).unwrap();
+                out.push((p.file_name().unwrap().to_string_lossy().to_string(),
+                          serde_json::from_str(&text).unwrap()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn the_usage_fixtures_match_hand_calculated_values() {
+        let expected: &[(&str, u64, u64, u64, bool, bool)] = &[
+            // (file, input_total, read, write, read_reported, write_reported)
+            ("anthropic-compatible.json", 12_900, 12_000, 0, true, false),
+            ("anthropic.json", 21_000, 18_000, 1_000, true, true),
+            ("deepseek.json", 21_000, 18_000, 0, true, false),
+            ("google.json", 21_000, 18_000, 0, true, false),
+            ("openai-cold.json", 5_000, 0, 0, true, false),
+            ("openai.json", 21_000, 18_000, 0, true, false),
+        ];
+        let fixtures = usage_fixtures();
+        assert_eq!(fixtures.len(), expected.len(), "fixture set changed: {:?}", fixtures.iter().map(|(n, _)| n).collect::<Vec<_>>());
+        for ((file, payload), (want_file, total, read, write, rrep, wrep)) in
+            fixtures.iter().zip(expected)
+        {
+            assert_eq!(file, want_file, "fixture order");
+            let u = NormalizedUsage::from_payload(payload)
+                .unwrap_or_else(|| panic!("{file}: not a usage payload"));
+            assert_eq!(u.input_total, *total, "{file}: inclusive input");
+            assert_eq!(u.cache_read, *read, "{file}");
+            assert_eq!(u.cache_write, *write, "{file}");
+            assert_eq!(u.cache_read_reported, *rrep, "{file}");
+            assert_eq!(u.cache_write_reported, *wrep, "{file}");
+        }
+    }
+
+    /// The fixtures stay SANITIZED: only the usage object lives here — never a
+    /// request body, never a header, never a key. The lint walks every file
+    /// under tests/fixtures and fails on anything that looks like prompt text
+    /// or a credential, so a future "real" fixture cannot smuggle secrets into
+    /// the repository.
+    #[test]
+    fn fixtures_stay_sanitized() {
+        const FORBIDDEN: &[&str] = &[
+            "authorization",
+            "api_key",
+            "apikey",
+            "sk-",
+            "bearer ",
+            "\"messages\"",
+            "system prompt",
+            "private key",
+            "password",
+        ];
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("fixtures dir") {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, hits);
+                } else if let Ok(text) = std::fs::read_to_string(&p) {
+                    let lower = text.to_lowercase();
+                    for bad in FORBIDDEN {
+                        if lower.contains(bad) {
+                            hits.push(format!("{}: contains {bad:?}", p.display()));
+                        }
+                    }
+                }
+            }
+        }
+        let dir = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let mut hits = Vec::new();
+        walk(std::path::Path::new(&dir), &mut hits);
+        assert!(hits.is_empty(), "unsanitized fixture content:\n{}", hits.join("\n"));
     }
 }

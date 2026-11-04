@@ -565,7 +565,12 @@ pub fn get_schedule(data_root: &Path, id: &str) -> Option<Value> {
     read_json(&schedule_file(data_root, id))
 }
 
-pub fn list_schedule_runs(data_root: &Path, schedule_id: &str, limit: usize) -> Value {
+/// Stored runs of one task (or ALL tasks when `schedule_id` is empty), newest
+/// first, bounded by `limit` — with a `before` cursor (epoch seconds) so the
+/// inbox can page DEEPER without offset drift: new runs arriving between page
+/// fetches shift offsets, but "strictly older than the oldest one I have" is
+/// stable, which is what keeps infinite-scroll RAM-bounded and gapless.
+pub fn list_schedule_runs(data_root: &Path, schedule_id: &str, limit: usize, before: f64) -> Value {
     let base = schedule_runs_dir(data_root);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&base)
         .map(|rd| {
@@ -595,6 +600,10 @@ pub fn list_schedule_runs(data_root: &Path, schedule_id: &str, limit: usize) -> 
             continue;
         }
         let started = obj.get("started_at").and_then(Value::as_f64).unwrap_or(0.0);
+        // Cursor: only runs STRICTLY older than `before` (0 = no cursor).
+        if before > 0.0 && started >= before {
+            continue;
+        }
         out.push((started, obj));
         if out.len() >= limit.max(1) {
             break;
@@ -607,7 +616,7 @@ pub fn list_schedule_runs(data_root: &Path, schedule_id: &str, limit: usize) -> 
 pub fn delete_schedule_runs(data_root: &Path, schedule_id: &str) -> Value {
     let mut removed = 0usize;
     if !schedule_id.is_empty() {
-        if let Value::Array(runs) = list_schedule_runs(data_root, schedule_id, 10_000) {
+        if let Value::Array(runs) = list_schedule_runs(data_root, schedule_id, 10_000, 0.0) {
             for r in runs {
                 if let Some(rid) = r.get("id").and_then(Value::as_str) {
                     if std::fs::remove_file(schedule_run_file(data_root, rid)).is_ok() {
@@ -640,7 +649,7 @@ pub fn delete_orphan_schedule_runs(data_root: &Path) -> Value {
         _ => vec![],
     };
     let mut removed = 0usize;
-    if let Value::Array(runs) = list_schedule_runs(data_root, "", 10_000) {
+    if let Value::Array(runs) = list_schedule_runs(data_root, "", 10_000, 0.0) {
         for r in runs {
             let sid = r.get("schedule_id").and_then(Value::as_str).unwrap_or_default();
             if !sid.is_empty() && !live.iter().any(|l| l == sid) {
@@ -1064,6 +1073,10 @@ pub async fn schedules_stop(
 pub struct RunsQuery {
     #[serde(default)]
     pub limit: Option<usize>,
+    /// صفحه‌بندی مبتنی بر کرسر: فقط ران‌های قدیمی‌تر از این epoch ثانیه —
+    /// برای infinite scroll بدون drift وقتی ران‌های جدید بین دو صفحه می‌رسند.
+    #[serde(default)]
+    pub before: Option<f64>,
 }
 
 pub async fn schedule_runs_list(
@@ -1071,7 +1084,7 @@ pub async fn schedule_runs_list(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<RunsQuery>,
 ) -> Response {
-    Json(json!({ "runs": list_schedule_runs(&st.root(), &id, q.limit.unwrap_or(20)) })).into_response()
+    Json(json!({ "runs": list_schedule_runs(&st.root(), &id, q.limit.unwrap_or(20), q.before.unwrap_or(0.0)) })).into_response()
 }
 
 pub async fn schedule_runs_clear(
@@ -1085,7 +1098,7 @@ pub async fn all_schedule_runs(
     State(st): State<crate::backend_light::AppState>,
     Query(q): Query<RunsQuery>,
 ) -> Response {
-    Json(json!({ "runs": list_schedule_runs(&st.root(), "", q.limit.unwrap_or(50)) })).into_response()
+    Json(json!({ "runs": list_schedule_runs(&st.root(), "", q.limit.unwrap_or(50), q.before.unwrap_or(0.0)) })).into_response()
 }
 
 pub async fn schedule_run_delete(
@@ -1241,7 +1254,7 @@ mod tests {
         // A run for a live schedule is listed; deleting the schedule orphans it.
         let run_file = schedule_run_file(&root, "run-1");
         atomic_write_json(&run_file, &json!({"id": "run-1", "schedule_id": id, "started_at": 1.0})).unwrap();
-        assert_eq!(list_schedule_runs(&root, &id, 50).as_array().unwrap().len(), 1);
+        assert_eq!(list_schedule_runs(&root, &id, 50, 0.0).as_array().unwrap().len(), 1);
         assert_eq!(delete_schedule(&root, &id)["ok"], json!(true));
         let out = delete_orphan_schedule_runs(&root);
         assert_eq!(out["removed"], json!(1));

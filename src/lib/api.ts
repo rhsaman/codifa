@@ -2472,9 +2472,13 @@ export async function stopScheduleRun(id: string): Promise<{ ok: true; stopped: 
 export async function listScheduleRuns(
   id: string,
   limit = 20,
+  /** کرسر صفحه‌بندی: فقط ران‌های قدیمی‌تر از این epoch ثانیه (۰ = از اول). */
+  before = 0,
 ): Promise<ScheduleRun[] | { error: string }> {
+  const qs = new URLSearchParams({ limit: String(limit) })
+  if (before > 0) qs.set('before', String(before))
   const out = await sidecarGet<{ runs: ScheduleRun[] }>(
-    `/schedules/${encodeURIComponent(id)}/runs?limit=${limit}`,
+    `/schedules/${encodeURIComponent(id)}/runs?${qs.toString()}`,
   )
   if ('error' in out) return out
   return out.runs ?? []
@@ -2598,9 +2602,12 @@ export async function clearChatTraces(chatId: string): Promise<{ ok: true; remov
 /** تازه‌ترین اجراهای همه تسک‌ها (برای Inbox؛ جدیدترین اول). */
 export async function listAllScheduleRuns(
   limit = 50,
+  before = 0,
 ): Promise<ScheduleRun[] | { error: string }> {
+  const qs = new URLSearchParams({ limit: String(limit) })
+  if (before > 0) qs.set('before', String(before))
   const out = await sidecarGet<{ runs: ScheduleRun[] }>(
-    `/schedule-runs?limit=${limit}`,
+    `/schedule-runs?${qs.toString()}`,
   )
   if ('error' in out) return out
   return out.runs ?? []

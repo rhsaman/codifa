@@ -79,25 +79,74 @@ struct Usage {
     /// inside `input` (so `input` stays the real billed number) — tracked here
     /// to report a hit RATE.
     cache_read: u64,
+    /// Input tokens that FILLED the cache this call (Anthropic
+    /// `cache_creation_input_tokens`): the write half a cold call is made of.
+    /// Also already counted inside `input`.
+    cache_write: u64,
     /// Calls whose response carried a cache field at all. A gateway that never
     /// reports one would otherwise look like a 0% hit rate instead of "not
     /// measured".
     cache_reported: usize,
+    cache_write_reported: usize,
+    /// WARM calls: the provider reported a read > 0 — the prefix cache hit.
+    warm_calls: usize,
+    warm_input: u64,
+    warm_read: u64,
+    warm_write: u64,
+    /// COLD calls: a reported cache read of 0 — the whole prompt billed fresh.
+    cold_calls: usize,
+    cold_input: u64,
+    cold_read: u64,
+    cold_write: u64,
 }
 
 impl Usage {
     fn add(&mut self, row: &Value) {
         self.calls += 1;
         if let Some(t) = row.get("tokens") {
-            self.input += t.get("input").and_then(Value::as_u64).unwrap_or(0);
+            let input = t.get("input").and_then(Value::as_u64).unwrap_or(0);
+            let read = t.get("cache_read").and_then(Value::as_u64);
+            let write = t.get("cache_write").and_then(Value::as_u64);
+            let read_reported = t
+                .get("cache_read_reported")
+                .and_then(Value::as_bool)
+                .unwrap_or(read.is_some());
+            let write_reported = t
+                .get("cache_write_reported")
+                .and_then(Value::as_bool)
+                .unwrap_or(write.is_some());
+            self.input += input;
             self.output += t.get("output").and_then(Value::as_u64).unwrap_or(0);
-            match t.get("cache_read").and_then(Value::as_u64) {
-                // Older traces predate the field: leave it out of the rate.
-                Some(v) => {
-                    self.cache_read += v;
-                    self.cache_reported += 1;
+            // Older traces predate the fields: only rows that say so join the
+            // rate, so a legacy trace stays out of the hit-rate denominator
+            // instead of reading as a 0% hit.
+            if read_reported {
+                let v = read.unwrap_or(0);
+                self.cache_read += v;
+                self.cache_reported += 1;
+            }
+            if write_reported {
+                let w = write.unwrap_or(0);
+                self.cache_write += w;
+                self.cache_write_reported += 1;
+            }
+            // The cold/warm split: a WARM call re-used the prefix (read > 0),
+            // a COLD call billed everything fresh (reported read of 0 — the
+            // state a cache reset after a fold or a prompt edit produces).
+            // Separate lines keep the two from averaging into a number that
+            // describes neither.
+            if read_reported {
+                if v_is_warm(read) {
+                    self.warm_calls += 1;
+                    self.warm_input += input;
+                    self.warm_read += read.unwrap_or(0);
+                    self.warm_write += write.unwrap_or(0);
+                } else {
+                    self.cold_calls += 1;
+                    self.cold_input += input;
+                    self.cold_read += 0;
+                    self.cold_write += write.unwrap_or(0);
                 }
-                None => {}
             }
         }
     }
@@ -117,6 +166,48 @@ impl Usage {
             self.cache_read, self.input, pct, self.cache_reported, self.calls
         )
     }
+
+    /// The cold/warm split: warm lines carry their read+write mix, cold lines
+    /// show what an all-fresh call costs. Calls the gateway said nothing about
+    /// are their own bucket — folding them into either side would fabricate a
+    /// rate for rows that never had one.
+    fn cold_warm_line(&self) -> String {
+        if self.cache_reported == 0 {
+            return "not reported by this gateway".to_string();
+        }
+        let warm = if self.warm_calls > 0 {
+            let pct = if self.warm_input > 0 {
+                self.warm_read * 100 / self.warm_input
+            } else {
+                0
+            };
+            format!(
+                "warm {} call(s) input={} read={} write={} ({}% hit)",
+                self.warm_calls, self.warm_input, self.warm_read, self.warm_write, pct
+            )
+        } else {
+            "warm 0 call(s)".to_string()
+        };
+        let cold = if self.cold_calls > 0 {
+            format!(
+                "cold {} call(s) input={} read=0 write={}",
+                self.cold_calls, self.cold_input, self.cold_write
+            )
+        } else {
+            "cold 0 call(s)".to_string()
+        };
+        let unreported = self.calls - self.cache_reported;
+        if unreported > 0 {
+            format!("{warm} | {cold} | not-reported {unreported} call(s)")
+        } else {
+            format!("{warm} | {cold}")
+        }
+    }
+}
+
+/// A warm call is one with a strictly positive reported read.
+fn v_is_warm(read: Option<u64>) -> bool {
+    read.unwrap_or(0) > 0
 }
 
 #[derive(Default)]
@@ -357,7 +448,17 @@ fn report(path: &Path) {
         input: total_input,
         output: total_output,
         cache_read: main.cache_read + sub_total.cache_read,
+        cache_write: main.cache_write + sub_total.cache_write,
         cache_reported: main.cache_reported + sub_total.cache_reported,
+        cache_write_reported: main.cache_write_reported + sub_total.cache_write_reported,
+        warm_calls: main.warm_calls + sub_total.warm_calls,
+        warm_input: main.warm_input + sub_total.warm_input,
+        warm_read: main.warm_read + sub_total.warm_read,
+        warm_write: main.warm_write + sub_total.warm_write,
+        cold_calls: main.cold_calls + sub_total.cold_calls,
+        cold_input: main.cold_input + sub_total.cold_input,
+        cold_read: main.cold_read + sub_total.cold_read,
+        cold_write: main.cold_write + sub_total.cold_write,
     };
     let dup_groups = seen_explores.values().filter(|v| **v > 1).count();
     let dup_rows: usize = seen_explores
@@ -536,6 +637,17 @@ fn report(path: &Path) {
     println!("      main          : {}", main.cache_line());
     if sub_total.calls > 0 {
         println!("      explore       : {}", sub_total.cache_line());
+    }
+    // The cold/warm split: warm = the prefix worked, cold = everything billed
+    // fresh (the state right after a fold reset or a prompt edit). The two
+    // averaged into one number describe neither, and the not-reported rows
+    // stay their own bucket.
+    println!("   H2) cold/warm    : all   {}", total_usage.cold_warm_line());
+    if main.calls > 0 {
+        println!("      main          : {}", main.cold_warm_line());
+    }
+    if sub_total.calls > 0 {
+        println!("      explore       : {}", sub_total.cold_warm_line());
     }
     println!(
         "   G) explores/turn : {:?}",

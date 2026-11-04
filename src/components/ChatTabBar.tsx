@@ -4,14 +4,16 @@ import { prepareContent } from "../lib/bidi";
 import { collectChatIds } from "../lib/chatTree";
 import {
   barFlowSign,
+  captureDragSlots,
   edgeScroll,
   inactiveTabIds,
-  slideWidth,
+  liveExtents,
+  slotExtents,
+  slotShifts,
   tabForPoint,
   tabMove,
-  type TabExtent,
+  type DragSlots,
 } from "../lib/tabBar";
-import { previewShifts } from "../lib/tabOrder";
 import { TabListButton, CloseTabsIcon, type TabListSection } from "./TabListMenu";
 import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
 
@@ -265,10 +267,11 @@ export function ChatTabBar() {
   );
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
-  // Slide geometry measured once at drag start: how far "one slot" is (the
-  // dragged tab's width + the bar gap) and which way array order flows
-  // (rtl windows render the row right→left, mirroring the slide).
-  const [dragGeom, setDragGeom] = useState<{ slot: number; sign: 1 | -1 } | null>(null);
+  // Slot boxes captured ONCE at drag start (see captureDragSlots): hit-testing
+  // and the slide distances both read these, never the live boxes — the live
+  // ones carry the slide transforms, which fed back into the next hit-test
+  // and made the preview oscillate (the drag visibly jumped).
+  const slotsRef = useRef<DragSlots | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
 
@@ -282,35 +285,30 @@ export function ChatTabBar() {
   const clearDrag = () => {
     setDragId(null);
     setDropTarget(null);
-    setDragGeom(null);
+    slotsRef.current = null;
   };
 
   // The bar previews the landing by SLIDING tabs aside with transforms: the
-  // dragged tab stays as a muted hole, its neighbours glide one slot toward
-  // the freed space, and the layout never reflows mid-drag (the old CSS
-  // `order` preview re-squeezed every tab on each preview change — the tabs
-  // "jumbled" while dragging). Transitions on `transform` animate the slide.
+  // dragged tab stays as a muted hole, its neighbours glide into the freed
+  // space, and the layout never reflows mid-drag. Shifts are exact per-tab
+  // pixel deltas from the CAPTURED slots (the post-commit reflow), so every
+  // tab — whatever its width — lands precisely where the commit puts it.
   const shifts = (() => {
-    if (!dragId || !dropTarget) return null;
-    return previewShifts(openChatIds, dragId, dropTarget.id, dropTarget.after);
+    if (!dragId || !dropTarget || !slotsRef.current) return null;
+    return slotShifts(slotsRef.current, dragId, dropTarget.id, dropTarget.after);
   })();
-  const slot = dragGeom?.slot ?? 0;
-  const sign = dragGeom?.sign ?? 1;
 
-  /** Landing preview for a pointer x: nearest tab by geometry, array-order
-   *  correct for rtl bars. Covers tabs, inter-tab gaps and the empty space
-   *  past the ends in ONE rule (the old code left the gaps as dead zones). */
+  /** Landing preview for a pointer x: nearest tab by geometry — read from the
+   *  captured slots (scroll-compensated), array-order correct for rtl bars.
+   *  Covers tabs, inter-tab gaps and the empty space past the ends in ONE
+   *  rule (the old code left the gaps as dead zones). */
   const previewAt = (clientX: number) => {
     const bar = barRef.current;
     if (!bar) return;
-    const tabs: TabExtent[] = Array.from(
-      bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
-    ).map((el) => ({
-      id: el.dataset.tabId ?? "",
-      left: el.getBoundingClientRect().left,
-      right: el.getBoundingClientRect().right,
-    }));
-    const next = tabForPoint(tabs, clientX, dragGeom?.sign ?? barFlowSign(bar));
+    const extents = slotsRef.current
+      ? slotExtents(slotsRef.current)
+      : liveExtents(bar, "data-tab-id", "x");
+    const next = tabForPoint(extents, clientX, slotsRef.current?.sign ?? barFlowSign(bar));
     if (!next) return;
     setDropTarget((prev) =>
       prev && prev.id === next.id && prev.after === next.after ? prev : next,
@@ -346,14 +344,10 @@ export function ChatTabBar() {
         const from = e.dataTransfer.getData("text/plain") || dragId;
         const bar = barRef.current;
         if (from && bar) {
-          const tabs: TabExtent[] = Array.from(
-            bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
-          ).map((el) => ({
-            id: el.dataset.tabId ?? "",
-            left: el.getBoundingClientRect().left,
-            right: el.getBoundingClientRect().right,
-          }));
-          const at = tabForPoint(tabs, e.clientX, dragGeom?.sign ?? barFlowSign(bar));
+          const extents = slotsRef.current
+            ? slotExtents(slotsRef.current)
+            : liveExtents(bar, "data-tab-id", "x");
+          const at = tabForPoint(extents, e.clientX, slotsRef.current?.sign ?? barFlowSign(bar));
           if (at && at.id !== from) {
             useStore.getState().moveChatTab(from, at.id, at.after);
           }
@@ -377,9 +371,7 @@ export function ChatTabBar() {
             draggable={editingId !== id}
             className={`editor-tab chat-tab${active ? " active" : ""}${meta?.streaming ? " busy" : ""}${meta?.unread ? " unread" : ""}${dragId === id ? " dragging drop-preview" : ""}`}
             style={
-              shift !== 0 && slot > 0
-                ? { transform: `translateX(${shift * slot * sign}px)` }
-                : undefined
+              shift !== 0 ? { transform: `translateX(${shift}px)` } : undefined
             }
             title={title}
             onClick={() => useStore.getState().openChat(id)}
@@ -407,8 +399,15 @@ export function ChatTabBar() {
               e.dataTransfer.setData("text/plain", id);
               e.dataTransfer.effectAllowed = "move";
               const bar = barRef.current;
-              const el = bar?.querySelector<HTMLElement>(`[data-tab-id="${id}"]`);
-              setDragGeom(el && bar ? { slot: slideWidth(el, bar), sign: barFlowSign(bar) } : null);
+              slotsRef.current = bar
+                ? captureDragSlots(
+                    bar,
+                    openChatIds,
+                    (cid) => bar.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(cid)}"]`),
+                    "x",
+                    barFlowSign(bar),
+                  )
+                : null;
               setDragId(id);
             }}
             onDragEnd={clearDrag}

@@ -3,13 +3,15 @@ import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import {
   barFlowSign,
+  captureDragSlots,
   edgeScroll,
-  slideWidth,
+  liveExtents,
+  slotExtents,
+  slotShifts,
   tabForPoint,
   tabMove,
-  type TabExtent,
+  type DragSlots,
 } from "../lib/tabBar";
-import { previewShifts } from "../lib/tabOrder";
 import { shownViewerTabId, TAB_STRIP_KINDS, useViewerScope, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerScope, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
@@ -352,9 +354,11 @@ export function ViewerTabBar() {
   const shownActiveId = tabs.some((t) => t.id === activeRowId) ? activeRowId : null;
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
-  // Slide geometry measured once at drag start (slot width + visual flow
-  // direction), mirroring ChatTabBar's transform-slide preview.
-  const [dragGeom, setDragGeom] = useState<{ slot: number; sign: 1 | -1 } | null>(null);
+  // Slot boxes captured ONCE at drag start (see captureDragSlots): hit-testing
+  // and slide distances both read these, never the live boxes — the live ones
+  // carry the slide transforms, which fed the next hit-test and made the
+  // preview oscillate (the drag visibly jumped).
+  const slotsRef = useRef<DragSlots | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
 
 
@@ -368,36 +372,28 @@ export function ViewerTabBar() {
   const clearDrag = () => {
     setDragId(null);
     setDropTarget(null);
-    setDragGeom(null);
+    slotsRef.current = null;
   };
 
   // The bar previews the landing by SLIDING tabs aside with transforms — no
-  // mid-drag reflow, animated slide (same design as ChatTabBar).
+  // mid-drag reflow, animated slide (same design as ChatTabBar). Shifts are
+  // exact per-tab pixel deltas from the CAPTURED slots, so every tab lands
+  // precisely where the commit reflows it.
   const shifts = (() => {
-    if (!dragId || !dropTarget) return null;
-    return previewShifts(
-      tabs.map((t) => t.id),
-      dragId,
-      dropTarget.id,
-      dropTarget.after,
-    );
+    if (!dragId || !dropTarget || !slotsRef.current) return null;
+    return slotShifts(slotsRef.current, dragId, dropTarget.id, dropTarget.after);
   })();
-  const slot = dragGeom?.slot ?? 0;
-  const sign = dragGeom?.sign ?? 1;
 
-  /** Landing preview for a pointer x: nearest tab by geometry — tabs, gaps
-   *  and the space past the ends in one rule. */
+  /** Landing preview for a pointer x: nearest tab by geometry, read from the
+   *  captured slots (scroll-compensated) — tabs, gaps and the space past the
+   *  ends in one rule. */
   const previewAt = (clientX: number) => {
     const bar = barRef.current;
     if (!bar) return;
-    const extents: TabExtent[] = Array.from(
-      bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
-    ).map((el) => ({
-      id: el.dataset.tabId ?? "",
-      left: el.getBoundingClientRect().left,
-      right: el.getBoundingClientRect().right,
-    }));
-    const next = tabForPoint(extents, clientX, dragGeom?.sign ?? barFlowSign(bar));
+    const extents = slotsRef.current
+      ? slotExtents(slotsRef.current)
+      : liveExtents(bar, "data-tab-id", "x");
+    const next = tabForPoint(extents, clientX, slotsRef.current?.sign ?? barFlowSign(bar));
     if (!next) return;
     setDropTarget((prev) =>
       prev && prev.id === next.id && prev.after === next.after ? prev : next,
@@ -432,14 +428,10 @@ export function ViewerTabBar() {
         const from = e.dataTransfer.getData("text/plain") || dragId;
         const bar = barRef.current;
         if (from && bar) {
-          const extents: TabExtent[] = Array.from(
-            bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
-          ).map((el) => ({
-            id: el.dataset.tabId ?? "",
-            left: el.getBoundingClientRect().left,
-            right: el.getBoundingClientRect().right,
-          }));
-          const at = tabForPoint(extents, e.clientX, dragGeom?.sign ?? barFlowSign(bar));
+          const extents = slotsRef.current
+            ? slotExtents(slotsRef.current)
+            : liveExtents(bar, "data-tab-id", "x");
+          const at = tabForPoint(extents, e.clientX, slotsRef.current?.sign ?? barFlowSign(bar));
           if (at && at.id !== from) {
             useViewerTabs.getState().moveViewerTab(from, at.id, at.after);
           }
@@ -464,9 +456,7 @@ export function ViewerTabBar() {
             draggable
             className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging drop-preview" : ""}`}
             style={
-              shift !== 0 && slot > 0
-                ? { transform: `translateX(${shift * slot * sign}px)` }
-                : undefined
+              shift !== 0 ? { transform: `translateX(${shift}px)` } : undefined
             }
             aria-label={title}
             title={title}
@@ -489,8 +479,15 @@ export function ViewerTabBar() {
             onDragStart={(e) => {
               setViewerDragData(e, t.id);
               const bar = barRef.current;
-              const el = bar?.querySelector<HTMLElement>(`[data-tab-id="${t.id}"]`);
-              setDragGeom(el && bar ? { slot: slideWidth(el, bar), sign: barFlowSign(bar) } : null);
+              slotsRef.current = bar
+                ? captureDragSlots(
+                    bar,
+                    tabs.map((x) => x.id),
+                    (cid) => bar.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(cid)}"]`),
+                    "x",
+                    barFlowSign(bar),
+                  )
+                : null;
               setDragId(t.id);
             }}
             onDragEnd={clearDrag}

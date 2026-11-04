@@ -1044,9 +1044,15 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Reachable from the stop command for as long as this run lives.
     let _live = register_live_run(&sid, &cancel);
-    // Walk the chain one rung per failure. A rejected key or an unknown model on
-    // one rung must not end the run while the user's own fallback list still has
-    // models in it — the same rule the interactive tools follow.
+    // Walk the chain one rung per failure — ANY failure, whatever it names:
+    // a rejected key, an unknown model, a rate limit or a dropped connection
+    // all move the run to the NEXT model immediately (no same-model retries).
+    // After the LAST rung fails the walk goes back to the top and tries the
+    // whole list again (SCHEDULE_MAX_CYCLES passes), pausing between passes so
+    // dead rungs are not hammered — the same ladder semantics the interactive
+    // tools follow.
+    const SCHEDULE_MAX_CYCLES: usize = 3;
+    const SCHEDULE_CYCLE_PAUSE_SECS: u64 = 10;
     let mut tried: Vec<String> = Vec::new();
     // The most text any rung produced before failing: a mid-turn provider error
     // must still leave the work so far in the run record (the inbox shows it
@@ -1060,79 +1066,99 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         "[schedule] run {run_id} for '{sid}' starting: {chain_rungs} rung(s), first '{}'",
         chain.first().map(|(_, m, ..)| m.as_str()).unwrap_or("-")
     );
-    for (kind, rung_model, rung_base, rung_keys, rung_provider_id) in chain {
-        // A stop request ends the whole chain, not just the current rung.
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
+    let cycles = if chain.len() > 1 { SCHEDULE_MAX_CYCLES } else { 1 };
+    'cycles: for cycle in 0..cycles {
+        if cycle > 0 {
+            // The pause BETWEEN passes is the only wait in the walk. It must
+            // stay stop-aware: a user pressing Stop during the pause ends the
+            // run instead of leaving it parked for the full 10s.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(SCHEDULE_CYCLE_PAUSE_SECS);
+            while std::time::Instant::now() < deadline {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break 'cycles;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break 'cycles;
+            }
         }
-        let mut rung = req.clone();
-        rung.provider = kind;
-        rung.model = rung_model.clone();
-        rung.base_url = rung_base;
-        rung.api_keys = rung_keys;
-        rung.provider_id = rung_provider_id;
-        // The capability flag follows the model actually being called, so a
-        // fallback that cannot reason is not sent a reasoning parameter.
-        rung.model_reasoning = crate::agent::provider_model_reasoning(
-            &rung.providers,
-            &rung.provider_id,
-            &rung.model,
-        );
-        // The final text is accumulated from the turn's own `text` events: the
-        // trace file has no `text` row at all (it records prompt/tool/llm/fold),
-        // so reading it back always produced an empty output.
-        let mut text = String::new();
-        let mut turn_errors: Vec<String> = Vec::new();
-        let res = {
-            let mut emit = |ev: &crate::agent::AgentEvent| match ev {
-                crate::agent::AgentEvent::Text { content } => text.push_str(content),
-                // Backstop: with `headless` set the stream-error path returns
-                // Err instead of emitting Error, but any other emitter must
-                // still fail the run — an error event is never a success.
-                crate::agent::AgentEvent::Error { content } => {
-                    turn_errors.push(content.clone());
+        for (kind, rung_model, rung_base, rung_keys, rung_provider_id) in chain.iter() {
+            // A stop request ends the whole chain, not just the current rung.
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break 'cycles;
+            }
+            let mut rung = req.clone();
+            rung.provider = kind.clone();
+            rung.model = rung_model.clone();
+            rung.base_url = rung_base.clone();
+            rung.api_keys = rung_keys.clone();
+            rung.provider_id = rung_provider_id.clone();
+            // The capability flag follows the model actually being called, so a
+            // fallback that cannot reason is not sent a reasoning parameter.
+            rung.model_reasoning = crate::agent::provider_model_reasoning(
+                &rung.providers,
+                &rung.provider_id,
+                &rung.model,
+            );
+            // The final text is accumulated from the turn's own `text` events: the
+            // trace file has no `text` row at all (it records prompt/tool/llm/fold),
+            // so reading it back always produced an empty output.
+            let mut text = String::new();
+            let mut turn_errors: Vec<String> = Vec::new();
+            let res = {
+                let mut emit = |ev: &crate::agent::AgentEvent| match ev {
+                    crate::agent::AgentEvent::Text { content } => text.push_str(content),
+                    // Backstop: with `headless` set the stream-error path returns
+                    // Err instead of emitting Error, but any other emitter must
+                    // still fail the run — an error event is never a success.
+                    crate::agent::AgentEvent::Error { content } => {
+                        turn_errors.push(content.clone());
+                    }
+                    _ => {}
+                };
+                tokio::select! {
+                    r = crate::agent::run_turn(&rung, &mut emit, &cancel) => r,
+                    // Stop pressed: the turn gets a short grace to end by itself,
+                    // then it is dropped so a hung tool cannot pin the run. This is
+                    // the ONLY way a run is cut short — there is no deadline, so a
+                    // paid tool call is never killed mid-flight.
+                    _ = stop_requested(&cancel) => Err("stopped by user".to_string()),
                 }
-                _ => {}
             };
-            tokio::select! {
-                r = crate::agent::run_turn(&rung, &mut emit, &cancel) => r,
-                // Stop pressed: the turn gets a short grace to end by itself,
-                // then it is dropped so a hung tool cannot pin the run. This is
-                // the ONLY way a run is cut short — there is no deadline, so a
-                // paid tool call is never killed mid-flight.
-                _ = stop_requested(&cancel) => Err("stopped by user".to_string()),
-            }
-        };
-        match res {
-            Ok(()) if turn_errors.is_empty() => {
-                final_text = text;
-                break;
-            }
-            Ok(()) => {
-                let e = turn_errors.join("; ");
-                eprintln!("[schedule] run {run_id} rung '{rung_model}' reported error: {e}");
-                last_error = e.clone();
-                tried.push(format!("{rung_model}: {e}"));
-                if text.chars().count() > partial_text.chars().count() {
-                    partial_text = text;
+            match res {
+                Ok(()) if turn_errors.is_empty() => {
+                    final_text = text;
+                    break 'cycles;
                 }
-                if !crate::llm::should_fall_back(&e) {
-                    break;
+                Ok(()) => {
+                    let e = turn_errors.join("; ");
+                    eprintln!("[schedule] run {run_id} rung '{rung_model}' reported error: {e}");
+                    last_error = e.clone();
+                    // Only the FIRST pass is reported: later passes repeat the
+                    // same models and would bury the reasons in the record.
+                    if cycle == 0 {
+                        tried.push(format!("{rung_model}: {e}"));
+                    }
+                    if text.chars().count() > partial_text.chars().count() {
+                        partial_text = text;
+                    }
+                    // ANY failure hands the call to the next rung — a rate limit
+                    // or a dropped connection on this model says nothing about
+                    // the next one, and the walk returns on the next pass.
                 }
-            }
-            Err(e) => {
-                eprintln!("[schedule] run {run_id} rung '{rung_model}' failed: {e}");
-                // Only a model-side rejection moves to the next model. A dropped
-                // connection or a timeout ends the run with its own reason
-                // instead of billing every fallback for a network problem.
-                let next = crate::llm::should_fall_back(&e);
-                last_error = e.clone();
-                tried.push(format!("{rung_model}: {e}"));
-                if text.chars().count() > partial_text.chars().count() {
-                    partial_text = text;
-                }
-                if !next {
-                    break;
+                Err(e) => {
+                    eprintln!("[schedule] run {run_id} rung '{rung_model}' failed: {e}");
+                    last_error = e.clone();
+                    if cycle == 0 {
+                        tried.push(format!("{rung_model}: {e}"));
+                    }
+                    if text.chars().count() > partial_text.chars().count() {
+                        partial_text = text;
+                    }
+                    // ANY failure moves to the next model, whatever it named:
+                    // the fallbacks sit on other providers with other endpoints.
                 }
             }
         }

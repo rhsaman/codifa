@@ -29,8 +29,16 @@ export function scheduleRunTokens(run: ScheduleRun): number {
 // Inbox badge can use them without loading this chunk; re-exported here.
 export { unseenRunCount, unseenRunCountForTask };
 
-/** انتخاب تسک نمایشی Inbox: انتخاب ذخیره‌شده اگر هنوز وجود دارد، وگرنه تسکی که
- *  تازه‌ترین ران را دارد (نه لزوماً اولین تسک لیست)، وگرنه اولین تسک. */
+/** اندازه‌ی هر صفحه از تاریخچه‌ی اجراها — infinite scroll همین را صف‌به‌صف
+ *  می‌کشد تا هرگز کل تاریخچه در رم لود نشود. */
+const RUNS_PAGE = 20;
+/** سقف ران‌های لودشده برای یک تسک: بعد از این اندازه، صفحات قدیمی دور ریخته
+ *  می‌شوند (hasMore دوباره true می‌شود) تا اسکرول طولانی هم رم را نفروشد. */
+const MAX_LOADED_RUNS = 200;
+
+/** انتخاب تسک نمایشی Inbox (سازگار با تست‌ها): انتخاب ذخیره‌شده اگر هنوز وجود
+ *  دارد، وگرنه تسکی که تازه‌ترین ران را دارد. در UI گرید دیگر auto-pick نمی‌کنیم —
+ *  گرید همه‌ی تسک‌ها را نشان می‌دهد و کلیک کاربر به صفحه‌ی همان تسک می‌رود. */
 export function pickInboxTask(
   schedules: ScheduledTask[],
   runs: ScheduleRun[],
@@ -41,13 +49,26 @@ export function pickInboxTask(
     const kept = schedules.find((t) => t.id === selected);
     if (kept) return kept;
   }
-  // تازه‌ترین ران اول است (بک‌اند جدیدترین اول می‌دهد) — تسک آن را انتخاب کن
-  // تا بج غیرصفر با پنل «No runs yet» همراه نشود.
   for (const r of runs) {
     const owner = schedules.find((t) => t.id === r.schedule_id);
     if (owner) return owner;
   }
   return schedules[0] ?? null;
+}
+
+/** ادغام دو لیست ران بدون تکرار (با id) و مرتب قطعی: جدیدترین اول. */
+function mergeRunsDesc(a: ScheduleRun[], b: ScheduleRun[]): ScheduleRun[] {
+  const m = new Map<string, ScheduleRun>();
+  for (const r of [...a, ...b]) m.set(r.id, r);
+  return [...m.values()].sort((x, y) => (y.started_at || 0) - (x.started_at || 0));
+}
+
+/** پیش‌نمایش کوتاه پرامپت: متن کامل هرگز به DOM نمی‌رود — یک خط nowrap با
+ *  چند KB متن bidi مخلوط، هر reflow (مثلاً درگ عرض) را به سنگین‌ترین عملیات
+ *  صفحه تبدیل می‌کند. محدود به ۲۴۰ کاراکتر + علامت ادامه. */
+export function promptPreview(prompt: string, max = 240): string {
+  const flat = prompt.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
 /** رندر مارکداون خروجی کرون دقیقاً با همان رندر چت (فونت، جهت، کد، جدول). */
@@ -64,29 +85,22 @@ function InboxMarkdown({ text }: { text: string }) {
 }
 
 /** اتصال کلیدهای vim به اینباکس — کامپوننت جدا تا هوک دقیقاً همزمان با mount
- *  شدن محتوا نصب شود: useVimScroll با deps خالی فقط یک بار refها را می‌خواند و
- *  اگر اینباکس با open=false mount شود (بازیابی تب هنگام بوت)، refها null
- *  می‌مانند و هوک برای همیشه از کار می‌افتد. */
+ *  شدن محتوا نصب شود. */
 function InboxVimScroll({
   inboxRef,
-  chatRef,
+  pageRef,
 }: {
   inboxRef: React.RefObject<HTMLDivElement | null>;
-  chatRef: React.RefObject<HTMLDivElement | null>;
+  pageRef: React.RefObject<HTMLDivElement | null>;
 }) {
-  useVimScroll(chatRef, inboxRef);
+  useVimScroll(pageRef, inboxRef);
 
-  // Override مخصوص اینباکس برای caret کهنهٔ WebKit: کرسر بعد از کلیک روی
-  // محتوای غیرقابل‌تایپ، در کامپوزر چت پارک می‌ماند؛ هوک مشترک چنین keydownی
-  // را «تایپ» می‌داند و j/k را رها می‌کند. اینباکس هیچ فیلد متنی خودش ندارد،
-  // پس وقتی جدیدترین تعامل کاربر کلیک داخل اینباکس بوده (نه رفتن به یک input)،
-  // j/k با اطمینان مالِ اسکرول‌اند — حتی با کرسر پارک‌شده بیرون. قاعده فقط
-  // وقتی اعمال می‌شود که هوک مشترک کلید را نگرفته باشد (defaultPrevented) و
-  // intent تایپ از intent پنل جدیدتر نباشد؛ وگرنه تایپ واقعی اولویت دارد.
+  // Override مخصوص اینباکس برای caret کهنهٔ WebKit: j/k مال اسکرول صفحهٔ
+  // اینباکس‌اند وقتی جدیدترین تعامل کاربر کلیک داخل اینباکس بوده.
   useEffect(() => {
     const dlg = inboxRef.current;
-    const chat = chatRef.current;
-    if (!dlg || !chat) return;
+    const page = pageRef.current;
+    if (!dlg || !page) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
       if (isPrefixArmed()) return;
@@ -98,7 +112,7 @@ function InboxVimScroll({
       if (st.region !== dlg || st.regionAt < st.typingAt) return;
       e.preventDefault();
       e.stopPropagation();
-      applyScroll(chat, delta, !e.repeat);
+      applyScroll(page, delta, !e.repeat);
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
@@ -107,7 +121,7 @@ function InboxVimScroll({
   return null;
 }
 
-/** کارت یک اجرا در Inbox — چت‌مانند: هدر خنثی + بدنه مارکداون با فونت چت. */
+/** کارت یک اجرا در صفحهٔ جزئیات — چت‌مانند: هدر خنثی + بدنه مارکداون با فونت چت. */
 function InboxRunCard({ run }: { run: ScheduleRun }) {
   const tokens = scheduleRunTokens(run);
   return (
@@ -125,8 +139,6 @@ function InboxRunCard({ run }: { run: ScheduleRun }) {
       </div>
       {run.error && <div className="schedule-run-error">{run.error}</div>}
       {run.status === "running" ? (
-        // A live run is IN PROGRESS: spinner + label, never a bare "No output"
-        // (that read like the run had finished and said nothing).
         <div className="schedule-run-live">
           <span className="schedule-run-spinner" aria-hidden="true" />
           Running…
@@ -140,7 +152,69 @@ function InboxRunCard({ run }: { run: ScheduleRun }) {
   );
 }
 
-/** Inbox کرون‌ها: لیست تسک‌ها + چت (تاریخچه اجراها) هر کرون + بج اجرای جدید. */
+/** کارت گرید یک تسک: نام + بج دیده‌نشده، کرون، اجرای بعدی، وضعیت آخرین ران. */
+function GridCard({
+  task,
+  unseen,
+  lastRun,
+  onClick,
+}: {
+  task: ScheduledTask;
+  unseen: number;
+  lastRun: ScheduleRun | null;
+  onClick: () => void;
+}) {
+  const tokens = lastRun ? scheduleRunTokens(lastRun) : 0;
+  return (
+    <button
+      type="button"
+      className="schedule-grid-card"
+      onClick={onClick}
+      title={`${task.name} — open its runs`}
+    >
+      <span className="schedule-grid-card-top">
+        <span className="schedule-grid-card-name">{task.name}</span>
+        {unseen > 0 && <span className="schedule-inbox-badge">{unseen}</span>}
+      </span>
+      {!task.enabled && <span className="schedule-grid-paused">Paused</span>}
+      <span className="schedule-grid-card-meta">
+        {task.cron_label || task.cron || "Once"}
+      </span>
+      <span className="schedule-grid-card-meta">
+        {task.next_run ? `Next: ${formatNextRunFa(task.next_run)}` : "No next run"}
+      </span>
+      <span className="schedule-grid-card-foot">
+        {typeof task.run_count === "number" && task.run_count > 0 ? (
+          <span className="schedule-grid-count">{task.run_count} runs</span>
+        ) : (
+          <span className="schedule-grid-count">No runs yet</span>
+        )}
+        {lastRun && lastRun.status !== "running" && (
+          <span className={`schedule-grid-status ${lastRun.status}`}>
+            {runStatusFa(lastRun.status)}
+          </span>
+        )}
+        {lastRun && lastRun.status === "running" && (
+          <span className="schedule-grid-status running">
+            <span className="schedule-run-spinner" aria-hidden="true" /> running
+          </span>
+        )}
+        {tokens > 0 && (
+          <span className="schedule-grid-count" title={`${tokens} tokens`}>
+            {formatTokens(tokens)}
+          </span>
+        )}
+      </span>
+    </button>
+  );
+}
+
+/** Inbox کرون‌ها — دو صفحه:
+ *  • GRID: کارت هر تسک (+ کارت اجراهای حذف‌شده‌ها)؛ کلیک → صفحهٔ همان تسک.
+ *  • DETAIL: پیام‌های یک تسک (یا اجراهای حذف‌شده‌ها) با تاریخچهٔ صفحه‌بندی‌شده.
+ *  قواعد: پیام‌ها فقط مالِ تسک انتخاب‌شده‌اند؛ Clear در هدر نمای فعال را پاک
+ *  می‌کند؛ تاریخچه با کرسر صفحه‌بندی می‌شود تا رم bounded بماند.
+ */
 export function ScheduleInbox() {
   const open = useStore((s) => s.scheduleInboxOpen);
   const setOpen = useStore((s) => s.setScheduleInboxOpen);
@@ -153,26 +227,20 @@ export function ScheduleInbox() {
   const dir = useStore((s) => s.dir);
   const [runs, setRuns] = useState<ScheduleRun[]>([]);
   const [taskRuns, setTaskRuns] = useState<ScheduleRun[] | null>(null);
+  const [taskHasMore, setTaskHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
-  const [orphanOpen, setOrphanOpen] = useState(false);
+  const [orphanView, setOrphanView] = useState(false);
   const [clearingOrphans, setClearingOrphans] = useState(false);
-  const [confirmClearOrphans, setConfirmClearOrphans] = useState(false);
   const [orphanError, setOrphanError] = useState<string | null>(null);
-  // پرامپت تسک به‌صورت پیش‌فرض جمع است — پیام‌های اجرا مهم‌ترند؛ کلیک بازش می‌کند.
   const [promptOpen, setPromptOpen] = useState(false);
 
-  // j/k/h/l مثل بقیهٔ پنل‌ها: ناحیهٔ ownership کل دیالوگ اینباکس است ولی
-  // اسکرولر هدف ستون پیام‌هاست — پیام‌ها مهم‌تر از لیست تسک‌اند. اتصال داخل
-  // InboxVimScroll انجام می‌شود (بالا) تا با mount واقعی محتوا همگام باشد.
   const inboxRef = useRef<HTMLDivElement>(null);
-  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
 
-  // باز شدن اینباکس کلیدها را همین‌جا می‌گیرد (مثل پاپ‌آپ گیت‌دیف): فوکوس روی
-  // ریشه + علامت‌گذاری ناحیهٔ vim، تا j/k بدون کلیک داخل پنل کار کند. بستن،
-  // فوکوس را به کامپوزر چت برمی‌گرداند.
   useEffect(() => {
     if (!open) return;
     const el = inboxRef.current;
@@ -182,13 +250,13 @@ export function ScheduleInbox() {
     markVimRegion(el);
     return () => {
       const a = document.activeElement;
-      if (a && a !== document.body) return; // کاربر خودش فوکوس را برده جای دیگر
+      if (a && a !== document.body) return;
       const id = useStore.getState().activeChatId;
       if (id) requestAnimationFrame(() => focusChatInput(id));
     };
   }, [open]);
 
-  // عرض پنل — با درگ لبهٔ چپ (مثل پنل گیت‌دیف) + ذخیرهٔ محلی.
+  // عرض پنل — درگ مستقیم روی DOM (بدون re-render) و commit یک‌باره در پایان.
   const [width, setWidth] = useState(() => {
     if (typeof window === "undefined") return 720;
     const vw =
@@ -227,62 +295,62 @@ export function ScheduleInbox() {
   }, [open, setOpen]);
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
+    const el = inboxRef.current;
+    if (!el) return;
     const startX = e.clientX;
-    const startW = width;
+    const startW = el.offsetWidth;
+    el.style.width = `${startW}px`;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    let last = startW;
     const onMove = (ev: MouseEvent) => {
       const w = Math.max(
         360,
         Math.min(window.innerWidth - 24, startW - (ev.clientX - startX)),
       );
-      setWidth(w);
-      try {
-        localStorage.setItem("coder:scheduleInboxWidth", String(w));
-      } catch {
-        /* حافظه در دسترس نیست — عرض فقط حفظ نمی‌شود */
-      }
+      last = w;
+      el.style.width = `${w}px`;
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       dragCleanup.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      try {
+        localStorage.setItem("coder:scheduleInboxWidth", String(last));
+      } catch {
+        /* حافظه در دسترس نیست */
+      }
+      setWidth(last);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     dragCleanup.current = onUp;
   };
 
-  const selectedTask: ScheduledTask | null = useMemo(
-    () => pickInboxTask(schedules, runs, selected),
-    [schedules, runs, selected],
-  );
+  const selectedTask: ScheduledTask | null = useMemo(() => {
+    if (orphanView || !selected) return null;
+    return schedules.find((t) => t.id === selected) ?? null;
+  }, [orphanView, schedules, selected]);
 
-  // ران‌های یتیم (تسک حذف‌شده ولی تاریخچه نگه‌داشته‌شده): در لیست چپ تسکی
-  // ندارند ولی در بج شمرده می‌شوند — آن‌ها را جداگانه نگه می‌داریم تا پنل راست
-  // به‌جای خالی، همین‌ها را نشان دهد.
   const orphanRuns = useMemo(
     () => runs.filter((r) => !schedules.some((t) => t.id === r.schedule_id)),
     [runs, schedules],
   );
 
-  // ترتیب لیست چپ: تسک‌های با ران تازه‌تر بالا (بج‌دارها گم نمی‌شوند).
-  const orderedSchedules = useMemo(() => {
-    const latest = new Map<string, number>();
+  // آخرین ران هر تسک — برای pill وضعیت روی کارت گرید.
+  const latestRunByTask = useMemo(() => {
+    const map = new Map<string, ScheduleRun>();
     for (const r of runs) {
-      const t = typeof r.started_at === "number" ? r.started_at : 0;
-      if (!latest.has(r.schedule_id) || (latest.get(r.schedule_id) ?? 0) < t) {
-        latest.set(r.schedule_id, t);
-      }
+      if (!map.has(r.schedule_id)) map.set(r.schedule_id, r);
     }
-    return [...schedules].sort(
-      (a, b) => (latest.get(b.id) ?? -1) - (latest.get(a.id) ?? -1),
-    );
-  }, [schedules, runs]);
+    return map;
+  }, [runs]);
 
   const refresh = useCallback(async () => {
     const out = await listSchedules();
     if (!("error" in out)) {
-      // بدون تغییر واقعی state را عوض نکن — وگرنه هر پولینگ هویت
-      // selectedTask عوض می‌شود و چت مدام به حالت Loading برمی‌گردد.
       const prev = useStore.getState().schedules;
       if (JSON.stringify(prev) !== JSON.stringify(out)) setSchedules(out);
     }
@@ -294,84 +362,144 @@ export function ScheduleInbox() {
 
   const selectedTaskId = selectedTask?.id ?? null;
 
+  const loadTaskRuns = useCallback(
+    async (taskId: string) => {
+      const one = await listScheduleRuns(taskId, RUNS_PAGE);
+      if ("error" in one) return;
+      setTaskRuns(one);
+      setTaskHasMore(one.length >= RUNS_PAGE);
+      markSeen(finishedRunIds(one));
+    },
+    [markSeen],
+  );
+
+  const loadOlderRuns = useCallback(async () => {
+    if (!selectedTaskId || !taskRuns || taskRuns.length === 0) return;
+    const oldest = taskRuns[taskRuns.length - 1].started_at || 0;
+    if (oldest <= 0) return;
+    setLoadingMore(true);
+    try {
+      const older = await listScheduleRuns(selectedTaskId, RUNS_PAGE, oldest - 0.001);
+      if ("error" in older) return;
+      const merged = mergeRunsDesc(taskRuns, older);
+      const capped = merged.length > MAX_LOADED_RUNS ? merged.slice(0, MAX_LOADED_RUNS) : merged;
+      setTaskRuns(capped);
+      setTaskHasMore(older.length >= RUNS_PAGE || merged.length > MAX_LOADED_RUNS);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [selectedTaskId, taskRuns]);
+
   const refreshTaskRuns = useCallback(async () => {
     if (!selectedTaskId) return;
-    const one = await listScheduleRuns(selectedTaskId, 20);
-    if (!("error" in one)) setTaskRuns(one);
-  }, [selectedTaskId]);
+    const one = await listScheduleRuns(selectedTaskId, RUNS_PAGE);
+    if ("error" in one) return;
+    setTaskRuns((prev) => (prev ? mergeRunsDesc(prev, one) : one));
+    markSeen(finishedRunIds(one));
+  }, [selectedTaskId, markSeen]);
 
   useEffect(() => {
     if (open) void refresh();
   }, [open, refresh]);
 
-  // پولینگ سبک هنگام باز بودن Inbox تا اجرای جدید (نوتیفیکیشن) دیده شود.
   useEffect(() => {
     if (!open) return;
-    const t = setInterval(() => void refresh(), 15000);
+    const t = setInterval(() => {
+      void refresh();
+      void refreshTaskRuns();
+    }, 15000);
     return () => clearInterval(t);
-  }, [open, refresh]);
+  }, [open, refresh, refreshTaskRuns]);
 
   useEffect(() => {
     if (!open || !selectedTask) {
       setTaskRuns(null);
+      setTaskHasMore(false);
       return;
     }
-    // تسک عوض شد → تأییدیه Clear تسک قبلی را دور بریز.
     setConfirmClear(false);
     setClearError(null);
     setPromptOpen(false);
     setTaskRuns(null);
-    void (async () => {
-      const out = await listScheduleRuns(selectedTask.id, 20);
-      if (!("error" in out)) {
-        setTaskRuns(out);
-        markSeen(finishedRunIds(out));
-      }
-    })();
-  }, [open, selectedTask, markSeen]);
+    setTaskHasMore(false);
+    void loadTaskRuns(selectedTask.id);
+  }, [open, selectedTask, loadTaskRuns]);
 
-  // باز شدن Inbox همه اجراهای فعلی را «دیده» می‌کند تا بج صفر شود.
   useEffect(() => {
     if (open && runs.length > 0) markSeen(finishedRunIds(runs));
   }, [open, runs, markSeen]);
 
-  // ران‌های نمایشی تسک انتخاب‌شده: اجتماع پاسخ مستقیم تسک و کش سراسری runs
-  // (حذف تکراری با id، جدیدترین اول) تا با بج ناسازگار نشود — هر کدام تازه‌تر
-  // باشد همان دیده می‌شود و نژاد پولینگ «بج دارد ولی پنل خالی است» می‌رود.
-  const displayedRuns: ScheduleRun[] | null = useMemo(() => {
-    if (!selectedTask) return taskRuns;
-    const fromAll = runs.filter((r) => r.schedule_id === selectedTask.id);
-    if (!taskRuns) return fromAll.length > 0 ? fromAll : null;
-    const merged = new Map<string, ScheduleRun>();
-    for (const r of [...taskRuns, ...fromAll]) merged.set(r.id, r);
-    return [...merged.values()].sort(
-      (a, b) => (b.started_at || 0) - (a.started_at || 0),
-    );
-  }, [taskRuns, runs, selectedTask]);
-
-  // تسکی که تازه‌ترین ران دیده‌نشده را دارد — برای دکمه پرش وقتی پنل راست خالی است.
-  const newestUnseenTaskId = useMemo(() => {
-    const seenSet = new Set(seen);
-    for (const r of runs) {
-      if (
-        r.status !== "running" &&
-        !seenSet.has(r.id) &&
-        schedules.some((t) => t.id === r.schedule_id)
-      ) {
-        return r.schedule_id;
-      }
+  const onChatScroll = useCallback(() => {
+    const el = pageRef.current;
+    if (!el || loadingMore || !taskHasMore || !selectedTaskId) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 480) {
+      void loadOlderRuns();
     }
-    return null;
-  }, [runs, seen, schedules]);
+  }, [loadingMore, taskHasMore, selectedTaskId, loadOlderRuns]);
+
+  const clearTarget: "task" | "orphans" | null = orphanView
+    ? orphanRuns.length > 0
+      ? "orphans"
+      : null
+    : selectedTask && (taskRuns?.length ?? 0) > 0
+      ? "task"
+      : null;
+
+  const goBackToGrid = () => {
+    setOrphanView(false);
+    setSelected(null);
+    setConfirmClear(false);
+    setClearError(null);
+    setOrphanError(null);
+  };
+
+  const clearActiveView = () => {
+    if (clearTarget === "task" && selectedTask) {
+      setClearing(true);
+      setClearError(null);
+      void clearScheduleRuns(selectedTask.id)
+        .then((out) => {
+          if ("error" in out) {
+            setClearError(out.error);
+            return;
+          }
+          setTaskRuns([]);
+          setTaskHasMore(false);
+          setRuns((prev) => prev.filter((r) => r.schedule_id !== selectedTask.id));
+          setConfirmClear(false);
+          void refresh();
+        })
+        .catch((err: unknown) => {
+          setClearError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(() => setClearing(false));
+    } else if (clearTarget === "orphans") {
+      setClearingOrphans(true);
+      setOrphanError(null);
+      void clearOrphanScheduleRuns()
+        .then((out) => {
+          if ("error" in out) {
+            setOrphanError(out.error);
+            return;
+          }
+          setRuns((prev) => prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)));
+          setConfirmClear(false);
+          void refresh();
+        })
+        .catch((err: unknown) => {
+          setOrphanError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(() => setClearingOrphans(false));
+    }
+  };
 
   if (!open) return null;
   const unseen = unseenRunCount(runs, seen);
+  const detail = orphanView || !!selectedTask;
 
   return (
     <div className="schedule-inbox-overlay" dir={dir}>
-      <InboxVimScroll inboxRef={inboxRef} chatRef={chatScrollRef} />
-      {/* Backdrop only blocks clicks behind the inbox — it never closes it.
-          Closing is via the ✕ button. */}
+      <InboxVimScroll inboxRef={inboxRef} pageRef={pageRef} />
       <div className="schedule-inbox-backdrop" />
       <div
         ref={inboxRef}
@@ -386,9 +514,78 @@ export function ScheduleInbox() {
           onMouseDown={startResize}
         />
         <div className="schedule-inbox-head" dir="ltr">
+          {detail && (
+            <button
+              className="review-header-btn schedule-inbox-back"
+              title="Back to all schedules"
+              aria-label="Back to all schedules"
+              onClick={goBackToGrid}
+            >
+              {/* فلش back در هر دو جهت ثابت است (مثل مرورگرها): ‹ — در RTL برعکس نمی‌شود. */}
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
+            </button>
+          )}
           {unseen > 0 && <span className="schedule-inbox-badge">{unseen} new</span>}
+          {orphanView && (
+            <span className="schedule-inbox-title">Runs from deleted tasks</span>
+          )}
+          {selectedTask && (
+            <span className="schedule-inbox-title" title={selectedTask.name}>
+              {selectedTask.name}
+            </span>
+          )}
           <span className="schedule-inbox-head-spacer" />
           <span className="review-header-actions">
+            {clearTarget !== null &&
+              (!confirmClear ? (
+                <button
+                  className="review-header-btn schedule-inbox-clear"
+                  title={
+                    clearTarget === "task"
+                      ? `Clear all runs of ${selectedTask?.name ?? ""}`
+                      : "Delete runs from deleted tasks"
+                  }
+                  aria-label={
+                    clearTarget === "task"
+                      ? `Clear all runs of ${selectedTask?.name ?? ""}`
+                      : "Delete runs from deleted tasks"
+                  }
+                  disabled={clearing || clearingOrphans}
+                  onClick={() => {
+                    setClearError(null);
+                    setOrphanError(null);
+                    setConfirmClear(true);
+                  }}
+                >
+                  Clear
+                </button>
+              ) : (
+                <span className="schedule-clear-confirm">
+                  <span className="schedule-clear-text">Clear all?</span>
+                  <button
+                    className="schedule-btn danger"
+                    title="Confirm clear"
+                    aria-label="Confirm clear"
+                    disabled={clearing || clearingOrphans}
+                    onClick={clearActiveView}
+                  >
+                    {clearing || clearingOrphans ? "Clearing…" : "Yes"}
+                  </button>
+                  <button
+                    className="schedule-btn"
+                    title="Cancel"
+                    aria-label="Cancel"
+                    disabled={clearing || clearingOrphans}
+                    onClick={() => {
+                      setConfirmClear(false);
+                      setClearError(null);
+                      setOrphanError(null);
+                    }}
+                  >
+                    No
+                  </button>
+                </span>
+              ))}
             <button
               className="review-header-btn"
               title="Refresh"
@@ -410,189 +607,52 @@ export function ScheduleInbox() {
             </button>
           </span>
         </div>
-        <div className="schedule-inbox-body">
-          <div className="schedule-inbox-list">
-            {orderedSchedules.length === 0 ? (
+        <div ref={pageRef} className="schedule-inbox-page" onScroll={onChatScroll}>
+          {!detail ? (
+            // GRID: کارت هر تسک + کارت اجراهای حذف‌شده‌ها
+            schedules.length === 0 && orphanRuns.length === 0 ? (
               <div className="schedule-runs-empty">No scheduled tasks yet</div>
             ) : (
-              orderedSchedules.map((t) => {
-                const taskUnseen = unseenRunCountForTask(runs, seen, t.id);
-                return (
-                  <button
+              <div className="schedule-inbox-grid">
+                {schedules.map((t) => (
+                  <GridCard
                     key={t.id}
-                    className={`schedule-inbox-item${selectedTask?.id === t.id ? " active" : ""}`}
+                    task={t}
+                    unseen={unseenRunCountForTask(runs, seen, t.id)}
+                    lastRun={latestRunByTask.get(t.id) ?? null}
                     onClick={() => setSelected(t.id)}
+                  />
+                ))}
+                {orphanRuns.length > 0 && (
+                  <button
+                    type="button"
+                    className="schedule-grid-card schedule-grid-card--orphan"
+                    title="Runs of tasks you deleted — their history is kept until cleared"
+                    onClick={() => setOrphanView(true)}
                   >
-                    <span className="schedule-item-name">{t.name}</span>
-                    {taskUnseen > 0 && (
-                      <span className="schedule-inbox-badge">{taskUnseen}</span>
-                    )}
-                    <span className="schedule-item-sub">{formatNextRunFa(t.next_run)}</span>
-                  </button>
-                );
-              })
-            )}
-            {orphanRuns.length > 0 && (
-              <div className="schedule-inbox-orphan-toggle">
-                <button
-                  className="schedule-btn"
-                  title="Show runs from deleted tasks"
-                  aria-label="Show runs from deleted tasks"
-                  aria-expanded={orphanOpen}
-                  onClick={() => setOrphanOpen((v) => !v)}
-                >
-                  {orphanOpen ? "Hide" : "Show"} {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""}
-                </button>
-              </div>
-            )}
-          </div>
-          <div ref={chatScrollRef} className="schedule-inbox-chat">
-            {!selectedTask ? (
-              orphanRuns.length > 0 ? (
-                <div className="schedule-inbox-runs">
-                  <div className="schedule-inbox-chat-head">
-                    <span className="schedule-inbox-prompt-label">Runs from deleted tasks</span>
-                    <span className="schedule-inbox-head-spacer" />
-                    {!confirmClearOrphans ? (
-                      <button
-                        className="schedule-btn danger"
-                        title="Delete runs from deleted tasks"
-                        aria-label="Delete runs from deleted tasks"
-                        disabled={clearingOrphans}
-                        onClick={() => {
-                          setOrphanError(null);
-                          setConfirmClearOrphans(true);
-                        }}
-                      >
-                        Clear
-                      </button>
-                    ) : (
-                      <span className="schedule-clear-confirm">
-                        <span className="schedule-clear-text">Delete all?</span>
-                        <button
-                          className="schedule-btn danger"
-                          title="Confirm delete"
-                          aria-label="Confirm delete"
-                          disabled={clearingOrphans}
-                          onClick={() => {
-                            setClearingOrphans(true);
-                            setOrphanError(null);
-                            void clearOrphanScheduleRuns()
-                              .then((out) => {
-                                if ("error" in out) {
-                                  setOrphanError(out.error);
-                                  return;
-                                }
-                                setRuns((prev) =>
-                                  prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)),
-                                );
-                                setConfirmClearOrphans(false);
-                                setOrphanOpen(false);
-                                void refresh();
-                              })
-                              .catch((err: unknown) => {
-                                setOrphanError(err instanceof Error ? err.message : String(err));
-                              })
-                              .finally(() => setClearingOrphans(false));
-                          }}
-                        >
-                          {clearingOrphans ? "Clearing…" : "Yes"}
-                        </button>
-                        <button
-                          className="schedule-btn"
-                          title="Cancel"
-                          aria-label="Cancel"
-                          disabled={clearingOrphans}
-                          onClick={() => {
-                            setConfirmClearOrphans(false);
-                            setOrphanError(null);
-                          }}
-                        >
-                          No
-                        </button>
-                      </span>
-                    )}
-                  </div>
-                  {orphanError && <div className="schedule-error">{orphanError}</div>}
-                  {orphanRuns.slice(0, 20).map((r) => (
-                    <InboxRunCard key={r.id} run={r} />
-                  ))}
-                </div>
-              ) : (
-                <div className="schedule-runs-empty">Select a task to see its runs</div>
-              )
-            ) : (
-              <>
-                <div className="schedule-inbox-chat-head">
-                  <strong>{selectedTask.name}</strong>
-                  <span className="schedule-item-cron">
-                    {selectedTask.cron_label || selectedTask.cron || "Once"}
-                  </span>
-                  <span className="schedule-inbox-head-spacer" />
-                  {!confirmClear ? (
-                    <button
-                      className="schedule-btn danger"
-                      title="Clear this task's inbox"
-                      aria-label="Clear this task's inbox"
-                      disabled={clearing || !taskRuns || taskRuns.length === 0}
-                      onClick={() => {
-                        setClearError(null);
-                        setConfirmClear(true);
-                      }}
-                    >
-                      Clear
-                    </button>
-                  ) : (
-                    <span className="schedule-clear-confirm">
-                      <span className="schedule-clear-text">Clear inbox?</span>
-                      <button
-                        className="schedule-btn danger"
-                        title="Confirm clear"
-                        aria-label="Confirm clear"
-                        disabled={clearing}
-                        onClick={() => {
-                          if (!selectedTask) return;
-                          setClearing(true);
-                          setClearError(null);
-                          void clearScheduleRuns(selectedTask.id)
-                            .then((out) => {
-                              if ("error" in out) {
-                                setClearError(out.error);
-                                return;
-                              }
-                              setTaskRuns([]);
-                              // کش سراسری را هم همان‌جا خالی کن تا اجتماع displayedRuns
-                              // ران‌های پاک‌شده را تا پولینگ بعدی زنده نکند.
-                              setRuns((prev) =>
-                                prev.filter((r) => r.schedule_id !== selectedTask.id),
-                              );
-                              setConfirmClear(false);
-                              void refresh();
-                            })
-                            .catch((err: unknown) => {
-                              setClearError(err instanceof Error ? err.message : String(err));
-                            })
-                            .finally(() => setClearing(false));
-                        }}
-                      >
-                        {clearing ? "Clearing…" : "Yes"}
-                      </button>
-                      <button
-                        className="schedule-btn"
-                        title="Cancel"
-                        aria-label="Cancel"
-                        disabled={clearing}
-                        onClick={() => {
-                          setConfirmClear(false);
-                          setClearError(null);
-                        }}
-                      >
-                        No
-                      </button>
+                    <span className="schedule-grid-card-top">
+                      <span className="schedule-grid-card-name">Deleted tasks</span>
+                      <span className="schedule-inbox-badge">{orphanRuns.length}</span>
                     </span>
-                  )}
-                </div>
-                {clearError && <div className="schedule-error">{clearError}</div>}
+                    <span className="schedule-grid-card-meta">
+                      history kept — click to view, Clear removes it
+                    </span>
+                  </button>
+                )}
+              </div>
+            )
+          ) : orphanView ? (
+            // DETAIL: اجراهای تسک‌های حذف‌شده
+            <div className="schedule-inbox-runs">
+              {orphanError && <div className="schedule-error">{orphanError}</div>}
+              {orphanRuns.map((r) => (
+                <InboxRunCard key={r.id} run={r} />
+              ))}
+            </div>
+          ) : (
+            // DETAIL: پیام‌های تسک انتخاب‌شده
+            selectedTask && (
+              <>
                 <div className={`schedule-inbox-prompt${promptOpen ? " open" : ""}`}>
                   <button
                     type="button"
@@ -604,7 +664,7 @@ export function ScheduleInbox() {
                     <span className="schedule-inbox-prompt-label">Task</span>
                     {!promptOpen && (
                       <span className="schedule-inbox-prompt-preview">
-                        {selectedTask.prompt.replace(/\s+/g, " ").trim()}
+                        {promptPreview(selectedTask.prompt)}
                       </span>
                     )}
                     <svg
@@ -624,210 +684,28 @@ export function ScheduleInbox() {
                   </button>
                   {promptOpen && <InboxMarkdown text={selectedTask.prompt} />}
                 </div>
+                {clearError && <div className="schedule-error">{clearError}</div>}
                 {loading && <div className="schedule-runs-empty">Loading…</div>}
-                {!displayedRuns ? (
+                {!taskRuns ? (
                   <div className="schedule-runs-empty">Loading…</div>
-                ) : displayedRuns.length === 0 ? (
-                  <>
-                    <div className="schedule-runs-empty">No runs yet</div>
-                    {newestUnseenTaskId && newestUnseenTaskId !== selectedTask.id && (
-                      <button
-                        className="schedule-btn"
-                        onClick={() => setSelected(newestUnseenTaskId)}
-                      >
-                        Show latest run
-                      </button>
-                    )}
-                    {orphanRuns.length > 0 && (
-                      <div className="schedule-inbox-orphan-section">
-                        <div className="schedule-inbox-orphan-head">
-                          <button
-                            className="schedule-btn"
-                            title="Show runs from deleted tasks"
-                            aria-label="Show runs from deleted tasks"
-                            aria-expanded={orphanOpen}
-                            onClick={() => setOrphanOpen((v) => !v)}
-                          >
-                            {orphanOpen ? "Hide" : "Show"} {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""}
-                          </button>
-                          <span className="schedule-inbox-head-spacer" />
-                          <button
-                            className="review-header-btn"
-                            title="Refresh deleted runs"
-                            aria-label="Refresh deleted runs"
-                            onClick={() => {
-                              setLoading(true);
-                              void refresh().finally(() => setLoading(false));
-                            }}
-                          >
-                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></svg>
-                          </button>
-                          {!confirmClearOrphans ? (
-                            <button
-                              className="schedule-btn danger"
-                              title="Delete runs from deleted tasks"
-                              aria-label="Delete runs from deleted tasks"
-                              disabled={clearingOrphans}
-                              onClick={() => {
-                                setOrphanError(null);
-                                setConfirmClearOrphans(true);
-                              }}
-                            >
-                              Clear
-                            </button>
-                          ) : (
-                            <span className="schedule-clear-confirm">
-                              <span className="schedule-clear-text">Delete all?</span>
-                              <button
-                                className="schedule-btn danger"
-                                title="Confirm delete"
-                                aria-label="Confirm delete"
-                                disabled={clearingOrphans}
-                                onClick={() => {
-                                  setClearingOrphans(true);
-                                  setOrphanError(null);
-                                  void clearOrphanScheduleRuns()
-                                    .then((out) => {
-                                      if ("error" in out) {
-                                        setOrphanError(out.error);
-                                        return;
-                                      }
-                                      setRuns((prev) =>
-                                        prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)),
-                                      );
-                                      setConfirmClearOrphans(false);
-                                      setOrphanOpen(false);
-                                      void refresh();
-                                    })
-                                    .catch((err: unknown) => {
-                                      setOrphanError(err instanceof Error ? err.message : String(err));
-                                    })
-                                    .finally(() => setClearingOrphans(false));
-                                }}
-                              >
-                                {clearingOrphans ? "Clearing…" : "Yes"}
-                              </button>
-                              <button
-                                className="schedule-btn"
-                                title="Cancel"
-                                aria-label="Cancel"
-                                disabled={clearingOrphans}
-                                onClick={() => {
-                                  setConfirmClearOrphans(false);
-                                  setOrphanError(null);
-                                }}
-                              >
-                                No
-                              </button>
-                            </span>
-                          )}
-                        </div>
-                        {orphanError && <div className="schedule-error">{orphanError}</div>}
-                        {orphanOpen && (
-                          <div className="schedule-inbox-runs">
-                            {orphanRuns.slice(0, 20).map((r) => (
-                              <InboxRunCard key={r.id} run={r} />
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </>
+                ) : taskRuns.length === 0 ? (
+                  <div className="schedule-runs-empty">No runs yet</div>
                 ) : (
-                  <>
-                    <div className="schedule-inbox-runs">
-                      {displayedRuns.map((r) => (
-                        <InboxRunCard key={r.id} run={r} />
-                      ))}
-                    </div>
-                    {orphanRuns.length > 0 && (
-                      <div className="schedule-inbox-orphan-section">
-                        <div className="schedule-inbox-orphan-head">
-                          <button
-                            className="schedule-btn"
-                            title="Show runs from deleted tasks"
-                            aria-label="Show runs from deleted tasks"
-                            aria-expanded={orphanOpen}
-                            onClick={() => setOrphanOpen((v) => !v)}
-                          >
-                            {orphanOpen ? "Hide" : "Show"} {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""}
-                          </button>
-                          <span className="schedule-inbox-head-spacer" />
-                          {!confirmClearOrphans ? (
-                            <button
-                              className="schedule-btn danger"
-                              title="Delete runs from deleted tasks"
-                              aria-label="Delete runs from deleted tasks"
-                              disabled={clearingOrphans}
-                              onClick={() => {
-                                setOrphanError(null);
-                                setConfirmClearOrphans(true);
-                              }}
-                            >
-                              Clear
-                            </button>
-                          ) : (
-                            <span className="schedule-clear-confirm">
-                              <span className="schedule-clear-text">Delete all?</span>
-                              <button
-                                className="schedule-btn danger"
-                                title="Confirm delete"
-                                aria-label="Confirm delete"
-                                disabled={clearingOrphans}
-                                onClick={() => {
-                                  setClearingOrphans(true);
-                                  setOrphanError(null);
-                                  void clearOrphanScheduleRuns()
-                                    .then((out) => {
-                                      if ("error" in out) {
-                                        setOrphanError(out.error);
-                                        return;
-                                      }
-                                      setRuns((prev) =>
-                                        prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)),
-                                      );
-                                      setConfirmClearOrphans(false);
-                                      setOrphanOpen(false);
-                                      void refresh();
-                                    })
-                                    .catch((err: unknown) => {
-                                      setOrphanError(err instanceof Error ? err.message : String(err));
-                                    })
-                                    .finally(() => setClearingOrphans(false));
-                                }}
-                              >
-                                {clearingOrphans ? "Clearing…" : "Yes"}
-                              </button>
-                              <button
-                                className="schedule-btn"
-                                title="Cancel"
-                                aria-label="Cancel"
-                                disabled={clearingOrphans}
-                                onClick={() => {
-                                  setConfirmClearOrphans(false);
-                                  setOrphanError(null);
-                                }}
-                              >
-                                No
-                              </button>
-                            </span>
-                          )}
-                        </div>
-                        {orphanError && <div className="schedule-error">{orphanError}</div>}
-                        {orphanOpen && (
-                          <div className="schedule-inbox-runs">
-                            {orphanRuns.slice(0, 20).map((r) => (
-                              <InboxRunCard key={r.id} run={r} />
-                            ))}
-                          </div>
-                        )}
-                      </div>
+                  <div className="schedule-inbox-runs">
+                    {taskRuns.map((r) => (
+                      <InboxRunCard key={r.id} run={r} />
+                    ))}
+                    {loadingMore && (
+                      <div className="schedule-runs-empty">Loading older runs…</div>
                     )}
-                  </>
+                    {!taskHasMore && taskRuns.length >= RUNS_PAGE && (
+                      <div className="schedule-runs-empty">— end of history —</div>
+                    )}
+                  </div>
                 )}
               </>
-            )}
-          </div>
+            )
+          )}
         </div>
       </div>
     </div>
@@ -840,11 +718,6 @@ export function ScheduleInbox() {
 export function ScheduleInboxDocked({ onClose }: { onClose: () => void }) {
   const open = useStore((s) => s.scheduleInboxOpen);
   const setOpen = useStore((s) => s.setScheduleInboxOpen);
-  // Close the tab only on a true→false transition AFTER mounting: the first
-  // effect run adopts whatever the flag was when the tab opened (openInbox
-  // pre-sets it true), otherwise an unguarded `if (!open) onClose()` here
-  // closed the tab in the same tick it opened and dumped the user on the
-  // previously active tab (e.g. the git diff).
   const prevOpenRef = useRef<boolean | null>(null);
   useEffect(() => {
     setOpen(true);

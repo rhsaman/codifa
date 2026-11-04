@@ -1,6 +1,8 @@
 // Shared interaction helpers for the editor tab bars (chats + viewers).
 // Pure functions so both bars behave identically and stay unit-testable.
 
+import { previewOrder } from "./tabOrder";
+
 /** Side of the hovered tab where a drop lands. `threshold` is the fraction of
  *  the tab extent (measured from its start edge) that counts as "before". */
 export type DropSide = "before" | "after";
@@ -203,4 +205,142 @@ export function inactiveTabIds(
   return openIds.filter(
     (id) => id !== activeId && !streamingSet.has(id) && !visibleSet.has(id),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Captured drag geometry — the fix for the drag "jump".
+//
+// The landing preview slides rows with transforms, and the drop target was
+// re-measured from LIVE rects on every dragover. Live rects carry those slide
+// transforms, so as rows slid under the cursor the next hit-test saw different
+// geometry, the target flipped, the slides flipped back — the preview
+// oscillated and the drop landed one slot off. Hit-testing must run against
+// the ORIGINAL layout, captured once at drag start and only scroll-compensated.
+// ---------------------------------------------------------------------------
+
+/** Slot extents captured at drag start: viewport-space start/end per id, the
+ *  scroller whose offset can shift the content mid-drag (the bar itself for
+ *  tab rails, the nearest scrolling ancestor for in-page lists), and that
+ *  scroller's offset at capture time. */
+export interface DragSlots {
+  ids: string[];
+  axis: TabAxis;
+  /** Flow sign (barFlowSign) — kept for tabForPoint's before/after semantics. */
+  sign: 1 | -1;
+  start: Map<string, number>;
+  end: Map<string, number>;
+  scroller: HTMLElement | null;
+  scroll0: number;
+}
+
+/** The nearest element that actually scrolls on the axis — `el` itself first
+ *  (tab rails scroll their own content), then its ancestors (settings lists
+ *  scroll inside .settings-content, not in the list). */
+function scrollParentOf(el: HTMLElement, axis: TabAxis): HTMLElement | null {
+  const prop = axis === "y" ? "overflowY" : "overflowX";
+  for (let n: HTMLElement | null = el; n; n = n.parentElement) {
+    try {
+      if (/(auto|scroll)/.test(getComputedStyle(n)[prop] ?? "")) return n;
+    } catch {
+      /* detached node — stop walking */
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Measure every row's box ONCE (drag start — all transforms are still at
+ *  rest). Returns null when any row is missing (caller falls back to live
+ *  measuring rather than half-captured geometry). */
+export function captureDragSlots(
+  container: HTMLElement | null,
+  ids: string[],
+  resolve: (id: string, index: number) => HTMLElement | null,
+  axis: TabAxis,
+  sign: 1 | -1,
+): DragSlots | null {
+  if (!container || ids.length === 0) return null;
+  const start = new Map<string, number>();
+  const end = new Map<string, number>();
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    const el = resolve(id, i);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    start.set(id, axis === "x" ? r.left : r.top);
+    end.set(id, axis === "x" ? r.right : r.bottom);
+  }
+  const scroller = scrollParentOf(container, axis);
+  const scroll0 = scroller ? (axis === "x" ? scroller.scrollLeft : scroller.scrollTop) : 0;
+  return { ids, axis, sign, start, end, scroller, scroll0 };
+}
+
+/** Captured extents mapped to the CURRENT viewport: the captured boxes only
+ *  go stale through the scroller's own offset, so shift them by the scroll
+ *  delta (sign works out identically for LTR and RTL scroll offsets). The
+ *  slide transforms are deliberately NOT reflected — hit-testing must see
+ *  the original layout or the preview oscillates. */
+export function slotExtents(slots: DragSlots): TabExtent[] {
+  const s = slots.scroller
+    ? slots.axis === "x"
+      ? slots.scroller.scrollLeft
+      : slots.scroller.scrollTop
+    : slots.scroll0;
+  const d = slots.scroll0 - s;
+  return slots.ids.map((id) => {
+    const a = (slots.start.get(id) ?? 0) + d;
+    const b = (slots.end.get(id) ?? 0) + d;
+    return slots.axis === "x" ? { id, left: a, right: b } : { id, top: a, bottom: b };
+  });
+}
+
+/** Exact per-id PIXEL shifts for a landing preview. Each id moves to the
+ *  start its preview position really has after the commit reflows — the sum
+ *  of the crossed slots' full strides (size + gap), so variable sizes and
+ *  list gaps land exactly, in BOTH directions (the delta is physical px; the
+ *  old uniform ±slot×sign slides misaligned by one gap per crossed row). */
+export function slotShifts(
+  slots: DragSlots,
+  fromId: string,
+  toId: string,
+  after: boolean,
+): Map<string, number> {
+  const shifts = new Map<string, number>();
+  const next = previewOrder(slots.ids, fromId, toId, after);
+  if (next.every((id, i) => id === slots.ids[i])) return shifts;
+  // Original stride of slot i (size + the gap that follows it); the last slot
+  // has no follower, so its stride is its own size.
+  const stride = (i: number) =>
+    i + 1 < slots.ids.length
+      ? (slots.start.get(slots.ids[i + 1]) ?? 0) - (slots.start.get(slots.ids[i]) ?? 0)
+      : (slots.end.get(slots.ids[i]) ?? 0) - (slots.start.get(slots.ids[i]) ?? 0);
+  // Reflowed start of every preview position, walking the preview order.
+  const finalStart: number[] = [];
+  let acc = slots.start.get(slots.ids[0]) ?? 0;
+  for (const id of next) {
+    finalStart.push(acc);
+    acc += stride(slots.ids.indexOf(id));
+  }
+  for (let p = 0; p < next.length; p++) {
+    const delta = finalStart[p] - (slots.start.get(next[p]) ?? 0);
+    if (delta !== 0) shifts.set(next[p], delta);
+  }
+  return shifts;
+}
+
+/** Live-measured extents — the fallback when no captured slots exist (a drag
+ *  that started before capture could run, or a test harness without refs).
+ *  Carries the same oscillation caveat as ever: prefer captureDragSlots. */
+export function liveExtents(
+  container: HTMLElement,
+  attr: string,
+  axis: TabAxis,
+): TabExtent[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(`[${attr}]`)).map((el) => {
+    const r = el.getBoundingClientRect();
+    const id = el.getAttribute(attr) ?? "";
+    return axis === "x"
+      ? { id, left: r.left, right: r.right }
+      : { id, top: r.top, bottom: r.bottom };
+  });
 }

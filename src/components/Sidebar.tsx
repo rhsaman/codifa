@@ -7,8 +7,8 @@ import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
 import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch } from "../lib/shortcuts";
-import { edgeScroll, menuLeft, menuTop, slideHeight, tabForPoint, tabMove } from "../lib/tabBar";
-import { previewOrder, previewShifts } from "../lib/tabOrder";
+import { edgeScroll, liveExtents, menuLeft, menuTop, captureDragSlots, slotExtents, slotShifts, tabForPoint, tabMove, type DragSlots } from "../lib/tabBar";
+import { previewOrder } from "../lib/tabOrder";
 import { WindowStripCluster } from "./WindowStripCluster";
 
 type ChatSummary = {
@@ -539,32 +539,34 @@ function SidebarContent({
   const listRef = useRef<HTMLDivElement>(null);
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
-  // Slide geometry measured once at drag start: how far "one slot" is (the
-  // dragged row's height + the list's row gap). Vertical lists flow top→bottom
-  // in both ltr and rtl, so no flow-sign mirroring is needed.
-  const [dragGeom, setDragGeom] = useState<{ slot: number } | null>(null);
+  // Row boxes captured ONCE at drag start (see captureDragSlots): hit-testing
+  // and slide distances both read these, never the live boxes — the live ones
+  // carry the slide transforms, which fed the next hit-test and made the
+  // preview oscillate (the drag visibly jumped). Vertical lists flow
+  // top→bottom in both ltr and rtl, so the flow sign is always 1.
+  const slotsRef = useRef<DragSlots | null>(null);
 
   const clearDrag = () => {
     setDragKey(null);
     setDropTarget(null);
-    setDragGeom(null);
+    slotsRef.current = null;
   };
 
   const folderKeys = visibleFolders.map((g) => g.key);
-  const shifts = dragKey && dropTarget
-    ? previewShifts(folderKeys, dragKey, dropTarget.id, dropTarget.after)
+  // Exact per-row pixel deltas from the CAPTURED slots: every row lands where
+  // the commit reflows it, whatever its height.
+  const shifts = dragKey && dropTarget && slotsRef.current
+    ? slotShifts(slotsRef.current, dragKey, dropTarget.id, dropTarget.after)
     : null;
-  const slot = dragGeom?.slot ?? 0;
 
-  /** Physical extents of the rendered folder rows, for geometric drop checks. */
+  /** Row extents for geometric drop checks — captured slots when available
+   *  (scroll-compensated, transform-free), live boxes as the fallback. */
   const rowExtents = () =>
-    Array.from(listRef.current?.querySelectorAll<HTMLElement>("[data-ws-id]") ?? []).map(
-      (el) => ({
-        id: el.dataset.wsId ?? "",
-        top: el.getBoundingClientRect().top,
-        bottom: el.getBoundingClientRect().bottom,
-      }),
-    );
+    slotsRef.current
+      ? slotExtents(slotsRef.current)
+      : listRef.current
+        ? liveExtents(listRef.current, "data-ws-id", "y")
+        : [];
 
   const onFolderDragStart = (e: React.DragEvent, key: string) => {
     setDragKey(key);
@@ -575,8 +577,15 @@ function SidebarContent({
       /* ignore dataTransfer restrictions (rare) */
     }
     const list = listRef.current;
-    const el = list?.querySelector<HTMLElement>(`[data-ws-id="${CSS.escape(key)}"]`);
-    setDragGeom(el && list ? { slot: slideHeight(el, list) } : null);
+    slotsRef.current = list
+      ? captureDragSlots(
+          list,
+          visibleFolders.map((g) => g.key),
+          (k) => list.querySelector<HTMLElement>(`[data-ws-id="${CSS.escape(k)}"]`),
+          "y",
+          1,
+        )
+      : null;
   };
 
   const onListDragOver = (e: React.DragEvent) => {
@@ -1222,8 +1231,11 @@ function SidebarContent({
           window buttons overlay this corner — the window-strip cluster
           (sidebar toggle + workspace + direction) lives here so those
           controls keep their exact position while the sidebar is open.
-          display:none off-mac and it collapses the strip entirely. */}
-      <div className="sidebar-drag" aria-hidden="false">
+          display:none off-mac and it collapses the strip entirely.
+          data-tauri-drag-region: mousedown drags the window, double-click
+          maximizes/restores it (Tauri's injected drag script); the cluster's
+          buttons are clickable elements, so they block the drag themselves. */}
+      <div className="sidebar-drag" data-tauri-drag-region="deep" aria-hidden="false">
         <WindowStripCluster />
       </div>
       <div
@@ -1451,8 +1463,8 @@ function SidebarContent({
                   {
                     "--ws": color,
                     transform:
-                      shift !== 0 && slot > 0
-                        ? `translateY(${shift * slot}px)`
+                      shift !== 0
+                        ? `translateY(${shift}px)`
                         : undefined,
                   } as React.CSSProperties
                 }

@@ -69,6 +69,7 @@ chmod +x "$WORK/one.sh"
 JOBS_LIST="$WORK/jobs.txt"
 cat > "$JOBS_LIST" <<'EOF'
 sections|tests/sections.test.ts|-
+dragReorder|tests/dragReorder.test.ts|--packages=external
 browserViewport|tests/browserViewport.test.ts|--packages=external --external:electron
 mcpTools|tests/mcpTools.test.ts|--packages=external --external:electron
 forkSection|tests/forkSection.test.ts|--external:electron

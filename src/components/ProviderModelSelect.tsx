@@ -187,6 +187,9 @@ export function ProviderModelSelect(props?: {
   const [query, setQuery] = useState("");
   /** تب فعال ریل: "__recent" | "__checked" | شناسهٔ پروایدر. */
   const [tab, setTab] = useState<string>("__recent");
+  /** دامنهٔ جستجو: «tab» فقط مدل‌های تبِ فعال را فیلتر می‌کند (پیش‌فرض) و
+   *  «all» مثل قبل روی همهٔ پروایدرها می‌گردد. */
+  const [searchScope, setSearchScope] = useState<"tab" | "all">("tab");
   const searchRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -226,18 +229,35 @@ export function ProviderModelSelect(props?: {
     () => new Set(checkedModels.map((c) => `${c.providerId}/${c.model}`)),
     [checkedModels],
   );
+  // تب «Checked»: مدل‌های تیک‌دار = نتیجهٔ ✓ زندهٔ این نشست + لیست ماندگار
+  // checkedModels (بعد از ری‌استارت وضعیت زنده idle است و همین لیست تب را
+  // پر می‌کند). نتیجهٔ fail زنده همیشه بیرون می‌ماند حتی اگر در لیست ذخیره
+  // باشد تا در همان تیک، افکت سینک آن را از لیست هم حذف کند.
+  // مرتب‌سازی: جدیدترین تست‌ها بالا — زمان مرجع هر مدل lastOkAt ماندگار است
+  // و مدل با ✓ زندهٔ همین لحظه newest حساب می‌شود تا ترتیب بلافاصله جابه‌جا
+  // شود (merge effect هم همان لحظه را در استور می‌نویسد). خود گروه‌های
+  // پروایدر هم بر اساس تازه‌ترین ✓شان از بالا به پایین می‌روند.
   const checkedGroups = useMemo<GroupedEntry[]>(() => {
-    const out: GroupedEntry[] = [];
+    const at = new Map(checkedModels.map((c) => [`${c.providerId}/${c.model}`, c.lastOkAt]));
+    const out: Array<{ p: ProviderConfig; models: string[]; newest: number }> = [];
     for (const p of providers) {
-      const models = allModels(p).filter((m) => {
+      const picked: Array<{ m: string; at: number }> = [];
+      for (const m of allModels(p)) {
         const st = getStatus(p, m).status;
-        if (st === "fail") return false;
-        return st === "ok" || checkedKeys.has(`${p.id}/${m}`);
-      });
-      if (models.length > 0) out.push({ p, models });
+        if (st === "fail") continue;
+        if (st !== "ok" && !checkedKeys.has(`${p.id}/${m}`)) continue;
+        picked.push({
+          m,
+          at: st === "ok" ? Date.now() : at.get(`${p.id}/${m}`) ?? 0,
+        });
+      }
+      if (picked.length === 0) continue;
+      picked.sort((a, b) => b.at - a.at);
+      out.push({ p, models: picked.map((x) => x.m), newest: picked[0].at });
     }
-    return out;
-  }, [providers, getStatus, checkedKeys]);
+    out.sort((a, b) => b.newest - a.newest);
+    return out.map(({ p, models }) => ({ p, models }));
+  }, [providers, getStatus, checkedKeys, checkedModels]);
 
   // نتایج ✓ زنده را در استور ماندگار می‌کند و failها (و ورودی‌های خارج از
   // کاتالوگ پروایدرها) را از لیست ذخیره حذف می‌کند — تب Checked بعد از
@@ -340,20 +360,21 @@ export function ProviderModelSelect(props?: {
     return () => document.removeEventListener("keydown", onKey, true);
   }, [open]);
 
-  // هر بار باز شدن: جستجو خالی و تب پیش‌فرض همیشه «Recent» — پروایدرها و
-  // مدل‌هایشان یک کلیک در ریل سمت چپ فاصله دارند.
+  // هر بار باز شدن: جستجو خالی، تب پیش‌فرض «Recent» و دامنهٔ جستجو هم روی
+  // «همین تب» برمی‌گردد — پروایدرها و مدل‌هایشان یک کلیک در ریل سمت چپ فاصله دارند.
   useEffect(() => {
     if (!open) return;
     setQuery("");
     setTab("__recent");
+    setSearchScope("tab");
     requestAnimationFrame(() => searchRef.current?.focus());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // با عوض شدن تب/باز شدن/تایپ، پنل راست به بالای لیست برمی‌گردد.
+  // با عوض شدن تب/باز شدن/تایپ/دامنهٔ جستجو، پنل راست به بالای لیست برمی‌گردد.
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
-  }, [tab, open, query]);
+  }, [tab, open, query, searchScope]);
 
   // اگر تبِ ذخیره‌شده به پروایدر حذف‌شده اشاره کند، به تب پیش‌فرض برمی‌گردیم.
   const tabValid =
@@ -366,6 +387,49 @@ export function ProviderModelSelect(props?: {
 
   const hasQuery = query.trim().length > 0;
   const totalMatches = searchGroups.reduce((n, g) => n + g.models.length, 0);
+
+  // نتایج جستجوی محدود به تبِ فعال (دامنهٔ «tab»): بسته به تب، از همان منبعِ
+  // خودِ آن تب فیلتر می‌شود — Recent از recentList، Checked از checkedGroups و
+  // تب پروایدر از کاتالوگ خودش. ترتیب و رفتار ردیف‌ها هم همان تب اصلی می‌ماند
+  // (Recent با پین/حذف، Checked با دکمهٔ ✕).
+  const tabSearch = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const terms = q ? q.split(/\s+/).filter(Boolean) : [];
+    const match = (p: ProviderConfig, m: string) =>
+      terms.every(
+        (t) => `${providerDisplayName(p)} ${p.id} ${m}`.toLowerCase().includes(t),
+      );
+    const recent = terms.length
+      ? recentList.filter(({ p, model }) => match(p, model))
+      : [];
+    const checked = terms.length
+      ? checkedGroups
+          .map(({ p, models }) => ({ p, models: models.filter((m) => match(p, m)) }))
+          .filter((g) => g.models.length > 0)
+      : [];
+    const provider =
+      terms.length && effectiveTab !== "__recent" && effectiveTab !== "__checked"
+        ? providers.find((x) => x.id === effectiveTab) ?? null
+        : null;
+    const providerModels = provider
+      ? allModels(provider).filter((m) => match(provider, m))
+      : [];
+    const entries =
+      effectiveTab === "__recent"
+        ? recent.map(({ p, model }) => ({ cfg: p, model }))
+        : effectiveTab === "__checked"
+          ? checked.flatMap((g) => g.models.map((m) => ({ cfg: g.p, model: m })))
+          : provider
+            ? providerModels.map((m) => ({ cfg: provider, model: m }))
+            : [];
+    const count =
+      effectiveTab === "__recent"
+        ? recent.length
+        : effectiveTab === "__checked"
+          ? checked.reduce((n, g) => n + g.models.length, 0)
+          : providerModels.length;
+    return { recent, checked, providerModels, entries, count };
+  }, [query, effectiveTab, recentList, checkedGroups, providers]);
   const checkedEntries = useMemo(
     () =>
       checkedGroups.flatMap((g) => g.models.map((m) => ({ cfg: g.p, model: m }))),
@@ -457,6 +521,62 @@ export function ProviderModelSelect(props?: {
     );
   };
 
+  /** ردیف تب Recent — با دکمهٔ پین و حذف؛ هم در خود تب Recent و هم در نتایج
+   *  جستجوی محدود به همین تب رندر می‌شود تا رفتارش یکسان بماند. */
+  const recentRow = (p: ProviderConfig, model: string, pinned: boolean) => {
+    const isCurrent = p.id === shownProviderId && model === shownModel;
+    const pinFull = !pinned && pinnedCount >= MAX_PINNED_RECENT_MODELS;
+    return (
+      <div key={`${p.id}/${model}`} className={`pm-model-row${pinned ? " pinned" : ""}`}>
+        <button
+          type="button"
+          className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
+          onClick={() => pick(p, model)}
+        >
+          <span className="pm-model-provider">{p.name}/</span>
+          <span className="pm-model-name">{model}</span>
+        </button>
+        <button
+          type="button"
+          className={`pm-recent-pin${pinned ? " on" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            togglePinRecentModel(model, p.id);
+          }}
+          title={
+            pinned
+              ? `Unpin ${model} (از بالای لیست بردار)`
+              : pinFull
+                ? `سقف پین ${MAX_PINNED_RECENT_MODELS} مدل است — اول یکی را آنپین کن`
+                : `Pin ${model} (همیشه بالای لیست اخیر)`
+          }
+          aria-label={pinned ? `Unpin ${model}` : `Pin ${model}`}
+          aria-pressed={pinned}
+          disabled={pinFull}
+        >
+          <PinIcon filled={pinned} />
+        </button>
+        {!pinned && (
+          <button
+            type="button"
+            className="pm-recent-remove"
+            onClick={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              removeRecentModel(model, p.id);
+            }}
+            title={`Remove ${model} from recent`}
+            aria-label={`Remove ${model} from recent`}
+          >
+            <RemoveIcon />
+          </button>
+        )}
+        <ModelTestButton cfg={p} model={model} />
+      </div>
+    );
+  };
+
   /** سربرگ گروه (نام پروایدر) در تب‌های Checked و نتایج جستجو. */
   const groupHeader = (p: ProviderConfig, count: number) => (
     <div className="pm-mpane-group">
@@ -497,6 +617,20 @@ export function ProviderModelSelect(props?: {
       : providers.find((p) => p.id === effectiveTab) ?? null;
   const paneModels = paneProvider ? allModels(paneProvider) : [];
 
+  // اسم تبِ فعال — برای placeholder فیلد جستجو وقتی دامنه روی «tab» است.
+  const scopeTabLabel =
+    effectiveTab === "__recent"
+      ? "Recent"
+      : effectiveTab === "__checked"
+        ? "Checked"
+        : paneProvider
+          ? providerDisplayName(paneProvider)
+          : "this tab";
+
+  // حالت جستجوی دامنهٔ «tab»: کوئری فقط روی مدل‌های تبِ فعال اعمال می‌شود و
+  // سربرگ پنل هم همان تب را نشان می‌دهد (نه «Search results» سراسری).
+  const tabSearching = hasQuery && searchScope === "tab";
+
   return (
     <div className={`pm-select${open ? " open" : ""}`}>
       <button
@@ -536,9 +670,41 @@ export function ProviderModelSelect(props?: {
                     ref={searchRef}
                     className="pm-modal-search"
                     value={query}
-                    placeholder="Search models…"
+                    placeholder={
+                      searchScope === "all"
+                        ? "Search all providers…"
+                        : `Search in ${scopeTabLabel}…`
+                    }
                     onChange={(e) => setQuery(e.target.value)}
+                    // فقط autoComplete="off" هاردکد می‌ماند: حباب پیشنهاد بومی
+                    // WKWebView (همان که بعد از تایپ کرسر را I-beam قفل می‌کرد)
+                    // را نمی‌سازد. autocorrect/spellcheck تابع سوییچ «Keyboard
+                    // suggestions» هستند — inputSuppress موقع فوکوس stamp می‌کند
+                    // و با فعال‌شدن پیشنهادها برمی‌دارد.
+                    autoComplete="off"
                   />
+                </div>
+                {/* دامنهٔ جستجو: «Tab» فقط تبِ فعال را می‌گردد (پیش‌فرض) و
+                    «All» سرچ کلی روی همهٔ پروایدرهاست. */}
+                <div className="pm-scope-toggle" role="group" aria-label="Search scope">
+                  <button
+                    type="button"
+                    className={`pm-scope-btn${searchScope === "tab" ? " active" : ""}`}
+                    onClick={() => setSearchScope("tab")}
+                    title="Search only the selected tab"
+                    aria-pressed={searchScope === "tab"}
+                  >
+                    Tab
+                  </button>
+                  <button
+                    type="button"
+                    className={`pm-scope-btn${searchScope === "all" ? " active" : ""}`}
+                    onClick={() => setSearchScope("all")}
+                    title="Search all providers"
+                    aria-pressed={searchScope === "all"}
+                  >
+                    All
+                  </button>
                 </div>
                 <button
                   type="button"
@@ -603,7 +769,54 @@ export function ProviderModelSelect(props?: {
                   ))}
                 </nav>
                 <section className="pm-mpane">
-                  {hasQuery ? (
+                  {tabSearching ? (
+                    <>
+                      <div className="pm-mpane-head">
+                        <span className="pm-mpane-title">{scopeTabLabel}</span>
+                        <span className="pm-mpane-sub">
+                          {tabSearch.count} {tabSearch.count === 1 ? "match" : "matches"}
+                        </span>
+                        {tabSearch.count > 0 && (
+                          <RecentTestButton
+                            entries={tabSearch.entries}
+                            label="matched"
+                            runKey={`search-tab-${effectiveTab}`}
+                          />
+                        )}
+                      </div>
+                      <div className="pm-mpane-scroll" ref={scrollRef}>
+                        {clearRow}
+                        {effectiveTab === "__recent" &&
+                          tabSearch.recent.map(({ p, model, pinned }) =>
+                            recentRow(p, model, pinned),
+                          )}
+                        {effectiveTab === "__checked" &&
+                          tabSearch.checked.map(({ p, models }) => (
+                            <div key={p.id}>
+                              {groupHeader(p, models.length)}
+                              {models.map((m) =>
+                                modelRow(p, m, false, true, checkedKeys.has(`${p.id}/${m}`)),
+                              )}
+                            </div>
+                          ))}
+                        {paneProvider &&
+                          effectiveTab !== "__recent" &&
+                          effectiveTab !== "__checked" &&
+                          tabSearch.providerModels.map((m) => modelRow(paneProvider, m, false))}
+                        {tabSearch.count === 0 && (
+                          <div className="pm-modal-empty">
+                            <span className="pm-empty-icon">
+                              <SearchIcon size={15} />
+                            </span>
+                            <strong>No models match “{query.trim()}”</strong>
+                            <span>
+                              Try a different term, or switch the search scope to “All”.
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  ) : hasQuery ? (
                     <>
                       <div className="pm-mpane-head">
                         <span className="pm-mpane-title">Search results</span>
@@ -652,62 +865,7 @@ export function ProviderModelSelect(props?: {
                       </div>
                       <div className="pm-mpane-scroll" ref={scrollRef}>
                         {clearRow}
-                        {recentList.map(({ p, model, pinned }) => {
-                          const isCurrent = p.id === shownProviderId && model === shownModel;
-                          const pinFull = !pinned && pinnedCount >= MAX_PINNED_RECENT_MODELS;
-                          return (
-                            <div
-                              key={`${p.id}/${model}`}
-                              className={`pm-model-row${pinned ? " pinned" : ""}`}
-                            >
-                              <button
-                                type="button"
-                                className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
-                                onClick={() => pick(p, model)}
-                              >
-                                <span className="pm-model-provider">{p.name}/</span>
-                                <span className="pm-model-name">{model}</span>
-                              </button>
-                              <button
-                                type="button"
-                                className={`pm-recent-pin${pinned ? " on" : ""}`}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  e.preventDefault();
-                                  togglePinRecentModel(model, p.id);
-                                }}
-                                title={
-                                  pinned
-                                    ? `Unpin ${model} (از بالای لیست بردار)`
-                                    : pinFull
-                                      ? `سقف پین ${MAX_PINNED_RECENT_MODELS} مدل است — اول یکی را آنپین کن`
-                                      : `Pin ${model} (همیشه بالای لیست اخیر)`
-                                }
-                                aria-label={pinned ? `Unpin ${model}` : `Pin ${model}`}
-                                aria-pressed={pinned}
-                                disabled={pinFull}
-                              >
-                                <PinIcon filled={pinned} />
-                              </button>
-                              {!pinned && (
-                                <button
-                                  type="button"
-                                  className="pm-recent-remove"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    e.preventDefault();
-                                    removeRecentModel(model, p.id);
-                                  }}
-                                  title={`Remove ${model} from recent`}
-                                  aria-label={`Remove ${model} from recent`}
-                                >
-                                  <RemoveIcon />
-                                </button>
-                              )}
-                              <ModelTestButton cfg={p} model={model} />
-                            </div>
-                          );
-                        })}
+                        {recentList.map(({ p, model, pinned }) => recentRow(p, model, pinned))}
                         {recentList.length === 0 && (
                           <div className="pm-modal-empty">
                             <span className="pm-empty-icon">

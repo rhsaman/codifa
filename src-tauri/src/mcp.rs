@@ -327,6 +327,7 @@ fn list_tools(server: &str, cfg: &Value) -> Result<Vec<Value>, String> {
 ///
 /// The index is built from the SAME `tools/list` payload as the schemas, so the
 /// names the prompt advertises and the names the guard accepts cannot drift.
+#[derive(Clone)]
 pub struct Discovered {
     pub schemas: Vec<Value>,
     pub index: Vec<crate::mcp_index::ConnectorEntry>,
@@ -339,6 +340,40 @@ pub struct Discovered {
 /// the index is the cheap half: `mcp_index::index_section` prints a line per
 /// connector, so the model learns that Proxmox exists without paying for its
 /// 300 tool schemas unless the turn asks for them.
+/// How long a cached discovery result serves turns before the NEXT turn
+/// refreshes it. The refresh itself runs in a BACKGROUND thread — the turn
+/// that notices the stale cache hands the cached result out immediately and
+/// never waits on a connector.
+const DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The last successful discovery, keyed by the CANONICAL connector map. One
+/// wedged connector holds a spawned session for up to [`REQUEST_TIMEOUT`] (60s)
+/// before its tools/list gives up — measured 54-68s inside `discover` on EVERY
+/// turn while a connector's `npx …` was cold, i.e. every user message paid the
+/// full wait before its prompt was even built. Caching turns that wait into a
+/// once-per-config-change cost, with a background refresh past the TTL.
+static DISCOVERY_CACHE: std::sync::Mutex<Option<(String, std::time::Instant, Discovered)>> =
+    std::sync::Mutex::new(None);
+
+/// Serialize the connector map with SORTED object keys at every depth, so the
+/// same configuration always produces the same cache key regardless of the
+/// `fs::read_dir` order the plugins were merged in.
+fn canonical(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), canonical(&m[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
 pub fn discover(servers: &Value) -> Discovered {
     let Some(map) = servers.as_object() else {
         // No connector is enabled at all: every cached session is now orphaned,
@@ -350,11 +385,67 @@ pub fn discover(servers: &Value) -> Discovered {
             failures: Vec::new(),
         };
     };
-    let (schemas, index, failures) = build(map);
+    // The canonical map is the cache identity: an empty map is its own cheap
+    // identity, and any configuration change (a connector edited, a plugin
+    // toggled) changes the key and forces one fresh walk.
+    let key = canonical(servers).to_string();
+    if key == "{}" {
+        return Discovered {
+            schemas: Vec::new(),
+            index: Vec::new(),
+            failures: Vec::new(),
+        };
+    }
+    if let Ok(guard) = DISCOVERY_CACHE.lock() {
+        if let Some((cached_key, at, cached)) = guard.as_ref() {
+            if *cached_key == key {
+                // Fresh: serve as-is. Stale past the TTL: serve the cached
+                // result NOW and refresh in a background thread — the walk may
+                // take up to REQUEST_TIMEOUT per connector, and no turn ever
+                // waits for a connector again.
+                if at.elapsed() >= DISCOVERY_TTL {
+                    let key = key.clone();
+                    let servers = servers.clone();
+                    std::thread::spawn(move || refresh_discovery(key, servers));
+                }
+                return cached.clone();
+            }
+        }
+    }
+    // COLD cache — the first turn of a process. Spawning every connector here
+    // (an `npx -y …` resolves its package over the network, `docker mcp
+    // gateway` needs a daemon) measured 54-76s BEFORE the prompt was built:
+    // the user's first message paid a full minute. Hand out an EMPTY set
+    // instead (the turn runs without connector tools; the model simply does
+    // not see them yet) and discover on a background thread, so the very next
+    // turn carries the index. One wedged connector can then delay nothing.
+    let servers = servers.clone();
+    std::thread::spawn(move || refresh_discovery(key, servers));
     Discovered {
+        schemas: Vec::new(),
+        index: Vec::new(),
+        failures: Vec::new(),
+    }
+}
+
+/// Run a full discovery walk and install it as the cached result for `key`.
+fn refresh_discovery(key: String, servers: Value) {
+    let (schemas, index, failures) = build(servers.as_object().unwrap_or(&serde_json::Map::new()));
+    let result = Discovered {
         schemas,
         index,
         failures,
+    };
+    if let Ok(mut g) = DISCOVERY_CACHE.lock() {
+        // Only install under THIS key: a config change that raced the walk
+        // must not be overwritten by a result for the old configuration.
+        let same_key = g
+            .as_ref()
+            .map(|(k, _, _)| k == &key)
+            .unwrap_or(false);
+        if same_key || g.is_none() {
+            *g = Some((key, std::time::Instant::now(), result));
+        }
     }
 }
 

@@ -1814,6 +1814,16 @@ fn spawn_browser() -> Result<u16, String> {
     // A browser left by a previous run (crash, forced quit) still holds the
     // profile and lock files; clear it before starting ours.
     reap_orphans();
+    // An install unpacked by an older build can be missing the executable bit
+    // on Chrome's INTERNAL helpers (crashpad handler, Helper apps) even though
+    // the main binary runs — every launch then spawns a fork child that dies
+    // pre-exec and macOS pops a crash dialog. Re-grant the bits on every
+    // installed build before probing candidates; a no-op once fixed.
+    for root in browser_roots() {
+        for dir in candidate_dirs(&root) {
+            make_executable(&dir);
+        }
+    }
     let candidates = chromium_candidates();
     if candidates.is_empty() {
         return Err(
@@ -2830,6 +2840,12 @@ fn download_to(url: &str, dest: &std::path::Path) -> Result<(), String> {
 ///
 /// `enclosed_name()` rejects entries that try to escape the target directory
 /// (`../`), so a hostile archive cannot write outside `dest`.
+///
+/// The archive's stored Unix mode is applied: the Chrome-for-Testing zips mark
+/// every binary 0755, and dropping that bit breaks the browser's INTERNAL
+/// spawns (crashpad's handler, the Helper apps) even though the main binary is
+/// chmod'ed afterwards — the missing bit made macOS pop a crash dialog on
+/// every launch (see `make_executable`).
 fn extract_zip(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
     let file = std::fs::File::open(archive)
         .map_err(|e| format!("cannot open the download: {e}"))?;
@@ -2854,6 +2870,14 @@ fn extract_zip(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), 
             .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
         std::io::copy(&mut entry, &mut writer)
             .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A mode-less archive means a plain file; a stored mode with any
+            // permission bit set is honoured as-is so 0755 binaries stay 0755.
+            let mode = entry.unix_mode().unwrap_or(0o644) & 0o7777;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
+        }
     }
     Ok(())
 }
@@ -2873,15 +2897,53 @@ fn single_child_dir(root: &std::path::Path) -> Result<PathBuf, String> {
     Err("the archive did not unpack into a single directory".to_string())
 }
 
+/// True when `file` starts with a Mach-O (or shebang) header — something
+/// `exec()` would run. Chrome's bundle carries executables far beyond the main
+/// binary: `Helpers/chrome_crashpad_handler`, `app_mode_loader` and every
+/// `Helper (...).app/Contents/MacOS/*`. A missing +x on any of them makes the
+/// browser's internal spawns fail with EACCES — crashpad's handler spawn then
+/// leaves a fork child that dies pre-exec, and macOS pops a "quit
+/// unexpectedly" dialog on EVERY launch even though the browser itself works.
+fn is_executable_image(file: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(file) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok()
+        && matches!(
+            magic,
+            [0xCA, 0xFE, 0xBA, 0xBE]   // fat/universal binary
+                | [0xCE, 0xFA, 0xED, 0xFE] // Mach-O 32-bit LE
+                | [0xFE, 0xED, 0xFA, 0xCE] // Mach-O 32-bit BE
+                | [0xCF, 0xFA, 0xED, 0xFE] // Mach-O 64-bit LE
+                | [0xFE, 0xED, 0xFA, 0xCF] // Mach-O 64-bit BE
+                | [b'#', b'!', _, _]   // shebang script
+        )
+}
+
+/// Grant the executable bit to every executable image under `dir`.
+///
 /// ZIP archives do not always carry the executable bit through, and a browser
 /// binary without it fails with a bare permission error. The probe walks the
 /// unpacked build itself — NOT `find_chromium()`, which until this fix lands
 /// still resolves to the previous install and once made it skip the chmod
 /// entirely (`Permission denied` on the very next launch).
+///
+/// `binaries_under` alone only reaches the MAIN binary; the same install also
+/// unpacked `chrome_crashpad_handler` and the Helper apps without their exec
+/// bit, and every launch then died in crashpad's handler spawn — visible to
+/// the user as a repeating macOS crash-report dialog. The deep walk below
+/// fixes every Mach-O in the tree, and the same walk is run over ALREADY
+/// installed builds from `spawn_browser`, so existing installs self-heal on
+/// the next launch without a re-download.
 fn make_executable(dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // The known main binaries first: the deep walk below would cover them,
+        // but this also reaches launcher shapes the layout list knows that the
+        // magic sniffing cannot (and the layout list is the documented path).
         for bin in binaries_under(dir) {
             if bin.is_file() {
                 if let Ok(meta) = std::fs::metadata(&bin) {
@@ -2889,6 +2951,28 @@ fn make_executable(dir: &std::path::Path) {
                     if perms.mode() & 0o111 == 0 {
                         perms.set_mode(0o755);
                         let _ = std::fs::set_permissions(&bin, perms);
+                    }
+                }
+            }
+        }
+        // Then the whole tree, so the bundle's internal helpers — crashpad's
+        // handler and every Helper app — end up executable too.
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.is_file() && is_executable_image(&p) {
+                    if let Ok(meta) = std::fs::metadata(&p) {
+                        let mut perms = meta.permissions();
+                        if perms.mode() & 0o111 == 0 {
+                            perms.set_mode(0o755);
+                            let _ = std::fs::set_permissions(&p, perms);
+                        }
                     }
                 }
             }

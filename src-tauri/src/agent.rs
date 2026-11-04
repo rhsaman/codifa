@@ -164,47 +164,59 @@ async fn run_slot_distill(
     {
         chain.push(step);
     }
-    // The distiller is a best-effort optimisation: try each rung once and hand
-    // the caller the raw payload when they all fail.
-    for (m, b, keys, pid, k) in chain {
-        let (reasoning, model_reasoning, auto_think) = crate::llm::reasoning_fields(
-            &k,
-            &crate::llm::level_from_source(
-                provider_model_thinking_levels(&req.providers, &pid, &m).as_deref(),
-                if level.is_empty() { "none" } else { level },
-            ),
-            provider_model_reasoning(&req.providers, &pid, &m),
-        );
-        let cfg = LlmConfig {
-            provider: k,
-            headers: crate::llm::custom_headers(&req.providers, &pid),
-            provider_id: pid,
-            model: m,
-            base_url: b,
-            api_keys: keys,
-            temperature: Some(0.2),
-            // A summary is a few hundred tokens; a reasoning model needs room for
-            // its preamble on top of that.
-            max_tokens: Some(1024),
-            timeout_secs: 60,
-            reasoning_level: reasoning,
-            model_reasoning,
-            auto_think,
-        };
-        match crate::llm::complete(client, &cfg, system, user).await {
-            Ok(res) => {
-                let text = res.text.trim().to_string();
-                if !text.is_empty() {
-                    return Some(text);
+    // The distiller walks the slot's chain in PASSES — the same ladder every
+    // tool slot follows: ONE try per rung, whatever the failure, then the next
+    // model immediately; after the last rung fails the walk starts over from
+    // the first model, pausing between passes. A single silent pass was why a
+    // dead first rung read as "web/fetch never use the Other model": the
+    // distiller gave up and the raw payload went out with no trace of the
+    // configured list.
+    const DISTILL_MAX_CYCLES: usize = 3;
+    const DISTILL_CYCLE_PAUSE_SECS: u64 = 10;
+    let cycles = if chain.len() > 1 { DISTILL_MAX_CYCLES } else { 1 };
+    for pass in 0..cycles {
+        if pass > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(DISTILL_CYCLE_PAUSE_SECS)).await;
+        }
+        for (m, b, keys, pid, k) in chain.iter() {
+            let (reasoning, model_reasoning, auto_think) = crate::llm::reasoning_fields(
+                k,
+                &crate::llm::level_from_source(
+                    provider_model_thinking_levels(&req.providers, pid, m).as_deref(),
+                    if level.is_empty() { "none" } else { level },
+                ),
+                provider_model_reasoning(&req.providers, pid, m),
+            );
+            let cfg = LlmConfig {
+                provider: k.clone(),
+                headers: crate::llm::custom_headers(&req.providers, pid),
+                provider_id: pid.clone(),
+                model: m.clone(),
+                base_url: b.clone(),
+                api_keys: keys.clone(),
+                temperature: Some(0.2),
+                // A summary is a few hundred tokens; a reasoning model needs room for
+                // its preamble on top of that.
+                max_tokens: Some(1024),
+                timeout_secs: 60,
+                reasoning_level: reasoning,
+                model_reasoning,
+                auto_think,
+            };
+            match crate::llm::complete(client, &cfg, system, user).await {
+                Ok(res) => {
+                    let text = res.text.trim().to_string();
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
                 }
+                // This chain IS the user's own list: a rung that did not answer
+                // hands the work to the NEXT model they picked, whatever the
+                // reason. Its rungs normally live on another provider with
+                // another endpoint, so an unreachable or rate-limited first rung
+                // says nothing about the ones behind it.
+                Err(_) => {}
             }
-            // The distiller is an optimisation, and this chain IS the user's own
-            // list: a rung that did not answer hands the work to the NEXT model
-            // they picked. Its rungs normally live on another provider with
-            // another endpoint, so an unreachable or rate-limited first rung
-            // says nothing about the ones behind it — stopping here is what left
-            // a configured list unused and the raw payload in place.
-            Err(_) => {}
         }
     }
     None
@@ -375,65 +387,84 @@ async fn run_vision_slot(
     );
     let mut failed_model = String::new();
     let mut failed_error = String::new();
-    for (c_model, c_base, c_keys, c_provider_id, c_kind) in chain {
-        let (v_reasoning, v_model_reasoning, v_auto_think) = crate::llm::reasoning_fields(
-            &c_kind,
-            // A side call defaults to no reasoning (never inherits the main level).
-            &crate::llm::level_from_source(
-                provider_model_thinking_levels(&req.providers, &c_provider_id, &c_model).as_deref(),
-                if v_level.is_empty() { "none" } else { v_level },
-            ),
-            provider_model_reasoning(&req.providers, &c_provider_id, &c_model),
-        );
-        let v_cfg = LlmConfig {
-            provider: c_kind,
-            headers: crate::llm::custom_headers(&req.providers, &c_provider_id),
-            provider_id: c_provider_id,
-            model: c_model.clone(),
-            base_url: c_base,
-            api_keys: c_keys,
-            temperature: Some(0.2),
-            max_tokens: Some(2048),
-            timeout_secs: crate::llm::NO_TIMEOUT_SECS,
-            reasoning_level: v_reasoning,
-            model_reasoning: v_model_reasoning,
-            auto_think: v_auto_think,
-        };
-        // Same model + same text + same image bytes = the same question, so a
-        // repeat of a screenshot this chat already sent is answered from the cache
-        // instead of a second paid round-trip. The key is the hash of the exact
-        // inputs, so a hit can never describe a different picture.
-        let cache_key = vision_cache_key(&v_cfg.model, text, images);
-        if let Some(desc) = vision_cache_get(cache_key) {
-            return VisionOutcome::Ok(desc);
+    // Passes over the slot's chain. ONE try per rung, whatever the failure —
+    // a rate limit, a 5xx or a dropped stream hands the images to the NEXT
+    // model immediately. After the last rung fails the walk starts over from
+    // the first model (a provider that was down a minute ago is often back),
+    // pausing between passes so dead rungs are not hammered — the same ladder
+    // semantics every tool slot follows.
+    const VISION_MAX_CYCLES: usize = 3;
+    const VISION_CYCLE_PAUSE_SECS: u64 = 10;
+    let cycles = if chain.len() > 1 { VISION_MAX_CYCLES } else { 1 };
+    for pass in 0..cycles {
+        if pass > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(VISION_CYCLE_PAUSE_SECS)).await;
         }
-        match crate::llm::complete_with_images(client, &v_cfg, VISION_SYSTEM_PROMPT, text, images)
-            .await
-        {
-            Ok(res) => {
-                let desc = res.text.trim().to_string();
-                if !desc.is_empty() {
-                    // Only a real answer is cached: a failure or an empty reply
-                    // must still be retried on the next turn.
-                    vision_cache_put(cache_key, &desc);
-                    return VisionOutcome::Ok(desc);
-                }
-                if failed_error.is_empty() {
-                    failed_model = v_cfg.model.clone();
-                    failed_error = "the model returned an empty description".into();
-                }
+        for (c_model, c_base, c_keys, c_provider_id, c_kind) in chain.iter() {
+            let (v_reasoning, v_model_reasoning, v_auto_think) = crate::llm::reasoning_fields(
+                c_kind,
+                // A side call defaults to no reasoning (never inherits the main level).
+                &crate::llm::level_from_source(
+                    provider_model_thinking_levels(&req.providers, c_provider_id, c_model)
+                        .as_deref(),
+                    if v_level.is_empty() { "none" } else { v_level },
+                ),
+                provider_model_reasoning(&req.providers, c_provider_id, c_model),
+            );
+            let v_cfg = LlmConfig {
+                provider: c_kind.clone(),
+                headers: crate::llm::custom_headers(&req.providers, c_provider_id),
+                provider_id: c_provider_id.clone(),
+                model: c_model.clone(),
+                base_url: c_base.clone(),
+                api_keys: c_keys.clone(),
+                temperature: Some(0.2),
+                max_tokens: Some(2048),
+                timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+                reasoning_level: v_reasoning,
+                model_reasoning: v_model_reasoning,
+                auto_think: v_auto_think,
+            };
+            // Same model + same text + same image bytes = the same question, so a
+            // repeat of a screenshot this chat already sent is answered from the cache
+            // instead of a second paid round-trip. The key is the hash of the exact
+            // inputs, so a hit can never describe a different picture.
+            let cache_key = vision_cache_key(&v_cfg.model, text, images);
+            if let Some(desc) = vision_cache_get(cache_key) {
+                return VisionOutcome::Ok(desc);
             }
-            Err(e) => {
-                if failed_error.is_empty() {
-                    failed_model = v_cfg.model.clone();
-                    failed_error = e.clone();
+            match crate::llm::complete_with_images(
+                client,
+                &v_cfg,
+                VISION_SYSTEM_PROMPT,
+                text,
+                images,
+            )
+            .await
+            {
+                Ok(res) => {
+                    let desc = res.text.trim().to_string();
+                    if !desc.is_empty() {
+                        // Only a real answer is cached: a failure or an empty reply
+                        // must still be retried on the next turn.
+                        vision_cache_put(cache_key, &desc);
+                        return VisionOutcome::Ok(desc);
+                    }
+                    if failed_error.is_empty() {
+                        failed_model = v_cfg.model.clone();
+                        failed_error = "the model returned an empty description".into();
+                    }
                 }
-                // The chain is the user's own list, so a rung that did not
-                // answer hands the work to the NEXT model they picked whatever
-                // the reason: the fallbacks sit on other providers with other
-                // endpoints, and one unreachable or rate-limited model must not
-                // strand the screenshots. The FIRST error is the one reported, so
-                // the caller still learns why the slot model failed.
+                Err(e) => {
+                    if failed_error.is_empty() {
+                        failed_model = v_cfg.model.clone();
+                        failed_error = e.clone();
+                    }
+                    // The FIRST error is the one reported, so the caller still
+                    // learns why the slot model failed. The rung itself is done:
+                    // the next model in the list takes the call, whatever this
+                    // one named as its reason.
+                }
             }
         }
     }
@@ -728,12 +759,12 @@ const EXPLORE_BUDGET_STEPS: usize = 3;
 /// the user sees one consistent retry story no matter which model hiccuped.
 /// How many attempts a rung may spend before the ladder's budget is used up.
 ///
-/// Purely a BUDGET multiplier: a rung only moves down the chain when its
-/// failure says the model itself is unusable (see [`subagent_error_is_fatal`]),
-/// so a slow-but-working model can retry for the whole budget without losing
-/// the user's fallbacks. The multiplier keeps a long list fully reachable when
-/// its rungs fail non-fatally.
-const SUBAGENT_RUNG_ATTEMPTS: usize = 2;
+/// ONE try per rung, whatever the failure: a refused key, a rate limit, a 5xx
+/// or a dropped connection all hand the call to the NEXT model immediately —
+/// asking the same model again right away can only reproduce the same error,
+/// and the walk returns to this rung on the next pass anyway. The pause lives
+/// between PASSES (a wrapped walk), not between retries of one model.
+const SUBAGENT_RUNG_ATTEMPTS: usize = 1;
 
 const SUBAGENT_MAX_ATTEMPTS: usize = 10;
 /// Fixed backoff between explore attempts — mirrors the main agent's fixed
@@ -1565,6 +1596,13 @@ fn edit_target_of(
 fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
     let (allowed, action) = match name {
         "write_file" | "edit_file" => (caps.write_files, "write or edit files"),
+        // Authoring a skill or a connector SAVES a file, so it follows the same
+        // capability: a read-only turn never sees these tools, even when a
+        // sticky `allow_create` (an authoring request earlier in the chat) is
+        // still set. Connector VISIBILITY stays — an enabled connector's tools
+        // ride in through the MCP index, and `plugin action=list` names the
+        // bundles — only the WRITING is gated here.
+        "create_skill" | "create_mcp" => (caps.write_files, "create or edit skills and connectors"),
         // Media tools create NEW files only (the result paths are minted
         // unique under media/ — an existing file is never overwritten), so
         // they stay available in the read-only Ask/Plan modes exactly like
@@ -1644,6 +1682,26 @@ user to switch to Build mode to edit the plugin."
     } else {
         None
     }
+}
+
+/// Why a read-only turn refuses this `schedule` action, else `None`.
+///
+/// Listing is reading; everything else SAVES a task, so it follows
+/// `write_files` exactly like `plugin`'s authoring actions. The schema is
+/// list-only in such a turn (`compact_schedule_schema`) — this is the loop
+/// backstop for a stale transcript, kept as a function so the refusal and its
+/// test live next to the same-shaped plugin gate.
+fn schedule_mode_refusal(action: &str, caps: &ToolCaps) -> Option<String> {
+    if caps.write_files || action == "list" {
+        return None;
+    }
+    Some(
+        format!(
+            "blocked: this turn is read-only — `schedule action={action}` saves a task, \
+which this mode does not allow. Use action=list to see the existing tasks, and tell the user \
+to switch to Build mode to change them."
+        ),
+    )
 }
 
 /// Narrow a sub-agent's tool set to the profile's declared tools.
@@ -2802,22 +2860,30 @@ pub enum AgentEvent {
     /// tokens. `cache_read` is the part of `input` the provider served from
     /// its prefix cache (DeepSeek `prompt_cache_hit_tokens`, OpenAI
     /// `prompt_tokens_details.cached_tokens`, Anthropic
-    /// `cache_read_input_tokens`). It is ALREADY included in `input`, so it is
-    /// reported for measurement only — never added to the meter, or the same
-    /// tokens would be billed twice.
+    /// `cache_read_input_tokens`); `cache_write` is the part that FILLED the
+    /// cache (Anthropic `cache_creation_input_tokens` — a cold call is all
+    /// write). `input_tokens` is INCLUSIVE: the provider's whole billed input
+    /// with the cache share inside it (see `llm::NormalizedUsage`), so the
+    /// cost math (`input − read − write` at fresh-input price) is right for
+    /// every provider without per-provider cases.
     Usage {
         input_tokens: u64,
         output_tokens: u64,
         cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        /// The payload carried a cache-read field at all — unknown (no field)
+        /// must stay distinguishable from a real zero (the cache missed).
+        cache_read_reported: bool,
+        cache_write_reported: bool,
         model: String,
         provider_id: String,
         sub: bool,
-        /// The size of the prompt the provider just billed, as the provider
-        /// counted it (`prompt_tokens`/`input_tokens`). This is the SAME number
-        /// the mid-turn auto-compaction trigger uses as its baseline, so the
-        /// renderer's context meter and the fold agree: the ring reaches 100%
-        /// exactly when compaction fires. 0 = the provider reported no usage
-        /// (the renderer then keeps its own estimate).
+        /// The size of the prompt the provider just billed, INCLUSIVE of the
+        /// cache share — the SAME number the mid-turn auto-compaction trigger
+        /// uses as its baseline, so the renderer's context meter and the fold
+        /// agree: the ring reaches 100% exactly when compaction fires. 0 = the
+        /// provider reported no usage (the renderer then keeps its own
+        /// estimate).
         context_tokens: u64,
         /// The window the trigger divides `context_tokens` by — the model's real
         /// window, resolved by the backend when the renderer did not know it.
@@ -3020,10 +3086,13 @@ impl AgentEvent {
                 "kind": "edit_target", "target": target, "action": action,
                 "name": name, "path": path,
             }),
-            AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub, context_tokens, context_window, reasoning_chars } => json!({
+            AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_read_reported, cache_write_reported, model, provider_id, sub, context_tokens, context_window, reasoning_chars } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "cache_read_reported": cache_read_reported,
+                "cache_write_reported": cache_write_reported,
                 "model": model, "provider_id": provider_id,
                 "sub": sub,
                 "context_tokens": context_tokens,
@@ -3174,8 +3243,23 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
     let schemas: &[(&str, &str, Value)] = &[
         (
             "write_file",
-            "Create or overwrite a file.",
-            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+            "Create or overwrite file(s). SEVERAL files: pass `files` — written IN ORDER in this ONE call; never spend one round-trip per file.",
+            json!({
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "files": {
+                    "type": "array",
+                    "description": "Several files written IN ORDER in this ONE call.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }),
         ),
         (
             "edit_file",
@@ -3212,9 +3296,10 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             // The schema is where the model learns the DIVISION OF LABOUR: the
             // backend refuses a shell read/search (MEASURED: the model reached
             // for `cat`/`sed -n` whenever the tool list did not say so).
-            "Run a shell command in the workspace with a timeout. For terminal-only work: listing/measuring (du, df, ps, lsof), builds, tests, git, and paths outside the workspace (shell grep/find is fine there). It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`. For a long-running process (dev server, watcher) set background=true: detached, output to a log, returns at once — never mute curl/wget (-s/-q hides progress).",
+            "Run shell command(s) in the workspace with a timeout. For terminal-only work: listing/measuring (du, df, ps, lsof), builds, tests, git, and paths outside the workspace (shell grep/find is fine there). It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`. For a long-running process (dev server, watcher) set background=true: detached, output to a log, returns at once — never mute curl/wget (-s/-q hides progress). SEVERAL commands: pass `commands` — they run IN ORDER in this ONE call (one result block each); never spend one round-trip per inspection.",
             json!({
                 "command": {"type": "string"},
+                "commands": {"type": "array", "items": {"type": "string"}, "description": "Several commands run IN ORDER in this ONE call — one result block per command. Batch every independent inspection here instead of one call each."},
                 "timeout": {"type": "integer", "description": "max seconds to wait (default 120, hard ceiling 1800 — for anything longer use background=true)"},
                 "background": {"type": "boolean"}
             }),
@@ -3347,10 +3432,11 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "load_skill",
-            "Load a skill's FULL body BEFORE work it covers; `query` finds one the list omits.",
+            "Load a skill's FULL body BEFORE work it covers; `query` searches every installed skill, `bundle` lists one plugin bundle's skills.",
             json!({
                 "name": {"type": "string", "description": "Name or slug"},
                 "query": {"type": "string", "description": "Words when the name is unknown"},
+                "bundle": {"type": "string", "description": "Plugin bundle slug: list that bundle's skills"},
                 "file": {"type": "string", "description": "Extra file of that skill"}
             }),
         ),
@@ -3359,7 +3445,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // short: create/update/toggle/delete/list instead of four tools.
         (
             "plugin",
-            "Create, edit, install or run a plugin: one switchable folder bundling skills, MCP connectors, commands, sub-agents, hooks and scripts. `create` MAKES one, `install` READS one from a repo or folder, `update` patches only what is sent, `toggle` flips `enabled`, `run` executes a script. Give every part a one-line English `description` — the agent matches requests against it. Scripts are Rust unless the user asked otherwise.",
+            "Create, edit, install or run a plugin: one switchable folder bundling skills, MCP connectors, commands, sub-agents, hooks and scripts. `create` MAKES one, `install` READS one from a repo or folder, `update` patches only what is sent, `toggle` flips `enabled`, `run` executes a script. `list` is compact — one line per bundle; pass `slug` with it for that one bundle's full manifest. Give every part a one-line English `description` — the agent matches requests against it. Scripts are Rust unless the user asked otherwise.",
             json!({
                 "action": {"type": "string", "enum": ["list", "install", "create", "update", "toggle", "delete", "run"]},
                 "repo": {"type": "string", "description": "install: `owner/repo`, GitHub URL, or local path"},
@@ -3546,7 +3632,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // (see the narrowing below) and the create path gets its full action
         // set — which is what an artifact with a Rust backend needs to RUN it.
         .filter(|(name, _, _)| {
-            allow_create || !matches!(*name, "create_skill" | "create_mcp" | "schedule")
+            allow_create || !matches!(*name, "create_skill" | "create_mcp")
         })
         .map(|(name, desc, props)| {
             json!({
@@ -3561,8 +3647,38 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         .collect();
     if !allow_create {
         compact_plugin_schema(&mut out);
+        compact_schedule_schema(&mut out);
     }
     out
+}
+
+/// Swap the `schedule` tool's full schema for the list-only one, the exact
+/// mirror of `compact_plugin_schema`: `schedule` STAYS in the tool list in every
+/// turn (the model can always answer "what is scheduled" without burning a
+/// round on a refusal), but the authoring prose and the create/update/toggle/
+/// delete enum only ride on a turn that may actually write. The full schema is
+/// ~1.1K chars re-sent on every round-trip, and a read-only turn advertising
+/// `action=create` only invites the call its own backstop then refuses.
+fn compact_schedule_schema(schemas: &mut [Value]) {
+    for s in schemas.iter_mut() {
+        if s["function"]["name"] != "schedule" {
+            continue;
+        }
+        *s = json!({
+            "type": "function",
+            "function": {
+                "name": "schedule",
+                "description": "List the user's scheduled tasks (name, cron, on/off). \
+Creating or editing one is not available in this mode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list"]},
+                    },
+                },
+            },
+        });
+    }
 }
 
 /// The four media-generation tools, bound ONLY on the main agent's turn (see
@@ -4419,6 +4535,17 @@ already approved with \"Always allow\".",
             m.get("role").and_then(Value::as_str),
             m.get("content").and_then(Value::as_str),
         ) {
+            // A stored system message can only sit MID-LIST here — messages[0]
+            // is the turn's own system prompt. Some providers reject any system
+            // message that is not the first one: Cloudflare Workers AI answers
+            // every such request with a hard 400 ("System message must be at
+            // the beginning"), so a compacted chat on that provider could never
+            // get an answer and the retry ladder burned itself out on the same
+            // deterministic rejection. Demote the stored role to `user` on the
+            // wire — the backend's own mid-turn compaction already writes its
+            // summary as `user` for exactly this reason, and the content reads
+            // as context either way.
+            let role = if role == "system" { "user" } else { role };
             // Carry the turn's non-prose state (tools run, preserved summary,
             // checklist) into the content — see history_recap.
             let recap = history_recap(m);
@@ -4701,9 +4828,13 @@ already approved with \"Always allow\".",
     // from the conversation history, so an Ask turn can carry it while the mode
     // forbids saving a bundle — with the full enum the model then names
     // `action=update` (the "updates the plugin instead of running it" report).
-    // The compact form keeps the door open for `list`/`run` only.
+    // The compact form keeps the door open for `list`/`run` only. The schedule
+    // tool narrows the same way (its full schema advertises create/update/
+    // toggle/delete, which a read-only turn refuses), and the authoring tools
+    // vanish outright — `denied_by_caps` already dropped them above.
     if !caps.write_files {
         compact_plugin_schema(&mut schemas);
+        compact_schedule_schema(&mut schemas);
     }
     // MCP connectors switched on in the composer become extra tools named
     // `mcp__<server>__<tool>`; their schemas come from each server's
@@ -5511,29 +5642,52 @@ the Vision model's description instead.\n"
             // clearing.
             continue;
         }
-        let (in_tok, out_tok) = usage_tuple(&acc);
-        let cache_tok = cache_read_tuple(&acc);
+        // The usage payload normalized to ONE vocabulary by its own shape (see
+        // `llm::NormalizedUsage`): additive (Anthropic-style) vs subset
+        // (OpenAI/DeepSeek/Google-style) is read off the fields the payload
+        // carries, so a custom Anthropic-compatible gateway is caught too —
+        // the old provider-NAME check (`req.provider == "anthropic"`) missed
+        // every custom endpoint and ignored the cache WRITE half entirely.
+        let usage = crate::llm::NormalizedUsage::from_payload(
+            acc.usage.as_ref().unwrap_or(&serde_json::Value::Null),
+        );
+        let (in_tok, out_tok, cache_tok, write_tok, read_rep, write_rep) = match &usage {
+            Some(u) => (
+                u.reported_input,
+                u.output_tokens,
+                u.cache_read,
+                u.cache_write,
+                u.cache_read_reported,
+                u.cache_write_reported,
+            ),
+            None => (0, 0, 0, 0, false, false),
+        };
         // The provider just told us how big the request it received was; that is
         // the ground truth the next round's mid-turn compaction trigger uses
         // (the local estimate cannot see the system prompt or the tool schemas).
         //
-        // Anthropic reports `cache_read_input_tokens` OUTSIDE `input_tokens`, so
-        // a cache-hit-heavy turn there would otherwise look tiny and the fold
-        // would fire far too late. Every other provider folds the cached part
-        // into the prompt count already, where adding it would double-count.
-        let prompt_basis = if req.provider == "anthropic" {
-            in_tok + cache_tok
-        } else {
-            in_tok
-        };
-        if in_tok > 0 {
+        // The basis is the INCLUSIVE input for EVERY provider: additive
+        // payloads contribute input + read + write, subset payloads their
+        // reported input. An Anthropic-shaped turn with input=2_000,
+        // read=18_000, write=1_000 bills a 21_000-token prompt — the old
+        // code (input alone, or read added only for provider=="anthropic")
+        // made the compaction trigger fire far too late on exactly the turns
+        // that were closest to their window.
+        let prompt_basis = usage.as_ref().map(|u| u.input_total).unwrap_or(0);
+        if prompt_basis > 0 {
             last_prompt_tokens = prompt_basis as usize;
             measured_upto = messages.len();
         }
         emit(&AgentEvent::Usage {
-            input_tokens: in_tok,
+            // Inclusive billed input: the fresh-input cost math (input − read
+            // − write) and the cache-hit denominator are correct for every
+            // provider from this one number.
+            input_tokens: usage.as_ref().map(|u| u.input_total).unwrap_or(0),
             output_tokens: out_tok,
             cache_read_tokens: cache_tok,
+            cache_write_tokens: write_tok,
+            cache_read_reported: read_rep,
+            cache_write_reported: write_rep,
             model: req.model.clone(),
             provider_id: req.provider_id.clone(),
             sub: req.mode == "subagent",
@@ -5574,10 +5728,16 @@ the Vision model's description instead.\n"
             kind: "llm".into(),
             model: Some(req.model.clone()),
             tokens: Some(crate::trace::Tokens {
-                input: in_tok,
+                // INCLUSIVE billed input (see the Usage event above) — the
+                // ruler's per-call cost math and its cold/warm split need the
+                // real footprint, not a provider-dependent slice of it.
+                input: usage.as_ref().map(|u| u.input_total).unwrap_or(0),
                 output: out_tok,
                 cache_read: cache_tok,
-                total: in_tok + out_tok,
+                cache_write: write_tok,
+                cache_read_reported: read_rep,
+                cache_write_reported: write_rep,
+                total: usage.as_ref().map(|u| u.input_total).unwrap_or(0) + out_tok,
             }),
             summary: if cache_tok > 0 {
                 format!(
@@ -6544,6 +6704,39 @@ user to ask for it. Available this turn: `list` and `run`."
                             (r, true)
                         }
                         Err(e) => (e, false),
+                    }
+                }
+            } else if name == "schedule" && !caps.write_files {
+                // The backstop next to the plugin gate: the schema is list-only
+                // in a read-only turn, so a create/update/toggle/delete that
+                // still arrives is a stale transcript or a hallucinated call —
+                // refuse it before anything reaches the schedule store. A
+                // sticky `allow_create` cannot arm this tool here (see
+                // `compact_schedule_schema`); listing stays possible so the
+                // model can still answer "what is scheduled".
+                let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+                match schedule_mode_refusal(&action, &caps) {
+                    Some(refusal) => (refusal, false),
+                    None => {
+                        let root_sb = root.clone();
+                        let name_sb = name.to_string();
+                        let args_sb = args.clone();
+                        let skill_root_sb = skill_root.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            tools::dispatch_bounded(
+                                &root_sb,
+                                &name_sb,
+                                &args_sb,
+                                None,
+                                Some(&skill_root_sb),
+                            )
+                        })
+                        .await
+                        .unwrap_or(Err("tool task failed".into()))
+                        {
+                            Ok(r) => (r, true),
+                            Err(e) => (e, false),
+                        }
                     }
                 }
             } else if name == "computer" {
@@ -9862,11 +10055,11 @@ fn single_call_hint(
     if name == "run_terminal" && shell_read_is_batchable(&calls[0].2, root) {
         if lone_rounds <= 1 {
             return Some(Cow::Borrowed(
-                "[hint] That step had ONE call. This command only READS, so it runs in the SAME concurrent batch as other lookups — and every step re-sends the whole conversation. Put the remaining commands, reads and greps you already know you need in the SAME step.",
+                "[hint] That step had ONE call. This command only READS, so it runs in the SAME concurrent batch as other lookups — and every step re-sends the whole conversation. Put the remaining commands you already know you need into ONE run_terminal call via commands=[\"cmd1\",\"cmd2\",…] (they run in order, one result block each), next to the reads and greps of the same step.",
             ));
         }
         return Some(Cow::Owned(format!(
-            "[hint] {lone_rounds} rounds in a row have now delivered ONE call each. A read-only command runs in the same concurrent batch as the lookups, so the commands, reads and greps you already know you need belong in the SAME step — every extra step re-sends the whole conversation."
+            "[hint] {lone_rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation. Batch NOW: one run_terminal call with commands=[…] runs every inspection IN ORDER in this one call (one result block each); reads and greps ride the SAME step."
         )));
     }
     if matches!(name, "edit_file" | "write_file" | "artifact") {
@@ -9996,12 +10189,12 @@ fn single_call_hint_text(rounds: usize) -> String {
         return SINGLE_CALL_HINT.to_string();
     }
     format!(
-        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch the independent work you already know you need into this next step — file edits run IN ORDER in a single step, and several replacements in one file go in ONE edit_file call as edits:[{{path, old_string, new_string, replace_all}}]."
+        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch NOW: several files in ONE write_file call as files:[{{path, content}}], several replacements in ONE edit_file call as edits:[{{path, old_string, new_string, replace_all}}], several shell commands in ONE run_terminal call as commands:[\"…\"]."
     )
 }
 
 /// The teaching form, delivered once at the start of a streak.
-const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: issue all the file edits and shell commands you already know you need together (they run IN ORDER, one after another) instead of spending a step on each. Several replacements in one file go in a SINGLE edit_file call as edits:[{path, old_string, new_string, replace_all}].";
+const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: several files go in ONE write_file call as files:[{path, content}]; several replacements in one file go in ONE edit_file call as edits:[{path, old_string, new_string, replace_all}]; several shell commands go in ONE run_terminal call as commands:[\"…\"]. Issue all of them you already know you need together instead of spending a step on each.";
 
 /// Cap on the saved-plan body injected into the system prompt. A plan is
 /// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
@@ -10921,17 +11114,12 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         last = failed;
         // Attempts spent on the CURRENT rung; reset whenever the rung moves.
         rung_attempts = rung_attempts.saturating_add(1);
-        // A rung is abandoned when its failure says the MODEL ITSELF is unusable
-        // (a refused key, an unknown model, an empty answer) — OR when the rung
-        // has spent its own attempt budget without producing a report.
-        //
-        // That second half is the bug the user reported. A slot model answering
-        // 429 on every single call is NOT fixed by retrying it forever: the
-        // fallback list exists for exactly this, but every rate limit was
-        // classified "transient", so the ladder kept the same model and burned
-        // all ten attempts on it — Settings → Tools → Explore → Fallbacks was
-        // never reached. Retrying a slow-but-working provider is still right,
-        // which is what SUBAGENT_RUNG_ATTEMPTS buys it before the chain moves on.
+        // A rung gets ONE try per pass, whatever the failure: a refused key, a
+        // rate limit, a 5xx or a dropped connection all hand the call to the
+        // NEXT model in the user's list immediately — asking the same model
+        // again right away can only reproduce the same error, and the walk
+        // returns to this rung on the next pass anyway. The pause lives
+        // between PASSES (the wrapped walk below), never between rungs.
         let rung_spent = rung_attempts >= SUBAGENT_RUNG_ATTEMPTS;
         let advance = attempt < max_attempts && (subagent_error_is_fatal(&last.0) || rung_spent);
         // Set when the walk ran off the END of the list and went back to rung 0:
@@ -10965,13 +11153,12 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                     sub_req.thinking_level = chain_level.clone();
                 }
             } else if next >= chain.len() {
-                // A one-model chain: there is nothing to rotate through. A FATAL
-                // failure is final right away; a TRANSIENT one keeps retrying
-                // this model with the remaining budget, so a slot with no
-                // fallback configured stays exactly as patient as it was before.
-                if subagent_error_is_fatal(&last.0) {
-                    break;
-                }
+                // A one-model chain: there is nothing to rotate through, so the
+                // pass ends after THIS rung either way. The walk wraps to the
+                // same model on the next pass (the pause below separates the
+                // passes) — a fatal error is not an early exit any more: the
+                // user's rule is uniform, every model gets its next pass until
+                // the attempt budget is spent.
                 rung_attempts = 0;
             } else {
                 // Moving down the chain: the NEXT fallback model the user picked,
@@ -11680,6 +11867,9 @@ mod tests {
             input_tokens: 3,
             output_tokens: 1,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_reported: false,
+            cache_write_reported: false,
             model: "sub-model".into(),
             provider_id: "p2".into(),
             sub: true,
@@ -11702,6 +11892,9 @@ mod tests {
             input_tokens: 900,
             output_tokens: 10,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_reported: false,
+            cache_write_reported: false,
             model: "main".into(),
             provider_id: "p1".into(),
             sub: false,
@@ -11967,6 +12160,140 @@ mod tests {
         assert!(plugin_mode_refusal("toggle", &caps_for_mode("ask")).is_some());
         assert!(plugin_mode_refusal("update", &caps_for_mode("build")).is_none());
         assert!(plugin_mode_refusal("list", &caps_for_mode("plan")).is_none());
+    }
+
+    #[test]
+    fn schedule_refusal_mirrors_the_plugin_gate() {
+        // Listing is reading: every mode may do it, and Build/unknown may write.
+        assert!(schedule_mode_refusal("list", &caps_for_mode("ask")).is_none());
+        assert!(schedule_mode_refusal("list", &caps_for_mode("plan")).is_none());
+        assert!(schedule_mode_refusal("create", &caps_for_mode("build")).is_none());
+        // The writes follow `write_files`: a read-only turn refuses them even
+        // with a sticky allow_create, in the same words the plugin gate uses.
+        for action in ["create", "update", "toggle", "delete"] {
+            let refusal = schedule_mode_refusal(action, &caps_for_mode("ask"))
+                .unwrap_or_else(|| panic!("ask must refuse schedule {action}"));
+            assert!(refusal.contains("read-only"), "{refusal}");
+            assert!(refusal.contains("action=list"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn authoring_tools_follow_write_files_wherever_they_come_from() {
+        // A sticky `allow_create` (an authoring request earlier in the chat)
+        // must not arm the authoring tools in a read-only turn: the schema
+        // filter drops them for a non-authoring turn, and `denied_by_caps`
+        // drops AND refuses them for a turn that cannot write — the second
+        // gate a stale transcript or a hallucinated call meets.
+        let caps = ToolCaps { write_files: false, ..ToolCaps::default() };
+        for name in ["create_skill", "create_mcp"] {
+            let refusal = denied_by_caps(&caps, name)
+                .unwrap_or_else(|| panic!("{name} must be gated on write_files"));
+            assert!(refusal.contains("read-only"), "{refusal}");
+        }
+        // A writable turn keeps them (the allow_create filter governs there).
+        assert!(denied_by_caps(&caps_for_mode("build"), "create_mcp").is_none());
+    }
+
+    #[test]
+    fn read_only_turns_see_the_compact_read_schema() {
+        // Ask (caps.write_files=false): the schema list is the first gate —
+        // authoring is ABSENT, plugin is list/run only, and schedule stays
+        // reachable but list-only, so "what is scheduled" costs no refusal.
+        let mut schemas = tool_schemas(false, false);
+        let ask = caps_for_mode("ask");
+        retain_allowed_tools(&mut schemas, &ask, "ask");
+        compact_plugin_schema(&mut schemas);
+        compact_schedule_schema(&mut schemas);
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"create_skill"), "ask must not offer create_skill");
+        assert!(!names.contains(&"create_mcp"), "ask must not offer create_mcp");
+        assert!(names.contains(&"plugin"), "ask keeps the plugin door");
+        assert!(names.contains(&"schedule"), "ask keeps schedule for listing");
+        let plugin = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "plugin")
+            .unwrap();
+        let plugin_enum: Vec<&str> = plugin["function"]["parameters"]["properties"]["action"]
+            ["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(plugin_enum, ["list", "run"], "ask plugin enum");
+        let schedule = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "schedule")
+            .unwrap();
+        let schedule_enum: Vec<&str> = schedule["function"]["parameters"]["properties"]["action"]
+            ["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(schedule_enum, ["list"], "ask schedule enum");
+    }
+
+    #[test]
+    fn authoring_turns_keep_the_full_schedule_schema() {
+        // Build with allow_create: the full schedule enum rides, and the
+        // authoring tools are present — the compact forms must only ever
+        // narrow a turn that cannot write.
+        let schemas = tool_schemas(true, false);
+        let schedule = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "schedule")
+            .expect("schedule must stay in the base list");
+        let schedule_enum: Vec<&str> = schedule["function"]["parameters"]["properties"]["action"]
+            ["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            schedule_enum,
+            ["list", "create", "update", "toggle", "delete"],
+            "authoring schedule enum"
+        );
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"create_skill"));
+        assert!(names.contains(&"create_mcp"));
+    }
+
+    #[test]
+    fn a_headless_build_run_still_lists_but_not_authors_schedules() {
+        // The scheduler sends `allow_create: false` with writable caps: today
+        // such a run had NO schedule tool at all and could not even answer
+        // "what is scheduled". It must get the list-only schema — the writes
+        // stay with an authoring turn.
+        let mut schemas = tool_schemas(false, false);
+        let caps = caps_for_mode("build");
+        retain_allowed_tools(&mut schemas, &caps, "build");
+        compact_schedule_schema(&mut schemas);
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"create_skill"));
+        assert!(!names.contains(&"create_mcp"));
+        assert!(names.contains(&"schedule"));
+        let schedule = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "schedule")
+            .unwrap();
+        assert_eq!(
+            schedule["function"]["parameters"]["properties"]["action"]["enum"],
+            json!(["list"])
+        );
     }
 
     #[test]
@@ -13142,8 +13469,14 @@ mod tests {
             // runs in page scope (nine traced rounds died trying to reach React
             // from it). Both are one-time prose, paid on every round, so the
             // ceilings move with the measurement as usual.
-            ("main", tool_schemas(false, false), 15_800usize),
-            ("main+browser", tool_schemas(false, true), 21_900),
+            // Re-based once more when `schedule` joined every NON-authoring set
+            // as the list-only compact schema (~0.4K chars: "what is scheduled"
+            // no longer costs a refusal round in a read-only turn), and
+            // `load_skill` learned the `bundle` drill-in + the `plugin` schema's
+            // `list` line grew its slug-detail hint. The step is those schemas
+            // themselves; the ~3.5% headroom convention still holds.
+            ("main", tool_schemas(false, false), 16_650usize),
+            ("main+browser", tool_schemas(false, true), 23_100),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -13154,8 +13487,8 @@ mod tests {
             // EAGER inlining of every connector's whole catalogue. That trade is
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
-            ("main+authoring", tool_schemas(true, false), 23_100),
-            ("main+authoring+browser", tool_schemas(true, true), 28_900),
+            ("main+authoring", tool_schemas(true, false), 23_900),
+            ("main+authoring+browser", tool_schemas(true, true), 30_400),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -13496,7 +13829,13 @@ mod tests {
         // the model cannot obey (59 such rounds, 50 firings, zero effect).
         for name in ["edit_file", "write_file"] {
             let hint = single_call_hint("agent", &one(name), 1, root).unwrap();
-            assert!(hint.contains("IN ORDER"), "{name}: {hint}");
+            // The batch FORMS are named explicitly now: files=[…] for writes,
+            // edits=[…] for replacements, commands=[…] for the shell — the
+            // traced model answers with exactly one call per reply, so the
+            // hint must teach the exact parameter, not the concept.
+            assert!(hint.contains("files:[{path, content}]"), "{name}: {hint}");
+            assert!(hint.contains("edits:[{path, old_string, new_string, replace_all}]"), "{name}: {hint}");
+            assert!(hint.contains("commands:"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
         // A SHELL round is a chain only when its command MUTATES, so a bare
@@ -13526,7 +13865,9 @@ mod tests {
         let read_hint = single_call_hint("agent", &mutating("git status --porcelain"), 1, root)
             .expect("a read-only command must be named as batchable");
         assert!(read_hint.contains("concurrent"), "{read_hint}");
-        assert!(read_hint.contains("SAME step"), "{read_hint}");
+        assert!(read_hint.contains("same step"), "{read_hint}");
+        // The batch FORM is named: commands=[…] is what the model must emit.
+        assert!(read_hint.contains("commands="), "{read_hint}");
         assert!(
             !read_hint.contains("IN ORDER"),
             "a read is concurrent, never ordered: {read_hint}"
@@ -14054,11 +14395,11 @@ mod tests {
     fn a_rate_limited_slot_model_still_falls_back() {
         // The reported bug: the banner sat on "Sub-agent retrying (7/10) … key
         // rejected (429)" while the user's configured Fallbacks were never
-        // tried. A rate limit is correctly classified TRANSIENT (retrying the
-        // same model is right for a hiccup), but that must not mean "retry it
-        // forever": once the rung has spent its own budget the chain has to move
-        // on, or the fallback list is unreachable for the one failure it exists
-        // for.
+        // tried. A rate limit is correctly classified TRANSIENT, but the
+        // ladder's rule is uniform now: ONE try per rung, whatever the failure
+        // — a rate limit, a 5xx or a dropped stream all hand the call to the
+        // NEXT model immediately, and the walk returns to this rung on the
+        // next pass (separated by the pause, not by a same-model retry).
         let budget_spent = |rung_attempts: usize, fatal: bool, can_advance: bool| {
             can_advance && (fatal || rung_attempts >= SUBAGENT_RUNG_ATTEMPTS)
         };
@@ -14066,10 +14407,10 @@ mod tests {
         assert!(!subagent_error_is_fatal(
             "key rejected (429): Rate limit exceeded. Please try again later."
         ));
-        // …but the rung's second failure DOES advance to the next model.
+        // …but a single failure already spends the rung: the NEXT model takes
+        // the call with no same-model retry in between.
         assert!(budget_spent(SUBAGENT_RUNG_ATTEMPTS, false, true));
-        // A single failure still retries the same model first.
-        assert!(!budget_spent(1, false, true));
+        assert!(budget_spent(1, false, true));
         // A fatal error advances immediately, without waiting for the budget.
         assert!(budget_spent(1, true, true));
     }
@@ -14477,9 +14818,11 @@ mod tests {
         // A query that names its skill in SEVERAL words beats the filler matches
         // outright, so it answers on the FIRST call. Traced (`mvyy1qf7`): such a
         // query listed the right skill beside three one-word matches and the model
-        // then spent a second call naming it — twice in one turn. Three distinctive
-        // words against a single shared one is that lead; two against one is a tie
-        // and must keep listing candidates.
+        // then spent a second call naming it — twice in one turn. Under IDF the
+        // lead only grows: one unique word against boilerplate ("skill" is in
+        // every name) is already a clear winner, so the one-unique-word query
+        // below answers with the body too. A GENUINE tie — every candidate
+        // matching the same words — is what still lists candidates.
         let dominant = dispatch(
             root,
             "load_skill",
@@ -14488,14 +14831,23 @@ mod tests {
         )
         .unwrap();
         assert!(dominant.contains("BODY OF 39"), "a clear winner answers at once: {dominant}");
-        let tied = dispatch(
+        let one_unique = dispatch(
             root,
             "load_skill",
             &json!({"query": "maintenance skill"}),
             None,
         )
         .unwrap();
-        assert!(!tied.contains("BODY OF"), "a near-tie must still list candidates: {tied}");
+        assert!(one_unique.contains("BODY OF 39"), "the unique word decides: {one_unique}");
+        let tied = dispatch(
+            root,
+            "load_skill",
+            &json!({"query": "filler skill"}),
+            None,
+        )
+        .unwrap();
+        assert!(tied.contains("Bulk Skill 0"), "{tied}");
+        assert!(!tied.contains("BODY OF"), "a real tie must still list candidates: {tied}");
         // A miss answers with a HINT, not with 40 names: a store with hundreds
         // of skills would spend a turn's worth of tokens on a failed lookup.
         let miss = dispatch(root, "load_skill", &json!({"query": "zzzz"}), None).unwrap_err();
@@ -16415,6 +16767,49 @@ mod tests {
             measured_prompt_tokens(&msgs, 0, 99, 1_000),
             full_estimate
         );
+    }
+
+    #[test]
+    fn an_inclusive_prompt_basis_fires_the_compaction_trigger_on_time() {
+        // The plan's fixture (plan §3): a raw Anthropic usage of input=2_000,
+        // read=18_000, write=1_000. The prompt the provider actually billed is
+        // 21_000 tokens — the basis `last_prompt_tokens` now carries for EVERY
+        // provider (`llm::NormalizedUsage::input_total`), not just
+        // provider=="anthropic", and never without the write half.
+        let basis = crate::llm::NormalizedUsage::from_payload(&json!({
+            "input_tokens": 2_000u64,
+            "cache_read_input_tokens": 18_000u64,
+            "cache_creation_input_tokens": 1_000u64,
+        }))
+        .unwrap()
+        .input_total;
+        assert_eq!(basis, 21_000);
+        // The trigger's comparison: measured >= threshold. With a 128K window
+        // at a 16% threshold the line sits at 20_480 — the inclusive basis
+        // crosses it; the OLD basis (the exclusive input alone, what a
+        // provider-name check or a custom gateway produced) stays far under
+        // and the compaction fires rounds too late.
+        let threshold = 128_000u64 * 16 / 100;
+        assert!(basis >= threshold, "inclusive basis must cross the line");
+        assert!(2_000 < threshold, "the exclusive input alone must not");
+        // The wiring end to end: `measured_prompt_tokens` anchored on that
+        // basis (+ the turn's appended delta) is what the trigger compares.
+        let msgs = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "u"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r".repeat(400)}),
+        ];
+        let measured = measured_prompt_tokens(&msgs, 0, 2, basis as usize);
+        assert!(measured as u64 >= threshold, "trigger fires at this call: {measured}");
+        // An OpenAI-style SUBSET payload must not double-count: prompt_tokens
+        // 21_000 with 18_000 already inside it stays 21_000.
+        let subset = crate::llm::NormalizedUsage::from_payload(&json!({
+            "prompt_tokens": 21_000u64,
+            "prompt_tokens_details": { "cached_tokens": 18_000u64 },
+        }))
+        .unwrap()
+        .input_total;
+        assert_eq!(subset, 21_000);
     }
 
     #[test]

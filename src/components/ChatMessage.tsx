@@ -1472,6 +1472,86 @@ export function RetryBanner({
   );
 }
 
+/** The compact inline retry line — the message-footer replacement for the
+ *  transcript-end RetryBanner. Every automatic retry marks itself `inline`
+ *  (the chat-error ladder, the sub-agent ladders, the watchdog) and renders
+ *  HERE instead: one muted line beside the Working pill, the full provider
+ *  error reachable through the tooltip. A gave-up line keeps the manual
+ *  one-click Retry. */
+function InlineRetryLine({
+  retry,
+  onManualRetry,
+}: {
+  retry: NonNullable<ChatMessage["retry"]>;
+  onManualRetry?: () => void;
+}) {
+  // The countdown re-arms on every NEW retry cycle (attempt/startedAt bump
+  // without a remount — the same fix the RetryBanner needed: a cycle that
+  // ended at 0 must not pin the next cycle at 0).
+  const [left, setLeft] = useState(() => computeLeft(retry.delay, retry.startedAt));
+  useEffect(() => {
+    setLeft(computeLeft(retry.delay, retry.startedAt));
+    if (retry.delay <= 0 || retry.gaveUp) return;
+    const t = setInterval(() => {
+      setLeft((l) => (l <= 1 ? 0 : l - 1));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [retry.delay, retry.startedAt, retry.attempt, retry.gaveUp]);
+  const gaveUp = retry.gaveUp === true;
+  // Provider bodies arrive pasted in raw (escaped JSON, several screen lines)
+  // — the line shows the humanized sentence; the tooltip carries everything.
+  const detail = retry.fallback
+    ? fallbackReason(retry.reason ?? "")
+    : humanizeError(retry.reason ?? "");
+  // Sub-agent retries name their owner ("explore") so a compact line still
+  // says WHICH ladder is cycling. Same dedup rule as the banner: repeating
+  // the tool inside an agent label that already names it is noise.
+  const who = [
+    retry.agent ?? "",
+    retry.tool &&
+    retry.agent &&
+    !retry.agent.toLowerCase().includes(retry.tool.toLowerCase())
+      ? `tool: ${retry.tool}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const counting = !gaveUp && retry.delay > 0;
+  const countdown = counting
+    ? left > 0
+      ? ` — in ${left}s`
+      : " — retrying…"
+    : "";
+  const cap =
+    retry.maxAttempts > 1 ? `${retry.attempt}/${retry.maxAttempts}` : `${retry.attempt}`;
+  return (
+    <span className="msg-retry-inline" dir="ltr" title={retry.reason || undefined}>
+      <span className="msg-retry-inline-icon" aria-hidden>
+        ↻
+      </span>
+      <span className="msg-retry-inline-text">
+        {who ? `${who} — ` : ""}
+        {gaveUp
+          ? retry.maxAttempts > 1
+            ? `failed after ${retry.attempt} tries`
+            : "failed"
+          : `retry ${cap}`}
+        {detail ? ` — ${detail}` : ""}
+        {countdown}
+      </span>
+      {gaveUp && onManualRetry && (
+        <button
+          className="msg-retry-inline-btn"
+          onClick={onManualRetry}
+          title="Retry — resumes where it stopped without redoing completed work"
+        >
+          Retry
+        </button>
+      )}
+    </span>
+  );
+}
+
 function localWords(s: string): number {
   return s.trim().split(/\s+/).filter(Boolean).length;
 }
@@ -2837,7 +2917,7 @@ export const ChatMessageView = memo(
         </div>
       )}
 
-      {!isUser && (message.content || message.usage || message.streaming || message.turnElapsedMs != null) && (
+      {!isUser && (message.content || message.usage || message.streaming || message.turnElapsedMs != null || message.retry) && (
         <div className="msg-actions">
           {message.usage && (
             <UsageBadge
@@ -3022,6 +3102,16 @@ export const ChatMessageView = memo(
                 startedAt={message.workingStartedAt}
               />
             ))}
+          {/* Automatic retries (chat-error ladder, sub-agent ladders, watchdog)
+              report HERE — one compact line beside the Working pill — instead
+              of the transcript-end banner. A gave-up retry keeps its manual
+              one-click Retry in the same line. */}
+          {message.retry && (
+            <InlineRetryLine
+              retry={message.retry}
+              onManualRetry={onRetry ? () => onRetry(message.id) : undefined}
+            />
+          )}
           {/* Turn duration + send clock share the far end of the footer,
               opposite the usage/buttons cluster (same spot the live Working
               indicator occupied while streaming). One auto margin on the

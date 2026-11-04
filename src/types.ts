@@ -465,6 +465,7 @@ export interface ToolActivity {
 }
 
 export interface TokenUsage {
+  /** INCLUSIVE billed input — the cache share is inside it for every provider. */
   inputTokens: number
   outputTokens: number
   totalTokens: number
@@ -472,6 +473,9 @@ export interface TokenUsage {
   reasoningTokens?: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
+  /** The provider payload carried the field at all (unknown ≠ 0). */
+  cacheReadReported?: boolean
+  cacheWriteReported?: boolean
 }
 
 /** One cumulative usage entry for a single (provider, model) pair used by a
@@ -590,7 +594,7 @@ export interface ChatMessage {
   skills?: string[]
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; branch?: number; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; branch?: number; fallback?: boolean; reconnecting?: boolean; startedAt?: number; /** Rendered as a compact line in the message footer, never as the transcript-end banner. */ inline?: boolean } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
@@ -694,6 +698,10 @@ export interface Chat {
   providerId?: string
   /** Per-chat model override (defaults to the global active provider's model). */
   model?: string
+  /** Per-chat auto-compaction threshold override, 1–99 (percent of the raw
+   *  window). Undefined = follow Settings → General → Auto-compaction
+   *  threshold; set from the context popover's slider for THIS chat only. */
+  compactAtPercent?: number
   root?: string
   /** Open "editing" badge (see ChatEditTarget): while set, sends go to this
    *  folder in Build mode until the user closes the badge. The chat's mode is
@@ -977,8 +985,14 @@ export interface SidecarEvent {
   output_tokens?: number
   total_tokens?: number
   context_tokens?: number
+  /** INCLUSIVE billed input: the cache share is inside it for every provider
+   *  (see llm::NormalizedUsage) — the cost math subtracts read+write. */
   cache_read_tokens?: number
   cache_write_tokens?: number
+  /** The payload carried the cache field at all — "not reported" stays
+   *  distinguishable from a real zero (the cache genuinely missed). */
+  cache_read_reported?: boolean
+  cache_write_reported?: boolean
   reasoning_tokens?: number
   /** Characters of reasoning content the backend actually observed in this
    *  response (0 = none). Positive evidence that the model reasons, recorded

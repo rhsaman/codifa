@@ -5,7 +5,15 @@
 //        --format=esm --outfile=src/lib/.tmp-retry.mjs && node src/lib/.tmp-retry.mjs
 
 import type { MessageSegment } from "../types"
-import { AutoRetryScheduler, resetStreamForRetry, resolveRestartUser, shouldIgnoreLateRetryEvent } from "./retry"
+import {
+  AutoRetryScheduler,
+  resetStreamForRetry,
+  resolveRestartUser,
+  shouldIgnoreLateRetryEvent,
+  isDeterministicTurnError,
+  isInlineRetry,
+  findRetryBannerMessage,
+} from "./retry"
 
 export {}
 
@@ -173,6 +181,37 @@ console.log('12) AutoRetryScheduler: normal retry still fires without stop, and 
   sched.schedule(0, () => { fired2++ })
   runAll()
   check('retry works again on the next turn', fired2 === 1)
+}
+
+// نردبان خطای چت: خطاهای قطعی (4xx / سهمیه‌ی تمام‌شده) retry خودکار نمی‌گیرند؛
+// خطاهای گذرا (ترنسپورت، 5xx، 429 واقعی) می‌گیرند. (اندازه‌گیری روی rust.log:
+// یک «key rejected (402) Free slots at capacity» ده بار پشت هم تکرار شد.)
+console.log('isDeterministicTurnError:')
+{
+  check('400 قطعی است', isDeterministicTurnError("Cloudflare upstream HTTP 400: System message must be at the beginning."))
+  check('key rejected (402) قطعی است', isDeterministicTurnError('key rejected (402): {"error":{"code":"insufficient_credits"}}'))
+  check('key rejected (401) قطعی است', isDeterministicTurnError("key rejected (401): invalid api key"))
+  check('بدون کلید قطعی است', isDeterministicTurnError("no api key configured"))
+  check('سهمیه‌ی تمام‌شده روی 429 قطعی است', isDeterministicTurnError('key rejected (429): Free usage limit reached. Subscribe to keep going.'))
+  check('429 واقعی گذراست', !isDeterministicTurnError("key rejected (429): Rate limit exceeded. Retry after 60 seconds."))
+  check('اتصال قطع‌شده گذراست', !isDeterministicTurnError("error sending request for url (http://x/v1/chat/completions)"))
+  check('انقضای بودجه‌ی هدر گذراست', !isDeterministicTurnError("provider sent no response headers within 60s"))
+  check('5xx گذراست', !isDeterministicTurnError("503 Service Unavailable"))
+}
+
+// ریترای inline: فقط خط فشرده‌ی فوتر؛ هرگز بنر انتهای ترنسکریپت.
+console.log('isInlineRetry + findRetryBannerMessage:')
+{
+  check('retry بدون inline بنر می‌گیرد', !isInlineRetry({ attempt: 1, maxAttempts: 3, delay: 0, reason: "x" }))
+  check('retry با inline بنر نمی‌گیرد', isInlineRetry({ attempt: 1, maxAttempts: 3, delay: 0, reason: "x", inline: true }))
+  const msgs = [
+    { id: "a", retry: { attempt: 1, maxAttempts: 3, delay: 0, reason: "x", inline: true } },
+    { id: "b", retry: { attempt: 2, maxAttempts: 3, delay: 0, reason: "y" } },
+  ]
+  const picked = findRetryBannerMessage(msgs, new Set(), new Set())
+  // پیام a فقط inline است و از اسکن بنر می‌پرد؛ بنرِ پیام b را برمی‌دارد.
+  check('اسکن بنر، retryهای inline را رد می‌کند', picked?.id === "b")
+  check('اسکن بنر با همه‌ی inlineها null می‌دهد', findRetryBannerMessage([msgs[0]], new Set(), new Set()) === null)
 }
 
 if (failed > 0) {

@@ -1248,6 +1248,19 @@ function InlineRetryLine({
   // glyph moves INSIDE the Retry button (a lone ↻ floating next to a "Retry"
   // button read as two unrelated things).
   const showInlineIcon = !(gaveUp && onManualRetry);
+  // Drives the chip's colour (`--tone` in CSS): one value per kind of row so
+  // an error, a live retry, a model switch and a compaction read differently
+  // at a glance instead of all sharing one grey line.
+  const tone =
+    progressPct !== null
+      ? "progress"
+      : gaveUp
+        ? "error"
+        : retry.fallback
+          ? "warn"
+          : isStatus
+            ? "info"
+            : "retry";
   return (
     // NO `dir` on this span: it is the ABSOLUTELY POSITIONED element, and a
     // `dir` here would make `inset-inline-end` resolve against THAT direction
@@ -1256,7 +1269,7 @@ function InlineRetryLine({
     // "↻ retry 7/10 — reason — in 7s" order stable.
     <span
       className="msg-retry-inline"
-      title={fullDetail || retry.reason || undefined}
+      data-state={tone}
       /* Custom hover card: the NATIVE `title` has a ~1s delay, gets dropped when
          the pointer jitters, and cannot wrap a multi-sentence provider body —
          which is why hovering "did not show the full error". The card below is
@@ -1278,7 +1291,10 @@ function InlineRetryLine({
               `↻ retry 4/10 → reason → dots → Retry` in both locales. */}
       <span className="msg-retry-inline-row" dir="ltr">
       <span className="msg-retry-inline-head" dir="ltr">
-        {showInlineIcon && (
+        {/* A compaction row carries no glyph: its determinate bar (below) is
+            the ONLY progress indicator. A spinner beside it said the same thing
+            twice. */}
+        {showInlineIcon && progressPct === null && (
           <span className="msg-retry-inline-icon" aria-hidden>
             {icon}
           </span>
@@ -1286,9 +1302,9 @@ function InlineRetryLine({
         {who && <span className="msg-retry-inline-who">{who}</span>}
         <span className="msg-retry-inline-count">{label}</span>
         {progressPct !== null && (
-          // PERCENTAGE ONLY. The bar was removed on request: it duplicated the
-          // number (a 92px bar and "42%" say exactly the same thing), and it
-          // made the row wide enough to crowd the clock/timer beside it.
+          // The number sits in the head; the determinate bar is drawn as the
+          // chip's own bottom edge (below), so it adds height, not width, and
+          // cannot crowd the clock/timer beside the footer.
           <span className="msg-retry-inline-pct">{progressPct}%</span>
         )}
       </span>
@@ -1322,7 +1338,7 @@ function InlineRetryLine({
         <button
           className="msg-retry-inline-btn"
           onClick={onManualRetry}
-          title="Retry — resumes where it stopped without redoing completed work"
+          aria-label="Retry — resumes where it stopped without redoing completed work"
           dir="ltr"
         >
           {/* The ↻ lives INSIDE the button now: a bare glyph next to a "Retry"
@@ -1337,6 +1353,20 @@ function InlineRetryLine({
         </button>
       )}
       </span>
+      {progressPct !== null && (
+        <span
+          className="msg-retry-inline-bar"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progressPct}
+        >
+          <span
+            className="msg-retry-inline-bar-fill"
+            style={{ width: `${progressPct}%` }}
+          />
+        </span>
+      )}
     </span>
   );
 }
@@ -2467,17 +2497,10 @@ export const ChatMessageView = memo(
     if (referenced) return null;
   }
 
-  // While the provider is retrying, the assistant message has no content yet —
-  // hide the empty placeholder so the retry banner (rendered once, at the END
-  // of the chat in Chat.tsx) is the only thing between the user's message and
-  // the incoming reply, instead of a dangling empty bubble.
-  if (
-    message.retry &&
-    !message.content &&
-    !(message.segments && message.segments.length > 0)
-  ) {
-    return null;
-  }
+  // NOT hidden while retrying, even when still empty: the transcript-end retry
+  // banner this once deferred to is gone — the retry/status line now lives in
+  // THIS message's footer, so hiding the empty message hid the only status the
+  // user had (just the Stop button was left).
   const roleLabel = isUser
     ? "You"
     : isSummary

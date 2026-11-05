@@ -2272,6 +2272,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const compactError = chat?.compactError ?? null;
   const compacting = chat?.compacting ?? false;
   const compactProgress = chat?.compactProgress ?? null;
+  // The backend ticks only when an attempt STARTS; the model call then runs for
+  // up to minutes with no tick. The footer's percent is derived from
+  // elapsed/budget, so without a local clock the bar froze at the opening 0%.
+  // Re-render once a second while a compaction runs so that derivation advances
+  // between ticks.
+  const [, setCompactClock] = useState(0);
+  useEffect(() => {
+    if (!compacting) return;
+    const t = setInterval(() => setCompactClock((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [compacting]);
   const cmdError = chat?.cmdError ?? null;
   const skillNotice = chat?.skillNotice ?? null;
   const undoNotice = chat?.undoNotice ?? null;
@@ -5705,12 +5716,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // backend) — clear it so a recovered turn does not keep showing a
         // stale "retry 4/10" footer. A gaveUp line stays: it carries the
         // manual Retry button for the failed turn.
+        // A FAILED turn (`error`) stays too: its `error` event always precedes
+        // this `done` sentinel and has just armed the 10s auto-retry, so this
+        // reconnecting line IS that retry's countdown. Clearing it hid the
+        // "retry 2/10 in 8s • • •" steps, dropped the footer to a bare "failed",
+        // and made `retryArmed` (finally block) false, so the composer released
+        // the Stop button during the wait.
         {
           const cur = useStore
             .getState()
             .chats.find((c) => c.id === chat.id)
             ?.messages.find((m) => m.id === assistantMsg.id);
-          if (cur?.retry?.inline && cur.retry.reconnecting && !cur.retry.gaveUp) {
+          if (
+            cur?.retry?.inline &&
+            cur.retry.reconnecting &&
+            !cur.retry.gaveUp &&
+            cur.error !== true
+          ) {
             useStore.getState().updateMessage(assistantMsg.id, { retry: null });
           }
         }

@@ -4632,17 +4632,23 @@ body.coder-dragging .chat-split-child {
      only; parking is handled by the outer auto margin. */
   order: 0;
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
   flex-shrink: 0;
 }
 
 .msg-retry-inline {
+  /* Colour of the whole chip (border, tint, icon, %, dots); set per kind of
+     row by `[data-state]` below. */
+  --tone: var(--text-dim);
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
   flex: 0 1 auto;
   min-width: 0;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--tone) 30%, transparent);
+  border-radius: 999px;
   /* NO `direction` on this element: it is the PARKING box. It inherits the
      footer's direction so `margin-inline-start: auto` absorbs free space on the
      same side the Working pill occupies. Setting `direction: ltr` here flipped
@@ -4675,19 +4681,17 @@ body.coder-dragging .chat-split-child {
    is what lets the OUTER box still park via the footer's (RTL) axis. */
 .msg-retry-inline-row {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
   min-width: 0;
-  /* A compaction row packs SIX pieces (phase, bar, %, time, budget, attempt).
-     At the shared 5px gap they all read as one mush. The row itself keeps 5px
-     for the plain retry sentence; the compaction groups below get explicit,
-     larger separation so the eye can split "what phase" / "how far" / "how
-     long". */
-  /* A compaction row is the one case with a bar in it: give the row a real
-     width budget (min(100%, 46ch)) so the bar's `flex: 1 1 90px` has space to
-     grow into instead of collapsing to its 60px floor. Plain text rows are
-     unaffected — they never ask for extra width. */
-  max-width: min(100%, 46ch);
+  /* The chip itself is already capped (`min(34rem, 100%)`); the row fills it.
+     Filling (not shrink-wrapping) is what keeps the content LEFT-aligned: the
+     chip inherits the footer's RTL, so a shrink-wrapped row sat on its right
+     edge whenever the chip was wider than its content (compaction min-width,
+     wrapped narrow footer). The compaction bar is the chip's own underline,
+     not part of this row. */
+  flex: 1 1 auto;
+  max-width: 100%;
   direction: ltr;
   flex-direction: row;
 }
@@ -4733,7 +4737,30 @@ body.coder-dragging .chat-split-child {
 
 .msg-retry-inline-icon {
   flex-shrink: 0;
-  color: var(--danger);
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--tone) 18%, transparent);
+  color: var(--tone);
+  font-size: 9px;
+  line-height: 1;
+}
+
+/* One colour per kind of row. */
+.msg-retry-inline[data-state="error"] {
+  --tone: var(--danger);
+}
+
+.msg-retry-inline[data-state="retry"],
+.msg-retry-inline[data-state="warn"] {
+  --tone: var(--warning, #d9a514);
+}
+
+.msg-retry-inline[data-state="info"],
+.msg-retry-inline[data-state="progress"] {
+  --tone: var(--accent);
 }
 
 /* Inner text row: carries the `dir="ltr"` pin (so the counter/reason/countdown
@@ -4760,16 +4787,38 @@ body.coder-dragging .chat-split-child {
    chrome, and ellipsized so it can never widen or wrap the footer. */
 .msg-retry-inline-pct {
   flex-shrink: 0;
-  /* Lighter than the phase name but brighter than the old metadata: the
-     number is the whole point of a compaction row, so it carries the emphasis. */
-  color: var(--text);
-  opacity: 0.82;
+  /* The number is the whole point of a compaction row, so it takes the tone
+     colour and a heavier weight. */
+  color: var(--tone);
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
-/* (`.msg-retry-inline-progress`, `-bar` and `-bar-fill` were REMOVED: the
-   compact row now shows the PERCENTAGE ONLY. A 92px bar plus "42%" stated the
-   same thing twice and widened the row enough to crowd the clock pair.) */
+/* Compaction: a taller chip with a determinate bar as its underline. The bar
+   is absolute, so it adds height only (never width), and `direction: ltr`
+   makes it fill left→right even in an RTL footer. */
+.msg-retry-inline[data-state="progress"] {
+  padding-block-end: 8px;
+  min-width: min(16rem, 100%);
+}
+
+.msg-retry-inline-bar {
+  position: absolute;
+  inset-inline: 12px;
+  bottom: 3px;
+  height: 2px;
+  direction: ltr;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.msg-retry-inline-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--tone);
+  transition: width 0.4s ease;
+}
 
 .msg-retry-inline-reason {
   /* `flex: 1 1 0` (not a fixed ch basis): the reason takes only the width left
@@ -4786,6 +4835,23 @@ body.coder-dragging .chat-split-child {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--danger);
+}
+
+/* Wrapped onto its own row (narrow footer): the chip spans the row, so the
+   reason takes every pixel left instead of its 22ch cap. */
+@container msg-actions (max-width: 34rem) {
+  .msg-retry-inline-reason {
+    flex: 1 1 0;
+    max-width: none;
+  }
+}
+
+/* Very narrow: drop the secondary labels, keep icon + state + Retry. */
+@container msg-actions (max-width: 20rem) {
+  .msg-retry-inline-who,
+  .msg-retry-inline-wait-label {
+    display: none;
+  }
 }
 
 /* Instant hover card carrying the WHOLE error. Native `title` was the wrong
@@ -4807,9 +4873,9 @@ body.coder-dragging .chat-split-child {
   max-width: min(46ch, 80vw);
   max-height: 40vh;
   overflow-y: auto;
-  padding: 7px 9px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  padding: 8px 11px;
+  border: 1px solid color-mix(in srgb, var(--tone) 40%, var(--border));
+  border-radius: 10px;
   background: var(--bg-elev);
   color: var(--text);
   font-family: var(--font-sans);
@@ -4826,6 +4892,14 @@ body.coder-dragging .chat-split-child {
 .msg-retry-inline:hover::after,
 .msg-retry-inline:has(.msg-retry-inline-reason:hover)::after {
   display: block;
+  animation: msg-retry-card-in 0.12s ease-out;
+}
+
+@keyframes msg-retry-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
 }
 
 .msg-retry-inline-btn {
@@ -4838,17 +4912,18 @@ body.coder-dragging .chat-split-child {
   align-items: center;
   gap: 4px;
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
-  background: transparent;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
   color: var(--danger);
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: 999px;
   font-size: 10px;
   font-family: var(--font-mono);
-  padding: 1px 7px;
+  padding: 1px 9px;
   cursor: pointer;
+  transition: background 0.15s ease;
 }
 
 .msg-retry-inline-btn:hover {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  background: color-mix(in srgb, var(--danger) 26%, transparent);
 }
 
 /* The ↻ carried by the Retry button, kept on the same optical baseline as the
@@ -4867,7 +4942,7 @@ body.coder-dragging .chat-split-child {
   order: 20;
   flex-shrink: 0;
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 3px;
 }
 
@@ -4892,7 +4967,7 @@ body.coder-dragging .chat-split-child {
   height: 5px;
   flex-shrink: 0;
   border-radius: 50%;
-  background: var(--text);
+  background: var(--tone);
   opacity: 0.2;
   /* EXACTLY the Working pill's animation (`msg-thinking-dot`, 1.4s,
      scale 0.7→1.3 with opacity 0.2→1). The previous bespoke `msg-retry-dot`
@@ -4926,10 +5001,13 @@ body.coder-dragging .chat-split-child {
   }
 }
 
+/* The dots deliberately IGNORE reduced-motion: they are the same "still alive"
+   indicator as the Working pill's dots, which have no such override. With the
+   override, macOS "Reduce motion" froze the retry dots at a static opacity
+   while the pill kept pulsing — the retry line then looked dead. */
 @media (prefers-reduced-motion: reduce) {
-  .msg-retry-inline-dots i {
-    animation: none;
-    opacity: 0.75;
+  .msg-retry-inline-bar-fill {
+    transition: none;
   }
 }
 

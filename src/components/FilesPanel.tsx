@@ -10,7 +10,7 @@
  * row dragged onto a folder moves into it. Every mutation goes through the
  * same path — run it, then re-read the tree from disk, never guess.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import { api, workspaceFiles } from "../lib/fs";
@@ -636,7 +636,11 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
         >
           {rows.map((row, pos) => {
             const isDir = row.kind === "dir";
-            const indent = { paddingLeft: 6 + row.depth * 13 };
+            // `--depth` feeds the CSS indent guides (one thin line per level).
+            const indent = {
+              paddingLeft: 6 + row.depth * 13,
+              ["--depth" as string]: row.depth,
+            } as CSSProperties;
             // Two independent highlights: the filter's Ctrl+K/J cursor, and the
             // row a file header asked to reveal (kept until another reveal).
             const filterActive = query ? pos === filterIdx : false;

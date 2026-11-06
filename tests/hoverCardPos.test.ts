@@ -39,9 +39,13 @@ console.log('۲) نزدیک لبهٔ پایین به بالا می‌چرخد:')
   check('از بالا باز می‌شود', pos.top < 860, pos.top)
   check('بالا مثبت می‌ماند', pos.top >= 8, pos.top)
   check('ارتفاع از فضای بالا', pos.maxHeight <= 860, pos.maxHeight)
-  // فضای پایین کم و بالای زیاد: بالاتر باز شود.
+  check('هنگام چرخش به بالا، لبهٔ پایین به کارت چسبیده است', pos.bottom === 900 - 860 + 8, pos.bottom)
+  // فضای زیر برای ارتفاع کامل کافی نیست ولی بالا بیشتر است: به بالا باز شود.
   const mid = diffPopupPos(rect(500), 1400, 900)
-  check('فضای کافی زیر: زیر باز می‌شود', mid.top === 538, mid.top)
+  check('فضای زیر کمتر از ارتفاع کامل: به بالا باز می‌شود', mid.bottom !== undefined && mid.top < 500, mid)
+  // فضای کافی زیر: زیر باز می‌شود و bottom ندارد.
+  const roomy = diffPopupPos(rect(300), 1400, 900)
+  check('فضای کافی زیر: زیر باز می‌شود', roomy.top === 338 && roomy.bottom === undefined, roomy)
 }
 
 console.log('۳) فضای خیلی کم: حداقل ارتفاع:')

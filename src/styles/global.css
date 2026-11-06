@@ -32539,3 +32539,795 @@ select:focus-visible {
 .settings-modal .settings-row-stack {
   gap: 8px;
 }
+
+/* ════════ پنل راست: Files / Explore / کارت‌های Todos ════════ */
+/* ── File explorer ── */
+.files-panel-head {
+  min-height: 40px;
+  padding: 0 8px 0 14px;
+  gap: 4px;
+}
+
+.files-panel-title {
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  opacity: 0.75;
+}
+
+.files-panel-action {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+.files-filter-input {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 9px;
+}
+
+.files-list {
+  padding: 8px 8px 12px;
+}
+
+.files-row {
+  padding-block: 5px;
+  padding-right: 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.files-row-dir {
+  font-weight: 550;
+}
+
+.files-row:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.files-row-active,
+.files-row-active:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.files-row-icon {
+  opacity: 0.9;
+}
+
+.files-row-caret {
+  opacity: 0.55;
+}
+
+/* ── Explore run panel ── */
+.explore-panel {
+  gap: 12px;
+  padding: 14px 16px 18px;
+}
+
+.explore-panel-head {
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.explore-panel-title {
+  flex: 1 1 8rem;
+  font-size: 13px;
+}
+
+.explore-panel-count {
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  opacity: 1;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.explore-tool-chips {
+  padding: 0;
+  gap: 6px;
+}
+
+.explore-tool-chip {
+  padding: 3px 10px;
+}
+
+.explore-call-list {
+  gap: 6px;
+}
+
+.explore-call {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 2.5%, transparent);
+  border-color: var(--hairline);
+}
+
+.explore-call-head {
+  padding: 8px 11px;
+  gap: 9px;
+}
+
+.explore-call-tool {
+  padding: 1px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text);
+}
+
+.explore-call-detail {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.explore-call-body {
+  padding: 0 11px 10px;
+}
+
+/* ── کارت‌های پنل راست: یکدست (Tools / Terminals / Plan) ── */
+.sidebar-panel.usage-docked,
+.sidebar-panel.terminals-docked,
+.sidebar-panel.todos-docked {
+  border-radius: 16px;
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-head,
+.sidebar-panel.terminals-docked .sidebar-panel-head,
+.sidebar-panel.todos-docked .sidebar-panel-head {
+  padding: 11px 14px;
+  gap: 9px;
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-title,
+.sidebar-panel.terminals-docked .sidebar-panel-title,
+.sidebar-panel.todos-docked .sidebar-panel-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text);
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-icon,
+.sidebar-panel.terminals-docked .sidebar-panel-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* This turn's tools */
+.turn-usage-body {
+  padding: 12px 14px 14px;
+  gap: 14px;
+}
+
+.turn-usage-label {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+}
+
+.turn-usage-count {
+  padding: 0 7px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.turn-usage-list {
+  gap: 6px;
+}
+
+.turn-usage-chip {
+  padding: 4px 11px;
+  font-size: 11px;
+}
+
+.turn-usage-chip.used .turn-usage-dot {
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+/* Background terminals */
+.terminals-list {
+  padding: 10px 12px 12px;
+  gap: 8px;
+}
+
+.terminals-item {
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.terminals-command {
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.terminals-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
+.terminals-stop {
+  padding: 4px 12px;
+}
+
+/* Todos — آیتم‌ها */
+.sidebar-todo-item {
+  border-radius: 12px;
+}
+
+.sidebar-todo-item.running {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* ════════ Artifacts ════════ */
+.artifacts-panel-head,
+.artifact-panel-head {
+  padding: 12px 16px;
+  gap: 10px;
+}
+
+.artifacts-panel-title,
+.artifact-panel-title {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.artifacts-panel-count {
+  padding: 1px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.artifacts-refresh {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+}
+
+.artifacts-list {
+  gap: 8px;
+  padding: 12px;
+}
+
+.artifacts-row {
+  border-radius: 14px;
+  transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+
+.artifacts-row:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+}
+
+.artifacts-open {
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.artifacts-icon,
+.artifact-card-icon {
+  min-width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.artifacts-title {
+  font-size: 13.5px;
+}
+
+.artifacts-meta {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  letter-spacing: 0.03em;
+}
+
+.artifacts-time {
+  width: auto;
+  min-width: 34px;
+}
+
+.artifact-card {
+  border-radius: 14px;
+  margin: 8px 0;
+  transition: border-color 0.15s ease;
+}
+
+.artifact-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+}
+
+.artifact-card-head {
+  padding: 11px 12px 11px 14px;
+  gap: 11px;
+}
+
+.artifact-card-title {
+  font-size: 13px;
+}
+
+.artifact-card-open {
+  padding: 5px 14px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+/* ════════ Schedule + Inbox ════════ */
+.schedule-item {
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--text) 2.5%, transparent);
+}
+
+.schedule-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--hairline));
+}
+
+.schedule-item.running {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+.schedule-item-name {
+  font-size: 13px;
+}
+
+.schedule-item-cron {
+  padding: 2px 9px;
+}
+
+.schedule-item-sub {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.schedule-item-body {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+  gap: 8px;
+}
+
+.schedule-pill {
+  padding: 2px 9px;
+}
+
+.schedule-grid-card {
+  padding: 14px 16px;
+  border-radius: 16px;
+  gap: 7px;
+}
+
+.schedule-grid-card:hover {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+}
+
+.schedule-grid-card-name {
+  font-size: 14px;
+}
+
+.schedule-grid-card-foot {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+.schedule-inbox-item {
+  padding: 10px 12px;
+  border-radius: 12px;
+  gap: 3px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.schedule-inbox-item:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline));
+}
+
+.schedule-inbox-item.active {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.schedule-inbox-run {
+  padding: 14px 16px;
+  border-radius: 16px;
+  gap: 10px;
+}
+
+.schedule-inbox-run-head {
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.schedule-inbox-status {
+  padding: 2px 11px;
+}
+
+/* ── Artifacts & Schedule as card GRIDS (same language as the Inbox grid) ── */
+.artifacts-panel .artifacts-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+  align-content: start;
+  padding: 4px 16px 16px;
+}
+
+.artifacts-panel .artifacts-row {
+  position: relative;
+  display: block;
+  padding: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--bg-panel);
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+
+.artifacts-panel .artifacts-row:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  transform: translateY(-1px);
+}
+
+.artifacts-panel .artifacts-open {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas: "icon ." "title title" "meta time";
+  align-content: start;
+  align-items: center;
+  gap: 10px 8px;
+  width: 100%;
+  min-height: 118px;
+  padding: 12px 14px;
+  text-align: start;
+  background: none;
+  border: 0;
+  border-radius: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.artifacts-panel .artifacts-icon {
+  grid-area: icon;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.artifacts-panel .artifacts-title {
+  grid-area: title;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.artifacts-panel .artifacts-meta {
+  grid-area: meta;
+  justify-self: start;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.artifacts-panel .artifacts-time {
+  grid-area: time;
+  justify-self: end;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.artifacts-panel .artifacts-delete {
+  position: absolute;
+  top: 10px;
+  inset-inline-end: 10px;
+  margin: 0;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.artifacts-panel .artifacts-row:hover .artifacts-delete,
+.artifacts-panel .artifacts-delete:focus-visible,
+.artifacts-panel .artifacts-delete.active {
+  opacity: 1;
+}
+
+.sidebar-panel.schedule-docked .schedule-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 12px;
+  align-content: start;
+  padding: 12px 16px 16px;
+}
+
+.sidebar-panel.schedule-docked .schedule-list > .schedule-loading,
+.sidebar-panel.schedule-docked .schedule-list > .schedule-empty {
+  grid-column: 1 / -1;
+}
+
+.sidebar-panel.schedule-docked .schedule-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--bg-panel);
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+
+.sidebar-panel.schedule-docked .schedule-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  transform: translateY(-1px);
+}
+
+.sidebar-panel.schedule-docked .schedule-item.disabled {
+  opacity: 0.7;
+  border-style: dashed;
+}
+
+.sidebar-panel.schedule-docked .schedule-item-body {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar-panel.schedule-docked .schedule-item-body .schedule-prompt-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sidebar-panel.schedule-docked .schedule-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* ── This turn's tools: calm sections, flat pill chips ── */
+.sidebar-panel.usage-docked .turn-usage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 14px 14px;
+}
+
+.sidebar-panel.usage-docked .turn-usage-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.sidebar-panel.usage-docked .turn-usage-count {
+  margin-inline-start: 6px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.sidebar-panel.usage-docked .turn-usage-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.sidebar-panel.usage-docked .turn-usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sidebar-panel.usage-docked .turn-usage-chip.used {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+}
+
+.sidebar-panel.usage-docked .turn-usage-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Side-by-side diff: visible horizontal scrollbars (the columns used to hide
+   theirs, so long lines were cut off with no way to reach them). Before/After
+   of a hunk stay in sync via onScrollCapture in DiffView. ── */
+.diff-columns .diff-col-code {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 30%, transparent) transparent;
+}
+
+.diff-columns .diff-col-code::-webkit-scrollbar {
+  display: block;
+  width: auto;
+  height: 9px;
+}
+
+.diff-columns .diff-col-code::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.diff-columns .diff-col-code::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  background-color: color-mix(in srgb, var(--text) 26%, transparent);
+}
+
+.diff-columns .diff-col-code::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text) 45%, transparent);
+}
+
+/* The popup that opens upward keeps its content flush against the anchor. */
+.diff-preview-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.diff-preview-card .diff-preview-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ── Modern file explorer ── */
+.files-panel .files-panel-head {
+  min-height: 42px;
+  padding: 0 10px 0 14px;
+  gap: 4px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.files-panel .files-panel-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.files-panel .files-panel-action {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+.files-panel .files-filter-input {
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.files-panel .files-list {
+  padding: 8px 8px 14px;
+}
+
+.files-panel .files-list .files-row {
+  position: relative;
+  gap: 8px;
+  min-height: 30px;
+  padding-block: 4px;
+  padding-right: 10px;
+  margin-bottom: 1px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  background-color: transparent;
+  /* one faint guide line per nesting level, aligned under the parent chevron */
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0 12px,
+    color-mix(in srgb, var(--text) 10%, transparent) 12px 13px
+  );
+  background-size: calc(var(--depth, 0) * 13px) 100%;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.files-panel .files-list .files-row:hover {
+  background-color: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.files-panel .files-list .files-row-active,
+.files-panel .files-list .files-row-active:hover {
+  background-color: color-mix(in srgb, var(--accent) 17%, transparent);
+  box-shadow: none;
+  color: var(--text);
+}
+
+.files-panel .files-list .files-row-active::before {
+  content: "";
+  position: absolute;
+  inset-block: 6px;
+  inset-inline-start: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+.files-panel .files-row-dir .files-row-name {
+  font-weight: 600;
+}
+
+.files-panel .files-row-dir .files-row-icon {
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
+}
+
+.files-panel .files-row-caret {
+  opacity: 0.6;
+}
+
+.files-panel .files-row:hover .files-row-caret {
+  opacity: 1;
+}
+
+.files-panel .files-row-name {
+  letter-spacing: 0.005em;
+}
+
+.files-panel .files-row.files-row-drop {
+  background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -1px;
+}
+
+.files-panel .viewer-empty {
+  margin: 16px;
+  padding: 18px 14px;
+  border: 1px dashed var(--hairline);
+  border-radius: 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}

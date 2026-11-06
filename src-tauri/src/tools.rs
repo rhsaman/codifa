@@ -4208,6 +4208,49 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
         // `query` searches the WHOLE store, which is what keeps a store with
         // hundreds of skills reachable from a prompt that cannot list them.
         "load_skill" => {
+            // ONE call, SEVERAL skills: `names=[...]` returns every body
+            // together, labeled — the whole skill set the task needs costs ONE
+            // round-trip instead of one per skill. Resolution is the same as
+            // the single form (name or slug, case-insensitive); a name that
+            // matches nothing is listed at the end instead of failing the
+            // batch, so one typo cannot lose the bodies that did resolve.
+            let names_list: Vec<String> = args["names"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !names_list.is_empty() {
+                let all = crate::skill_router::load_skills(store_base);
+                let resolve = |wanted: &str| {
+                    all.iter().find(|sk| {
+                        let n = sk["name"].as_str().unwrap_or_default().trim().to_lowercase();
+                        let slug = sk["slug"].as_str().unwrap_or_default().trim().to_lowercase();
+                        n == wanted.to_lowercase() || slug == wanted.to_lowercase()
+                    })
+                };
+                let mut out = String::new();
+                let mut missing: Vec<String> = Vec::new();
+                for wanted in &names_list {
+                    match resolve(wanted) {
+                        Some(sk) => out.push_str(&skill_body(sk)),
+                        None => missing.push(wanted.clone()),
+                    }
+                }
+                if !missing.is_empty() {
+                    out.push_str(&format!(
+                        "not found: {} — Available: {}",
+                        missing.join(", "),
+                        available_hint(&all)
+                    ));
+                }
+                return Ok(out);
+            }
             let name = s("name");
             if name.trim().is_empty() {
                 // bundle=<slug> drills into one plugin bundle: the catalog cap
@@ -4257,9 +4300,88 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 )),
             }
         }
+        // The ROUND-ELIMINATION executor: ONE call carries up to `BATCH_MAX_OPS`
+        // tool calls, run IN ORDER, every sub-result the FULL output of the same
+        // tool (nothing reduced), labeled per op. A whole step — the lookups,
+        // the edits, the verification command — costs ONE round-trip instead of
+        // one per call; a wave that needs a result it does not have yet waits
+        // for the model's next round. Ops the TURN may not run are pre-marked
+        // `refused` by the loop's caps gate (the only place caps live) and come
+        // back as inline refusals without executing.
+        "batch" => {
+            let ops = args["ops"]
+                .as_array()
+                .ok_or("batch needs ops: [{tool, args}]")?;
+            if ops.is_empty() {
+                return Err("batch: ops is empty".into());
+            }
+            if ops.len() > BATCH_MAX_OPS {
+                return Err(format!(
+                    "batch: {} ops exceed the {BATCH_MAX_OPS} cap — split into two batches",
+                    ops.len()
+                ));
+            }
+            let mut out = String::new();
+            for (i, op) in ops.iter().enumerate() {
+                let tool = op["tool"].as_str().unwrap_or_default().trim().to_string();
+                let label = format!("[{}/{}] {}", i + 1, ops.len(), tool);
+                if let Some(reason) = op["refused"].as_str() {
+                    out.push_str(&format!("\n=== {label} → REFUSED ===\n{reason}\n"));
+                    continue;
+                }
+                if tool == "batch" {
+                    out.push_str(&format!(
+                        "\n=== {label} → REFUSED ===\nnested batch is not allowed — one level only\n"
+                    ));
+                    continue;
+                }
+                if !BATCH_TOOLS.contains(&tool.as_str()) {
+                    out.push_str(&format!(
+                        "\n=== {label} → REFUSED ===\n{tool:?} is not a batch tool. Batchable: {}\n",
+                        BATCH_TOOLS.join(", ")
+                    ));
+                    continue;
+                }
+                let sub_args = op.get("args").cloned().unwrap_or_else(|| json!({}));
+                out.push_str(&format!("\n=== {label} ===\n"));
+                // Same-depth recursion through the WITH variant so a terminal
+                // op's output still streams live through `on_tail`.
+                match dispatch_bounded_with(root, &tool, &sub_args, permit, data_root, on_tail) {
+                    Ok(r) => out.push_str(&r),
+                    Err(e) => out.push_str(&format!("ERROR: {e}")),
+                }
+            }
+            Ok(out)
+        }
         _ => Err(format!("tool {name:?} is not available")),
     }
 }
+
+/// Batchable tools for the `batch` executor — the read-only search family plus
+/// the writers and the terminal, so a WHOLE step (lookups → edits → verify)
+/// rides one round-trip. `load_skill` and the delegation tools stay out: their
+/// results are turn-shaping decisions the model should make on its own round.
+const BATCH_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "find_symbol",
+    "lsp_symbols",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_diagnostics",
+    "run_terminal",
+    "edit_file",
+    "write_file",
+    "current_time",
+    "system_stats",
+];
+
+/// How many tool calls ONE batch may carry. 10-call steps fit; the cap keeps
+/// a single result from growing unbounded (each sub-result keeps its own
+/// tool's normal cap).
+const BATCH_MAX_OPS: usize = 10;
 
 /// Activity Monitor for the agent: per-process RSS/CPU via `ps` (read-only,
 /// available in every mode so the agent can diagnose memory/CPU issues).
@@ -5038,6 +5160,96 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not found") && err.contains("action=list"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_skill_names_loads_every_body_in_one_call() {
+        // ONE round-trip for the whole skill set: names=[...] resolves each
+        // name/slug and returns every body together; a name that matches
+        // nothing is listed at the end instead of failing the batch.
+        let root = fixture_store();
+        let out = dispatch_with_data_root(
+            &root,
+            "load_skill",
+            &json!({"names": ["Test UI", "browser-automation", "no-such-skill"]}),
+            None,
+            Some(&root),
+        )
+        .unwrap();
+        assert!(out.contains("===== SKILL: Test UI ====="), "{out}");
+        assert!(out.contains("Fixture body for Test UI"), "{out}");
+        assert!(out.contains("===== SKILL: Browser Automation ====="), "{out}");
+        assert!(out.contains("not found: no-such-skill"), "{out}");
+        assert!(out.contains("Available:"), "{out}");
+        // A body is not truncated away by the multi form.
+        assert!(!out.contains("elided"), "{out}");
+    }
+
+    #[test]
+    fn batch_runs_every_op_in_order_with_full_results() {
+        // The round-elimination executor: a whole step (read + grep + write +
+        // terminal) in ONE dispatch, each sub-result the FULL output of the
+        // same tool, labeled per op, run in order.
+        let root = std::env::temp_dir().join(format!("codifa-batch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello todo list").unwrap();
+        let base = root.to_str().unwrap();
+        let out = dispatch_with_data_root(
+            base,
+            "batch",
+            &json!({"ops": [
+                {"tool": "read", "args": {"filePath": "a.txt"}},
+                {"tool": "grep", "args": {"pattern": "todo", "path": ".", "include": "*.txt"}},
+                {"tool": "write_file", "args": {"path": "new.txt", "content": "written by batch"}},
+                {"tool": "run_terminal", "args": {"command": "echo batch-terminal-ok"}},
+            ]}),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        assert!(out.contains("[1/4] read"), "{out}");
+        assert!(out.contains("[2/4] grep"), "{out}");
+        assert!(out.contains("[3/4] write_file"), "{out}");
+        assert!(out.contains("[4/4] run_terminal"), "{out}");
+        assert!(out.contains("hello todo list"), "read sub-result carries the file: {out}");
+        assert!(out.contains("batch-terminal-ok"), "terminal sub-result ran: {out}");
+        // The write HAPPENED (in-order execution the later ops could see).
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "written by batch");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn batch_refuses_nested_unknown_and_over_cap_ops_without_dying() {
+        let root = std::env::temp_dir().join(format!("codifa-batch-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.to_str().unwrap();
+        // A failing op comes back as an inline ERROR; the rest still run.
+        let out = dispatch_with_data_root(
+            base,
+            "batch",
+            &json!({"ops": [
+                {"tool": "read", "args": {"filePath": "missing.txt"}},
+                {"tool": "batch", "args": {"ops": []}},
+                {"tool": "teleport", "args": {}},
+            ]}),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        assert!(out.contains("ERROR:"), "the failed read is inline: {out}");
+        assert!(out.contains("nested batch is not allowed"), "{out}");
+        assert!(out.contains("is not a batch tool"), "{out}");
+        // Over the op cap: a plain error naming the cap.
+        let mut ops = Vec::new();
+        for _ in 0..11 {
+            ops.push(json!({"tool": "current_time", "args": {}}));
+        }
+        let err = dispatch_with_data_root(base, "batch", &json!({"ops": ops}), None, Some(base))
+            .unwrap_err();
+        assert!(err.contains("exceed the 10 cap"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 

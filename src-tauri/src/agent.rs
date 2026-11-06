@@ -1633,6 +1633,11 @@ fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
         | "lsp_references" | "lsp_hover" | "lsp_diagnostics" => {
             (caps.read_files, "read or search the workspace")
         }
+        // The batch executor rides the READ capability at the NAME level (its
+        // write/terminal ops are gated per-op in the loop, the only place the
+        // caps are known): a turn that cannot read the workspace cannot batch
+        // its lookups either.
+        "batch" => (caps.read_files, "read or search the workspace"),
         "web_search" | "fetch_url" => (caps.web, "search or fetch the web"),
         _ => return None,
     };
@@ -3458,13 +3463,32 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             }),
         ),
         (
+            "batch",
+            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}, {\"tool\": \"edit_file\", ...}, {\"tool\": \"run_terminal\", ...}]. Batchable: read, grep, glob, find_symbol, the lsp_* lookups, run_terminal, edit_file, write_file, current_time, system_stats (max 10). Every result comes back COMPLETE, labeled per op, run in order — a later op sees an earlier edit's effects. Plan the WHOLE step here: all the lookups you expect to need, the edits, and the verification command together. A wave that needs a result you do not have yet waits for your next round.",
+            json!({
+                "ops": {
+                    "type": "array",
+                    "description": "The tool calls of this step, IN ORDER. Each entry: {tool, args} with args = that tool's normal arguments.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "description": "One of the batchable tools"},
+                            "args": {"type": "object", "description": "That tool's normal arguments"}
+                        },
+                        "required": ["tool"]
+                    }
+                }
+            }),
+        ),
+        (
             "load_skill",
-            "Load a skill's FULL body BEFORE work it covers; `query` searches every installed skill, `bundle` lists one plugin bundle's skills.",
+            "Load a skill's FULL body BEFORE work it covers. ONE call can load SEVERAL skills: names=[\"A\",\"B\"] returns every body together — ask for all the skills the task needs here, a second load call costs a round-trip. `query` searches every installed skill, `bundle` lists one plugin bundle's skills.",
             json!({
                 "name": {"type": "string", "description": "Name or slug"},
+                "names": {"type": "array", "items": {"type": "string"}, "description": "SEVERAL skills in THIS one call — every body comes back together"},
                 "query": {"type": "string", "description": "Words when the name is unknown"},
                 "bundle": {"type": "string", "description": "Plugin bundle slug: list that bundle's skills"},
-                "file": {"type": "string", "description": "Extra file of that skill"}
+                "file": {"type": "string", "description": "Extra file of that skill (single-name form only)"}
             }),
         ),
         // Plugins bundle skills + MCP connectors into ONE switchable unit. The
@@ -4027,6 +4051,24 @@ fn research_schemas() -> Vec<Value> {
             "lsp_diagnostics",
             "Diagnostics for one file (LSP).",
             json!({"filePath": {"type": "string"}}),
+        ),
+        (
+            "batch",
+            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole research step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}] (max 10). Batchable: read, grep, glob, find_symbol, the lsp_* lookups, current_time, system_stats. Every result comes back COMPLETE, labeled per op. Plan the WHOLE search phase here — every lookup you expect to need in one round; a wave that needs a result you do not have yet waits for your next round.",
+            json!({
+                "ops": {
+                    "type": "array",
+                    "description": "The lookups of this step, IN ORDER. Each entry: {tool, args} with args = that tool's normal arguments.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string"},
+                            "args": {"type": "object"}
+                        },
+                        "required": ["tool"]
+                    }
+                }
+            }),
         ),
         (
             "search_memory",
@@ -6973,6 +7015,76 @@ user to ask for it. Available this turn: `list` and `run`."
                         }
                     }
                 }
+            } else if name == "batch" {
+                // Per-op caps gating happens HERE — the only place the turn's
+                // caps live: an op the turn may not run is pre-marked
+                // `refused` and comes back as an inline refusal while the rest
+                // of the batch executes. Refusing the WHOLE batch would burn
+                // the very round the batch exists to save; running a forbidden
+                // op would break the mode's contract.
+                let mut batch_args = args.clone();
+                if let Some(ops) = batch_args["ops"].as_array_mut() {
+                    for op in ops.iter_mut() {
+                        let tool =
+                            op["tool"].as_str().unwrap_or_default().trim().to_ascii_lowercase();
+                        let reason = match tool.as_str() {
+                            "write_file" | "edit_file" if !caps.write_files => Some(
+                                "this turn is read-only — writing or editing files needs Build mode"
+                                    .to_string(),
+                            ),
+                            "run_terminal" if !caps.run_terminal => Some(
+                                "this turn cannot run commands — running them needs a mode with terminal access"
+                                    .to_string(),
+                            ),
+                            "run_terminal" if !caps.write_files && is_mutating_command(
+                                op["args"]["command"].as_str().unwrap_or_default(),
+                            ) =>
+                            {
+                                Some(
+                                    "this turn is read-only — a command that would change the workspace needs Build mode"
+                                        .to_string(),
+                                )
+                            }
+                            _ => None,
+                        };
+                        if let Some(reason) = reason {
+                            op["refused"] = json!(reason);
+                        }
+                    }
+                }
+                // Sequential dispatch must NOT park the async worker (terminal
+                // ops block) — same pattern as the plugin arm, with the live
+                // tail so terminal output inside the batch still streams.
+                let (tail_tx, mut tail_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+                let id_tail = id.clone();
+                let tail_tx_sink = tail_tx.clone();
+                let sink: tools::TailSink =
+                    Arc::new(move |tail: &str| {
+                        let _ = tail_tx_sink.send((id_tail.clone(), tail.to_string()));
+                    });
+                let root_sb = root.clone();
+                let name_sb = name.to_string();
+                let skill_root_sb = skill_root.clone();
+                let permit_sb = permit.clone();
+                let handle = tokio::task::spawn_blocking(move || {
+                    tools::dispatch_bounded_with(
+                        &root_sb,
+                        &name_sb,
+                        &batch_args,
+                        permit_sb.as_ref(),
+                        Some(&skill_root_sb),
+                        Some(&sink),
+                    )
+                });
+                drop(tail_tx);
+                while let Some((cid, tail)) = tail_rx.recv().await {
+                    emit(&AgentEvent::ToolOutput { id: cid, tail });
+                }
+                match handle.await.unwrap_or(Err("tool task failed".into())) {
+                    Ok(r) => (r, true),
+                    Err(e) => (e, false),
+                }
             } else if name == "computer" {
                 // Bound only when the user enabled Computer Use; the schema is
                 // withheld otherwise, so reaching here means it is allowed.
@@ -9830,6 +9942,17 @@ fn is_delegation(name: &str) -> bool {
 fn mutates_workspace(name: &str, _args: &Value) -> bool {
     match name {
         "write_file" | "edit_file" | "artifact" => true,
+        // A batch carries the step's writers too: one write/edit/terminal op
+        // inside it invalidates the file-body cache exactly like the same
+        // call on its own would (conservative — a terminal op is a writer).
+        "batch" => _args["ops"].as_array().is_some_and(|ops| {
+            ops.iter().any(|op| {
+                matches!(
+                    op["tool"].as_str().unwrap_or_default(),
+                    "write_file" | "edit_file" | "run_terminal"
+                )
+            })
+        }),
         // A terminal command runs arbitrary `sh -c`: the workspace-file guard
         // refuses the workspace READ/dump forms, but a build, a test or a script
         // can still rewrite a file (`cargo` into `target/`, a generator into
@@ -10069,6 +10192,13 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
         // carried it. "As it is right now" is only true while nothing has
         // changed the file: `run_terminal` can, which is why every mutating call
         // clears the guard (see READONLY_NATIVE_TOOLS).
+        "batch" => {
+            // The whole batch is its identity: an identical re-batch is
+            // answered with a pointer (its results are already in context,
+            // and re-running the same edits would fail their old_strings
+            // anyway).
+            Some(format!("batch|{}", args["ops"].to_string()))
+        }
         "lsp_symbols" => {
             let file = s("filePath");
             if file.is_empty() {
@@ -10490,12 +10620,12 @@ fn single_call_hint_text(rounds: usize) -> String {
         return SINGLE_CALL_HINT.to_string();
     }
     format!(
-        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch NOW: several files in ONE write_file call as files:[{{path, content}}], several replacements in ONE edit_file call as edits:[{{path, old_string, new_string, replace_all}}], several shell commands in ONE run_terminal call as commands:[\"…\"]."
+        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch NOW: the `batch` tool runs your whole step (lookups + edits + the verify command) IN ORDER in ONE call as ops:[{{tool, args}},…] — or per-family: files:[{{path, content}}] on write_file, edits:[…] on edit_file, commands:[\"…\"] on run_terminal."
     )
 }
 
 /// The teaching form, delivered once at the start of a streak.
-const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: several files go in ONE write_file call as files:[{path, content}]; several replacements in one file go in ONE edit_file call as edits:[{path, old_string, new_string, replace_all}]; several shell commands go in ONE run_terminal call as commands:[\"…\"]. Issue all of them you already know you need together instead of spending a step on each.";
+const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so a whole step belongs in ONE call: the `batch` tool runs up to 10 tool calls (lookups, edits, the verify command) IN ORDER in one round-trip as ops:[{tool, args},…]; several files also fit ONE write_file as files:[{path, content}]; several replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}]; several shell commands ONE run_terminal as commands:[\"…\"].";
 
 /// Cap on the saved-plan body injected into the system prompt. A plan is
 /// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
@@ -13851,8 +13981,12 @@ mod tests {
             // Re-based again for `ask_user`'s optional `sections` param: the
             // multi-part card (~0.3K chars) buys ONE round-trip instead of
             // several serial ask gates on a multi-facet fork.
-            ("main", tool_schemas(false, false), 17_450usize),
-            ("main+browser", tool_schemas(false, true), 24_200),
+            // Re-based when the `batch` executor joined the main set: the
+            // whole-step tool is the round-elimination lever itself — ~1.1K
+            // chars of schema buys back 3-7 round-trips on a search-heavy
+            // step, the exact trade this ceiling prices deliberately.
+            ("main", tool_schemas(false, false), 19_200usize),
+            ("main+browser", tool_schemas(false, true), 26_050),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -13864,9 +13998,12 @@ mod tests {
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
             // Raised for `ask_user` `sections` (see the `main` note above).
-            ("main+authoring", tool_schemas(true, false), 24_300),
-            ("main+authoring+browser", tool_schemas(true, true), 30_950),
-            ("explore", research_schemas(), 8_800),
+            ("main+authoring", tool_schemas(true, false), 26_250),
+            ("main+authoring+browser", tool_schemas(true, true), 33_100),
+            // Re-based when `batch` joined the RESEARCH set: the explore
+            // sub-agent is the heaviest search caller, so the whole-step
+            // executor rides there too (that is where the round-trips are).
+            ("explore", research_schemas(), 9_950),
         ] {
             let got = chars(&schemas);
             if got > budget {
@@ -14162,7 +14299,16 @@ mod tests {
         assert_ne!(lookup_key("find_symbol", &f1), lookup_key("find_symbol", &json!({"symbol": "foo", "path": "backend"})));
         assert!(lookup_key("find_symbol", &json!({"path": "src"})).is_none());
         // Shapes without a target are never deduped (nothing to compare).
-        assert!(lookup_key("read", &json!({"path": "src"})).is_none());
+        // `path` IS a real alias the dispatch accepts (a guard blind to it let
+        // one fixture file re-read at full size three times in a single run),
+        // so an alias-only read is DEDUPABLE; only a call naming no file at
+        // all stays keyless.
+        assert_eq!(
+            lookup_key("read", &json!({"path": "src/a.ts"})),
+            lookup_key("read", &json!({"filePath": "src/a.ts"})),
+            "the alias and the canonical form are the same lookup"
+        );
+        assert!(lookup_key("read", &json!({})).is_none());
         assert!(lookup_key("grep", &json!({"path": "src"})).is_none());
         // A multi-FILE read carries no top-level filePath, yet it is exactly the
         // call that moves the most bytes: it must still be deduped, and two
@@ -17374,6 +17520,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[tokio::test]
+    async fn a_batch_round_carries_a_whole_step_in_one_llm_call() {
+        // THE round-elimination scenario: the model plans a whole step —
+        // lookups + a write + the verify command — as ONE `batch` call. Four
+        // tool calls, ONE llm round; the answer round makes two. Nothing is
+        // skipped: every sub-result is the full output of its tool.
+        let dir = std::env::temp_dir().join(format!("codifa-scen-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello batch").unwrap();
+        let batch_args = json!({
+            "ops": [
+                {"tool": "read", "args": {"filePath": "a.txt"}},
+                {"tool": "grep", "args": {"pattern": "batch", "path": ".", "include": "*.txt"}},
+                {"tool": "write_file", "args": {"path": "out.txt", "content": "step output"}},
+                {"tool": "run_terminal", "args": {"command": "echo verify-ok"}},
+            ]
+        });
+        let (base, _rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "batch", &batch_args.to_string()),
+                finish_frame("tool_calls", 150, 10),
+            ],
+            vec![text_frame("step complete"), finish_frame("stop", 200, 8)],
+        ])
+        .await;
+        let events = scenario_events();
+        let res = scenario_turn(&base, "scen-batch", dir.to_str().unwrap(), events.clone()).await;
+        assert!(res.is_ok(), "{res:?}");
+        let ev = events.lock().unwrap();
+        // ONE tool round + ONE answer round = TWO llm calls for FOUR tool calls.
+        assert_eq!(count_kind(&ev, "usage"), 2, "4 tool calls must cost 1 tool round");
+        let result = ev
+            .iter()
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "batch")
+            .and_then(|e| e["result"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        for label in ["[1/4] read", "[2/4] grep", "[3/4] write_file", "[4/4] run_terminal"] {
+            assert!(result.contains(label), "missing {label}: {result}");
+        }
+        assert!(result.contains("hello batch") && result.contains("verify-ok"), "{result}");
+        // The write inside the batch really landed on disk.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "step output"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_refuses_batch_writes_inline_and_keeps_the_rest() {
+        // The caps gate is PER-OP: in Ask mode the lookups of a batch run and
+        // its write op comes back as an inline refusal — the whole batch is
+        // NOT burned, and nothing forbidden executes.
+        let dir =
+            std::env::temp_dir().join(format!("codifa-scen-batchcaps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "readable").unwrap();
+        let batch_args = json!({
+            "ops": [
+                {"tool": "read", "args": {"filePath": "a.txt"}},
+                {"tool": "write_file", "args": {"path": "nope.txt", "content": "must not land"}},
+            ]
+        });
+        let (base, _rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "batch", &batch_args.to_string()),
+                finish_frame("tool_calls", 120, 6),
+            ],
+            vec![text_frame("answered around it"), finish_frame("stop", 140, 8)],
+        ])
+        .await;
+        let chat = format!("scen-batchcaps-{}", std::process::id());
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_str().unwrap(),
+            "mode": "ask",
+            "prompt": "run the scenario",
+            "history": [],
+            "chat_id": chat,
+            "data_root": dir.to_str().unwrap(),
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = scenario_events();
+        let ev_c = events.clone();
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        let res = run_turn(&req, &mut emit, &cancel).await;
+        assert!(res.is_ok(), "{res:?}");
+        let ev = events.lock().unwrap();
+        let result = ev
+            .iter()
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "batch")
+            .and_then(|e| e["result"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(result.contains("[1/2] read") && result.contains("readable"), "{result}");
+        assert!(
+            result.contains("[2/2] write_file → REFUSED") && result.contains("read-only"),
+            "the write op is refused inline: {result}"
+        );
+        assert!(
+            !dir.join("nope.txt").exists(),
+            "a refused op must not touch the disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn headless_turn_surfaces_a_provider_error_as_err() {

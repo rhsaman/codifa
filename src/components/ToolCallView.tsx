@@ -8,6 +8,7 @@ import {
   useMemo,
   useCallback,
   type KeyboardEvent,
+  type UIEvent as ReactUIEvent,
 } from "react";
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
@@ -1307,7 +1308,7 @@ const DiffPreview = memo(function DiffPreview({
       className="diff-preview-card"
       style={{
         position: "fixed",
-        top: pos.top,
+        ...(pos.bottom !== undefined ? { bottom: pos.bottom } : { top: pos.top }),
         left: pos.left,
         width: pos.width,
         maxHeight: pos.maxHeight,
@@ -1716,6 +1717,18 @@ export function DiffView({
     );
   };
 
+  // Before/After of one hunk scroll horizontally as ONE unit: a scroll in one
+  // column mirrors onto its sibling (scroll events do not bubble, so the pair
+  // listens in the capture phase). The equality guard stops the echo loop.
+  const syncPairScroll = (e: ReactUIEvent<HTMLElement>) => {
+    const src = e.target as HTMLElement | null;
+    if (!src || !src.classList?.contains("diff-col-code")) return;
+    const pair = e.currentTarget;
+    pair.querySelectorAll<HTMLElement>(".diff-col-code").forEach((el) => {
+      if (el !== src && el.scrollLeft !== src.scrollLeft) el.scrollLeft = src.scrollLeft;
+    });
+  };
+
   const renderSide = () => (
     <div className="diff-columns" dir="ltr" {...drag}>
       <div className="diff-columns-head">
@@ -1733,7 +1746,7 @@ export function DiffView({
         const metas = item.rows.filter((r) => "text" in r);
         const contents = item.rows.filter((r) => !("text" in r));
         return (
-          <div key={item.key} className="diff-hunk-pair">
+          <div key={item.key} className="diff-hunk-pair" onScrollCapture={syncPairScroll}>
             {metas.map((m, mi) => (
               <div key={`${item.key}-m${mi}`} className={`diff-u-meta ${m.type}`}>
                 {"text" in m ? m.text : ""}

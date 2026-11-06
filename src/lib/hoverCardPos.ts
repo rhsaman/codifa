@@ -18,6 +18,10 @@ export interface DiffPopPos {
   left: number;
   width: number;
   maxHeight: number;
+  /** Set when the popup opens UPWARD: distance from the viewport bottom to the
+   *  anchor's top (+gap). The card is pinned by its bottom edge, so it grows
+   *  upward and never leaves a gap when its content is shorter than maxHeight. */
+  bottom?: number;
 }
 
 /** Position the diff popup for an anchor rect in viewport coordinates.
@@ -40,10 +44,18 @@ export function diffPopupPos(
 
   const below = viewH - rect.bottom - gap - 8;
   const above = rect.top - gap - 8;
-  // Flip above only when below is genuinely unusable AND above is better.
-  if (below < DIFF_POP_MIN_H && above > below) {
+  // Open upward whenever the room below cannot hold the preferred height and
+  // above has more room (a card near the bottom of the chat used to open
+  // downward into a squashed popup).
+  if (below < DIFF_POP_H && above > below) {
     const maxHeight = Math.max(DIFF_POP_MIN_H, Math.min(DIFF_POP_H, above));
-    return { top: Math.max(8, rect.top - gap - maxHeight), left, width: w, maxHeight };
+    return {
+      top: Math.max(8, rect.top - gap - maxHeight),
+      left,
+      width: w,
+      maxHeight,
+      bottom: viewH - rect.top + gap,
+    };
   }
   const maxHeight = Math.max(DIFF_POP_MIN_H, Math.min(DIFF_POP_H, below));
   return { top: rect.bottom + gap, left, width: w, maxHeight };

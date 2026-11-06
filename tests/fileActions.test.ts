@@ -19,11 +19,17 @@ import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 // A module may now live as a directory of parts (the Rust reorg); concatenate
 // everything so whole-module assertions keep their meaning.
 const readModuleSrc = (p: string): string => {
-  if (existsSync(p) && statSync(p).isFile()) return readFileSync(p, 'utf8')
-  return readdirSync(p)
-    .filter((f) => f.endsWith('.rs') || f.endsWith('.ts'))
-    .map((f) => readFileSync(`${p}/${f}`, 'utf8'))
-    .join('\n')
+  const parts: string[] = []
+  for (const ext of ['.ts', '.tsx']) {
+    if (existsSync(p + ext)) parts.push(readFileSync(p + ext, 'utf8'))
+  }
+  if (existsSync(p) && statSync(p).isDirectory()) {
+    for (const f of readdirSync(p).filter((f) => /\.(rs|ts|tsx)$/.test(f))) {
+      parts.push(readFileSync(`${p}/${f}`, 'utf8'))
+    }
+  }
+  if (parts.length === 0 && existsSync(p)) return readFileSync(p, 'utf8')
+  return parts.join('\n')
 }
 
 import { copyName, isInside, joinPath, moveTarget, parentPath } from '../src/lib/fileTree'

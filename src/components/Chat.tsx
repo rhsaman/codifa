@@ -256,375 +256,10 @@ import { buildLiveSpeakSuffix } from "../lib/livePrompt";
 import { playTts, playTtsStream, stopTts, speakableMessageText, subscribeTts } from "../lib/tts";
 import type { LiveVoiceState } from "../lib/liveVoiceState";
 import { claimLiveVoice, isLiveVoiceBusy, liveVoiceLeaseHolder, syncLiveVoiceLease } from "../lib/liveVoiceState";
-const LIVE_TTS_OWNER = 9007199;
-const PLAN_APPROVE_TOKEN = "__plan_approve__";
-const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
-
-// ---- Per-chat auto-retry runtime, shared by EVERY mounted ChatPanel ----
-// These used to live in per-instance refs. The panel REMOUNTS on every chat
-// switch (and every window mounts its own panel), so the error-retry ladder
-// armed by the previous instance kept a live timer nothing could reach:
-// Stop in the freshly-mounted panel stopped a brand-new scheduler while the
-// orphaned timer fired anyway, and the turn the user had just stopped
-// restarted on its own ("pressed Stop, it still auto-retries"). Module scope
-// gives ONE scheduler / stop flag / attempt count per chat id, so Stop from
-// any panel — even a remount — drops ladders armed by any other instance.
-const CHAT_ERROR_MAX_RETRIES = 10;
-const chatStopped = new Map<string, boolean>();
-const chatAutoRetry = new Map<string, AutoRetryScheduler>();
-const autoRetryFor = (chatId: string): AutoRetryScheduler => {
-  let sched = chatAutoRetry.get(chatId);
-  if (!sched) {
-    sched = new AutoRetryScheduler();
-    chatAutoRetry.set(chatId, sched);
-  }
-  return sched;
-};
-
-// A compaction reports its percent from WALL-CLOCK budget spent, so a fast
-// summary legitimately finishes while the bar is still around 40–60%. Clearing
-// the row at that instant looked like the job was cut off midway. Hold the row
-// at 100% long enough for the fill transition to visibly land, then dismiss it.
-const COMPACT_DONE_HOLD_MS = 900;
-const compactDoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
-function holdCompactComplete(chatId: string): void {
-  const st = useStore.getState();
-  const chat = st.chats.find((c) => c.id === chatId);
-  if (!chat) return;
-  const prev = chat.compactProgress;
-  // Keep `compacting` true through the hold: the footer derives the row from
-  // that flag, and the per-second clock keeps it painted.
-  st.setChatCompacting(chatId, true);
-  st.setChatCompactProgress(chatId, {
-    phase: "done",
-    attempt: prev?.attempt ?? 0,
-    attempts: prev?.attempts ?? 0,
-    model: prev?.model ?? "",
-    providerId: prev?.providerId ?? "",
-    percent: 100,
-    budgetSecs: 0,
-    elapsedSecs: 0,
-    at: Date.now(),
-  });
-  const pending = compactDoneTimers.get(chatId);
-  if (pending) clearTimeout(pending);
-  compactDoneTimers.set(
-    chatId,
-    setTimeout(() => {
-      compactDoneTimers.delete(chatId);
-      // A NEW compaction may have started during the hold; its progress is no
-      // longer "done", so this stale timer must not clear its row.
-      const cur = useStore.getState().chats.find((c) => c.id === chatId);
-      if (cur?.compactProgress?.phase === "done") {
-        useStore.getState().setChatCompacting(chatId, false);
-      }
-    }, COMPACT_DONE_HOLD_MS),
-  );
-}
-function clearCompactHold(chatId: string): void {
-  const pending = compactDoneTimers.get(chatId);
-  if (pending) {
-    clearTimeout(pending);
-    compactDoneTimers.delete(chatId);
-  }
-}
-
-// THINKING_OPTIONS / THINKING_LABELS / THINKING_DESCS live in the shared
-// src/lib/thinking-options.ts module so Settings → Tools rows can render the
-// exact same picker (imported below next to the other lib imports).
-
-const COMMANDS: Array<{ name: string; hint: string }> = [
-  { name: "help", hint: "List all commands" },
-  { name: "compact", hint: "Summarize & compact the chat context" },
-  { name: "clear", hint: "Clear all messages in this chat (stops a running turn)" },
-  { name: "new", hint: "Start a new chat" },
-  { name: "plan", hint: "Switch this chat to Plan mode (describe the work after the command to plan it)" },
-  { name: "undo", hint: "Undo the last exchange (stops a running turn first)" },
-  { name: "redo", hint: "Redo the last undone exchange" },
-  {
-    name: "plugin",
-    hint: "Create, install, edit, toggle or delete a plugin — skills + connectors as one bundle (e.g. /plugin install <repo>)",
-  },
-  {
-    name: "artifact",
-    hint: "Build or manage an artifact — a previewable HTML/Markdown document (e.g. /artifact create <description>)",
-  },
-  {
-    name: "schedule",
-    hint: "Create, edit, run or delete a scheduled task (e.g. /schedule create every day at 9am …)",
-  },
-  { name: "goal", hint: "Set a persistent goal (e.g. /goal all tests pass); /goal clear clears it" },
-];
-
-/** The argument a sub-command's token expects, and where it lives in the line. */
-type CmdArg = "name" | "repo" | "url" | "free";
-
-/**
- * Permissions the Computer Use card has to report, plus the signing identity
- * macOS keyed them to. `identity` is null off macOS, where there is no TCC.
- */
-type PermInfo = {
-  screen: boolean;
-  accessibility: boolean;
-  identity: { id: string; name: string; path: string; adhoc: boolean } | null;
-};
-
-/** How long the named values behind the third level are reused before a refetch.
- *  Short enough that a plugin just installed appears, long enough that opening
- *  the palette costs no request. */
-const ARG_VALUE_TTL_MS = 15_000;
-
-/** The `--plugins` picks, spelled out for the schedule prompt.
- *
- *  The composer let the user PICK the values, so handing the model a sentence it
- *  may re-interpret loses the choice; naming the array verbatim makes it pass
- *  the list straight to the tool. Empty when the line carried no flags. */
-function describeScheduleFlags(flags: ScheduleFlags): string {
-  return flags.plugins.length ? `plugins=[${flags.plugins.join(", ")}]` : "";
-}
-
-/** True when a message asks to create/edit/install/import skills or MCP connectors,
- *  so the agent gets the `create_skill` / `create_mcp` tools for the turn.
- *  Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
- *  action; اسکیل/مهارت → skill target) so Persian-only prompts work too.
- *  `create_skill` overwrites an existing skill with the same name, so the same
- *  grant covers both creating AND editing a skill. */
-function wantsSkillOrMcp(text: string): boolean {
-  const low = text.toLowerCase();
-  const action =
-    /\b(install|add|create|import|save|set up|setup|copy|edit|update|modify|change|fix|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ذخیره|اضافه|ویرایش|ادیت|اصلاح|تغییر|حذف|آپدیت|بروز)/.test(
-      low,
-    );
-  const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|کانکتور|ام‌سی‌پی)/.test(low);
-  return action && target;
-}
-
-/** True when a message asks to create/edit/pause/delete a scheduled task, so
- *  the agent gets the `schedule` tool for the turn. */
-function wantsSchedule(text: string): boolean {
-  const low = text.toLowerCase();
-  const action =
-    /\b(create|add|make|set up|setup|edit|update|change|pause|resume|enable|disable|delete|remove|schedule)\b|(بساز|ساخت|ایجاد|ویرایش|ادیت|اصلاح|تغییر|حذف|متوقف|فعال|غیرفعال|زمان‌بندی|زمانبندی)/.test(
-      low,
-    );
-  const target = /\b(schedule|scheduled|cron|recurring|reminder)s?\b|(تسک|کرون|تکرار|یادآور|زمان‌بندی)/.test(
-    low,
-  );
-  return action && target;
-}
-
-/** True when a message asks to create/edit/toggle/delete a plugin bundle. */
-function wantsPlugin(text: string): boolean {
-  const low = text.toLowerCase();
-  const action =
-    /\b(install|add|create|make|edit|update|change|toggle|enable|disable|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ویرایش|ادیت|اصلاح|تغییر|حذف|روشن|خاموش|فعال|غیرفعال)/.test(
-      low,
-    );
-  const target = /\bplugin(s)?\b|(پلاگین|افزونه)/.test(low);
-  return action && target;
-}
-
-/** The only commands whose `update <name>` pick opens a pinned session. */
-const EDIT_TARGET_COMMANDS = new Set(["plugin", "artifact"]);
-
-/** The folder holding a file path (a skill row points at its SKILL.md). */
-function folderOf(p?: string): string {
-  if (!p) return "";
-  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
-  return i > 0 ? p.slice(0, i) : "";
-}
-
-/** Pin (open) the update session for a named target whose folder is known.
- *  ONE session per chat: `setChatEditTarget` refuses a DIFFERENT target while
- *  a badge is open — the × on the badge is the only way out. False ⇒ nothing
- *  was pinned (unknown folder, or another session holds the chat). */
-function openEditTargetSession(
-  chatId: string,
-  target: ChatEditTarget["target"],
-  name: string,
-  dirs: Record<string, Record<string, string>>,
-): boolean {
-  const dir = dirs[target]?.[name];
-  if (!dir) return false;
-  return useStore.getState().setChatEditTarget(chatId, {
-    target,
-    action: "update",
-    name,
-    path: dir,
-  });
-}
-
-/** `chatId:target:name` pins the user closed with the badge's ×. The turn that
- *  produced the pin keeps streaming and often emits the SAME `edit_target`
- *  event after the click; re-pinning from that echo would make the × a lie
- *  (the badge returns and Build stays forced). Deliberate `/plugin update`
- *  commands re-open the session through openEditTargetSession, which does not
- *  consult this set. */
-const dismissedEditTargets = new Set<string>();
-
-function dismissedEditTargetKey(chatId: string, target: string, name: string): string {
-  return `${chatId}:${target}:${name}`;
-}
-
-/** × on the badge: end the session and remember the target was closed, so the
- *  trailing `edit_target` events of the running turn cannot re-pin it. */
-function dismissEditTarget(chatId: string, t: ChatEditTarget | null | undefined): void {
-  if (!t) return;
-  dismissedEditTargets.add(dismissedEditTargetKey(chatId, t.target, t.name));
-  // FIFO trim: only recent closes can be re-echoed by a live stream.
-  if (dismissedEditTargets.size > 200) {
-    const oldest = dismissedEditTargets.values().next().value;
-    if (oldest) dismissedEditTargets.delete(oldest);
-  }
-  useStore.getState().clearChatEditTarget(chatId);
-}
-
-/** System-prompt suffix while an edit badge is open: the agent must know it is
- *  working INSIDE the pinned folder — and for plugins, where secrets live
- *  (the runner injects the plugin folder's .env into every script run). */
-function editTargetSuffix(t?: ChatEditTarget | null): string {
-  if (!t) return "";
-  const base =
-    `EDIT SESSION ACTIVE: you are updating the ${t.target} "${t.name}" — its folder on disk is ${t.path}. ` +
-    "Make every change inside that folder and nowhere else. The edit session stays open across turns " +
-    "until the user closes the badge above the composer — never treat the session as finished on your own, " +
-    "and never ask the user to re-run the update command for follow-up changes. " +
-    "The session only pins WHERE you edit; it does not turn every request into more editing. When the " +
-    "user asks to RUN this target (fire its script, trade through its plugin, run its build), run it " +
-    "now in this Build-mode session — do not switch to updating the target instead.";
-  if (t.target === "plugin") {
-    return (
-      base +
-      " Never hard-code secrets or API keys into the script source: write them into the plugin's own " +
-      ".env file (KEY=value lines in that same folder) — the script runner injects them as environment " +
-      "variables when the plugin's scripts run."
-    );
-  }
-  return base;
-}
-
-/**
- * Extract @skill mentions from a prompt and return the matched skill names plus
- * the prompt with those @mentions stripped (the model must not see raw @tokens;
- * the stored transcript keeps the original text with the @mentions).
- *
- * The canonical mention token is the skill's slug (e.g.
- * "@anthropic-frontend-design") — space-free and unambiguous. A legacy fallback
- * also matches display names that contain spaces (e.g. "@Anthropic Frontend
- * Design") for text pasted from before the slug-based flow. The actual
- * extraction logic lives in ../lib/skills (extractMentionSkills) so it can be
- * unit-tested independently of the React component.
- */
-const IMAGE_EXTS = new Set([
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "bmp",
-  "avif",
-  "heic",
-  "heif",
-]);
-
-/** Drop corrupt image data URLs before send (truncated snapshots, bad base64).
- *  Keeps path-only entries and the text; warns for each dropped image. */
-function cleanImagesForSend<T extends { path: string; name?: string; dataUrl?: string }>(imgs: T[]): T[] {
-  const out: T[] = [];
-  for (const img of imgs ?? []) {
-    if (!img) continue;
-    if (!img.dataUrl) {
-      out.push(img);
-      continue;
-    }
-    const clean = sanitizeImageDataUrl(img.dataUrl);
-    if (clean) {
-      out.push(clean === img.dataUrl ? img : { ...img, dataUrl: clean });
-    } else {
-      console.warn("[chat] dropping corrupt image data URL (not sent):", img.path);
-    }
-  }
-  return out;
-}
-
-function relFromRoot(root: string, p: string): string | null {
-  const norm = (s: string) => s.replace(/\\/g, "/").replace(/\/+$/, "");
-  const r = norm(root).split("/");
-  const f = norm(p).split("/");
-  let i = 0;
-  while (i < r.length && i < f.length && r[i] === f[i]) i++;
-  if (i < r.length) return null;
-  const rel = f.slice(i).join("/");
-  return rel || null;
-}
-
-/** Fixed width of the context-breakdown popover (also used to clamp its
- *  horizontal anchor so it never overflows the viewport). */
-const CTX_POPOVER_WIDTH = 300;
-
-/** Client-side mirror of the server's GOAL_MAX_EXTRA_TURNS (backend/goals.py).
- *  The server is authoritative; this just avoids firing one wasted turn on a
- *  stale [GOAL CONTINUES] marker. Keep in sync with the backend value. */
-const MAX_GOAL_TURNS = 15;
-
-/** Reason text after a backend goal marker, e.g. "[GOAL CONTINUES] <reason>".
- *  Fed into the next loop prompt as guidance (Claude-style). Capped so a
- *  verbose judge cannot bloat the prompt. */
-function goalReasonAfter(content: string, marker: string): string {
-  try {
-    const idx = (content ?? "").indexOf(marker);
-    if (idx === -1) return "";
-    const tail = (content ?? "").slice(idx + marker.length).trim();
-    if (!tail) return "";
-    const line = tail.split("\n")[0].trim();
-    return line.slice(0, 300);
-  } catch {
-    return "";
-  }
-}
-
-/** Circular context-usage indicator rendered in the composer next to Send. */
-function ContextRing({ pct }: { pct: number | null }) {
-  if (pct === null)
-    return <span className="ctx-ring-empty" aria-hidden="true" />;
-  const rounded = Math.min(100, Math.max(0, Math.round(pct)));
-  const clamped = rounded / 100;
-  const radius = 6;
-  const circumference = 2 * Math.PI * radius;
-  return (
-    <span className="context-meter-ring" aria-hidden="true">
-      <svg viewBox="0 0 16 16" width="24" height="24" aria-hidden="true">
-        <circle cx="8" cy="8" r={radius} className="context-meter-ring-track" />
-        <circle
-          cx="8"
-          cy="8"
-          r={radius}
-          className="context-meter-ring-fill"
-          strokeDasharray={circumference}
-          strokeDashoffset={circumference * (1 - clamped)}
-        />
-      </svg>
-      <span
-        className={`context-meter-ring-label${rounded >= 100 ? " triple" : ""}`}
-      >
-        {rounded}
-      </span>
-    </span>
-  );
-}
-
-/** Shown while a chat's transcript is still being fetched (index-only row).
- *  The body lives in its own file on disk now, so a freshly opened chat has a
- *  short window where only its metadata is in memory — rendering the empty
- *  state there would read as "this chat lost all its messages". */
-function ChatLoader() {
-  return (
-    <div className="chat-loader" data-testid="chat-hydrating">
-      <span className="spinner" />
-      <span>Loading conversation…</span>
-    </div>
-  );
-}
+import { ARG_VALUE_TTL_MS, COMMANDS, CmdArg, PermInfo, describeScheduleFlags, wantsPlugin, wantsSchedule, wantsSkillOrMcp } from './chat/commands'
+import { EDIT_TARGET_COMMANDS, IMAGE_EXTS, cleanImagesForSend, dismissEditTarget, dismissedEditTargetKey, dismissedEditTargets, editTargetSuffix, folderOf, openEditTargetSession, relFromRoot } from './chat/editTarget'
+import { CTX_POPOVER_WIDTH, ChatLoader, ContextRing, MAX_GOAL_TURNS, goalReasonAfter } from './chat/rings'
+import { CHAT_ERROR_MAX_RETRIES, COMPACT_DONE_HOLD_MS, LIVE_TTS_OWNER, PLAN_APPROVE_TOKEN, PLAN_DISMISS_TOKEN, autoRetryFor, chatAutoRetry, chatStopped, clearCompactHold, compactDoneTimers, holdCompactComplete } from './chat/roomState'
 
 export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Multi-window: each stacked window mounts its own ChatPanel with an
@@ -12721,3 +12356,40 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     </div>
   );
 }
+
+// Original surface, re-exported verbatim:
+export { CHAT_ERROR_MAX_RETRIES } from './chat/roomState'
+export { COMPACT_DONE_HOLD_MS } from './chat/roomState'
+export { LIVE_TTS_OWNER } from './chat/roomState'
+export { PLAN_APPROVE_TOKEN } from './chat/roomState'
+export { PLAN_DISMISS_TOKEN } from './chat/roomState'
+export { autoRetryFor } from './chat/roomState'
+export { chatAutoRetry } from './chat/roomState'
+export { chatStopped } from './chat/roomState'
+export { clearCompactHold } from './chat/roomState'
+export { compactDoneTimers } from './chat/roomState'
+export { holdCompactComplete } from './chat/roomState'
+export { ARG_VALUE_TTL_MS } from './chat/commands'
+export { COMMANDS } from './chat/commands'
+export type { CmdArg } from './chat/commands'
+export type { PermInfo } from './chat/commands'
+export { describeScheduleFlags } from './chat/commands'
+export { wantsPlugin } from './chat/commands'
+export { wantsSchedule } from './chat/commands'
+export { wantsSkillOrMcp } from './chat/commands'
+export { EDIT_TARGET_COMMANDS } from './chat/editTarget'
+export { IMAGE_EXTS } from './chat/editTarget'
+export { cleanImagesForSend } from './chat/editTarget'
+export { dismissEditTarget } from './chat/editTarget'
+export { dismissedEditTargetKey } from './chat/editTarget'
+export { dismissedEditTargets } from './chat/editTarget'
+export { editTargetSuffix } from './chat/editTarget'
+export { folderOf } from './chat/editTarget'
+export { openEditTargetSession } from './chat/editTarget'
+export { relFromRoot } from './chat/editTarget'
+export { CTX_POPOVER_WIDTH } from './chat/rings'
+export { ChatLoader } from './chat/rings'
+export { ContextRing } from './chat/rings'
+export { MAX_GOAL_TURNS } from './chat/rings'
+export { goalReasonAfter } from './chat/rings'
+

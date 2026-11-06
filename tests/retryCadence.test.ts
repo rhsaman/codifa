@@ -16,11 +16,17 @@ export {}
 // their meaning either way.
 const readModuleSrc = async (p: string): Promise<string> => {
   const fs = await import('node:fs')
-  if (fs.existsSync(p) && fs.statSync(p).isFile()) return fs.readFileSync(p, 'utf8')
-  return fs.readdirSync(p)
-    .filter((f) => f.endsWith('.rs') || f.endsWith('.ts'))
-    .map((f) => fs.readFileSync(`${p}/${f}`, 'utf8'))
-    .join('\n')
+  const parts: string[] = []
+  for (const ext of ['.ts', '.tsx']) {
+    if (fs.existsSync(p + ext)) parts.push(fs.readFileSync(p + ext, 'utf8'))
+  }
+  if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+    for (const f of fs.readdirSync(p).filter((f) => /\.(rs|ts|tsx)$/.test(f))) {
+      parts.push(fs.readFileSync(`${p}/${f}`, 'utf8'))
+    }
+  }
+  if (parts.length === 0 && fs.existsSync(p)) return fs.readFileSync(p, 'utf8')
+  return parts.join('\n')
 }
 
 // Pass-through timer that collapses the retry waits to 0ms. Anything shorter
@@ -123,7 +129,7 @@ console.log('1) a dropped connection retries 10 times, then gives up:')
 console.log('2) the chat panel error ladder matches the transport cadence:')
 {
   const fs = await import('node:fs')
-  const chatSrc = fs.readFileSync('src/components/Chat.tsx', 'utf8')
+  const chatSrc = await readModuleSrc('src/components/Chat')
   const apiSrc = fs.readFileSync('src/lib/api.ts', 'utf8')
   check(
     'api.ts computes the delay from the shared adaptive ladder',
@@ -207,7 +213,7 @@ console.log('3) the steer-interrupt signal is wired end to end:')
 {
   const fs = await import('node:fs')
   const typesSrc = await readModuleSrc('src/types')
-  const chatSrc = fs.readFileSync('src/components/Chat.tsx', 'utf8')
+  const chatSrc = await readModuleSrc('src/components/Chat')
   const llmSrc = await readModuleSrc('src-tauri/src/llm')
   const agentSrc = await readModuleSrc('src-tauri/src/agent')
   check("the event union knows 'steer_interrupt'", typesSrc.includes("'steer_interrupt'"))
@@ -253,7 +259,7 @@ console.log('4) a steer no step could carry is handed back, not erased:')
 {
   const fs = await import('node:fs')
   const typesSrc = await readModuleSrc('src/types')
-  const chatSrc = fs.readFileSync('src/components/Chat.tsx', 'utf8')
+  const chatSrc = await readModuleSrc('src/components/Chat')
   const agentSrc = await readModuleSrc('src-tauri/src/agent')
   check(
     "the panel knows the 'steer_dropped' event",

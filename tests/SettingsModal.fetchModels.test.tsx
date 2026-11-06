@@ -89,7 +89,12 @@ console.log('۱) رندر تب Providers — بدون فچ خودکار + وجو
   // قفل می‌کنیم: dependency array قدیمی effect فچ خودکار باید حذف شده باشد
   // و فراخوانی fetchAndPersist فقط در هندلر دستی (fetchProviderModels) بماند.
   const fs = await import('node:fs')
-  const src = fs.readFileSync('src/components/SettingsModal.tsx', 'utf8')
+  // The SettingsModal module now spans the component + its settings/ parts;
+  // concatenate them so whole-module assertions keep their meaning.
+  const readdir = fs.readdirSync('src/components/settings').filter((f) => f.endsWith('.tsx'))
+  const src = [fs.readFileSync('src/components/SettingsModal.tsx', 'utf8')]
+    .concat(readdir.map((f) => fs.readFileSync(`src/components/settings/${f}`, 'utf8')))
+    .join('\n')
   check(
     'effect فچ خودکار قدیمی حذف شده (dependency array قبلی در سورس نیست)',
     !src.includes('[active.id, cfg.baseUrl, cfg.apiKey, cfg.kind]'),

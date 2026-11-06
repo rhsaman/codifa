@@ -51,7 +51,18 @@ const disk = new Map<string, string>()
   ),
 }
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
+
+// A module may now live as a directory of parts (the Rust reorg); concatenate
+// everything so whole-module assertions keep their meaning.
+const readModuleSrc = (p: string): string => {
+  if (existsSync(p) && statSync(p).isFile()) return readFileSync(p, 'utf8')
+  return readdirSync(p)
+    .filter((f) => f.endsWith('.rs') || f.endsWith('.ts'))
+    .map((f) => readFileSync(`${p}/${f}`, 'utf8'))
+    .join('\n')
+}
+
 
 // Dynamic imports: a STATIC import is hoisted above the stubs above, so the
 // store would hydrate before `window` exists. `terminalTab.test.ts` does the
@@ -119,7 +130,7 @@ console.log('3) the file menu always opens Neovim INSIDE the app:')
 
 console.log('4) the backend keeps no external terminal launcher:')
 {
-  const src = readFileSync('src-tauri/src/commands.rs', 'utf8')
+  const src = readModuleSrc('src-tauri/src/commands')
   for (const fn of ['launch_terminal', 'launch_ghostty', 'launch_cmux', 'launch_iterm', 'launch_warp', 'launch_system_terminal', 'launch_portable']) {
     check(`${fn} is gone`, !src.includes(`fn ${fn}(`), fn)
   }

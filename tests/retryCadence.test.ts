@@ -11,6 +11,18 @@
 // delays; the ASSERTIONS are about attempt counts and advertised delays.
 export {}
 
+// Some asserted modules now live as DIRECTORIES of parts (the Rust/TS reorg),
+// so read a file or concatenate a module dir — whole-module assertions keep
+// their meaning either way.
+const readModuleSrc = async (p: string): Promise<string> => {
+  const fs = await import('node:fs')
+  if (fs.existsSync(p) && fs.statSync(p).isFile()) return fs.readFileSync(p, 'utf8')
+  return fs.readdirSync(p)
+    .filter((f) => f.endsWith('.rs') || f.endsWith('.ts'))
+    .map((f) => fs.readFileSync(`${p}/${f}`, 'utf8'))
+    .join('\n')
+}
+
 // Pass-through timer that collapses the retry waits to 0ms. Anything shorter
 // than a second (internal batching) keeps its real delay.
 const realSetTimeout = globalThis.setTimeout
@@ -194,10 +206,10 @@ console.log('2) the chat panel error ladder matches the transport cadence:')
 console.log('3) the steer-interrupt signal is wired end to end:')
 {
   const fs = await import('node:fs')
-  const typesSrc = fs.readFileSync('src/types.ts', 'utf8')
+  const typesSrc = await readModuleSrc('src/types')
   const chatSrc = fs.readFileSync('src/components/Chat.tsx', 'utf8')
-  const llmSrc = fs.readFileSync('src-tauri/src/llm.rs', 'utf8')
-  const agentSrc = fs.readFileSync('src-tauri/src/agent.rs', 'utf8')
+  const llmSrc = await readModuleSrc('src-tauri/src/llm')
+  const agentSrc = await readModuleSrc('src-tauri/src/agent')
   check("the event union knows 'steer_interrupt'", typesSrc.includes("'steer_interrupt'"))
   check(
     'the panel handles steer_interrupt',
@@ -240,9 +252,9 @@ console.log('3) the steer-interrupt signal is wired end to end:')
 console.log('4) a steer no step could carry is handed back, not erased:')
 {
   const fs = await import('node:fs')
-  const typesSrc = fs.readFileSync('src/types.ts', 'utf8')
+  const typesSrc = await readModuleSrc('src/types')
   const chatSrc = fs.readFileSync('src/components/Chat.tsx', 'utf8')
-  const agentSrc = fs.readFileSync('src-tauri/src/agent.rs', 'utf8')
+  const agentSrc = await readModuleSrc('src-tauri/src/agent')
   check(
     "the panel knows the 'steer_dropped' event",
     typesSrc.includes("'steer_dropped'") && chatSrc.includes('event.kind === "steer_dropped"'),

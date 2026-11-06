@@ -14,7 +14,18 @@
 //
 // `fileTree.ts` only imports a TYPE from `fs.ts`, so this needs no bridge stub.
 export {}
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
+
+// A module may now live as a directory of parts (the Rust reorg); concatenate
+// everything so whole-module assertions keep their meaning.
+const readModuleSrc = (p: string): string => {
+  if (existsSync(p) && statSync(p).isFile()) return readFileSync(p, 'utf8')
+  return readdirSync(p)
+    .filter((f) => f.endsWith('.rs') || f.endsWith('.ts'))
+    .map((f) => readFileSync(`${p}/${f}`, 'utf8'))
+    .join('\n')
+}
+
 import { copyName, isInside, joinPath, moveTarget, parentPath } from '../src/lib/fileTree'
 
 let failures = 0
@@ -132,7 +143,7 @@ console.log('6) every layer exposes copy and rename:')
   check('the bridge invokes fs_copy', bridgeSrc.includes("'fs_copy'"))
   check('the bridge invokes fs_rename', bridgeSrc.includes("'fs_rename'"))
 
-  const cmdSrc = readFileSync('src-tauri/src/commands.rs', 'utf8')
+  const cmdSrc = readModuleSrc('src-tauri/src/commands')
   check('the Rust command fs_copy exists', cmdSrc.includes('pub fn fs_copy('))
   check('the Rust command fs_rename exists', cmdSrc.includes('pub fn fs_rename('))
   check('a copy never overwrites silently', cmdSrc.includes('destination already exists'))

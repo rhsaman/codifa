@@ -127,16 +127,16 @@ ltrIslandCode|tests/ltrIslandCode.ssr.test.tsx|--jsx=automatic --packages=extern
 chatBubble|tests/chatBubble.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 chartBlock|tests/chartBlock.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 fileTypes|tests/fileTypes.test.ts|-
-tabBar|src/lib/tabBar.test.ts|
-slash|src/lib/slash.test.ts|--packages=external --external:electron
-chatTree|src/lib/chatTree.test.ts|
-webkitDeadKey|src/lib/webkitDeadKey.test.ts|
-fileDrag|src/lib/fileDrag.test.ts|
-chatWindowMeta|src/lib/chatWindowMeta.test.ts|
-chatClose|src/lib/chatClose.test.ts|
-viewerTabs|src/lib/viewerTabs.test.ts|--packages=external --external:electron
-shortcutsKeys|src/lib/shortcuts.test.ts|
-fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
+tabBar|tests/tabBar.test.ts|
+slash|tests/slash.test.ts|--packages=external --external:electron
+chatTree|tests/chatTree.test.ts|
+webkitDeadKey|tests/webkitDeadKey.test.ts|
+fileDrag|tests/fileDrag.test.ts|
+chatWindowMeta|tests/chatWindowMeta.test.ts|
+chatClose|tests/chatClose.test.ts|
+viewerTabs|tests/viewerTabs.test.ts|--packages=external --external:electron
+shortcutsKeys|tests/shortcuts.test.ts|
+fsWrappers|tests/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-
 settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 mediaProviders|tests/mediaProviders.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
@@ -173,13 +173,13 @@ modelTest|tests/modelTest.test.tsx|--jsx=automatic --packages=external --externa
 manualContext|tests/manualContext.test.ts|--packages=external --external:electron
 gitApiError|tests/gitApiError.test.ts|--packages=external --external:electron
 reviewDiff|tests/reviewDiff.test.ts|--packages=external --external:electron
-reviewStats|src/lib/reviewStats.test.ts|--packages=external --external:electron
+reviewStats|tests/reviewStats.test.ts|--packages=external --external:electron
 reviewAccordion|tests/reviewAccordion.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 diffSearch|tests/diffSearch.test.ts|-
 uncommitted|tests/uncommitted.test.ts|--packages=external --external:electron
-tts|src/lib/tts.test.ts|--packages=external --external:electron
+tts|tests/tts.test.ts|--packages=external --external:electron
 schedule|tests/schedule.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --loader:.mp3=file --external:electron
-fetchModels|src/components/SettingsModal.fetchModels.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+fetchModels|tests/SettingsModal.fetchModels.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 chatLag|tests/chatLag.test.ts|--packages=external --external:electron
 diffResponsive|tests/diffResponsive.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 diffComments|tests/diffComments.test.ts|-
@@ -193,7 +193,7 @@ time|tests/time.test.ts|-
 fileSuggest|tests/fileSuggest.test.ts|--packages=external --external:electron
 textViewer|tests/textViewer.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 composerLayout|tests/composerLayout.test.ts|-
-chatQuote|src/lib/chatQuote.test.ts|
+chatQuote|tests/chatQuote.test.ts|
 fileComment|tests/fileComment.test.ts|
 selectionBar|tests/selectionBar.test.ts|
 workspacePath|tests/workspacePath.test.ts|
@@ -202,11 +202,11 @@ nvimEdit|tests/nvimEdit.test.ts|-
 nvimTerminals|tests/nvimTerminals.test.ts|--packages=external --external:electron
 historySubmit|tests/historySubmit.test.ts|-
 historyPayload|tests/historyPayload.test.ts|-
-historyWindow|src/lib/historyWindow.test.ts|
+historyWindow|tests/historyWindow.test.ts|
 viewerTabRail|tests/viewerTabRail.ssr.test.tsx|--jsx=automatic --loader:.mp3=file --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --external:electron
 retryCadence|tests/retryCadence.test.ts|--packages=external --external:electron
 undoRedo|tests/undoRedo.test.ts|--packages=external --external:electron
-inputSuppress|src/lib/inputSuppress.test.ts|
+inputSuppress|tests/inputSuppress.test.ts|
 settingsSuggestions|tests/settingsSuggestions.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 xtermTheme|tests/xtermTheme.test.ts|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 terminalTab|tests/terminalTab.test.ts|--packages=external --external:electron
@@ -217,28 +217,40 @@ fileTree|tests/fileTree.test.ts|--packages=external --external:electron
 fileActions|tests/fileActions.test.ts|--packages=external --external:electron
 viewerFilesKind|tests/viewerFilesKind.test.ts|--packages=external --external:electron
 viewerPages|tests/viewerPages.test.ts|--packages=external --external:electron
-toolSlots|src/lib/toolSlots.test.ts|
+toolSlots|tests/toolSlots.test.ts|
 filesPanel|tests/filesPanel.ssr.test.tsx|--jsx=automatic --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 chatNormalMode|tests/chatNormalMode.test.ts|-
 artifactPanel|tests/artifactPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 artifactsPage|tests/artifactsPage.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 tabOrder|tests/tabOrder.test.ts|-
-stt|src/lib/stt.test.ts|
-localLive|src/lib/localLive.test.ts|
+stt|tests/stt.test.ts|
+localLive|tests/localLive.test.ts|
 mediaUrl|tests/mediaUrl.test.ts|
-liveSession|src/lib/liveSession.test.ts|
-livePrompt|src/lib/livePrompt.test.ts|
+liveSession|tests/liveSession.test.ts|
+livePrompt|tests/livePrompt.test.ts|
 paging|tests/paging.test.ts|-
 fuzzy|tests/fuzzy.test.ts|-
 paneCycle|tests/paneCycle.test.ts|
 prefixState|tests/prefixState.test.ts|
 panePointer|tests/panePointer.test.ts|
-chatFind|src/lib/chatFind.test.ts|
+chatFind|tests/chatFind.test.ts|
 terminalKeys|tests/terminalKeys.test.ts|
 scrollKeys|tests/scrollKeys.test.ts|
 pluginDetail|tests/pluginDetail.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
-browserPanelMemory|src/lib/browserPanelMemory.test.ts|
+browserPanelMemory|tests/browserPanelMemory.test.ts|
 editTarget|tests/editTarget.test.ts|--packages=external --external:electron
+api|tests/api.test.ts|--packages=external --external:electron
+arrowDir|tests/arrowDir.test.ts|--packages=external --external:electron
+realtimeLive|tests/realtimeLive.test.ts|--packages=external --external:electron
+retryScheduler|tests/retryScheduler.test.ts|--packages=external --external:electron
+storeDedupe|tests/store.dedupe.test.ts|--packages=external --external:electron
+storeSeen|tests/store.seen.test.ts|--packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+toolActivityDedupe|tests/toolActivity.dedupe.test.ts|--packages=external --external:electron
+toolActivityStuckCards|tests/toolActivity.stuckCards.test.ts|--packages=external --external:electron
+toolActivityTerminal|tests/toolActivity.terminal.test.ts|--packages=external --external:electron
+watchdogTiming|tests/watchdogTiming.test.ts|--packages=external --external:electron
+xtermThemeAttach|tests/xtermTheme.attach.test.ts|--packages=external --external:electron
+chatMessageEdit|tests/ChatMessage.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 EOF
 
 # Split into per-job files (zero-padded so glob order == list order).

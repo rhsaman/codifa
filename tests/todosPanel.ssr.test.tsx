@@ -1,3 +1,20 @@
+// global.css is an index over src/styles/global/NN-*.css (split without
+// changing the cascade); concatenate all parts so stylesheet assertions see
+// the full text.
+async function readFullCss(p: string | URL): Promise<string> {
+  const fs = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const path = typeof p === 'string' ? p : fileURLToPath(p)
+  const parts: string[] = []
+  if (fs.existsSync(path) && fs.statSync(path).isFile()) parts.push(fs.readFileSync(path, 'utf8'))
+  const dir = path.replace(/\.css$/, '')
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.css')).sort()) {
+      parts.push(fs.readFileSync(`${dir}/${f}`, 'utf8'))
+    }
+  }
+  return parts.join('\n')
+}
 // SSR sanity test for TodosPanel pure functions (run via test/run-frontend.sh).
 // Covers: latestTodos (last non-empty plan), loadTodoPanelUi (migration from
 // legacy x-anchor and coder:sidebarUi), clampPos (right/y bounds clamping).
@@ -243,7 +260,11 @@ console.log("۱۶) پنل راست — تاگل استور و لایه‌بند�
   check("toggleRightPanel برمی‌گرداند", useStore.getState().rightPanelOpen === initial)
   // لایه‌بندی: پنل راست همیشه پشت مطالعه و گیت‌دیف
   const { readFileSync } = await import("node:fs")
-  const css = readFileSync("src/styles/global.css", "utf8")
+  const css = [await readFullCss("src/styles/global.css")]
+    .concat(((await import("node:fs")).readdirSync("src/styles/global") || [])
+      .filter((f) => f.endsWith(".css")).sort()
+      .map((f) => readFileSync(`src/styles/global/${f}`, "utf8")))
+    .join("\n")
   const pick = (name: string) => {
     const m = css.match(new RegExp(`${name}:\\s*(\\d+)`))
     return m ? parseInt(m[1], 10) : NaN
@@ -406,6 +427,7 @@ console.log("۲۴) بخش Terminals — ترمینال‌های بک‌گران�
   // مطمئن می‌شویم رندر از فیلتر خالص می‌خواند: زنده‌ها + خروج‌یافته‌های grace
   const { visibleAgentTerminals, runningAgentTerminals, formatRunningFor } =
     await import("../src/lib/agentTerminals")
+
   check("فیلتر نمایش از helper خالص می‌آید", src.includes("visibleAgentTerminals(terminals"))
   check("ردیف خروج‌یافته برچسب exit دارد", src.includes("terminalExitLabel(t)"))
   const rows = [

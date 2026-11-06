@@ -46,6 +46,23 @@ const {
   unseenRunCount: unseenRunCountLib,
 } = await import("../src/lib/schedule-notify")
 const { readFileSync } = await import("node:fs")
+// global.css is an index over src/styles/global/NN-*.css (split without
+// changing the cascade); concatenate all parts so stylesheet assertions see
+// the full text.
+async function readFullCss(p: string | URL): Promise<string> {
+  const fs = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const path = typeof p === 'string' ? p : fileURLToPath(p)
+  const parts: string[] = []
+  if (fs.existsSync(path) && fs.statSync(path).isFile()) parts.push(fs.readFileSync(path, 'utf8'))
+  const dir = path.replace(/\.css$/, '')
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.css')).sort()) {
+      parts.push(fs.readFileSync(`${dir}/${f}`, 'utf8'))
+    }
+  }
+  return parts.join('\n')
+}
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -220,7 +237,12 @@ console.log("13) the badge's plumbing is actually mounted (regression: the badge
   check("the dock renders the badge element", barSrc.includes("viewer-dock-badge"))
   check("the inbox never marks a running run seen", !/markSeen\([a-z]+\.map\(/.test(inboxSrc) && inboxSrc.includes("markSeen(finishedRunIds("))
   check("no second poller: the old titlebar button is gone", !inboxSrc.includes("ScheduleInboxButton"))
-  const css = readFileSync("src/styles/global.css", "utf8")
+  const css = [await readFullCss("src/styles/global.css")]
+    .concat(((await import("node:fs")).readdirSync("src/styles/global") || [])
+
+      .filter((f) => f.endsWith(".css")).sort()
+      .map((f) => readFileSync(`src/styles/global/${f}`, "utf8")))
+    .join("\n")
   check("the dock badge is positioned over its button", /\.viewer-dock-btn\s*\{[^}]*position:\s*relative/.test(css) && /\.viewer-dock-badge\s*\{[^}]*position:\s*absolute/.test(css))
 }
 
@@ -252,7 +274,7 @@ console.log("15) the grid card shows per-card unseen counts instead of Done (and
   check("the Done status pill is gone from the grid card", !/\$\{lastRun\.status\}/.test(inboxSrc))
   check("opening the inbox no longer marks every run seen", !inboxSrc.includes("markSeen(finishedRunIds(runs))"))
   check("viewing a task's page still marks its runs seen", inboxSrc.includes("markSeen(finishedRunIds(one))"))
-  const css = readFileSync("src/styles/global.css", "utf8")
+  const css = await readFullCss("src/styles/global.css")
   check("the new-count pill has its own accent style", /\.schedule-grid-status\.new\s*\{/.test(css))
   check("the green Done pill style is unused by the grid card now", !inboxSrc.includes("schedule-grid-status done"))
 }

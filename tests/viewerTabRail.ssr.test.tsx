@@ -69,6 +69,24 @@ const {
 const { useStore } = await import("../src/lib/store")
 const { useViewerTabs, viewerTabRows } = await import("../src/lib/viewerTabs")
 
+// global.css is an index over src/styles/global/NN-*.css (split without
+// changing the cascade); concatenate all parts so stylesheet assertions see
+// the full text.
+async function readFullCss(p: string | URL): Promise<string> {
+  const fs = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const path = typeof p === 'string' ? p : fileURLToPath(p)
+  const parts: string[] = []
+  if (fs.existsSync(path) && fs.statSync(path).isFile()) parts.push(fs.readFileSync(path, 'utf8'))
+  const dir = path.replace(/\.css$/, '')
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.css')).sort()) {
+      parts.push(fs.readFileSync(`${dir}/${f}`, 'utf8'))
+    }
+  }
+  return parts.join('\n')
+}
+
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
   if (cond) {
@@ -108,7 +126,7 @@ console.log("2) markup + CSS keep the strip on top and the dock at the bottom:")
   check("the strip comes BEFORE the content", headAt !== -1 && headAt < contentAt)
   check("the dock comes AFTER the content", dockAt !== -1 && dockAt > contentAt)
 
-  const css = readFileSync("src/styles/global.css", "utf8")
+  const css = await readFullCss("src/styles/global.css")
   const stripCss = css.slice(css.indexOf("--- side pane chrome"))
   check("the pane chrome block exists in the stylesheet", stripCss.length > 0)
 
@@ -193,7 +211,7 @@ console.log("3) the strip ends with [+ | spacer | fullscreen | pane toggle]:")
   check("the pane toggle sits to the RIGHT of the fullscreen toggle", toggleAt > fullAt)
   check("the dock renders after the content (no toggle inside it)", !appSrc.slice(appSrc.indexOf("<ViewerDockBar")).includes("viewer-dock-toggle"))
 
-  const css = readFileSync("src/styles/global.css", "utf8")
+  const css = await readFullCss("src/styles/global.css")
   check("strip icon buttons share one geometry", /\.viewer-pane-head \.titlebar-icon-btn/.test(css))
 }
 

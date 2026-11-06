@@ -1,0 +1,2644 @@
+
+
+/* ── File viewer tab (FileViewerPanel) ──────────────────────────────────── */
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg, #101418);
+  position: relative;
+}
+
+.file-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+  min-width: 0;
+  direction: ltr;
+  text-align: left;
+}
+
+.file-viewer-dir {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.6;
+}
+
+.file-viewer-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The header name is a button (click = show this file in the Files explorer),
+   so it resets the native button chrome and keeps the plain-text look. */
+.file-viewer-name-btn {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 4px;
+}
+
+.file-viewer-name-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.file-viewer-name-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.file-viewer-line {
+  color: var(--text-dim);
+}
+
+.file-viewer-spacer {
+  margin-left: auto;
+}
+
+.fv-copy {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.fv-copy:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.fv-copy.copied {
+  color: var(--text);
+}
+
+/* Icon-only header actions (search / copy / open / comment): compact 26px
+   buttons replacing the old text buttons. */
+.fv-icon-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.fv-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.fv-icon-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.fv-icon-btn.copied {
+  color: var(--success, #7dc888);
+}
+
+.fv-icon-btn svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+/* Excel sheet picker: compact inline form, never wraps under the input. */
+.fv-sheet-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.fv-sheet-input,
+.fv-search-input {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 6px;
+  padding: 4px 8px;
+  outline: none;
+  min-width: 0;
+}
+
+.fv-sheet-input {
+  width: 110px;
+  flex: 0 1 auto;
+}
+
+.fv-sheet-input::placeholder,
+.fv-search-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.fv-sheet-input:focus,
+.fv-search-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.fv-sheet-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.fv-sheet-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* In-viewer search bar: single row, themed input, compact count + nav. */
+.fv-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.fv-search-bar .fv-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.fv-search-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  min-width: 72px;
+  text-align: end;
+}
+
+.fv-search-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+/* Search hit highlight: substring mark + row tint, derived from the theme so
+   it stays legible on dark palettes (a light-yellow row made the light code
+   text vanish). The mark gets a solid-ish tint + forced dark-on-light text so
+   the hit itself always reads, while the row keeps a faint theme tint. */
+.fv-mark,
+mark.fv-mark {
+  background: color-mix(in srgb, var(--thinking) 85%, transparent);
+  color: var(--bg);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+tr[data-search-current] .fv-mark,
+.fv-line.search-current .fv-mark {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.fv-line.search-current {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -1px;
+}
+
+/* Floating comment trigger at the highlight position: small pill button that
+   never interrupts the drag — the editor opens only after clicking it.
+   Fixed positioning + very high z-index so it floats above chat panes. */
+.fv-comment-fab {
+  position: fixed;
+  z-index: 9999;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 92%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  box-shadow: var(--shadow-pop);
+  backdrop-filter: blur(16px) saturate(1.2);
+  white-space: nowrap;
+}
+
+.fv-comment-fab:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* Comment editor popup anchored at the highlight: fixed + top z-index so it
+   never stays behind chat windows. JS must clamp the inline left/top so the
+   popup never overflows the viewport: left = min(x, innerWidth - popupWidth - 8),
+   top = min(y, innerHeight - popupHeight - 8). The max-width below is only a
+   second guard so the box itself never exceeds the viewport. */
+.fv-comment-pop {
+  position: fixed;
+  z-index: 9999;
+  width: min(320px, calc(100vw - 16px));
+  max-width: min(320px, calc(100vw - 16px));
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--bg-panel, var(--bg));
+  opacity: 1;
+  isolation: isolate;
+  box-shadow: var(--shadow-pop);
+}
+
+.fv-comment-pop-title {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+}
+
+/* Highlight comment box: themed textarea + quote, no raw white boxes. */
+.fv-comment-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  flex: 0 0 auto;
+}
+
+.fv-comment-quote {
+  margin: 0;
+  padding: 6px 10px;
+  border-inline-start: 3px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  border-radius: 0 6px 6px 0;
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.92;
+  max-height: 96px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.fv-comment-input {
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg, #101418) 60%, transparent);
+  background: var(--bg-input, color-mix(in srgb, var(--text) 6%, transparent));
+  border: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  border-radius: 8px;
+  padding: 7px 9px;
+  outline: none;
+  resize: vertical;
+  min-height: 56px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.fv-comment-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+.fv-comment-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Copy/Reply toolbar armed by a highlight. The comment editor opens only after
+   Reply, so selecting text never yanks focus into a textarea mid-drag. */
+.fv-sel-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 97%, transparent);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 40%);
+  backdrop-filter: blur(16px) saturate(1.2);
+}
+
+.fv-sel-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.fv-sel-btn:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Floating highlight comment: */
+.fv-comment-float {
+  position: fixed;
+  z-index: 9999;
+  width: min(320px, calc(100vw - 16px));
+  max-width: min(320px, calc(100vw - 16px));
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  padding: 8px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--bg-panel, var(--bg));
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 97%, transparent);
+  opacity: 1;
+  isolation: isolate;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 45%);
+  backdrop-filter: blur(20px) saturate(1.2);
+}
+/* Narrow viewport fallback: dock the comment popup to the inline-end edge
+   so it can never overflow the app from the right. Wide screens keep the
+   JS-anchored position; only small screens force docking. */
+@media (max-width: 760px) {
+  .fv-comment-pop,
+  .fv-comment-float,
+  .fv-sel-bar {
+    left: auto !important;
+    right: 8px !important;
+  }
+}
+
+.fv-comment-float:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 65%, transparent);
+}
+
+.fv-comment-float .fv-comment-input {
+  width: 100%;
+  min-height: 48px;
+  max-height: 140px;
+  border: none;
+  outline: none;
+  background: transparent;
+  resize: none;
+  padding: 4px 6px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.fv-comment-float .fv-comment-input::placeholder {
+  opacity: 0.55;
+}
+
+/* Preserved highlight for the commented range. Opening the popup focuses the
+   textarea, which collapses window.getSelection() and drops the native
+   highlight. JS must save the Range (or selected text + quote) BEFORE focusing
+   the textarea, keep the quote element rendered from the saved text so send
+   still works, and re-apply the saved range on close/cancel. Apply this class
+   to the commented range while the popup is open to keep it visibly marked. */
+.fv-comment-highlight-persist {
+  background: color-mix(in srgb, var(--accent) 38%, transparent);
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Excel-like grid wrapper: single app scrollbar from .file-viewer-doc. */
+.fv-sheet-wrap {
+  width: 100%;
+}
+
+.fv-grid-doc {
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+/* MD/Raw render toggle in the text-viewer head (segmented, fv-copy family). */
+.tv-view-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.tv-view-toggle button {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+
+.tv-view-toggle button + button {
+  border-left: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.tv-view-toggle button:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.tv-view-toggle button.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Markdown render of the text-viewer body: same padding rhythm as the raw
+   pre, prose follows the shared chat markdown styles. */
+.text-viewer-md {
+  padding: 10px 14px 16px;
+}
+
+.text-viewer-md .chat-message {
+  max-width: none;
+}
+
+/* Close-match file chips under the "no file at this path" note. */
+.fv-suggest {
+  flex: 0 0 auto;
+  padding: 4px 12px 12px;
+}
+
+.fv-suggest-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.fv-suggest-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.file-viewer-note {
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.file-viewer-image {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.file-viewer-image img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 6px;
+}
+
+/* Rich document previews (docx/xlsx rendered as HTML by the backend). */
+.file-viewer-doc {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 24px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.file-viewer-doc h1,
+.file-viewer-doc h2,
+.file-viewer-doc h3,
+.file-viewer-doc h4 {
+  margin: 14px 0 8px;
+  line-height: 1.3;
+}
+
+.file-viewer-doc p {
+  margin: 6px 0;
+}
+
+.file-viewer-doc ul {
+  margin: 6px 0;
+  padding-inline-start: 24px;
+}
+
+.file-viewer-doc table {
+  margin: 10px 0;
+  font-size: 13px;
+  border-color: color-mix(in srgb, var(--text) 22%, transparent);
+}
+
+.file-viewer-doc td,
+.file-viewer-doc th {
+  border-color: color-mix(in srgb, var(--text) 22%, transparent);
+}
+
+/* PDF visual previews: one stacked page image per PDF page. */
+.file-viewer-pages {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.file-viewer-pages img {
+  width: 100%;
+  max-width: 860px;
+  border-radius: 6px;
+  box-shadow: 0 2px 14px rgb(0 0 0 / 35%);
+  background: #fff;
+}
+
+
+.file-viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  /* Wide children (code blocks, long unbroken lines) scroll horizontally
+     inside the body instead of being clipped by the panel edge. */
+  min-width: 0;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.file-viewer-pre {
+  margin: 0;
+  padding: 8px 0 16px;
+  font-family: var(--font-mono);
+  font-size: var(--viewer-font-size);
+  line-height: 1.55;
+  display: block;
+}
+
+.fv-line {
+  display: block;
+  position: relative;
+  padding: 0 12px 0 52px;
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.fv-text {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.fv-line.target {
+  background: color-mix(in srgb, #4ea1ff 20%, transparent);
+}
+
+/* Frozen comment quote: the native Selection moves into the popup textarea
+   on focus, so the quoted line range keeps a tint while the box is open. */
+.fv-line.comment-target {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -1px;
+}
+
+.fv-gutter {
+  position: absolute;
+  left: 0;
+  width: 40px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-dim);
+  opacity: 0.55;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+}
+
+/* ── Text viewer tab (TextViewerPanel) ──────────────────────────────────── */
+.text-viewer-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+
+.text-viewer-pre {
+  margin: 0;
+  padding: 10px 14px 16px;
+  font-family: var(--font-mono);
+  /* Long lines scroll horizontally instead of clipping at the panel edge. */
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* External-editor buttons (nvim / VS Code) in the file-viewer head. */
+.fv-ext {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.fv-ext:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* "Open in" split button + dropdown in the file-viewer head. Mirrors the
+   composer plus-menu language: tonal surface, accent hover, blurred pop. */
+.fv-open-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
+.fv-open-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
+}
+
+.fv-open-btn:hover,
+.fv-open-btn[aria-expanded="true"] {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.fv-open-btn svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.fv-open-chev {
+  font-size: 9px;
+  opacity: 0.7;
+  transition: transform 0.14s ease;
+}
+
+.fv-open-chev.open {
+  transform: rotate(180deg);
+}
+
+.fv-open-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 248px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  direction: ltr;
+  unicode-bidi: isolate;
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-pop);
+  z-index: 9999;
+  backdrop-filter: blur(24px) saturate(1.2);
+  transform-origin: top right;
+  animation: plus-menu-in 0.14s ease-out;
+}
+
+.fv-open-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.fv-open-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.fv-open-item:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.fv-open-icon {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.fv-open-icon-inapp {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  color: var(--accent);
+}
+
+.fv-open-icon-nvim {
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+}
+
+.fv-open-icon-vscode {
+  background: color-mix(in srgb, var(--link) 16%, transparent);
+  color: var(--link);
+}
+
+.fv-open-icon-cmux {
+  background: color-mix(in srgb, var(--warning, #d9a514) 16%, transparent);
+  color: var(--warning, #d9a514);
+}
+
+.fv-open-icon-ghostty {
+  background: color-mix(in srgb, #cba6f7 16%, transparent);
+  color: #cba6f7;
+}
+
+.fv-open-icon-warp {
+  background: color-mix(in srgb, #fab387 16%, transparent);
+  color: #fab387;
+}
+
+.fv-open-icon-default {
+  background: color-mix(in srgb, var(--link) 16%, transparent);
+  color: var(--link);
+}
+
+.fv-open-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.fv-open-label {
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.fv-open-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+
+/* Attachment chips in messages open the file in the side panel. */
+.attachment-chip-open {
+  cursor: pointer;
+}
+
+.attachment-chip-open:hover {
+  color: var(--text);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 10%, transparent),
+    0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+
+.tool-path.tool-path-open {
+  cursor: pointer;
+}
+
+.tool-path.tool-path-open:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+/* File-viewer syntax colors follow the ACTIVE APP THEME — overrides the
+   global github-dark token palette (higher specificity wins regardless of
+   stylesheet order). */
+.file-viewer-pre.hljs {
+  color: var(--text);
+  background: transparent;
+}
+
+.file-viewer-pre .hljs-comment,
+.file-viewer-pre .hljs-quote {
+  color: var(--text-dim);
+}
+
+.file-viewer-pre .hljs-keyword,
+.file-viewer-pre .hljs-selector-tag,
+.file-viewer-pre .hljs-literal,
+.file-viewer-pre .hljs-doctag,
+.file-viewer-pre .hljs-name,
+.file-viewer-pre .hljs-tag {
+  color: var(--accent);
+}
+
+.file-viewer-pre .hljs-string,
+.file-viewer-pre .hljs-regexp,
+.file-viewer-pre .hljs-addition {
+  color: var(--success);
+}
+
+.file-viewer-pre .hljs-number,
+.file-viewer-pre .hljs-symbol,
+.file-viewer-pre .hljs-bullet,
+.file-viewer-pre .hljs-attr,
+.file-viewer-pre .hljs-variable,
+.file-viewer-pre .hljs-template-variable,
+.file-viewer-pre .hljs-type,
+.file-viewer-pre .hljs-attribute {
+  color: var(--thinking);
+}
+
+.file-viewer-pre .hljs-title,
+.file-viewer-pre .hljs-title.function_,
+.file-viewer-pre .hljs-section,
+.file-viewer-pre .hljs-built_in,
+.file-viewer-pre .hljs-link {
+  color: var(--link);
+}
+
+.file-viewer-pre .hljs-deletion {
+  color: var(--danger);
+}
+
+.file-viewer-pre .hljs-emphasis {
+  font-style: italic;
+}
+
+.file-viewer-pre .hljs-strong {
+  font-weight: 700;
+}
+
+/* Diff code uses the SAME token palette as the file viewer, so a change reads
+   like the real file instead of flat text. Scoped to `.diff-code` (the span
+   DiffLineText wraps highlight.js output in) — the raw `.hljs` rules above are
+   scoped to .file-viewer-pre and would not reach inside a diff. */
+.diff-code {
+  color: var(--text);
+}
+
+.diff-code .hljs-comment,
+.diff-code .hljs-quote {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.diff-code .hljs-keyword,
+.diff-code .hljs-selector-tag,
+.diff-code .hljs-literal,
+.diff-code .hljs-doctag,
+.diff-code .hljs-name,
+.diff-code .hljs-tag {
+  color: var(--accent);
+}
+
+.diff-code .hljs-string,
+.diff-code .hljs-regexp,
+.diff-code .hljs-addition {
+  color: var(--success);
+}
+
+.diff-code .hljs-number,
+.diff-code .hljs-symbol,
+.diff-code .hljs-bullet,
+.diff-code .hljs-attr,
+.diff-code .hljs-variable,
+.diff-code .hljs-template-variable,
+.diff-code .hljs-type,
+.diff-code .hljs-attribute {
+  color: var(--thinking);
+}
+
+.diff-code .hljs-title,
+.diff-code .hljs-title.function_,
+.diff-code .hljs-section,
+.diff-code .hljs-built_in,
+.diff-code .hljs-link {
+  color: var(--link);
+}
+
+.diff-code .hljs-deletion {
+  color: var(--danger);
+}
+
+.diff-code .hljs-emphasis {
+  font-style: italic;
+}
+
+.diff-code .hljs-strong {
+  font-weight: 700;
+}
+
+/* Click-opened preview of an edit/write diff: a floating card over the chat so
+   the change can be read without leaving the transcript. It is opened by the
+   `Review ↗` pill on the row; clicking the row itself still opens the full
+   Review panel. Visual language matches .usage-popover.
+
+   The classes used to be .diff-hover-*: the preview is click-opened now, never
+   hover-driven (a card that followed the pointer landed on top of the row it
+   belonged to, which then reported a `pointerleave` and closed it again). */
+.diff-preview-card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* Same surface as the chat panel (.chat-panel): flat --bg-alt, no accent
+     tint (see .chat-panel). */
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-pop);
+  animation: popover-in 0.12s ease;
+}
+
+.diff-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  border-bottom: 1px solid var(--hairline);
+  background: transparent;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  user-select: none;
+}
+
+.diff-preview-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* Close (✕) — a click-opened card needs an explicit way out (Escape and an
+   outside press also work). Modelled on .review-header-btn, one size down. */
+.diff-preview-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.diff-preview-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.diff-preview-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 8px;
+}
+
+/* ============================================================
+   Bottom terminal panel (Cmd/Ctrl+J)
+   Docked under the whole app body. Tabs mirror the reference
+   layout: "Terminal" label, one chip per pty session, +/× on
+   the right. Sessions keep running while the panel is hidden.
+   ============================================================ */
+.terminal-panel {
+  flex: 0 0 auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  overflow: visible;
+  /* xterm.css is a copy of VS Code's scrollbar stylesheet: xterm.js replaced
+     the slider colours with runtime-injected CSS but kept the
+     `var(--vscode-scrollbar-shadow, #000)` fallback on the scroll area's inset
+     shadows — and nothing in the app defines that variable, so those shadows
+     painted pure black under every theme. Scoped here, at the one place both
+     xterm and this panel live. */
+  --vscode-scrollbar-shadow: var(--bg-alt);
+  /* Animated open/close: the panel root stays mounted (sessions keep running
+     while hidden — same contract as the old display:none toggle) and the
+     height+fade transition runs in both directions. The xterm refits from its
+     own ResizeObserver as the height settles. */
+  transition:
+    height 0.26s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.2s ease;
+}
+
+.terminal-panel[data-open='false'] {
+  /* Beats the inline open height (style={{ height }}) so the shell can own
+     the collapsed state without the component knowing the pixel value. */
+  height: 0 !important;
+  min-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  border-top-color: transparent;
+}
+
+/* Terminal fullscreen (Ctrl+M while the terminal has focus): overlays the
+   whole app so the shell gets the full viewport. Sessions keep running —
+   this is a CSS toggle, same as open/close. */
+.terminal-panel.terminal-full {
+  position: fixed;
+  inset: 0;
+  z-index: 250;
+  height: 100vh;
+  border-top: none;
+}
+
+.terminal-panel.terminal-full .terminal-resize-handle {
+  display: none;
+}
+
+/* Terminal tabs in the side pane are ORDINARY viewer tabs now (kind
+   'terminal', see src/components/TerminalTabPanel.tsx): the pane's normal body
+   sizing applies, so no dock-specific geometry is left here. This wrapper only
+   has to be the positioned box that the shared .terminal-screen rule (position:
+   absolute) is inset against. */
+.terminal-tab-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--bg-alt);
+  overflow: hidden;
+  /* Same inherited xterm variables as the bottom panel (see .terminal-panel):
+     xterm.css paints its scroll-area inset shadows with a hard-coded black
+     fallback, and nothing in the app defines that variable — so a pane hosted
+     terminal showed a BLACK strip along its edge. Defined here too, because this
+     host is outside `.terminal-panel`. */
+  --vscode-scrollbar-shadow: var(--bg-alt);
+}
+
+/* xterm.css sets `.xterm .xterm-viewport { background-color: #000 }` (the macOS
+   opaque-scrollbar trick). The app's override has the SAME specificity
+   (0,2,0) but xterm.css is injected later by the lazy xterm import, so it won —
+   leaving a black band under the canvas. Bumping to (0,3,0) makes the themed
+   background win regardless of injection order, in BOTH hosts. */
+.terminal-screen .xterm .xterm-viewport {
+  background-color: var(--bg-alt);
+}
+
+/* A program the backend could not start (a missing `nvim`, a bad cwd) must say
+   so INSIDE the tab — an empty pane reads as broken. Overlays the (still blank)
+   screen so an early xterm paint cannot hide the reason. */
+.terminal-tab-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--danger);
+  background: var(--bg-alt);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-resize-handle {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: ns-resize;
+  z-index: 30;
+}
+
+.terminal-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 3px;
+  height: 1px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.terminal-resize-handle:hover::after,
+.terminal-resize-handle:active::after {
+  background: var(--accent);
+}
+
+.terminal-tabbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
+.terminal-tabs {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.terminal-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 9px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.terminal-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.terminal-tab-active {
+  background: var(--bg-panel);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.terminal-tab-shell {
+  font-weight: 600;
+}
+
+.terminal-tab-cwd {
+  opacity: 0.7;
+}
+
+.terminal-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+}
+
+.terminal-tab-close:hover {
+  opacity: 1;
+  background: var(--bg-hover);
+}
+
+.terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.terminal-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.terminal-action-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.terminal-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.terminal-screen {
+  position: absolute;
+  /* Full-bleed bottom: the old 4px bottom inset left a dark strip under
+     the xterm viewport that read as a stray black line. */
+  inset: 4px 10px 0;
+  display: none;
+}
+
+.terminal-screen[data-active='true'] {
+  display: block;
+}
+
+.terminal-screen .xterm {
+  height: 100%;
+}
+
+/* Wide output never scrolls the panel horizontally — lines wrap instead
+   (VSCode behaviour). xterm draws its OWN VS Code-style scrollbar element
+   (.xterm-scrollable-element > .scrollbar.horizontal), so hiding the native
+   viewport overflow is not enough: that custom horizontal bar was the dark
+   strip along the panel's bottom. */
+.terminal-screen .xterm-viewport {
+  overflow-x: hidden;
+  /* xterm.css hard-codes #000 here (the opaque-scrollbar trick on macOS). The
+     canvas covers most of it with the theme background, but the gap beside the
+     scrollbar showed as a black strip along the panel's edge. */
+  background-color: var(--bg-alt);
+}
+
+/* IME composition popup: xterm.css hard-codes background:#000 / color:#FFF,
+   which lands a black box on a light theme. */
+.terminal-screen .xterm .composition-view {
+  background: var(--bg-panel);
+  color: var(--text);
+}
+
+.terminal-screen .xterm .xterm-scrollable-element > .scrollbar.horizontal {
+  display: none !important;
+}
+
+.terminal-screen .xterm .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.terminal-screen .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--bg-raised);
+  border-radius: 4px;
+}
+
+.terminal-unsupported {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+/* A requested program ("Edit in nvim") the backend could not start: the panel
+   would otherwise sit open and empty with no visible reason. */
+.terminal-spawn-error {
+  position: absolute;
+  inset: 8px 10px auto;
+  z-index: 2;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-panel));
+  color: var(--danger);
+  font-size: 12px;
+  text-align: center;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ============================================================
+   File explorer (right pane, Viewer → Files)
+   Lazy workspace tree rendered as ONE flat row list indented by
+   depth — a deep tree stays a single scrolling container instead
+   of nested scroll boxes.
+   ============================================================ */
+.files-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.files-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 6px 0 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.files-panel-title {
+  flex: 1 1 auto;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.files-panel-action {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.files-panel-action:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.files-panel-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Name filter (Ctrl/Cmd+F): a chip that replaces the title in the head while
+   active, plus the pressed state of its toggle button. */
+.files-panel-action[aria-pressed="true"] {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.files-filter {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.files-filter-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.files-filter-input::placeholder {
+  color: var(--text-dim);
+}
+
+.files-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* RTL safety net: a stray horizontal scroll offset in the docked pane would
+     visually swallow the rows' right inset. */
+  overflow-x: hidden;
+  padding: 4px 0;
+}
+
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  /* padding-left is set INLINE per depth (see FilesPanel) — the value here is
+     only the depth-0 fallback. */
+  padding: 3px 8px 3px 6px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease;
+}
+
+.files-row:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+/* Keyboard-highlighted hit while the name filter is navigating (Ctrl+K/J):
+   an accent tint, distinct from the plain hover wash. */
+.files-row-active,
+.files-row-active:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.files-row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.files-row-caret {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  color: var(--text-dim);
+}
+
+.files-chevron {
+  display: inline-flex;
+  transition: transform 0.12s ease;
+}
+
+.files-chevron.open {
+  transform: rotate(90deg);
+}
+
+.files-row-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-dim);
+}
+
+/* Folders carry the app's path/link colour, files stay neutral: the icon is
+   what tells the two apart at a glance in a deep tree. */
+.files-row-dir .files-row-icon {
+  color: var(--link);
+}
+
+.files-row-dir .files-row-name {
+  font-weight: 500;
+}
+
+.files-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- editing rows: context menu, drop highlight, rename --------------- */
+
+/* A failed mutation is reported ABOVE the tree, never instead of it: the rows
+   the user was working with must stay on screen. */
+.files-panel-error {
+  flex: 0 0 auto;
+  margin: 6px 8px 0;
+  padding: 6px 9px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  overflow-wrap: anywhere;
+}
+
+/* The folder a dragged row is currently over: the whole row tints, so the
+   target reads at a glance even in a deep tree. */
+.files-row.files-row-drop {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text);
+}
+
+/* The dragged row itself stays visible as the source of the move. */
+.files-row.files-row-dragging {
+  opacity: 0.5;
+}
+
+.files-row.files-row-renaming {
+  cursor: default;
+}
+
+.files-row.files-row-renaming:hover {
+  background: transparent;
+}
+
+/* Inline rename input: one row tall, indented with its own row. */
+.files-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+
+/* Context menu: the shared `.ws-menu` box, cursor-anchored inside the pane. */
+.files-ctx-menu {
+  min-width: 178px;
+}
+
+.files-ctx-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 9px 2px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.files-ctx-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.files-ctx-actions {
+  display: flex;
+  gap: 2px;
+  padding-top: 2px;
+  border-top: 1px solid var(--hairline);
+}
+
+.files-ctx-actions .ws-menu-btn {
+  justify-content: center;
+}
+
+/* Live voice composer controls (separate from dictate mic). */
+.live-btn-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.live-btn .wave svg {
+  width: 18px;
+  height: 18px;
+}
+.live-chev-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.live-chev-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+.live-chev-btn svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+.live-btn.live-active {
+  color: var(--accent);
+}
+/* Composer voice buttons are borderless ghost icons — no ring, outline or background. */
+.composer-right-actions .icon-btn,
+.composer-right-actions .attach-btn,
+.composer-right-actions .icon-btn.mic-btn,
+.composer-right-actions .icon-btn.live-btn,
+.composer-right-actions .icon-btn.mic-btn:hover,
+.composer-right-actions .icon-btn.live-btn:hover,
+.composer-right-actions .icon-btn.mic-btn:active,
+.composer-right-actions .icon-btn.live-btn:active,
+.composer-right-actions .icon-btn.mic-btn:focus,
+.composer-right-actions .icon-btn.live-btn:focus,
+.composer-right-actions .icon-btn.mic-btn.recording,
+.composer-right-actions .icon-btn.mic-btn.transcribing,
+.composer-right-actions .attach-btn:hover,
+.composer-right-actions .attach-btn:active,
+.composer-right-actions .attach-btn:focus,
+.live-btn-wrap,
+.live-chev-btn,
+.live-chev-btn:hover,
+.live-chev-btn:active,
+.live-chev-btn:focus {
+  background: transparent;
+  background-color: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+}
+.composer-right-actions .icon-btn.mic-btn.recording {
+  color: var(--danger, #e5484d);
+}
+.composer-right-actions .icon-btn.mic-btn.transcribing,
+.composer-right-actions .icon-btn.live-btn.live-active {
+  color: var(--accent);
+}
+.composer-right-actions .icon-btn.mic-btn:focus-visible,
+.composer-right-actions .icon-btn.live-btn:focus-visible,
+.live-chev-btn:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+.mic-menu {
+  text-align: left;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  min-width: 220px;
+  max-width: min(300px, 80vw);
+  padding: 8px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-alt) 94%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow: var(--shadow-pop);
+  backdrop-filter: blur(22px) saturate(1.2);
+}
+.mic-menu-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 8px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.mic-menu-head svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+.mic-level {
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  overflow: hidden;
+}
+.mic-level-dot {
+  display: block;
+  width: 8px;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.mic-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.mic-item:hover {
+  background: var(--accent-dim);
+}
+.mic-item-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mic-check {
+  flex: 0 0 auto;
+  color: #2f81f7;
+  font-weight: 700;
+}
+.live-stop-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 999px;
+  background: #131a2e;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.live-stop-pill:hover {
+  filter: brightness(1.15);
+}
+.live-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.live-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #7aa2f7;
+  animation: live-dot-pulse 1.2s ease-in-out infinite;
+}
+.live-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.live-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes live-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+/* --- side pane chrome -----------------------------------------------------
+   Three stacked regions: a titled tab strip along the TOP edge (every open
+   viewer tab, squeeze-to-fit), the viewer content, and a fixed launcher dock
+   along the BOTTOM edge (one permanent icon per page, T3-Code style — small
+   muted glyphs that light up when their page is on screen). */
+.viewer-pane-body {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.viewer-pane-body > .viewer-content {
+  position: relative;
+  z-index: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  /* The pane host takes the caret on click (click-to-focus); it must not
+     paint a ring for it — focus here is a state, not an affordance. */
+  outline: none;
+}
+
+/* Top strip: [tab-list chevron | tabs … | spacer | fullscreen]. A quiet
+   extension of the pane, separated from the content by a hairline. */
+.viewer-pane-body .viewer-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  height: 38px;
+  padding: 0 8px 0 6px;
+  /* Physical layout: the strip reads left-to-right in RTL too. */
+  direction: ltr;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  background: none;
+  overflow: hidden;
+  /* The strip must never act as the frameless window's drag region, or
+     hovering/clicking its tabs gets swallowed. */
+  -webkit-app-region: no-drag;
+}
+
+.viewer-pane-body .viewer-pane-spacer {
+  flex: 1 1 auto;
+  min-width: 8px;
+}
+
+.viewer-pane-body .viewer-pane-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+}
+
+/* --- top tab strip --------------------------------------------------------
+   Titled pills like the chat bar: icon + name + hover ✕. Tabs squeeze instead
+   of scrolling (the chevron beside them reaches everything). */
+.viewer-pane-body .viewer-tabs-top {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 0;
+  border-bottom: 0;
+  overflow-x: hidden;
+  overflow-y: hidden;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  width: auto;
+  min-width: 30px;
+  max-width: 200px;
+  flex: 0 1 auto;
+  padding: 0 5px 0 8px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  opacity: 1;
+  overflow: hidden;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:hover {
+  transform: none;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:not(.active) {
+  color: var(--text-dim);
+  background: transparent;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:hover,
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: color-mix(in srgb, currentColor 16%, transparent);
+}
+
+/* The active tab is claimed by a soft accent surface, not by dimming every
+   other tab. */
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.viewer-pane-body .viewer-tabs-top .viewer-tab-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The label is ALWAYS visible here (unlike the old icon rail): name + ✕ in
+   one row, the name ellipsizing so a long path never pushes the ✕ out. */
+.viewer-pane-body .viewer-tabs-top .editor-tab-label {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.viewer-pane-body .viewer-tabs-top .viewer-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+/* The ✕ is quiet until the tab is hovered: no box, no background — just the
+   glyph warming up, then turning red under the pointer. */
+.viewer-pane-body .viewer-tabs-top .editor-tab .editor-tab-close {
+  position: static;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  transform: none;
+  border-radius: 5px;
+  opacity: 0;
+  pointer-events: none;
+  background: none;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab:hover .editor-tab-close,
+.viewer-pane-body .viewer-tabs-top .editor-tab:focus-visible .editor-tab-close,
+.viewer-pane-body .viewer-tabs-top .editor-tab.active .editor-tab-close,
+.viewer-pane-body .viewer-tabs-top .editor-tab:has(:focus-visible) .editor-tab-close {
+  opacity: 0.75;
+  pointer-events: auto;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab .editor-tab-close:hover,
+.viewer-pane-body .viewer-tabs-top .editor-tab .editor-tab-close:focus-visible {
+  opacity: 1;
+  transform: none;
+  color: var(--danger);
+  background: none;
+  box-shadow: none;
+}
+
+/* Drop feedback in the strip: no insertion line — the dragged tab is
+   re-ordered into its landing slot (inline CSS `order` set by ViewerTabBar, so
+   the DOM node never moves mid-drag) and drawn as a ghost. */
+.viewer-tabs-top .editor-tab.drop-before,
+.viewer-tabs-top .editor-tab.drop-after {
+  box-shadow: none;
+}
+
+.viewer-tabs-top .editor-tab.drop-before::after,
+.viewer-tabs-top .editor-tab.drop-after::after {
+  display: none;
+}
+
+/* The dragged tab stays where the pointer is and is ghosted; its DOM `order`
+   moves it into the landing slot, so this outline IS the drop preview. */
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.drop-preview {
+  opacity: 0.55;
+  transform: none;
+  border-color: color-mix(in srgb, var(--link) 55%, transparent);
+  background: color-mix(in srgb, var(--link) 12%, transparent);
+  box-shadow:
+    inset 0 0 0 1.5px color-mix(in srgb, var(--link) 62%, transparent),
+    0 10px 24px -14px rgba(0, 0, 0, 0.65);
+  outline: 1px dashed color-mix(in srgb, var(--link) 50%, transparent);
+  outline-offset: -3.5px;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+/* Strip buttons (tab list chevron, fullscreen, "+") are 30px icon squares
+   centered on the strip's axis. */
+.viewer-pane-body .viewer-pane-head .tab-list-btn,
+.viewer-pane-body .viewer-pane-head .editor-tab-new,
+.viewer-pane-body .viewer-pane-head .editor-tab-full,
+.viewer-pane-body .viewer-pane-head .titlebar-icon-btn {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+}
+
+.viewer-pane-body .viewer-pane-head .viewer-pane-full {
+  width: 30px;
+}
+
+.viewer-pane-body .viewer-pane-head .tab-list-wrap {
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+/* --- bottom launcher dock -------------------------------------------------
+   A slim, always-present icon row (one button per page): quiet, evenly spaced
+   glyphs that read at a glance, mirroring the active page with a soft accent
+   pill. */
+.viewer-dock {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  height: 48px;
+  padding: 0 14px;
+  /* Physical layout: the dock reads left-to-right in RTL too. */
+  direction: ltr;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  -webkit-app-region: no-drag;
+}
+
+.viewer-dock-btn {
+  position: relative;
+  width: 38px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease;
+}
+
+/* One uniform glyph size for every dock icon: the sources mix 13–17px
+   attributes, so the row used to look uneven and tiny. */
+.viewer-dock-btn svg {
+  display: block;
+  width: 19px;
+  height: 19px;
+  stroke-width: 1.7;
+}
+
+.viewer-dock-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.viewer-dock-btn:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+/* The page currently on screen owns a soft accent pill — the same language as
+   the top strip's active tab, so dock + strip always agree. */
+.viewer-dock-btn.active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* Unread count on a dock icon (the Inbox's finished, not-yet-seen runs). */
+.viewer-dock-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent, #fff);
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.viewer-dock-spacer {
+  flex: 1 1 auto;
+  min-width: 12px;
+}
+
+/* --- explore (sub-agent run): chat card + side panel ----------------------
+   The chat card stays a compact summary: a live status badge (spinner while
+   the run is working, a check the moment it lands), the run title, and one
+   chip per tool with its call count. The calls themselves live in the
+   right-hand panel. */
+.tool-card.explore {
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease;
+}
+
+/* A live run reads as "working": a stronger accent edge plus a soft breathing
+   halo, so the state is obvious at a glance even before the first call lands. */
+.tool-card.explore.running {
+  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  animation: explore-breathe 2.2s ease-in-out infinite;
+}
+
+.tool-card.explore.done {
+  border-color: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.tool-card.explore.error {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+.tool-card.explore.denied {
+  border-color: color-mix(in srgb, var(--thinking) 45%, transparent);
+}
+
+@keyframes explore-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+}
+
+.explore-card-open {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: none;
+  border: 0;
+  padding: 9px 12px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: start;
+  border-radius: 14px 14px 0 0;
+  transition: background 0.14s ease;
+}
+
+.explore-card-open:hover {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.explore-card-open:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  outline-offset: -2px;
+}
+
+/* Status badge: the same glyphs as every other tool row (spinner → check), so
+   the chat card and the side panel never disagree about a run's state.
+   No ring and no disc: the tick reads as a bare glyph. The old 1px inset ring
+   plus the tinted fill drew a box around the check that competed with the card
+   for attention, so state is carried by the glyph itself (spinner / ✓ / ✗ / ⏹)
+   and by its colour. */
+.explore-card-status {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+
+.explore-card-status .spinner {
+  width: 10px;
+  height: 10px;
+  border-width: 1.6px;
+}
+
+/* The check pops in when the run lands — the "done" beat of the loading. */
+.explore-card-status svg {
+  animation: explore-check-pop 0.28s ease-out both;
+}
+
+/* The explore card's tick is a THEME-tinted glyph, not a semantic green.
+   `.status-ok` (below in this file) sets `color: var(--success, …)`, which on
+   most themes is a green — so a finished explore read as a green light that
+   clashed with the card's accent palette. Keep the glyph and the badge on the
+   same accent the running state uses; only the fill marks the state change. */
+.explore-card-status .status-ok,
+.explore-panel .explore-card-status .status-ok {
+  color: var(--accent);
+}
+
+@keyframes explore-check-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* No per-state disc any more: the glyph already differs per state (✓ / ✗ / ⏹)
+   and is tinted by `.status-ok` / `.status-err` / `.status-denied` below, so the
+   background ring was pure decoration around a mark that was already distinct. */
+
+/* Run title: takes the free width on ONE line with a real ellipsis. */
+.trace-head-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.82;
+}
+
+.explore-card-count {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+.explore-card-arrow {
+  font-size: 11px;
+  opacity: 0.55;
+  transition:
+    transform 0.16s ease,
+    opacity 0.16s ease;
+}
+
+.explore-card-open:hover .explore-card-arrow {
+  opacity: 1;
+  transform: translate(1px, -1px);
+}
+
+/* Working state: an indeterminate shimmer rail under the head, so the card
+   still shows motion when no call has landed yet. */
+.explore-card-progress {
+  position: relative;
+  height: 2px;
+  margin: 0 12px 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.explore-card-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: explore-progress 1.35s ease-in-out infinite;
+}
+
+@keyframes explore-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+.explore-tool-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 12px 10px;
+}
+
+.explore-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.6;
+  animation: explore-chip-in 0.22s ease-out both;
+}
+
+.explore-tool-chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--text);
+}
+
+@keyframes explore-chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.explore-tool-name {
+  font-weight: 500;
+}
+
+.explore-tool-n {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+/* Motion is decoration here: state is still carried by color and glyphs. */
+@media (prefers-reduced-motion: reduce) {
+  .tool-card.explore.running,
+  .explore-card-status svg,
+  .explore-tool-chip {
+    animation: none;
+  }
+  .explore-card-progress::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.4;
+  }
+}
+
+/* Side panel: ONE explore run's tool group (calls, not the report). */
+.explore-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.explore-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.explore-panel-title {
+  font-weight: 600;
+  font-size: 12.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explore-panel-count {
+  font-size: 11px;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+.explore-panel-running {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.explore-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.explore-call {
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
+  overflow: hidden;
+  transition:
+    border-color 0.14s ease,
+    background 0.14s ease;
+}
+
+.explore-call:hover {
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* A failed or blocked call keeps its own edge, so it reads at a glance inside
+   a long run of otherwise identical rows. */
+.explore-call.running {
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.explore-call.error {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+.explore-call.denied {
+  border-color: color-mix(in srgb, var(--thinking) 40%, transparent);
+}
+
+.explore-call-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  padding: 6px 9px;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: start;
+}
+
+.explore-call-head:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.explore-call-head:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -2px;
+}
+
+.explore-call-head:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.explore-call-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: currentColor;
+  opacity: 0.55;
+}
+
+.explore-call-dot.done {
+  background: var(--success);
+  opacity: 1;
+}
+
+.explore-call-dot.running {
+  background: var(--accent);
+  opacity: 1;
+  animation: explore-dot-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes explore-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ToolActivity statuses are running|done|error|denied: style each one. The
+   generic `.failed` rule is kept as an alias so nothing regresses. */
+.explore-call-dot.failed,
+.explore-call-dot.error {
+  background: var(--danger);
+  opacity: 1;
+}
+
+.explore-call-dot.denied {
+  background: var(--thinking);
+  opacity: 1;
+}
+
+.explore-call-tool {
+  font-weight: 600;
+}
+
+/* The panel reuses the chat card's loading rail, flush with its own padding. */
+.explore-panel .explore-card-progress {
+  margin: 0;
+}
+
+.explore-call-tool {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+.explore-call-detail {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+  direction: ltr;
+}
+
+.explore-call-chev {
+  flex: 0 0 auto;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.explore-call-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 9px 8px;
+}

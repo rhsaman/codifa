@@ -166,7 +166,7 @@ console.log("4) unknown message id -> no-op, history untouched:");
 
 console.log("5) edit styles present in global.css:");
 {
-  const css = fs.readFileSync("src/styles/global.css", "utf8");
+  const css = await readFullCss("src/styles/global.css");
   check("pencil button class (.msg-copy.msg-edit)", css.includes(".msg-copy.msg-edit"));
   check("disabled edit button style", css.includes(".msg-copy.msg-edit:disabled"));
   check("inline edit box (.msg-edit-wrap)", css.includes(".msg-edit-wrap"));
@@ -249,4 +249,22 @@ if (failed > 0) {
 console.log("\nAll message edit checks passed");
 // The store keeps timers alive (persistSoon etc.) — force-exit so the script
 // terminates cleanly instead of hanging.
+
+// global.css is an index over src/styles/global/NN-*.css (split without
+// changing the cascade); concatenate all parts so stylesheet assertions see
+// the full text.
+async function readFullCss(p: string | URL): Promise<string> {
+  const fs = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const path = typeof p === 'string' ? p : fileURLToPath(p)
+  const parts: string[] = []
+  if (fs.existsSync(path) && fs.statSync(path).isFile()) parts.push(fs.readFileSync(path, 'utf8'))
+  const dir = path.replace(/\.css$/, '')
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.css')).sort()) {
+      parts.push(fs.readFileSync(`${dir}/${f}`, 'utf8'))
+    }
+  }
+  return parts.join('\n')
+}
 process.exit(0);

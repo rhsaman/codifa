@@ -1,0 +1,2523 @@
+
+
+
+/* ---- Settings → Tools: per-tool cards ----
+   One calm card per tool. The head gives the tool's name and purpose on one
+   line; the controls below share a FIXED two-column grid, so every card's
+   model picker and effort bar start and end at the same x — that alignment is
+   what makes four cards scan as one block instead of four loose forms, and it
+   is what keeps every reasoning slider exactly the same width. */
+.slot-page-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  margin-bottom: 6px;
+}
+
+.slot-intro {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  max-width: 72ch;
+}
+
+.slot-intro b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.slot-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  transition: border-color 0.15s ease;
+}
+
+.slot-card:hover {
+  border-color: color-mix(in srgb, var(--border) 75%, var(--accent) 25%);
+}
+
+.slot-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 10px;
+}
+
+.slot-card-title {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.slot-card-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+/* The tools' models are ONE column of pickers, capped at the composer picker's
+   own 340px, so a Settings row is never wider here than in the footer. The
+   effort bar sits directly above the list and is capped to the same width, so
+   the bar and every model picker start at the same x on all four cards. */
+.slot-chain-effort {
+  max-width: 340px;
+  margin-bottom: 10px;
+}
+
+.slot-card-effort {
+  min-width: 0;
+}
+
+/* The picker fills its (capped) column instead of sizing to the longest model
+   name, so all rows line up regardless of what each one has selected. */
+.slot-fallback-picker .pm-select {
+  display: flex;
+  width: 100%;
+}
+
+.slot-fallback-picker .pm-select-btn {
+  width: 100%;
+  max-width: none;
+  justify-content: space-between;
+}
+
+.slot-fallback-picker .pm-select-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.slot-card-effort .thinking-bar {
+  margin: 0;
+}
+
+/* One width for every level label too: without this the track loses a few
+   pixels whenever the current level is a long word ("Medium", "XHigh"). */
+.slot-card-effort .thinking-bar-label {
+  flex: 0 0 44px;
+  width: 44px;
+  text-align: right;
+}
+
+/* A model that cannot report reasoning keeps the bar usable; the card only
+   dims its label instead of printing a paragraph under every row. */
+.slot-card[data-reasoning='off'] .thinking-bar-label {
+  opacity: 0.55;
+}
+
+.slot-card-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 7px;
+}
+
+.slot-card-sub-title {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.slot-card-sub-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+@media (max-width: 720px) {
+  .slot-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+
+  .slot-card-effort .thinking-bar-label {
+    flex: 0 0 40px;
+    width: 40px;
+  }
+
+  /* Full width on a narrow screen: a capped column would leave the pickers
+     shorter than the card for no reason. */
+  .slot-chain-effort {
+    max-width: none;
+  }
+}
+
+/* ---- Settings → Tools: fallback rows ---- */
+/* ---- Settings: shared drag-to-reorder (Tools fallbacks, Web Provider
+   engines, Media Provider ladders, provider API keys). Same drag feel as the
+   chat tab bar: the dragged row slides into its landing slot and the rows
+   between slide aside — `shiftStyle` transforms and `.dnd-shifting` provides
+   the transition, so the list previews its final order live. ---- */
+.dnd-grip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 26px;
+  border-radius: 6px;
+  color: var(--text-dim);
+  /* Dimmed like the other per-row controls: N always-on grips per list is
+     noise; hover/focus reveals them at full strength. */
+  opacity: 0.45;
+  cursor: grab;
+  transition:
+    opacity 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.dnd-grip:hover,
+.slot-fallback-row:hover .dnd-grip,
+.slot-fallback-row:focus-within .dnd-grip,
+.plugin-row:hover .dnd-grip,
+.voice-fallback-card:hover .dnd-grip,
+.api-key-row:hover .dnd-grip {
+  opacity: 1;
+}
+
+.dnd-grip:active {
+  cursor: grabbing;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* The slide animation, attached ONLY while a drag is active: dropping also
+   clears the transforms, and without this class that removal would animate
+   on top of the already-corrected DOM order (a one-row flash). */
+.dnd-shifting {
+  transition: transform 170ms cubic-bezier(0.25, 0.7, 0.3, 1);
+}
+
+/* The dragged row itself — the muted landing slot, like the tab bar's
+   drop-preview: it arrives where it will land. */
+.dnd-dragging {
+  opacity: 0.72;
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent) !important;
+  background: color-mix(in srgb, var(--accent) 9%, transparent) !important;
+  outline: 1px dashed color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: -1px;
+  z-index: 1;
+}
+
+.slot-fallbacks {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.slot-fallback-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.slot-fallback-order {
+  flex: 0 0 auto;
+  width: 13px;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  opacity: 0.6;
+  text-align: right;
+}
+
+/* Row 1 is the tool's OWN model, not a fallback: its number is tinted and it is
+   nudged apart from the rest, so the list reads "this one first, then these"
+   without a second label. */
+.slot-fallback-row-own {
+  margin-bottom: 3px;
+}
+
+.slot-fallback-row-own .slot-fallback-order {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.slot-fallback-picker {
+  /* Same cap as the model picker above, so a fallback row never becomes a
+     card-wide text field either. */
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 340px;
+}
+
+.slot-fallback-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex: 0 0 auto;
+  /* Dimmed until the row is hovered or focused: four cards x N rows of
+     always-on buttons is the noise this design avoids. 0.55 keeps each icon
+     above the 3:1 contrast floor for graphical controls. */
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+
+.slot-fallback-row:hover .slot-fallback-actions,
+.slot-fallback-row:focus-within .slot-fallback-actions {
+  opacity: 1;
+}
+
+.slot-fallback-remove:hover {
+  color: var(--danger, #e5484d);
+}
+
+.slot-fallback-add {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 3px 0 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.slot-fallback-add:hover {
+  color: var(--accent);
+}
+
+.slot-fallback-add:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+@media (max-width: 640px) {
+  .slot-fallback-actions {
+    opacity: 1;
+  }
+}
+
+/* ---- Settings: shared panel card (Web Providers / Media Providers) ----
+   The same calm anatomy as the tool cards, so all three tabs read alike. */
+.panel-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.panel-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 10px;
+}
+
+.panel-card-title {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.panel-card-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+@media (max-width: 720px) {
+  .panel-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+}
+
+/* Web Providers: engine rows are flat list items inside a panel card. */
+.plugin-list {
+  gap: 6px;
+}
+
+.plugin-row {
+  border-radius: 10px;
+  background: var(--bg-inset);
+  border-color: var(--hairline);
+}
+
+.plugin-row.off {
+  opacity: 0.5;
+}
+
+.plugin-row-head {
+  padding: 8px 10px;
+}
+
+.plugin-role-hint {
+  font-style: normal;
+  font-size: 10.5px;
+  opacity: 0.7;
+}
+
+/* Media Providers: flatten the nested wells so each card is one surface. */
+.model-card-voice {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.model-card-voice .model-card-head {
+  padding: 0;
+  border: none;
+  background: none;
+  margin-bottom: 10px;
+}
+
+.model-card-voice .model-card-head .model-card-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.model-card-voice .model-card-head .model-card-desc {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.model-card-voice .model-card-body {
+  padding: 0;
+  border: none;
+  background: none;
+  gap: 12px;
+}
+
+.voice-section {
+  padding: 0;
+  border: none;
+  background: none;
+  gap: 10px;
+}
+
+.voice-fallbacks {
+  padding: 0;
+  border: none;
+  background: none;
+  gap: 6px;
+}
+
+.voice-fallback-card {
+  gap: 8px;
+  padding: 8px;
+  border-radius: 10px;
+  background: var(--bg-inset);
+  border-color: var(--hairline);
+}
+/* A skill that ships inside a plugin: the label is the owning bundle name, so a
+   mixed list of own skills and plugin skills stays readable at a glance. */
+.badge.plugin-skill-badge {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A bundle that is switched off contributes nothing to the agent, so its
+   skills are listed but visibly inert. */
+.badge.plugin-skill-badge.off {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+/* A connector owned by a plugin keeps its own name (the bundle owns the file),
+   so the name field is locked and the badge says who owns it. Its settings are
+   still editable and the row is still deletable. */
+.mcp-card-title .badge.plugin-skill-badge {
+  margin-left: 6px;
+}
+
+/* ---------------------------------------------------------------------------
+   Plugin detail page (src/components/PluginDetail.tsx)
+
+   The card in the grid answers "is this on, and what does it carry"; this page
+   answers "what exactly is inside it, and what are those things FOR". It is a
+   full-screen overlay rather than an expander because three lists with their
+   own forms do not fit in a grid column. Sits above the settings modal (100)
+   and the reading panel (120), and is portalled to <body> so no ancestor can
+   clip it.
+   --------------------------------------------------------------------------- */
+
+/* The way in, on every bundle card: one full-width hit area under the meta row,
+   so the whole card body reads as openable without a hunt for a small link. */
+.pm-card-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: auto;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.pm-card-open:hover {
+  background: var(--accent-dim, rgba(128, 128, 128, 0.12));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.pm-card-open-hint {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pm-card-open .pd-chevron {
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.pd-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  animation: modal-fade-in 0.15s ease;
+}
+
+.pd-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(980px, 100%);
+  max-height: min(88vh, 900px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-panel, var(--bg-alt));
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+/* Header: the bundle's identity on the left, its census on the right. */
+.pd-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 10%, transparent),
+    transparent
+  );
+}
+
+.pd-head-title {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+
+.pd-head-title h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-slug {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.pd-badge {
+  font-size: 10px;
+  line-height: 1.6;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.pd-badge--off {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+/* A part row with nothing to edit (a command row, a hook row): the head is a
+   plain line, not a disclosure button, so it must not advertise "Edit". */
+.pd-part-head--static {
+  cursor: default;
+}
+
+/* The hooks approval banner: a shell-invoking part of a bundle the user has to
+   say yes to, so it is stated in place rather than buried in a tab. */
+.pd-hook-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pd-hook-state.on {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text);
+}
+
+.pd-head-meta {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The header's right side: the whole-bundle Delete next to the close button. */
+.pd-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.pd-close {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.pd-close:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Tabs: pills, so the active room is a filled shape instead of an underline. */
+.pd-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.pd-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.pd-tab:hover {
+  color: var(--text);
+  background: var(--accent-dim, rgba(128, 128, 128, 0.12));
+}
+
+.pd-tab.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.pd-count {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-alt);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pd-source {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding-bottom: 2px;
+}
+
+/* One part (skill / connector / script): a row that opens into its editor.
+   Closed rows stay quiet; the open one gets the accent rail so the page shows
+   at a glance how many editors are live.
+
+   `flex: 0 0 auto` is what keeps a row ROW-sized: `.pd-content` is a flex
+   column that scrolls, and a scroll container SHRINKS its children to fit
+   (shrink defaults to 1). A bundle with 26 skills asked for ~700px inside a
+   ~600px box, so flex divided the overflow by the row count and every row came
+   out a few px shorter than its own text — 13px instead of 57px. The head is
+   `overflow: hidden` on the row, so each name lost its top and bottom the way
+   the screenshot showed. The page scrolls through `.pd-content`'s
+   `overflow-y: auto`; the rows just have to keep their natural height. */
+.pd-part {
+  position: relative;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color 0.15s ease;
+}
+
+.pd-part.open {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.pd-part.open::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent);
+}
+
+/* Two lines per row: the name/badge/action line gets the full width, and the
+   description sits UNDER it. Side by side, the description — which is long by
+   nature — squeezed the name down to "Anthronic Fronten…". */
+.pd-part-head {
+  display: grid;
+  flex: none;
+  grid-template-columns: auto 1fr;
+  column-gap: 9px;
+  row-gap: 3px;
+  align-items: center;
+  width: 100%;
+  padding: 10px 13px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pd-part-head:hover {
+  background: var(--accent-dim, rgba(128, 128, 128, 0.1));
+}
+
+.pd-part-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.pd-part-name {
+  font-weight: 600;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-part-sub {
+  grid-column: 2;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+  /* Two lines, then it is cut. `max-height` + `overflow: hidden` clamps the
+     same way in every engine — the WebKit-only `-webkit-line-clamp` behaves
+     differently under WKWebView, where this app actually runs. A paragraph-long
+     description must not push the next row off screen, and it must never be
+     hidden outright: it is the one thing that tells two parts apart. */
+  max-height: calc(2 * 1.4em);
+  overflow: hidden;
+}
+
+.pd-part-action {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.pd-chevron {
+  flex: 0 0 auto;
+  font-size: 8px;
+  color: var(--text-dim);
+  transition: transform 0.18s ease;
+}
+
+.pd-chevron.open {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+
+.pd-part-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 13px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+/* The bulk pass over a bundle's untranslated skills: the sentence explains why
+   the button matters (no Persian keyword = unreachable from a Persian ask), so
+   the row reads as a fix, not as another toolbar. */
+.pd-bulk {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* The per-row "Translate description" affordance under the keyword field. */
+.pd-field-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pd-bundle {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+/* Forms: two labelled fields shared by all three part types, then a row of
+   actions. Inputs are styled here rather than inherited, so a part editor looks
+   the same wherever it is opened. */
+.pd-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pd-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.pd-panel input,
+.pd-panel textarea,
+.pd-panel select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  resize: vertical;
+}
+
+.pd-panel input:focus,
+.pd-panel textarea:focus,
+.pd-panel select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.pd-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pd-error {
+  color: var(--danger);
+}
+
+.pd-msg {
+  position: sticky;
+  bottom: 0;
+  align-self: flex-start;
+  padding: 6px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 999px;
+  background: var(--bg-panel, var(--bg-alt));
+  color: var(--text);
+  font-size: 12px;
+}
+
+.pd-content .mcp-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+@media (max-width: 720px) {
+  .pd-overlay {
+    padding: 10px;
+  }
+
+  .pd-panel {
+    max-height: 94vh;
+  }
+
+  /* The description is NOT hidden on a narrow window. It used to be
+     `display: none` here, which is why a smaller window rendered every row as a
+     bare name with no way to tell two parts apart; the two-line clamp above
+     already keeps the row short. */
+}
+
+/* ==========================================================================
+   Modern-terminal polish layer — applies to EVERY page.
+   Global primitives only (scrollbars, selection, carets, numbers, focus,
+   baselines): the per-page themes already carry the identity, this layer
+   makes them all feel like one instrument panel. No layout changes.
+   ========================================================================== */
+
+/* Native widgets (checkboxes, radios, progress) pick up the theme accent. */
+:root {
+  accent-color: var(--accent);
+}
+
+/* The caret glows with the accent — a small but constant "live terminal" cue
+   in every input on every page. */
+input,
+textarea,
+[contenteditable="true" i],
+[contenteditable="plaintext-only" i] {
+  caret-color: var(--accent);
+}
+
+/* Numbers align in columns everywhere (usage chips, timestamps, diff counts,
+   token stats): the tabular read is half the terminal feel. */
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Text selection: a quiet accent wash instead of the platform default. */
+::selection {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text);
+}
+
+/* Scrollbars: slimmer, translucent, and they fade up when the pane is
+   hovered — chrome that stays out of the way until wanted. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text) 26%, transparent);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Focus ring: one crisp accent line plus a soft halo — precise like a cursor
+   block, not a heavy 2px slab. */
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+/* Every button gets one shared interaction baseline, so hovers feel uniform
+   across pages even where a component declares none of its own. */
+button {
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease,
+    opacity 0.12s ease;
+}
+
+/* Inputs that no page styled explicitly still land on the shared shape. */
+:where(input[type="text"], input[type="search"], input:not([type])) {
+  border-radius: 8px;
+}
+
+/* Floating chrome (tab-list dropdown, workspace menu) turns into frosted
+   glass: translucent panel fill + backdrop blur reads modern without losing
+   the dark terminal weight. */
+.tab-list-menu {
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.1);
+  backdrop-filter: blur(18px) saturate(1.1);
+}
+
+.ws-menu {
+  background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(16px) saturate(1.1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Settings pages — UI refresh
+   Every rule below is scoped to `.settings-modal` (or a class only the
+   settings pages use) so no other surface changes. Goals:
+   one visual language for all 11 tabs — lifted cards on the page
+   background, a clear title/row/sub-label hierarchy, readable line
+   lengths, softer borders, consistent focus states.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.settings-modal {
+  --set-card-border: color-mix(in srgb, var(--border) 55%, transparent);
+  --set-card-border-hover: color-mix(in srgb, var(--border) 45%, var(--accent) 55%);
+  --set-card-bg: color-mix(in srgb, var(--bg-panel) 72%, var(--bg) 28%);
+  --set-max-w: 1080px;
+}
+
+/* ── Shell ─────────────────────────────────────────────────────────────── */
+
+.settings-modal .settings-header {
+  padding: 16px 28px;
+  background: color-mix(in srgb, var(--bg) 92%, var(--text) 8%);
+  /* macOS: the traffic lights overlay this header (the modal covers the whole
+     window), so the title starts right of them. Direction pinned LTR because
+     the lights are physical — in RTL the close button must not slide under
+     them either. */
+  direction: ltr;
+}
+
+.mac .settings-modal .settings-header {
+  padding-left: 88px;
+}
+
+.settings-modal .settings-header h2 {
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.settings-modal .settings-header-tab {
+  padding: 3px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.settings-modal .modal-close {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+}
+
+.settings-modal .modal-close:hover {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+/* Sidebar — flat pill tabs instead of a left bar accent. */
+.settings-modal .settings-tabs {
+  flex: 0 0 204px;
+  padding: 16px 12px 20px;
+  gap: 3px;
+  background: color-mix(in srgb, var(--bg) 55%, var(--bg-panel) 45%);
+  /* No scrollbar-width here: the global overlay-bar sweep owns this scroller
+     (.sp-scroll hides the native bar). A native thin bar AND the overlay
+     thumb on the same edge rendered as TWO scrollbars on every settings
+     page. */
+}
+
+.settings-tab-group {
+  padding: 16px 12px 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  color: var(--text-dim);
+  opacity: 0.62;
+}
+
+.settings-tab-group:first-child {
+  padding-top: 4px;
+}
+
+.settings-modal .settings-tab {
+  border-left: none;
+  border-radius: 9px;
+  padding: 8px 12px;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.settings-modal .settings-tab:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+
+.settings-modal .settings-tab:active {
+  background: color-mix(in srgb, var(--text) 11%, transparent);
+}
+
+.settings-modal .settings-tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.settings-modal .settings-tab.active {
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-modal .settings-tab-icon {
+  opacity: 0.8;
+}
+
+.settings-modal .settings-tab.active .settings-tab-icon {
+  color: var(--accent);
+}
+
+/* Content — one readable column, centered on wide windows. */
+.settings-modal .settings-content {
+  padding: 26px 34px 64px;
+  max-width: var(--set-max-w);
+  margin: 0 auto;
+  /* No scrollbar-width/color here (same reason as .settings-tabs): the
+     overlay sweep owns this scroller — a native thin bar plus the overlay
+     thumb painted TWO scrollbars on every settings page. */
+}
+
+/* Footer — hairline + slightly taller, so the action row feels anchored. */
+.settings-modal .modal-actions {
+  padding: 13px 28px;
+  gap: 10px;
+  background: color-mix(in srgb, var(--bg) 96%, var(--text) 4%);
+}
+
+.settings-modal .modal-actions .btn {
+  padding: 8px 22px;
+}
+
+/* ── Typography hierarchy ──────────────────────────────────────────────── */
+
+/* Bare `.field > label` opens a SECTION (Providers, Modes, Theme, Font
+   Size…); `.field-head label` titles one SETTING row; `.field-label` is a
+   small sub-label. Keeping these three apart is what makes every tab scan
+   the same way. */
+.settings-modal .field > label {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.settings-modal .field-head label,
+.settings-modal .field-head .field-label {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+  margin-bottom: 0;
+}
+
+.settings-modal .field .field-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  margin: 12px 0 5px;
+}
+
+/* Hints: readable line length (the auth intro ran the full 1200px width). */
+.settings-modal .hint {
+  font-size: 12px;
+  line-height: 1.62;
+  color: var(--text-dim);
+  max-width: 76ch;
+}
+
+.settings-modal .field .hint {
+  font-size: 12px;
+  opacity: 1;
+  margin-top: 6px;
+}
+
+.settings-modal .hint b,
+.settings-modal .hint strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-modal .hint code {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+}
+
+/* Inline error/note hints become quiet banners instead of naked red text. */
+.settings-modal .hint.error-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 26%, transparent);
+  color: var(--danger);
+  max-width: 100%;
+}
+
+/* Empty states (no plugins, nothing matches) read as a quiet well. */
+.settings-modal .empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 34px 20px;
+  border: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 14px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  background: color-mix(in srgb, var(--bg-panel) 40%, transparent);
+}
+
+/* ── Inputs & selects ────────────────────────────────────────────────────
+   The global "borderless" pass strips input borders; inside Settings the
+   card language needs the field edge back, so these re-declare the full
+   border shorthand (not just border-color) at higher specificity. */
+.settings-modal .field input,
+.settings-modal .field select {
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 13px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  background: color-mix(in srgb, var(--bg-input) 88%, var(--bg) 12%);
+}
+
+.settings-modal .field input:hover:not(:focus),
+.settings-modal .field select:hover:not(:focus) {
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+.settings-modal .field input::placeholder {
+  color: color-mix(in srgb, var(--text-dim) 62%, transparent);
+}
+
+.settings-modal .field textarea.system-prompt {
+  border-radius: 12px;
+  padding: 11px 13px;
+  min-height: 110px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  background: color-mix(in srgb, var(--bg-input) 88%, var(--bg) 12%);
+}
+
+.settings-modal .field textarea.system-prompt:hover:not(:focus) {
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+/* Number steppers (results per search, TTL, budget…). */
+.settings-modal .settings-row-control input[type="number"],
+.settings-modal .field input[type="number"] {
+  width: 96px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-modal .field-unit {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* ── Unified cards ───────────────────────────────────────────────────────
+   One card recipe for every tab: lifted panel surface, soft border,
+   gentle hover lift. Applies to the settings-only card classes. */
+.settings-modal .settings-group,
+.settings-modal .slot-card,
+.settings-modal .panel-card,
+.settings-modal .models-tab .model-card,
+.settings-modal .model-card-voice,
+.settings-modal .mode-card,
+.settings-modal .models-catalog-card,
+.settings-modal .guided-steps {
+  border: 1px solid var(--set-card-border);
+  border-radius: 14px;
+  background: var(--set-card-bg);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12);
+  transition:
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.16s ease;
+}
+
+.settings-modal .settings-group:hover,
+.settings-modal .slot-card:hover,
+.settings-modal .panel-card:hover,
+.settings-modal .models-tab .model-card:hover,
+.settings-modal .model-card-voice:hover,
+.settings-modal .mode-card:hover,
+.settings-modal .models-catalog-card:hover {
+  border-color: var(--set-card-border-hover);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 6px 20px -8px rgba(0, 0, 0, 0.35);
+}
+
+.settings-modal .settings-group,
+.settings-modal .panel-card,
+.settings-modal .slot-card {
+  padding: 14px 16px 15px;
+  margin-bottom: 14px;
+}
+
+/* Card head: title on its own line, description BELOW it (the old
+   baseline-joined row made every card read as one long sentence). */
+.settings-modal .panel-card-head,
+.settings-modal .slot-card-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.settings-modal .panel-card-title,
+.settings-modal .slot-card-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.settings-modal .panel-card-desc,
+.settings-modal .slot-card-desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  opacity: 1;
+  max-width: 82ch;
+}
+
+/* ── Providers ─────────────────────────────────────────────────────────── */
+
+.settings-modal .provider-tabs {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-modal .provider-tab {
+  border-radius: 10px;
+  padding: 7px 13px;
+  gap: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  background: color-mix(in srgb, var(--bg-input) 75%, var(--bg) 25%);
+  transition:
+    border-color 0.14s ease,
+    background 0.14s ease,
+    box-shadow 0.14s ease;
+}
+
+.settings-modal .provider-tab:hover {
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+.settings-modal .provider-tab.active {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.settings-modal .provider-tab-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Status dot: colored core + soft halo, so ok/off reads at a glance. */
+.settings-modal .provider-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.settings-modal .provider-tab-dot.ok {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent);
+}
+
+.settings-modal .provider-tab-dot.off {
+  background: color-mix(in srgb, var(--text-dim) 55%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-dim) 10%, transparent);
+}
+
+.settings-modal .provider-tab-remove {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  opacity: 0.55;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.settings-modal .provider-tab:hover .provider-tab-remove {
+  opacity: 1;
+}
+
+.settings-modal .provider-tab-remove:hover {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
+}
+
+/* The "no API key yet" warning becomes a real banner. */
+.settings-modal .env-key-hint {
+  font-size: 12.5px;
+}
+
+.settings-modal .env-key-hint.fail {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 13px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+  margin: 4px 0 12px;
+}
+
+.settings-modal .env-key-hint.ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 13px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--success) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--success) 22%, transparent);
+  margin: 4px 0 12px;
+}
+
+/* Models catalog card: button and count chip align on one baseline row. */
+.settings-modal .models-catalog-card {
+  padding: 13px 14px;
+}
+
+.settings-modal .fetch-models-status {
+  flex: 1 1 auto;
+}
+
+.settings-modal .fetch-models-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  white-space: nowrap;
+}
+
+/* ── Auth ──────────────────────────────────────────────────────────────── */
+
+.settings-modal .guided-steps {
+  padding: 10px 14px;
+  margin: 10px 0 14px;
+}
+
+.settings-modal .guided-steps summary {
+  font-weight: 650;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.settings-modal .oauth-signin-btn {
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25), 0 6px 18px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* ── Web Providers (search engines) ────────────────────────────────────── */
+
+.settings-modal .plugin-row {
+  border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  background: color-mix(in srgb, var(--bg) 55%, var(--bg-input) 45%);
+  transition: border-color 0.14s ease, opacity 0.14s ease;
+}
+
+.settings-modal .plugin-row:hover {
+  border-color: color-mix(in srgb, var(--border) 35%, var(--accent) 65%);
+}
+
+.settings-modal .plugin-kind {
+  font-weight: 650;
+}
+
+.settings-modal .plugin-badge.primary {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--accent);
+}
+
+.settings-modal .plugin-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  min-width: 24px;
+  padding: 3px 6px;
+}
+
+.settings-modal .plugin-remove:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+
+/* ── Media Providers ───────────────────────────────────────────────────── */
+
+.settings-modal .model-card-voice {
+  padding: 16px 18px;
+}
+
+.settings-modal .model-card-voice .model-card-title {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.settings-modal .voice-field select,
+.settings-modal .voice-field input,
+.settings-modal .voice-field textarea {
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+}
+
+.settings-modal .voice-fallback-card {
+  border-radius: 11px;
+}
+
+/* ── Tools ─────────────────────────────────────────────────────────────── */
+
+.settings-modal .slot-intro {
+  font-size: 12.5px;
+  line-height: 1.65;
+  margin-bottom: 16px;
+  max-width: 78ch;
+}
+
+.settings-modal .slot-card {
+  padding: 15px 17px;
+}
+
+.settings-modal .slot-card-title {
+  font-size: 13.5px;
+}
+
+/* Effort bar: taller track, gradient fill, ringed thumb, visible pips. */
+.settings-modal .thinking-bar-track::before {
+  height: 6px;
+  background: color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.settings-modal .thinking-bar-fill {
+  height: 6px;
+  background: linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 45%, transparent),
+      var(--accent));
+}
+
+.settings-modal .thinking-bar-thumb {
+  width: 15px;
+  height: 15px;
+  border-width: 3px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+.settings-modal .thinking-bar-pip {
+  width: 4px;
+  height: 4px;
+  opacity: 0.65;
+}
+
+.settings-modal .thinking-bar-label {
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+/* ── Modes ─────────────────────────────────────────────────────────────── */
+
+.settings-modal .mode-card {
+  padding: 15px 17px;
+  margin-bottom: 12px;
+}
+
+.settings-modal .mode-card-title {
+  font-size: 14px;
+}
+
+.settings-modal .mode-card .badge {
+  font-size: 10.5px;
+}
+
+/* ── Plugins & Marketplaces grids ──────────────────────────────────────── */
+
+.settings-modal .pm-card,
+.settings-modal .market-card {
+  border-radius: 13px;
+  border: 1px solid var(--set-card-border);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.settings-modal .pm-card:hover,
+.settings-modal .market-card:hover {
+  border-color: var(--set-card-border-hover);
+  box-shadow: 0 6px 20px -8px rgba(0, 0, 0, 0.35);
+}
+
+.settings-modal .settings-search input[type="search"],
+.settings-modal .market-add-repo {
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+}
+
+/* ── Storage (reference card style, gently polished) ───────────────────── */
+
+.settings-modal .settings-group-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  font-size: 16px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  filter: none;
+  margin-top: 0;
+}
+
+.settings-modal .settings-group-title {
+  font-size: 13.5px;
+}
+
+.settings-modal .settings-row {
+  padding: 14px 16px;
+}
+
+.settings-modal .settings-row-title {
+  font-size: 13px;
+}
+
+.settings-modal .settings-row-desc {
+  max-width: 82ch;
+}
+
+/* ── Appearance ────────────────────────────────────────────────────────── */
+
+.settings-modal .theme-grid {
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 10px;
+}
+
+.settings-modal .theme-card {
+  border-radius: 13px;
+  padding: 12px;
+  gap: 9px;
+  background: var(--set-card-bg);
+}
+
+.settings-modal .theme-swatch i {
+  width: 16px;
+  height: 16px;
+}
+
+.settings-modal .theme-name {
+  font-size: 12.5px;
+}
+
+.settings-modal .font-preview {
+  border-radius: 12px;
+  font-size: 1.05em;
+}
+
+/* ── General ───────────────────────────────────────────────────────────── */
+
+.settings-modal .font-size-row {
+  max-width: 640px;
+}
+
+.settings-modal .range-thumb {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+/* Saved chip ("Saved ✓") floats in the footer. */
+.settings-modal .settings-saved {
+  border-radius: 999px;
+  padding: 5px 14px;
+}
+
+/* ── Follow-ups from the visual pass ───────────────────────────────────── */
+
+/* Single-line dropdowns and lone text inputs cap at the same width as the
+   sliders next to them (the app's own --field-max-w intent for fullscreen
+   settings). Composite rows (API-key list, manual-model row) keep their own
+   layout — only DIRECT field children and voice-field text inputs cap. */
+.settings-modal .field > select,
+.settings-modal .field > input,
+.settings-modal .voice-field select,
+.settings-modal .voice-field input {
+  max-width: var(--field-max-w);
+}
+
+/* Marketplace chips: flat underlined links become real pills, so the
+   subscription list reads as a set of removable items. */
+.settings-modal .market-tab {
+  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  background: color-mix(in srgb, var(--bg-input) 75%, var(--bg) 25%);
+  border-radius: 9px;
+  padding: 4px 8px 4px 12px;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.settings-modal .market-tab + .market-tab::before {
+  display: none;
+}
+
+.settings-modal .market-tab:hover {
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+.settings-modal .market-tab.active {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 11%, var(--bg-input));
+}
+
+.settings-modal .market-tab-name {
+  text-decoration: none;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.settings-modal .market-tab.active .market-tab-name {
+  color: var(--accent);
+}
+
+.settings-modal .market-tab-x {
+  opacity: 0.6;
+}
+
+.settings-modal .market-tab-x:hover {
+  opacity: 1;
+}
+
+/* The check bubble renders on EVERY theme card (the span is always present,
+   only its ✓ text changes), so inactive cards showed a bare accent dot.
+   Only the selected card keeps it. */
+.settings-modal .theme-card:not(.active) .theme-check {
+  display: none;
+}
+
+/* Native <input type=range> used to leak WebKit's light track into the
+   Appearance sliders; they now use the custom RangeSlider. Any native range
+   that ever appears still gets theme-consistent track/thumb colors instead
+   of the macOS default. */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 18px;
+  background: transparent;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+input[type='range']::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
+
+input[type='range']::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Plugin detail popup (PluginDetail) — same design language as the
+   settings refresh. The panel is PORTALED to <body>, so `.settings-modal`
+   rules never reach it; these selectors stand alone.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.pd-panel {
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 86%, var(--bg) 14%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 24px 70px -12px rgba(0, 0, 0, 0.6);
+}
+
+.pd-head {
+  align-items: center;
+  padding: 15px 20px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  background: none;
+}
+
+.pd-head-title {
+  gap: 10px;
+}
+
+.pd-head-title h2 {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.pd-slug {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.pd-close {
+  margin-left: auto;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 9px;
+  font-size: 13px;
+  background: transparent;
+  transition: background 0.13s ease, color 0.13s ease;
+}
+
+.pd-close:hover {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  color: var(--text);
+}
+
+/* Tabs → one segmented control instead of loose pills. */
+.pd-tabs {
+  gap: 4px;
+  padding: 10px 18px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.pd-tab {
+  padding: 6px 13px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--text-dim);
+}
+
+.pd-tab:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+
+.pd-tab.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text);
+  font-weight: 650;
+}
+
+.pd-tab.active .pd-count {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--accent);
+}
+
+.pd-count {
+  font-size: 10.5px;
+  font-weight: 650;
+  padding: 1px 7px;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+/* Content column breathes more. */
+.pd-content {
+  padding: 16px 20px 20px;
+  gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 18%, transparent) transparent;
+}
+
+/* Part rows: quieter closed state, clearer open state. */
+.pd-part {
+  border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--bg) 45%, var(--bg-panel) 55%);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.pd-part:hover {
+  border-color: color-mix(in srgb, var(--border) 35%, var(--accent) 65%);
+}
+
+.pd-part.open {
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 80%, var(--bg) 20%);
+}
+
+.pd-part-head {
+  padding: 11px 14px;
+  column-gap: 10px;
+}
+
+.pd-part-head:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.pd-part-name {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.pd-part-sub {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+/* Edit/Close affordance: a real ghost pill instead of bare dim text. */
+.pd-part-action {
+  font-size: 11px;
+  font-weight: 650;
+  padding: 3px 11px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  color: var(--text-dim);
+  transition: color 0.13s ease, border-color 0.13s ease, background 0.13s ease;
+}
+
+.pd-part-head:hover .pd-part-action {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+.pd-part.open .pd-part-action {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.pd-chevron {
+  font-size: 9px;
+  width: 10px;
+  text-align: center;
+}
+
+.pd-part-body {
+  padding: 14px 16px 16px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  background: color-mix(in srgb, var(--bg) 55%, var(--bg-panel) 45%);
+}
+
+/* Form fields match the settings inputs: soft edge, hover tint. */
+.pd-panel input,
+.pd-panel textarea,
+.pd-panel select {
+  padding: 8px 11px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-input) 88%, var(--bg) 12%);
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.pd-panel input:hover:not(:focus),
+.pd-panel textarea:hover:not(:focus),
+.pd-panel select:hover:not(:focus) {
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+.pd-panel input:focus,
+.pd-panel textarea:focus,
+.pd-panel select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.pd-field {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* ═══════════════ Plugin bundle cards — decluttered redesign ═══════════════
+   The rail + boxed footer + oversized switch made every card read busy.
+   The switch alone carries state now; the card joins the settings card
+   language and the footer becomes a hairline row. */
+.settings-modal .pm-card {
+  gap: 9px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--bg-panel) 72%, var(--bg) 28%);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.settings-modal .pm-card:hover {
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 6px 20px -8px rgba(0, 0, 0, 0.35);
+}
+
+/* Off state: quiet, not dimmed-to-illegible. */
+.settings-modal .pm-card--off {
+  opacity: 0.72;
+}
+
+.settings-modal .pm-card--off .pm-card-name {
+  color: var(--text-dim);
+}
+
+.settings-modal .pm-card-name {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.settings-modal .pm-card-desc {
+  font-size: 12px;
+  line-height: 1.55;
+  -webkit-line-clamp: 2;
+}
+
+.settings-modal .pm-card-actions .btn.tiny.secondary {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--border) 65%, transparent);
+  color: var(--text-dim);
+}
+
+.settings-modal .pm-card-actions .btn.tiny.secondary:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--border) 40%, var(--accent) 60%);
+}
+
+.settings-modal .pm-card-actions .btn.tiny.secondary.pm-danger:hover {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+/* Footer action: a hairline row, not another box inside the box. */
+.settings-modal .pm-card-open {
+  margin-top: 3px;
+  padding: 9px 2px 1px;
+  border: none;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  border-radius: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-modal .pm-card-open:hover {
+  background: transparent;
+  color: var(--accent);
+}
+
+.settings-modal .pm-card-open:hover .pd-chevron {
+  color: var(--accent);
+}
+
+.settings-modal .pm-card-open .pd-chevron {
+  font-size: 8px;
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+
+.settings-modal .pm-card-open:hover .pd-chevron {
+  transform: translateX(2px);
+}
+
+/* Switch: one size calmer than the old pill. */
+.settings-modal .pm-switch {
+  --sw-w: 30px;
+  --sw-h: 17px;
+}
+
+.settings-modal .pm-switch .pm-switch-knob {
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+}
+
+/* ═══════════════ Follow-ups from the live plugin-tab pass ═══════════════ */
+
+/* Cards in ONE row share one height; the footer (margin-top:auto) pins to the
+   bottom so every card's action row lines up. */
+.settings-grid {
+  align-items: stretch;
+}
+
+/* The slug next to the popup title looked like a text input (border + fill).
+   Quiet mono text carries the same fact without the chrome. */
+.pd-slug {
+  border: none;
+  background: none;
+  padding: 0;
+  text-transform: lowercase;
+}
+
+/* Active tab: tint only, no outline; the count reads as a plain number, not a
+   pill nested inside a pill. */
+.pd-tab.active {
+  border-color: transparent;
+}
+
+.pd-count {
+  padding: 0 2px;
+  background: none;
+  color: var(--text-dim);
+  opacity: 0.9;
+}
+
+.pd-tab.active .pd-count {
+  background: none;
+  color: var(--accent);
+}
+
+/* The global :focus-visible halo draws a RECTANGLE around the borderless
+   composer textarea, inside the rounded pill — read as a stray border. The
+   caret is the composer's focus indicator; no ring, no halo. */
+.composer-input:focus,
+.composer-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* History popup rows are KEYBOARD-ONLY: the mouse gets zero effect — no
+   hover highlight, no click-to-send, no hover-fill of the input. Rows ignore
+   the pointer entirely (the popup itself still wheel-scrolls over them);
+   only the pin button opts back in, since pinning is mouse-only. */
+.hist-card {
+  pointer-events: none;
+  cursor: default;
+}
+
+.hist-card .history-pin {
+  pointer-events: auto;
+}
+
+/* ═══════════════ Storage tab — de-banner the settings groups ═══════════════
+   The group head painted a DARKER strip than the card body (its gradient
+   ends at --bg while the card surface is lighter), and the :has(.btn.danger)
+   rule ringed the whole Backup card in a colored border. One quiet card
+   recipe instead: flat head, hairline separators, no mood rings. */
+.settings-modal .settings-group-head {
+  background: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  padding: 14px 16px 12px;
+}
+
+.settings-modal .settings-group-head::after {
+  display: none;
+}
+
+.settings-modal .settings-group-icon {
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
+  border-radius: 8px;
+}
+
+/* Section headers carry real SVG icons now (same feather set as the nav
+   rail) — size them to the box and keep the accent tint from the wrapper. */
+.settings-modal .settings-group-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+  color: var(--accent);
+}
+
+.settings-modal .settings-group-title {
+  color: var(--text);
+}
+
+/* The "this group holds a destructive button" mood ring reads as a random
+   accent border; the danger tone stays on the button itself. */
+.settings-modal .settings-group:has(.btn.danger),
+.settings-modal .settings-group:has(.btn.danger):hover {
+  border-color: color-mix(in srgb, var(--border) 55%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.settings-modal .settings-group:has(.btn.danger) .settings-group-icon,
+.settings-modal .settings-group:has(.btn.danger) .settings-group-title {
+  color: inherit;
+}
+
+.settings-modal .settings-group:has(.btn.danger) .settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, var(--accent) 3%);
+}
+
+.settings-modal .settings-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+}
+
+.settings-modal .settings-row:hover {
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+/* The last row of a group keeps no separator even when a conditional node
+   (a saved-chip, a progress bar) follows it — otherwise every card ends in a
+   stray line above dead space. */
+.settings-modal .settings-row:last-of-type {
+  border-bottom: none;
+}
+
+/* ---------- Storage: backup actions + last-backup card ---------- */
+
+/* The primary errand of the section gets a real primary button, not one more
+   look-alike tiny button in a row of three. */
+.settings-modal .btn.accent {
+  background: var(--accent);
+  color: #fff;
+}
+.settings-modal .btn.accent:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 86%, #000);
+}
+
+.settings-modal .backup-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Persistent "last backup" summary: archive name on top, size/files/duration
+   beneath, with the folder a click away — the run's message can scroll away,
+   this card answers "what did I get, and where?" at any time. */
+.settings-modal .backup-last {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.settings-modal .backup-last-icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.settings-modal .backup-last-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-modal .backup-last-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-modal .backup-last-sub {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 1px;
+}
+
+/* ---------- Live terminal output + download progress (running tool card) ---- */
+
+/* The live tail streams into a still-RUNNING run_terminal card (tool_output
+   events). Same clamped block as the final output, plus a subtle "alive" left
+   rail so the user can tell streaming output from finished output. */
+.tool-live-output {
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.tool-download-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.tool-download-progress-track {
+  height: 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  overflow: hidden;
+}
+
+.tool-download-progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  transition: width 0.4s ease;
+}
+
+.tool-download-progress-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+
+.tool-download-progress-pct {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.tool-download-progress-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Collapsed-card chip: the running percent stays visible without expanding. */
+.tool-progress-chip {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MODERN UI POLISH — final override layer
+   Appended last so it wins the cascade without touching rules above.
+   1. Borderless fields everywhere (the chat composer subtree is excluded
+      and untouched). border-COLOR only → zero layout shift.
+   2. Fields whose border was their affordance get the house "well"
+      (tonal surface + inset highlight) + one unified accent focus glow.
+   3. Soft glass on dialogs and the command palette.
+   4. Composer responsive behavior via container queries.
+   5. Chat scrollbar: slim at rest, fat on hover.
+   6. Git pill integrated into the app bar (#titlebar-git).
+   Everything derives from theme vars via color-mix — every theme wins.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── 1a. No visible border on any field, anywhere ────────────────────────
+   The composer subtree (:not(.composer *)) is excluded on purpose — its
+   styling is frozen by design. Toggles/sliders/pickers keep their own
+   custom-drawn chrome. */
+input:not(.composer *):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]),
+select:not(.composer *),
+textarea:not(.composer *) {
+  border-color: transparent !important;
+}
+
+/* ── 1b. Fields whose border WAS the affordance → house "well" ───────────
+   Tonal surface + inset highlight, so the field still reads as editable
+   once the outline is gone. */
+.chat-find-input,
+.pm-modal-search,
+.settings-row-control input[type="number"],
+.manual-model-ctx-input,
+.files-filter-input,
+.fv-sheet-input,
+.fv-search-input,
+.fv-comment-input,
+.media-editor-ask-input,
+.review-search {
+  background: var(--bg-input);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+/* Inline rename fields sit in tight rows — surface only, they keep their
+   own ring shadow as the editing affordance. */
+.chat-rename-input,
+.ws-rename-input,
+.chat-window-title-input,
+.editor-tab-rename-input,
+.files-rename-input {
+  background: var(--bg-input);
+}
+
+/* ── 1c. One unified focus glow for every field that lost its border ───── */
+.chat-find-input:focus,
+.pm-modal-search:focus,
+.settings-row-control input[type="number"]:focus,
+.manual-model-ctx-input:focus,
+.files-filter-input:focus,
+.fv-sheet-input:focus,
+.fv-search-input:focus,
+.fv-comment-input:focus,
+.media-editor-ask-input:focus,
+.review-search:focus-within {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 6px 18px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* ── 1d. Settings + plugin detail: every remaining field gets the well ───
+   Catches the unclassed OAuth fields, fallback selects and manual-model
+   inputs that still rendered with browser-default chrome. Toggles,
+   sliders and the intentionally transparent api-key field are excluded. */
+.settings-modal input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not(.api-key-input),
+.settings-modal select,
+.settings-modal textarea,
+.pd-panel input,
+.pd-panel select,
+.pd-panel textarea,
+.voice-fallback-card input,
+.voice-fallback-card select {
+  background: var(--bg-input);
+  border-radius: 8px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.settings-modal input:focus,
+.settings-modal select:focus,
+.settings-modal textarea:focus,
+.pd-panel input:focus,
+.pd-panel select:focus,
+.pd-panel textarea:focus,
+.voice-fallback-card input:focus,
+.voice-fallback-card select:focus {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 6px 18px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* Select-like pill buttons outside the composer lose their outline too. */
+.settings-modal .pm-select-btn {
+  border-color: transparent;
+}
+
+/* Smooth interactions + shared caret/placeholder for the fields above. */
+.chat-find-input,
+.pm-modal-search,
+.manual-model-ctx-input,
+.files-filter-input,
+.fv-sheet-input,
+.fv-search-input,
+.fv-comment-input,
+.media-editor-ask-input,
+.settings-modal input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not(.api-key-input),
+.settings-modal select,
+.settings-modal textarea,
+.pd-panel input,
+.pd-panel select,
+.pd-panel textarea {
+  caret-color: var(--accent);
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.2s ease,
+    border-color 0.16s ease;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}

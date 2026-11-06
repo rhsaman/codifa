@@ -1,0 +1,2774 @@
+
+
+/* ----- update button (titlebar, next to the workspace picker) ----- */
+.update-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.update-btn::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
+  animation: update-dot 2s ease-out infinite;
+}
+
+@keyframes update-dot {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
+  }
+
+  100% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+
+.update-btn:hover {
+  background: linear-gradient(135deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 70%, var(--text)));
+  color: var(--on-accent);
+  border-color: transparent;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.update-btn:active {
+  transform: translateY(0);
+}
+
+.update-btn:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+
+.update-btn.downloading::before,
+.update-btn.installing::before,
+.update-btn.done::before,
+.update-btn.error::before {
+  display: none;
+}
+
+.update-ring {
+  transform: rotate(-90deg);
+  flex-shrink: 0;
+}
+
+.update-ring-track {
+  fill: none;
+  stroke: color-mix(in srgb, var(--accent) 22%, transparent);
+  stroke-width: 3.5;
+}
+
+.update-ring-bar {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3.5;
+  stroke-linecap: round;
+  stroke-dasharray: 100;
+  transition: stroke-dashoffset 0.25s ease;
+}
+
+.update-btn.done {
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+  background: color-mix(in srgb, var(--success) 14%, var(--bg-input));
+  color: var(--success);
+}
+
+.update-btn.error {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-input));
+  color: var(--danger);
+}
+
+/* ----- ensure RTL/LTR correctness for mixed scripts ----- */
+.chat-message {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  font-size: var(--chat-font-size);
+  line-height: 1.68;
+}
+
+.chat-message.user-text {
+  max-width: 72ch;
+}
+
+/* Markdown-rendered content must NOT use pre-wrap: react-markdown emits literal
+   "\n" text nodes between sibling blocks and list items, and pre-wrap turns
+   each of those into a visible blank line — the source of the big gaps between
+   p/ul/ol/li that no amount of margin tweaking can remove. Restoring normal
+   whitespace collapses them (markdown's own standard behavior: a single newline
+   is a soft break). User text stays pre-wrap because it isn't markdown. */
+.markdown-body {
+  white-space: normal;
+}
+
+/* Per-message text direction: every .chat-message element carries its own dir
+   attribute (detectDir of its content — any Persian/Arabic char → rtl). The
+   transcript container keeps a STATIC data-dir="rtl" (APP_DIR) which only the
+   bubble-parking / chrome rules below key off, so bubble sides stay fixed
+   while the text direction follows the message language (the ChatGPT model). */
+.chat-message[dir="rtl"] {
+  direction: rtl;
+  text-align: right;
+}
+
+.chat-message[dir="ltr"] {
+  direction: ltr;
+  text-align: left;
+}
+
+.markdown-body {
+  line-height: 1.68;
+}
+
+/* Tight, consistent vertical rhythm for rendered markdown. The browser's
+   default 1em block margins make paragraphs/lists drift too far apart, so we
+   compact them and collapse the trailing margin on the last element. */
+.markdown-body p,
+.markdown-body blockquote,
+.markdown-body table,
+.markdown-body hr {
+  margin: 0 0 1.15em;
+}
+
+.markdown-body pre {
+  margin: 0.2em 0 1.4em;
+}
+
+/* Mermaid diagrams rendered from ```mermaid fenced blocks. Colors are driven by
+   the diagram's themeVariables (set from the app CSS vars in Mermaid.tsx); the
+   container chrome below uses the same theme tokens so it blends in. */
+.mermaid-block {
+  margin: 0.4em 0 1.4em;
+  padding: 14px 16px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-x: auto;
+  text-align: center;
+  cursor: zoom-in;
+}
+
+.mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Static stand-in shown while the mermaid engine chunk loads and until the
+   block scrolls into view. It keeps the layout from jumping when the SVG
+   lands (the real block is a padded box). */
+.mermaid-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 72px;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: default;
+}
+
+/* Fallback while the assistant is still streaming an incomplete diagram: show
+   the raw source as a code block instead of an error. */
+.mermaid-fallback {
+  margin: 0.4em 0 1.4em;
+  padding: 12px 14px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  unicode-bidi: plaintext;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* ```chart fenced blocks (ChartBlock): the rendered SVG chart, plus the raw
+   source fallback while the body is still streaming or unparsable — same
+   chrome as .mermaid-fallback. */
+.chart-block {
+  margin: 0.4em 0 1.4em;
+  padding: 12px 10px 6px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-x: auto;
+}
+
+.chart-fallback {
+  margin: 0.4em 0 1.4em;
+  padding: 12px 14px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  unicode-bidi: plaintext;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0 0 0.8em;
+  padding-inline-start: 1.35em;
+}
+
+.markdown-body li {
+  margin-bottom: 0.3em;
+}
+
+.markdown-body li>p {
+  margin-bottom: 0.3em;
+}
+
+.markdown-body li>ul,
+.markdown-body li>ol {
+  margin-top: 0.4em;
+  margin-bottom: 0;
+}
+
+.markdown-body li:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body> :last-child,
+.markdown-body p:last-child,
+.markdown-body ul:last-child,
+.markdown-body ol:last-child,
+.markdown-body blockquote:last-child,
+.markdown-body pre:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin: 0.7em 0 0.3em;
+  line-height: 1.2;
+}
+
+.markdown-body h1 {
+  font-size: 1.75em;
+}
+
+.markdown-body h2 {
+  font-size: 1.6em;
+}
+
+.markdown-body h3 {
+  font-size: 1.4em;
+}
+
+.markdown-body h4 {
+  font-size: 1.15em;
+}
+
+.markdown-body h5 {
+  font-size: 1.05em;
+}
+
+.markdown-body h6 {
+  font-size: 1em;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  max-width: 72ch;
+  /* Center the capped reading column. Without auto inline margins a capped
+     block parks at its container's inline-start — in an rtl message (any
+     Persian char → dir=rtl) that is the RIGHT edge, so English paragraphs
+     (per-block dir=ltr, left-aligned text) hugged the right side of wide
+     surfaces (inbox, md viewer, reading mode) with a big empty half. Auto on
+     both inline margins centers the column; per-block text-align: start is
+     untouched. Must live in this rule (it comes after every `margin:`
+     shorthand above) so those shorthands don't reset the inline margins to 0.
+     The CHAT transcript is the one surface where blocks must hug their
+     reading edge like before — exempted in the .chat-messages rule below. */
+  margin-inline: auto;
+}
+
+/* Chat transcript exemption: inside the transcript the 72ch blocks keep the
+   old parking (flush to the message's reading edge — left for English, right
+   for Persian). Centering is for wide document surfaces, not the chat flow. */
+.chat-messages .markdown-body p,
+.chat-messages .markdown-body ul,
+.chat-messages .markdown-body ol,
+.chat-messages .markdown-body blockquote,
+.chat-messages .markdown-body h1,
+.chat-messages .markdown-body h2,
+.chat-messages .markdown-body h3,
+.chat-messages .markdown-body h4,
+.chat-messages .markdown-body h5,
+.chat-messages .markdown-body h6 {
+  margin-inline: 0;
+  /* عرض کامل ستون چت — سقف ۷۲ch فقط برای سطوح مستندمانند (inbox/md viewer) */
+  max-width: none;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0.9em 0;
+}
+
+/* ChatGPT-style per-PARAGRAPH direction: every prose block resolves its own
+   base direction from its first strong character (unicode-bidi: plaintext)
+   and aligns to THAT direction (text-align: start). Inside one mixed
+   message, English paragraphs read left-to-right flush-left and Persian
+   paragraphs read right-to-left flush-right — in both message directions,
+   and everywhere .markdown-body renders (chat, text viewer, plan, inbox,
+   reading mode). Lists keep the message direction on purpose: `li` markers
+   would jump sides per item and tear the list apart. `pre` keeps its own
+   LTR rule (code). */
+.markdown-body p,
+.markdown-body li,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  /* NO unicode-bidi: plaintext here! Chrome's plaintext re-derives the
+     paragraph direction from the FIRST strong character and OVERRIDES the
+     explicit dir attribute — a mostly-English paragraph that merely touches
+     a Persian word laid out RTL (measured live). The dir ATTRIBUTE stamped
+     per block by rehypeLtrIslands (language-majority, dirByText) is the
+     single source of truth; text-align: start resolves against it.
+     li/ul/ol/blockquote MUST be listed explicitly: without a direct rule
+     they inherit text-align: right from the rtl message container and
+     English list items render right-aligned (live-measured). */
+  text-align: start;
+}
+
+.markdown-body blockquote {
+  border-inline-start: 3px solid var(--border);
+  padding-inline-start: 0.8em;
+  color: var(--text-dim);
+}
+
+/* Table styles for markdown rendering */
+.markdown-body .markdown-table-scroll {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 0.3em 0;
+  background: var(--bg-panel);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.markdown-body .markdown-table-scroll table {
+  display: table;
+  width: 100%;
+  min-width: 100%;
+  max-width: none;
+  border-collapse: collapse;
+  border-spacing: 0;
+  table-layout: auto;
+  font-size: 0.9em;
+  margin: 0;
+  border: none;
+}
+
+.markdown-body .markdown-table-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.markdown-body .markdown-table-scroll::-webkit-scrollbar-track {
+  background: var(--bg-alt);
+  border-radius: 4px;
+}
+
+.markdown-body .markdown-table-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+.markdown-body .markdown-table-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
+.markdown-body table th,
+.markdown-body table td {
+  padding: 0.6em 0.9em;
+  border: 1px solid var(--border);
+  /* start (not left): cells follow the table's direction, which inherits the
+     message's own direction — in an RTL message the whole table reads RTL
+     (mirrored columns AND right-aligned cells), in LTR it stays left-aligned.
+     Numbers/URLs inside cells are kept readable by the LTR islands injected
+     in lib/ltrIslands.ts. No per-cell unicode-bidi: plaintext here — it made
+     each cell resolve its own alignment from its first strong character, so
+     an English-first cell ("TE: Q4 …") left-aligned inside an otherwise
+     right-aligned RTL table. */
+  text-align: start;
+  vertical-align: top;
+  min-width: 80px;
+}
+
+.markdown-body table th {
+  background-color: var(--bg-alt);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.markdown-body table thead th {
+  z-index: 3;
+}
+
+.markdown-body table tbody tr:nth-child(2n) td {
+  background-color: var(--bg-alt);
+}
+
+.markdown-body table tbody tr:hover td {
+  background-color: var(--accent-dim);
+}
+
+.markdown-body table caption {
+  padding: 0.5em;
+  font-weight: 600;
+  color: var(--text-dim);
+  caption-side: bottom;
+}
+
+/* Ensure proper table structure even if thead/tbody missing */
+.markdown-body table tr:first-child th {
+  background-color: var(--bg-alt);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.markdown-body a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  direction: ltr;
+  unicode-bidi: isolate;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+/* Island span around a code chip + its URL link (mdComponents.code): keeps
+   the split pieces in left-to-right command order ("/plugin install URL")
+   as one unit inside an RTL line instead of two RTL-ordered islands. */
+.markdown-body .ltr-island {
+  unicode-bidi: isolate;
+}
+
+.markdown-body a:hover {
+  text-decoration: none;
+}
+
+.markdown-body a[href^="http"]::after,
+.markdown-body a[target="_blank"]::after {
+  content: "\2197";
+  margin-inline-start: 0.2em;
+  font-size: 0.85em;
+  opacity: 0.7;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.markdown-body pre {
+  direction: ltr;
+  text-align: left;
+  /* white-space is inherited from .markdown-body (normal, see above); code
+     blocks must keep their explicit wrapping/formatting. */
+  white-space: pre;
+}
+
+.markdown-body :not(pre)>code {
+  direction: ltr;
+  unicode-bidi: isolate;
+  /* Atomic chip: it must never split across lines. A split fragment
+     re-enters the surrounding RTL line's bidi resolution on its own, so
+     numbers and connectors attach to the wrong neighbor and the sentence
+     reads scrambled. The max-width + ellipsis keeps an over-long chip
+     from overflowing the column instead of wrapping. */
+  display: inline-block;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+.markdown-body code {
+  font-family: var(--font-mono);
+}
+
+/* ----- split panes ----- */
+.pane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.resizer {
+  flex: 0 0 5px;
+  background: transparent;
+  cursor: col-resize;
+  position: relative;
+  z-index: 5;
+}
+
+.resizer:hover,
+.resizer.active {
+  background: var(--accent-dim);
+}
+
+/* ----- multi-window chat group (VSCode-like split) ----- */
+.chat-windows {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.chat-windows.vertical {
+  flex-direction: column;
+}
+
+.chat-windows.horizontal {
+  flex-direction: row;
+}
+
+.chat-window-slot {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-windows.vertical .chat-window-slot {
+  flex-direction: column;
+}
+
+.chat-windows.horizontal .chat-window-slot {
+  flex-direction: row;
+}
+
+.chat-windows.single .chat-window-slot {
+  flex: 1 1 auto;
+}
+
+.chat-windows.single .chat-window {
+  flex: 1 1 auto;
+  height: 100%;
+}
+
+.chat-window {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-windows.multi .chat-window {
+  position: relative;
+  isolation: isolate;
+  border: none;
+  border-radius: 10px;
+  background: var(--bg-alt);
+  /* The window outline is painted as an INSET BOX-SHADOW, not a border:
+     shadows render in the same paint pass as the background, so during the
+     sidebar/pane width animations the outline can never lag behind the
+     background the way a real border did (the stale-border artifact). */
+  box-shadow: inset 0 0 0 1px var(--border);
+  /* Own compositing layer: when the sidebar/right pane animate the windows'
+     size, each window re-rasterizes from its own layer. */
+  transform: translateZ(0);
+}
+
+.chat-windows.multi .chat-window.focused {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+/* Cheap focus cue: opacity only (no blur/filter), so unfocused windows
+   stay readable but clearly recede. */
+.chat-windows.multi .chat-window.dimmed .chat-window-body {
+  opacity: 0.85;
+}
+
+.chat-windows.multi .chat-window.focused .chat-window-body {
+  opacity: 1;
+}
+
+.chat-panel.chat-window-dimmed .chat-scroll {
+  pointer-events: auto;
+}
+
+.chat-window-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: grab;
+  user-select: none;
+}
+
+.chat-window-head.focused {
+  color: var(--text);
+}
+
+.chat-window-head:active {
+  cursor: grabbing;
+}
+
+.chat-window-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-window-title-input,
+.editor-tab-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  font: inherit;
+  color: inherit;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 4px;
+  outline: none;
+}
+
+.editor-tab-rename-input {
+  font-size: 12px;
+}
+
+.chat-window-ws {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 38%;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ws, var(--accent)) 30%, transparent);
+  background: color-mix(in srgb, var(--ws, var(--accent)) 10%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.chat-window-head.focused .chat-window-ws {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--ws, var(--accent)) 45%, transparent);
+  background: color-mix(in srgb, var(--ws, var(--accent)) 14%, transparent);
+}
+
+.chat-window-ws-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-window-close,
+.chat-window-minimize {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 80ms ease-out, background-color 80ms ease-out, border-color 80ms ease-out;
+}
+
+.chat-window-close:hover,
+.chat-window-minimize:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.chat-window-fullscreen {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: transform 80ms ease-out, background-color 80ms ease-out, border-color 80ms ease-out;
+}
+
+.chat-window-fullscreen:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.chat-window-close:active,
+.chat-window-minimize:active,
+.chat-window-fullscreen:active {
+  transform: scale(0.9);
+}
+
+.chat-window-fullscreen[aria-pressed="true"] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: var(--accent);
+}
+
+.chat-windows.window-full .chat-window {
+  flex: 1 1 auto;
+}
+
+/* Fullscreen keeps every ChatPanel mounted: hidden windows/subtrees use
+   display:none so toggling fullscreen never remounts panels (no lag). */
+.chat-windows.window-full {
+  position: relative;
+}
+
+.chat-windows .chat-window.window-hidden,
+.chat-windows .chat-split-child.window-hidden {
+  display: none;
+}
+
+/* Root-edge drop preview: whole chat-area strip (dragged window's own space
+   counts as empty, so the remaining tree decides the landing zone). */
+.chat-windows {
+  position: relative;
+}
+
+.chat-window-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-window-resize {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.chat-window-resize.row {
+  height: 7px;
+  margin: -2px 0;
+  padding: 2px 0;
+  cursor: row-resize;
+}
+
+.chat-window-resize.col {
+  width: 7px;
+  margin: 0 -2px;
+  padding: 0 2px;
+  cursor: col-resize;
+}
+
+.chat-window-resize::after {
+  content: "";
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.chat-window-resize.row::after {
+  height: 3px;
+}
+
+.chat-window-resize.col::after {
+  width: 3px;
+  height: 100%;
+}
+
+.chat-window-resize:hover::after {
+  background: var(--accent-dim);
+}
+
+.chat-window.drop-before {
+  box-shadow: 0 -2px 0 var(--accent);
+}
+
+.chat-window.drop-after {
+  box-shadow: 0 2px 0 var(--accent);
+}
+
+.chat-windows.horizontal .chat-window.drop-before {
+  box-shadow: -2px 0 0 var(--accent);
+}
+
+.chat-windows.horizontal .chat-window.drop-after {
+  box-shadow: 2px 0 0 var(--accent);
+}
+
+/* ----- recursive split tree (VSCode-like free layout) ----- */
+.chat-windows.tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.chat-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  gap: 6px;
+}
+
+.chat-split.col {
+  flex-direction: column;
+}
+
+.chat-split.row {
+  flex-direction: row;
+}
+
+.chat-split-child {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Safety net: a split whose siblings were all removed keeps its wrapper, but
+   the survivor's stale inline flexGrow (chatTree clamps sizes to [0.25, 4])
+   would leave the rest of the row/col empty. A lone child claims all space. */
+.chat-split > .chat-split-child:only-child {
+  flex-grow: 1 !important;
+}
+
+/* The split wrapper stretches, but in single-leaf tree mode `multi` is false
+   and LeafView emits the .chat-window with NO inline flex — it then sizes to
+   content and leaves the rest of the wrapper empty. A lone (or any) window
+   inside a split child must claim the child's full box. */
+.chat-split-child > .chat-window {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+
+.chat-split.col > .chat-split-child {
+  flex-direction: column;
+}
+
+.chat-split.row > .chat-split-child {
+  flex-direction: row;
+}
+
+.chat-split-resize {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.chat-split-resize.row-bar {
+  height: 7px;
+  margin: -2px 0;
+  padding: 2px 0;
+  cursor: row-resize;
+}
+
+.chat-split-resize.col-bar {
+  width: 7px;
+  margin: 0 -2px;
+  padding: 0 2px;
+  cursor: col-resize;
+}
+
+.chat-split-resize::after {
+  content: "";
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.chat-split-resize.row-bar::after {
+  height: 3px;
+}
+
+.chat-split-resize.col-bar::after {
+  width: 3px;
+  height: 100%;
+}
+
+.chat-split-resize:hover::after {
+  background: var(--accent-dim);
+}
+
+/* Edge highlight: the exact zone the dragged chat will land in. */
+.chat-windows.tree .chat-window {
+  position: relative;
+  isolation: isolate;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-alt);
+  /* Fit all windows on screen: never force horizontal overflow. Inner
+     content scrolls instead of pushing panes off screen. */
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+}
+
+.chat-split.row > .chat-split-child {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-split.col > .chat-split-child {
+  min-height: 0;
+}
+
+/* Narrow panes: keep trace/edit heads on one readable row instead of
+   painting pills over stats. Pills and captions ellipsize, the trailing
+   meta cluster never overlaps them. */
+.chat-windows.tree .chat-window .trace-head,
+.chat-windows.tree .chat-window .edit-group-row-main {
+  min-width: 0;
+  overflow: hidden;
+  gap: 6px;
+}
+.chat-windows.tree .chat-window .trace-head-pills {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+.chat-windows.tree .chat-window .trace-pill,
+.chat-windows.tree .chat-window .trace-head-caption,
+.chat-windows.tree .chat-window .edit-group-file {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-windows.tree .chat-window .trace-head-right,
+.chat-windows.tree .chat-window .edit-group-row-end {
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-windows.tree .chat-window.focused {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+/* Single window or window fullscreen: no border — there is nothing to
+   separate, so the pane blends into the chat area. Placed after the tree
+   border rules so it wins at equal specificity. */
+.chat-windows.single .chat-window,
+.chat-windows.window-full .chat-window {
+  border: none;
+}
+
+/* The unified overlay is the drop highlight (dashed page inside it); the
+   pane's own drop-active border would paint a second outline on top. */
+
+.chat-windows.tree .chat-window.drag-source .chat-drop-preview {
+  display: none;
+}
+
+/* Drag source stays in layout (no display:none): dim only so the preview
+   zone never shifts under the cursor while dragging. */
+.chat-windows.tree .chat-window.drag-source {
+  opacity: 0.55;
+}
+
+.viewer-windows.tree .viewer-window.drag-source.drop-active {
+  border-color: var(--border);
+}
+
+.viewer-windows.tree .viewer-window.drag-source .viewer-drop-preview {
+  display: none;
+}
+
+/* ----- viewer multi-window (right panel splits, VSCode-like) ----- */
+.viewer-windows {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+}
+
+.viewer-content > .viewer-windows {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.viewer-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  gap: 6px;
+}
+
+.viewer-split.col {
+  flex-direction: column;
+}
+
+.viewer-split.row {
+  flex-direction: row;
+}
+
+.viewer-split-child {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+.viewer-split.col > .viewer-split-child {
+  flex-direction: column;
+}
+
+.viewer-split.row > .viewer-split-child {
+  flex-direction: row;
+}
+
+.viewer-split-resize {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.viewer-split-resize.row-bar {
+  height: 7px;
+  margin: -2px 0;
+  padding: 2px 0;
+  cursor: row-resize;
+}
+
+.viewer-split-resize.col-bar {
+  width: 7px;
+  margin: 0 -2px;
+  padding: 0 2px;
+  cursor: col-resize;
+}
+
+.viewer-split-resize::after {
+  content: "";
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.viewer-split-resize.row-bar::after {
+  height: 3px;
+}
+
+.viewer-split-resize.col-bar::after {
+  width: 3px;
+  height: 100%;
+}
+
+.viewer-split-resize:hover::after {
+  background: var(--accent-dim);
+}
+
+.viewer-windows.tree .viewer-window {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-alt);
+  min-width: 280px;
+  min-height: 220px;
+}
+
+.viewer-split.row > .viewer-split-child {
+  min-width: 280px;
+}
+
+.viewer-split.col > .viewer-split-child {
+  min-height: 220px;
+}
+
+.viewer-windows.tree .viewer-window.focused {
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border));
+}
+
+.viewer-windows.tree .viewer-window.drop-active {
+  border-color: var(--link);
+}
+
+/* Cheap focus cue: opacity only (no blur/filter). */
+.viewer-windows.tree .viewer-window.dimmed .viewer-window-body {
+  opacity: 0.85;
+}
+
+.viewer-windows.tree .viewer-window.focused .viewer-window-body {
+  opacity: 1;
+}
+
+.viewer-window-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: default;
+  user-select: none;
+}
+
+.viewer-window-head.focused {
+  color: var(--text);
+}
+
+.viewer-window-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: grab;
+}
+
+.viewer-window-title:active {
+  cursor: grabbing;
+}
+
+.viewer-window-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.viewer-window-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.viewer-window-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.viewer-window-body > * {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Edge highlight: the exact zone the dragged tab will land in. */
+.viewer-drop-preview {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  pointer-events: none;
+  padding: 6px;
+  box-sizing: border-box;
+}
+
+.viewer-drop-preview.preview-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 50%;
+}
+
+.viewer-drop-preview.preview-right {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  right: 0;
+}
+
+.viewer-drop-preview.preview-top {
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 50%;
+}
+
+.viewer-drop-preview.preview-bottom {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  top: 50%;
+}
+
+.viewer-drop-preview.preview-center {
+  inset: 0;
+}
+
+.viewer-drop-empty-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-panel));
+  border: 1.5px dashed color-mix(in srgb, var(--link) 70%, transparent);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+
+.viewer-drop-empty-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-drop-hint {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+
+/* Unified drop overlay: one persistent element for the whole stack. It is
+   positioned in px over the target pane/strip every frame, so moving between
+   panes or zones animates as a real transition (per-pane overlays mount and
+   unmount, which can never animate). */
+.chat-drop-overlay {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  pointer-events: none;
+  padding: 6px;
+  box-sizing: border-box;
+  opacity: 0;
+  transition:
+    top 140ms ease,
+    left 140ms ease,
+    width 140ms ease,
+    height 140ms ease,
+    opacity 120ms ease;
+}
+
+@keyframes chat-drop-fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.chat-drop-hint {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+
+/* Sibling ghost: a real flex sibling with equal size, so an edge drop along
+   the split axis previews N equal windows (e.g. dragging the 3rd window
+   shows 3 equal panes, not an overlay that reads as a 4th). */
+.chat-drop-ghost {
+  min-height: 0;
+  min-width: 0;
+  pointer-events: none;
+}
+
+/* The unified overlay draws the landing visual by gliding onto the ghost
+   slot's rect, so the ghost's own page stays invisible — a visible ghost
+   under a gliding overlay would read as a double preview. */
+.chat-drop-ghost .chat-drop-ghost-page {
+  visibility: hidden;
+}
+
+/* Smooth the layout shift when the ghost mounts or a pane vacates mid-drag:
+   flex-grow is animatable, so panes glide to their new sizes instead of
+   snapping the whole split under the cursor. Scoped to the dragging state so
+   normal pane resizing stays instant. NOTE: the class is removed BEFORE the
+   drop event dispatches, so the final post-drop relayout is instant. */
+body.coder-dragging .chat-split-child {
+  transition: flex-grow 150ms ease;
+}
+
+.chat-drop-ghost-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  min-height: 120px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+
+/* Single window also hosts the empty-page preview, so it needs positioning. */
+.chat-windows.single .chat-window {
+  position: relative;
+  isolation: isolate;
+}
+
+/* Empty-page ghost: the exact pane the dragged chat will occupy. */
+.chat-drop-empty-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+
+.chat-drop-empty-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----- chat ----- */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  position: relative;
+  /* The chat keeps the flat theme background (--bg-alt == --bg); the sidebar
+     sits one step off it (--bg-sidebar). No accent tint here: with a
+     saturated accent (one-dark blue, onyx white) a 3% mix visibly washes
+     the whole panel off the theme's true background. */
+  background: var(--bg-alt);
+}
+
+.chat-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Toolbar now renders inside the titlebar via a React portal from ChatPanel */
+.titlebar #titlebar-toolbar,
+.titlebar #titlebar-right {
+  display: contents;
+}
+
+.titlebar .chat-toolbar {
+  padding: 0;
+  border-bottom: none;
+  gap: 6px;
+  margin-left: 2px;
+  align-items: center;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+/* Balance pill inside the appbar: one soft pill language — same hairline
+   border, same translucent fill as usage-chip. 30px tall so the 20px wallet
+   icon matches the Finder badge beside it. */
+.titlebar #titlebar-right .titlebar-balance-clickable {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-dim);
+  box-shadow: none;
+}
+
+.titlebar #titlebar-right .titlebar-balance-clickable:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+/* No amount fetched yet: the chip is a bare ghost icon button — same 30px
+   square, transparent chrome — so it reads like the neighboring titlebar
+   icon buttons instead of an empty pill. */
+.titlebar #titlebar-right .titlebar-balance-clickable[data-has-balance="false"] {
+  width: 30px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.titlebar #titlebar-right .titlebar-balance-clickable[data-has-balance="false"]:hover {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.chat-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  /* Full-bleed wide tool cards stretch edge-to-edge of the panel; hide the
+     horizontal overflow they'd otherwise create (their own diff scrolls
+     internally). */
+  overflow-x: hidden;
+  padding: 14px;
+  /* Keep the last messages, notices and error banners fully above the
+     floating composer — the padding must exceed the composer's total height
+     (input + toolbar + padding ≈ 142px) with comfortable clearance so
+     nothing tucks under it when scrolled to the bottom. */
+  padding-bottom: 210px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  position: relative;
+}
+
+/* Floating "jump to bottom" pill, Claude-style: floats centered fully ABOVE
+   the whole composer stack (input card + git diff bar) with a small gap
+   (no overlap). Anchored to .composer (position: absolute) — NOT to
+   .composer-inner — so showing the .composer-diff-bar above the input card
+   never slides the git bar under the button. */
+/* Dedicated entrance animation for .scroll-jump: fade-only so the button's
+   own translateX(-50%) transform is never overridden — any keyframe
+   transform would render the button un-centered while the animation runs. */
+@keyframes scroll-jump-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.scroll-jump {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  top: auto;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  max-width: 32px;
+  max-height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg,
+      var(--bg-panel),
+      color-mix(in srgb, var(--bg-panel) 90%, var(--accent-dim)));
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 8px 22px rgba(0, 0, 0, 0.3);
+  animation: scroll-jump-in 0.15s ease;
+  transition:
+    background 0.15s ease,
+    transform 0.15s ease,
+    box-shadow 0.15s ease,
+    color 0.15s ease;
+}
+
+.scroll-jump svg {
+  width: 16px;
+  height: 16px;
+  transition: transform 0.15s ease;
+}
+
+.scroll-jump:hover {
+  background: var(--accent-dim);
+  color: var(--text);
+  transform: translateX(-50%) translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 10px 26px rgba(0, 0, 0, 0.35);
+}
+
+.scroll-jump:hover svg {
+  transform: translateY(1px);
+}
+
+.scroll-jump:active {
+  transform: translateX(-50%) scale(0.94);
+}
+
+/* ── Chat find bar (Cmd/Ctrl+F) ─────────────────────────────────────────
+   VSCode-style floating widget over the transcript's top edge: query field,
+   "n of m" counter, prev/next, match-case, close. The matches themselves are
+   painted by src/lib/chatFind.ts through the CSS Custom Highlight API — the
+   ::highlight() rules below address the document-global registry names that
+   module owns, so no DOM is touched (React owns the transcript). */
+.chat-find-bar {
+  position: absolute;
+  top: 10px;
+  inset-inline-end: 16px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 10px 28px rgba(0, 0, 0, 0.35);
+  animation: scroll-jump-in 0.15s ease;
+}
+
+.chat-find-icon {
+  flex-shrink: 0;
+  margin-inline: 2px;
+  color: var(--text-dim);
+}
+
+.chat-find-input {
+  width: 190px;
+  padding: 5px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.chat-find-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+/* No focus ring on the find fields: the global :focus-visible outline + halo
+   doubled the field's own border into a loud double ring. The field border
+   plus the caret are the focus indicator. */
+.chat-find-input:focus-visible,
+.files-filter-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.chat-find-count {
+  min-width: 64px;
+  text-align: center;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.chat-find-count.none {
+  color: var(--danger);
+}
+
+.chat-find-btn,
+.chat-find-opt {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 2px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.chat-find-btn:hover:not(:disabled),
+.chat-find-opt:hover {
+  background: var(--bg-hover);
+}
+
+.chat-find-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.chat-find-opt {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 5px;
+}
+
+.chat-find-opt.on {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.chat-find-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--hairline);
+  margin: 0 2px;
+}
+
+/* Match paint — registry names owned by src/lib/chatFind.ts. Inactive
+   matches take a translucent accent tint (legible over light and dark
+   palettes); the active match gets the full accent with --on-accent text. */
+::highlight(chat-find) {
+  background-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: inherit;
+}
+
+::highlight(chat-find-active) {
+  background-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.chat-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: var(--chat-max-w);
+  width: 100%;
+  margin: 0 auto;
+  flex: 1 1 auto;
+}
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* "Load earlier messages" row shown at the top of the transcript until every
+   message is rendered (lazy paging). It also auto-triggers on scroll-to-top. */
+.load-older-row {
+  display: flex;
+  justify-content: center;
+  padding: 2px 0 6px;
+  flex: 0 0 auto;
+}
+
+.load-older-btn {
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--bg-panel) 70%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.load-older-btn:hover {
+  color: var(--text);
+  border-color: var(--accent-dim);
+}
+
+.msg-role {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+/* User messages get a small identity dot before the "You" label so the
+   bubble reads as the user's own at a glance. */
+.msg.user .msg-role {
+  color: color-mix(in srgb, var(--text) 78%, var(--accent));
+  font-weight: 600;
+  letter-spacing: 0.8px;
+}
+
+/* Small accent avatar (person icon) before the "You" label so the bubble
+   reads as the user's own at a glance. */
+.msg-role-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  margin-inline-end: 7px;
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 24%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 10%, var(--bg-panel)));
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  vertical-align: -4px;
+}
+
+.msg-role-avatar svg {
+  width: 10px;
+  height: 10px;
+}
+
+.steer-note {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.steer-note .steer-dot {
+  font-size: 8px;
+  color: var(--link, #4f8cff);
+  animation: steer-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes steer-pulse {
+
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.msg-bubble {
+  padding: 10px 4px;
+  border-radius: var(--radius);
+  background: transparent;
+  border: none;
+}
+
+/* Claude-style interleaved assistant messages: text slices flow continuously
+   with inline tool cards inserted at the point each call happened. */
+.msg-bubble.segmented {
+  padding: 10px 0 0;
+}
+
+.msg-bubble.segmented>.chat-message.markdown-body {
+  padding: 0 4px;
+}
+
+.msg-bubble.segmented>.tool-card {
+  margin: 4px 4px;
+}
+
+.msg-bubble.segmented>.tool-group {
+  margin: 4px 4px;
+}
+
+.msg-bubble.segmented>.tool-trace {
+  margin: 4px 4px;
+}
+
+/* A steer message (typed mid-run) injected inline between tool calls: renders
+   right after the tool card that carried it, with the agent's later text and
+   tool cards stacking below. Full-width, mirroring a normal user message
+   EXACTLY — the .msg.user wrapper reuses the same role header + bubble styles,
+   so an interleaved steer is indistinguishable from the user's own messages. */
+.msg-bubble.segmented>.msg.user.seg-steer {
+  /* Clear gap both sides so the bubble reads as a separate user message, not a
+     tool card glued to its neighbors (the surrounding tool cards use 4px). */
+  margin: 16px 0;
+}
+
+.msg-bubble.segmented>.chat-message+.chat-message {
+  margin-top: 2px;
+}
+
+/* A mid-turn auto-compact checkpoint, spliced in via a `compact` segment at
+   the exact point it fired — same clear-gap treatment as the steer bubble
+   above so it reads as a distinct event, not glued to the surrounding tool
+   cards (4px each side). */
+.msg-bubble.segmented>.summary-block {
+  margin: 16px 4px;
+}
+
+/* Room for the bubble tail: the tail pokes 7px past the bubble, so it must sit
+   inside this padding to stay fully visible in both LTR and RTL. */
+.msg.user {
+  padding-inline: 10px;
+}
+
+/* Align the WHOLE user block (label + bubble + copy/retry buttons) to the
+   user's side — right in RTL, left in LTR. align-items on the .msg wrapper
+   is the most robust lever: the .msg wrapper is always LTR (the app never
+   sets direction on it), so flex-end/flex-start are physical and can't be
+   defeated by the bubble's own dir. It also keeps the buttons matched to
+   the bubble in both modes. */
+.chat-messages[data-dir="rtl"] .msg.user {
+  align-items: flex-end;
+}
+
+.msg.user .msg-bubble {
+  /* Compact bubble that hugs its content — NOT a full-width strip. This is
+     what makes it read as a real chat bubble instead of a tool card. */
+  width: fit-content;
+  max-width: min(72ch, 100%);
+  position: relative;
+  /* Lighter-than-panel fill so the user bubble reads distinct (user request:
+     pick from the theme) — --bg-input is one step up from --bg-panel. */
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 18px 18px 18px 6px;
+  color: var(--text);
+  /* Flat and clean — just a hairline inner top highlight, no outer shadow. */
+  box-shadow: none;
+  /* The base .msg-bubble only pads 4px horizontally — that's what glued the
+     text to the corner. User bubbles get real breathing room. */
+  padding: 10px 14px;
+}
+
+/* Real speech-bubble tail — a small triangle on the user's side (LTR: left).
+   The tail follows the new dark-grey fill instead of the old accent gradient. */
+.msg.user .msg-bubble::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: -7px;
+  width: 14px;
+  height: 14px;
+  background: var(--bg-input);
+  border-left: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  clip-path: polygon(100% 0, 0 50%, 100% 100%);
+}
+
+.chat-messages[data-dir="rtl"] .msg.user .msg-bubble {
+  /* direction: rtl is what actually pins the 72ch user-text box to the RIGHT
+     edge. The box's own dir="rtl" only right-aligns text INSIDE it; a block
+     box's position is decided by its PARENT's direction, and .msg-bubble
+     otherwise inherits ltr from the root — so the box hugged the left even in
+     RTL mode. */
+  direction: rtl;
+  text-align: right;
+  /* RTL: the user's side is the RIGHT — pin the compact bubble there.
+     align-self is physical (the .msg wrapper is always LTR), so it can't be
+     defeated by the bubble's own direction. IMPORTANT: do NOT add an auto
+     margin here — an auto margin on an item whose own direction is rtl makes
+     the browser resolve the position to flex-start (LEFT) and defeats
+     align-self (verified in a real Electron render test). */
+  align-self: flex-end;
+  /* RTL tail on the bottom-RIGHT (the user's side). */
+  border-radius: 18px 18px 6px 18px;
+}
+
+/* RTL: the tail points right, toward the user. */
+.chat-messages[data-dir="rtl"] .msg.user .msg-bubble::after {
+  left: auto;
+  right: -7px;
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+  border-left: none;
+  border-right: 1px solid var(--border);
+}
+
+/* Keep the "You" label aligned with the bubble: right in RTL, left in LTR. */
+.chat-messages[data-dir="rtl"] .msg.user .msg-role {
+  width: fit-content;
+  margin-left: auto;
+}
+
+/* Claude-style folding for long user text: clamp the text only, keep
+   attachments/images and the toggle always visible. */
+.chat-message.user-text.clamped {
+  max-height: 180px;
+  overflow: hidden;
+  position: relative;
+}
+
+.msg.user .msg-bubble:has(.user-text.clamped) .msg-expand {
+  margin-top: 6px;
+}
+
+.msg-expand {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.msg-expand:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.msg-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 0 4px;
+  /* Positioning context for the inline retry line, which is taken OUT of the
+     button flow so it can sit where the Working pill sits. */
+  position: relative;
+  /* Container context so the retry line wraps on the FOOTER's width, not the
+     window's — the sidebar changes one without the other. */
+  container-type: inline-size;
+  container-name: msg-actions;
+}
+
+/* خط ریترای inline — جایگزین جمع‌وجور بنر ریترای. هر ریترای خودکار (نردبان
+   خطای چت، نردبان‌های ساب‌ایجنت، watchdog) کنار نشانگر Working در فوتر پیام
+   رندر می‌شود؛ متن کامل خطا در tooltip است. کمرنگ و تک‌خطی تا فوتر را شلوغ
+   نکند و مثل بقیه‌ی فوتر به عرض پیام محدود بماند. */
+/* ── Ordered groups of the retry line (see `.msg-retry-inline`) ─────────────
+   Each group carries its own `order`, so the optional Retry button can sit
+   between the dots and the reason without the DOM having to move. */
+.msg-retry-inline-head {
+  /* 0 — opens the sentence. The row runs `direction: ltr` for CONTENT order
+     only; parking is handled by the outer auto margin. */
+  order: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.msg-retry-inline {
+  /* Colour of the whole chip (border, tint, icon, %, dots); set per kind of
+     row by `[data-state]` below. */
+  --tone: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 3px 10px;
+  /* Status/retry rows are plain footer text. The rounded box around them read
+     as an error banner, which is exactly what this slot replaced. */
+  border: 0;
+  border-radius: 999px;
+  /* NO `direction` on this element: it is the PARKING box. It inherits the
+     footer's direction so `margin-inline-start: auto` absorbs free space on the
+     same side the Working pill occupies. Setting `direction: ltr` here flipped
+     that auto margin to the opposite physical side and parked the line beside
+     the buttons (552px from the left) instead of at the pill's spot (4px).
+     CONTENT order is pinned on `.msg-retry-inline-row` below instead. */
+  /* LAST in the row's visual order: in an RTL row a LARGER `order` sorts
+     toward the visual LEFT, which is exactly where the Working pill sits
+     (measured: pill left edge = 4px). This line takes the pill's place, so it
+     must sort past the clock/timer pair (order 2/3) to claim that edge.
+     It is also the ONLY item with an auto margin — two autos split the free
+     space and park both of them in the middle. */
+  order: 9;
+  /* Old parking: margin-inline-start:auto absorbed the row's free space and
+     flung the chip to the far edge. Inside the FIXED status group it must sit
+     flush-LEFT (user: errors/status always left) — the group owns parking. */
+  margin-inline-start: 0;
+  /* The hover card is positioned against this box. */
+  position: relative;
+  /* Bounded so a 4-screen provider body cannot dominate the row; past that it
+     ellipsizes and the full text lives in the hover card. */
+  max-width: min(34rem, 100%);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* CONTENT row: forces LTR so the sentence reads
+   `↻ retry 4/10 → reason → dots → Retry` in BOTH locales, with each `order`
+   value meaning one physical side everywhere. Keeping this on its own element
+   is what lets the OUTER box still park via the footer's (RTL) axis. */
+.msg-retry-inline-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  /* The chip itself is already capped (`min(34rem, 100%)`); the row fills it.
+     Filling (not shrink-wrapping) is what keeps the content LEFT-aligned: the
+     chip inherits the footer's RTL, so a shrink-wrapped row sat on its right
+     edge whenever the chip was wider than its content (compaction min-width,
+     wrapped narrow footer). The compaction bar is the chip's own underline,
+     not part of this row. */
+  flex: 1 1 auto;
+  max-width: 100%;
+  direction: ltr;
+  flex-direction: row;
+}
+
+/* Narrow panes: there is no room beside the buttons, so the line takes the
+   whole row ABOVE them. Now that the line is a real flex item, this only needs
+   to force the wrap — no repositioning, so it cannot collide at any width.
+   The trigger is a CONTAINER query on the footer width (not the viewport): the
+   sidebar shrinks the chat pane without shrinking the window. */
+@container msg-actions (max-width: 34rem) {
+  .msg-actions {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .msg-retry-inline {
+    flex: 1 0 100%;
+    max-width: 100%;
+    order: -1;
+    /* Wrapped onto its own row: left-align it with the buttons instead of
+       keeping the auto margin, which would push it to the far edge of that
+       row for no reason. */
+    margin-inline-start: 0;
+  }
+}
+
+/* Fallback for engines without container queries: same rule on the viewport. */
+@supports not (container-type: inline-size) {
+  @media (max-width: 860px) {
+    .msg-actions {
+      flex-wrap: wrap;
+      row-gap: 2px;
+    }
+
+    .msg-retry-inline {
+      flex: 1 0 100%;
+      max-width: 100%;
+      order: -1;
+      margin-inline-start: 0;
+    }
+  }
+}
+
+/* One colour per kind of row. */
+.msg-retry-inline[data-state="error"] {
+  --tone: var(--danger);
+}
+
+.msg-retry-inline[data-state="retry"],
+.msg-retry-inline[data-state="warn"] {
+  --tone: var(--warning, #d9a514);
+}
+
+.msg-retry-inline[data-state="info"],
+.msg-retry-inline[data-state="progress"] {
+  --tone: var(--accent);
+}
+
+/* Inner text row: carries the `dir="ltr"` pin (so the counter/reason/countdown
+   order never flips) while the OUTER span stays direction-inheriting and
+   therefore positionable with `inset-inline-end`. */
+.msg-retry-inline-inner {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  /* The Retry button carries order 0 and the dots live here; putting the text
+     wrapper after the button keeps the visual order "… [Retry] • • •". */
+  order: 1;
+}
+
+.msg-retry-inline-who,
+.msg-retry-inline-count,
+.msg-retry-inline-wait {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+
+/* The error text itself: red so it reads as a failure rather than as more
+   chrome, and ellipsized so it can never widen or wrap the footer. */
+.msg-retry-inline-pct {
+  flex-shrink: 0;
+  /* The number is the whole point of a compaction row, so it takes the tone
+     colour and a heavier weight. */
+  color: var(--tone);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Compaction: a taller chip with a determinate bar as its underline. The bar
+   is absolute, so it adds height only (never width), and `direction: ltr`
+   makes it fill left→right even in an RTL footer. */
+.msg-retry-inline[data-state="progress"] {
+  padding-block-end: 8px;
+  min-width: min(16rem, 100%);
+}
+
+.msg-retry-inline-bar {
+  position: absolute;
+  inset-inline: 12px;
+  bottom: 3px;
+  height: 2px;
+  direction: ltr;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.msg-retry-inline-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--tone);
+  transition: width 0.4s ease;
+}
+
+.msg-retry-inline-reason {
+  /* `flex: 1 1 0` (not a fixed ch basis): the reason takes only the width left
+     over after the counter/countdown, so the LINE stays narrow and its auto
+     margin lands on the far end instead of the middle of the footer. The 34ch
+     max keeps one very long provider body from dominating the row; past that
+     it ellipsizes and the full text stays in the tooltip. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 22ch;
+  /* 10: after the head, before the trailing dots. */
+  order: 10;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--danger);
+}
+
+/* Sub-agent line (user request): the model name takes the tone colour in the
+   head — it IS the state being reported (which rung the ladder is on) — and
+   the run's tool tally replaces the error text in the reason slot, dim grey
+   like the rest of the line so nothing reads as a failure. */
+.msg-retry-inline-model {
+  color: var(--tone);
+  font-weight: 600;
+}
+
+.msg-retry-inline-tools {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* A touch wider than the reason cap: "Read File ×4 · Search Files ×4" is
+     the whole sentence and must not ellipsize on a normal-width footer. */
+  max-width: 34ch;
+  /* Same slot as the reason it replaces. */
+  order: 10;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+/* Wrapped onto its own row (narrow footer): the chip spans the row, so the
+   reason takes every pixel left instead of its 22ch cap. */
+@container msg-actions (max-width: 34rem) {
+  .msg-retry-inline-reason,
+  .msg-retry-inline-tools {
+    flex: 1 1 0;
+    max-width: none;
+  }
+}
+
+/* Very narrow: drop the secondary labels, keep icon + state + Retry. */
+@container msg-actions (max-width: 20rem) {
+  .msg-retry-inline-who,
+  .msg-retry-inline-wait-label {
+    display: none;
+  }
+}
+
+/* Instant hover card carrying the WHOLE error. Native `title` was the wrong
+   tool: 1s delay, dropped on pointer jitter, single line — so a long provider
+   body "did not show". This is pure CSS on the row's own data attribute. */
+.msg-retry-inline::after {
+  content: attr(data-full-error);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  /* The status group (and this chip) always parks flush-LEFT now, so the card
+     must grow RIGHTWARD from the chip's left edge — the old inline-end anchor
+     threw it past the viewport's left edge (user screenshot). */
+  inset-inline-start: 0;
+  z-index: 40;
+  display: none;
+  /* `max-content` used to be clipped by the row's `overflow: hidden`, which is
+     why hovering "did not show the full error" at all. The row no longer clips
+     (only the reason span does), and the card is bounded + scrollable so a
+     4-screen provider body stays inside the viewport. */
+  width: max-content;
+  max-width: min(46ch, 80vw);
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 8px 11px;
+  border: 1px solid color-mix(in srgb, var(--tone) 40%, var(--border));
+  border-radius: 10px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.5;
+  /* The card wraps: that is the whole point of replacing the native tooltip. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 28%);
+  pointer-events: none;
+}
+
+.msg-retry-inline:hover::after,
+.msg-retry-inline:has(.msg-retry-inline-reason:hover)::after {
+  display: block;
+  animation: msg-retry-card-in 0.12s ease-out;
+}
+
+@keyframes msg-retry-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+
+.msg-retry-inline-btn {
+  flex-shrink: 0;
+  /* 30: after the dots — the button is the very last thing in the row. */
+  order: 30;
+  align-self: center;
+  /* Inline gap between the ↻ glyph and the "Retry" label. */
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  /* Follow the ROW's tone: red once the ladder gave up, amber while a live
+     retry can be skipped with "Retry now". */
+  border: 1px solid color-mix(in srgb, var(--tone) 45%, transparent);
+  background: color-mix(in srgb, var(--tone) 12%, transparent);
+  color: var(--tone);
+  border-radius: 999px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 1px 9px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.msg-retry-inline-btn:hover {
+  background: color-mix(in srgb, var(--tone) 26%, transparent);
+}
+
+/* The ↻ carried by the Retry button, kept on the same optical baseline as the
+   label. */
+.msg-retry-inline-btn-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+/* Three retry dots — the SAME pulse as the Working pill, so a pending cycle
+   reads as "alive and coming back" instead of a frozen label. */
+.msg-retry-inline-wait {
+  /* 20: the dots TERMINATE the sentence, after the reason (10). Without this
+     declaration the group defaulted to `order: 0` and sat level with the head,
+     which is why it kept jumping to the sentence's start. */
+  order: 20;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+/* NOTE: an older block above still lists `.msg-retry-inline-wait` in a shared
+   colour rule; it carries no `order`, so it does not conflict with the value
+   set here. */
+.msg-retry-inline-dots {
+  display: inline-flex;
+  align-items: center;
+  /* 5px between dots, not 3px: at 4px+3px the trio fused into one smudge and
+     the indicator was read as "2 dots" even though all three were painted. */
+  gap: 5px;
+  /* A hair of inline padding so the first/last dot never abuts the counter or
+     the sentence text and get clipped by the neighbours' antialiasing. */
+  padding-inline: 1px;
+}
+
+.msg-retry-inline-dots i {
+  /* Identical geometry to the Working pill's dots so the two indicators read as
+     the same kind of thing. */
+  width: 5px;
+  height: 5px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--tone);
+  opacity: 0.2;
+  /* EXACTLY the Working pill's animation (`msg-thinking-dot`, 1.4s,
+     scale 0.7→1.3 with opacity 0.2→1). The previous bespoke `msg-retry-dot`
+     only shifted opacity at a 1.2s cadence, so the two loaders visibly
+     disagreed even though they represent the same "still working" state. */
+  animation: msg-thinking-dot 1.4s ease-in-out infinite;
+}
+
+.msg-retry-inline-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.msg-retry-inline-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes msg-retry-dot {
+  0%,
+  60%,
+  100% {
+    /* Floor 0.7 — high on purpose. Lower values made the "resting" dots
+       disappear at this size and the indicator was misread as 2 dots. The
+       wave is now driven mostly by the 1.0 peak + the 1.5px lift, which is
+       plenty of motion without ever hiding a dot. */
+    opacity: 0.7;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-1.5px);
+  }
+}
+
+/* The dots deliberately IGNORE reduced-motion: they are the same "still alive"
+   indicator as the Working pill's dots, which have no such override. With the
+   override, macOS "Reduce motion" froze the retry dots at a static opacity
+   while the pill kept pulsing — the retry line then looked dead. */
+@media (prefers-reduced-motion: reduce) {
+  .msg-retry-inline-bar-fill {
+    transition: none;
+  }
+}
+
+.msg-interrupted {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 1px dashed color-mix(in srgb, var(--warning, #d9a514) 55%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning, #d9a514) 8%, transparent);
+  color: color-mix(in srgb, var(--warning, #d9a514) 80%, var(--text-dim));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.msg-actions {
+  /* FIXED sides in BOTH message directions (user request): status group
+     (retry/thinking/timer) always LEFT, usage + action icons always RIGHT.
+     The row runs LTR for stable geometry; bidi-sensitive children manage
+     their own direction. */
+  direction: ltr;
+  justify-content: space-between;
+}
+
+.msg-actions-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* The USER bubble's actions row has bare buttons (no groups). TWO fixes:
+   justify-content packs them under the right-parked bubble, and width:100%
+   undoes the inline-size-container collapse — `container-type: inline-size`
+   makes shrink-to-fit ignore the CONTENTS, so under the row's
+   `align-items: flex-end` the row collapsed to its 2×4px padding and the
+   icons overflowed invisible (the old "where are the user icons" bug). */
+.msg.user .msg-actions {
+  justify-content: flex-end;
+  width: 100%;
+}
+
+.msg-actions-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* Standalone chat bubbles outside the transcript (schedule inbox run outputs,
+   reading-mode sections): full-width, no transcript-specific parking. */
+.chat-bubble .msg-bubble {
+  max-width: none;
+}
+
+.schedule-inbox-bubble .msg-bubble {
+  margin: 0;
+  padding: 10px 14px 6px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.schedule-inbox-bubble .msg-actions {
+  padding-top: 4px;
+}
+
+.reading-mode-bubble .msg-bubble {
+  margin: 0 0 10px;
+  padding: 4px 18px 6px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.msg-usage {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: color-mix(in srgb, var(--accent) 78%, var(--text-dim));
+  opacity: 0.85;
+  white-space: nowrap;
+  margin-inline-end: 10px;
+}
+
+.msg-usage.live {
+  opacity: 1;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.msg-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 6px;
+  border-radius: 7px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0;
+  transition:
+    opacity 0.15s,
+    background 0.15s,
+    color 0.15s;
+}
+
+.msg:hover .msg-copy {
+  opacity: 1;
+}
+
+/* User bubbles: the copy/fork icons are ALWAYS visible — hover-only made
+   them look missing entirely (user report). */
+/* User bubble icons show on HOVER (user request) — the width fix below is
+   what makes them appear under the bubble at all; before it the row collapsed
+   to 8px and even hover showed nothing. */
+.msg:hover .msg-copy {
+  opacity: 1;
+}
+
+/* Per-line blocks inside the user bubble (see perLineDir). */
+.user-text-line {
+  white-space: pre-wrap;
+  /* start resolves against the LINE's own dir=auto direction: English lines
+     flush-left, Persian lines flush-right, inside the right-parked bubble. */
+  text-align: start;
+}
+
+.msg-copy:hover {
+  background: var(--bg-input);
+  color: var(--text);
+}
+
+.msg-actions .msg-copy svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.msg-copy.copied {
+  opacity: 1;
+  color: var(--success);
+}
+
+/* Pencil edit button — sibling of retry/fork/copy in .msg-actions.
+   Inherits the .msg-copy ghost-button base; only the active state differs. */
+.msg-copy.msg-edit.editing {
+  opacity: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.msg-copy.msg-edit:disabled {
+  opacity: 0;
+  cursor: default;
+  pointer-events: none;
+}
+
+.msg:hover .msg-copy.msg-edit:disabled {
+  opacity: 0.35;
+}
+
+.queued-bubble:hover .msg-copy {
+  opacity: 1;
+}
+
+.queued-bubble:hover .msg-copy.msg-edit:disabled {
+  opacity: 0.35;
+}
+
+/* Inline edit box replacing the user bubble while editing. */
+.msg.user .msg-bubble.editing,
+.msg.user .msg-bubble:has(.msg-edit-wrap) {
+  width: 100%;
+  max-width: 100%;
+  align-self: stretch;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.msg.user .msg-bubble.editing::after,
+.msg.user .msg-bubble:has(.msg-edit-wrap)::after {
+  display: none;
+}
+
+.msg-edit-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(680px, 100%);
+  margin: 0 auto;
+}
+
+.msg-edit-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 120px;
+  max-height: 320px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  background: var(--bg-alt);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.7;
+  resize: vertical;
+  overflow-y: auto;
+  text-align: start;
+  field-sizing: content;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
+    0 0 24px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.msg-edit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent),
+    0 0 28px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.msg-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.msg-edit-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--text-dim);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+.msg-edit-cancel {
+  padding: 6px 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.msg-edit-cancel:hover {
+  color: var(--text);
+}
+
+/* خطای پخش صدا زیر دکمه Speak — به‌جای title */
+.msg-tts-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--danger, #e5484d);
+  max-width: 100%;
+}
+
+.msg-tts-error-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
+.msg-tts-retry {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger, #e5484d);
+  border: 1px solid color-mix(in srgb, var(--danger, #e5484d) 40%, transparent);
+  background: transparent;
+  cursor: pointer;
+}
+
+.msg-tts-retry:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
+}
+
+.msg-tts-retry:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* "Read" button — plain ghost icon like the other footer buttons. */
+
+/* "Speak" button — same hover reveal as Copy, accent-tinted while speaking. */
+.msg-speak.speaking {
+  opacity: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.msg-speak.speaking:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.msg-speak.loading {
+  opacity: 1;
+}
+
+.msg-speak.paused {
+  opacity: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.tts-spinner {
+  animation: tts-spin 0.9s linear infinite;
+}
+
+@keyframes tts-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

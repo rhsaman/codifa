@@ -1,0 +1,114 @@
+
+
+/* ── Modern file explorer ── */
+.files-panel .files-panel-head {
+  min-height: 42px;
+  padding: 0 10px 0 14px;
+  gap: 4px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.files-panel .files-panel-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.files-panel .files-panel-action {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+.files-panel .files-filter-input {
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.files-panel .files-list {
+  padding: 8px 8px 14px;
+}
+
+.files-panel .files-list .files-row {
+  position: relative;
+  gap: 8px;
+  min-height: 30px;
+  padding-block: 4px;
+  padding-right: 10px;
+  margin-bottom: 1px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  background-color: transparent;
+  /* one faint guide line per nesting level, aligned under the parent chevron */
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0 12px,
+    color-mix(in srgb, var(--text) 10%, transparent) 12px 13px
+  );
+  background-size: calc(var(--depth, 0) * 13px) 100%;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.files-panel .files-list .files-row:hover {
+  background-color: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.files-panel .files-list .files-row-active,
+.files-panel .files-list .files-row-active:hover {
+  background-color: color-mix(in srgb, var(--accent) 17%, transparent);
+  box-shadow: none;
+  color: var(--text);
+}
+
+.files-panel .files-list .files-row-active::before {
+  content: "";
+  position: absolute;
+  inset-block: 6px;
+  inset-inline-start: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+.files-panel .files-row-dir .files-row-name {
+  font-weight: 600;
+}
+
+.files-panel .files-row-dir .files-row-icon {
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
+}
+
+.files-panel .files-row-caret {
+  opacity: 0.6;
+}
+
+.files-panel .files-row:hover .files-row-caret {
+  opacity: 1;
+}
+
+.files-panel .files-row-name {
+  letter-spacing: 0.005em;
+}
+
+.files-panel .files-row.files-row-drop {
+  background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -1px;
+}
+
+.files-panel .viewer-empty {
+  margin: 16px;
+  padding: 18px 14px;
+  border: 1px dashed var(--hairline);
+  border-radius: 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}

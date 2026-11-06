@@ -2,9 +2,14 @@
 // --on-accent (که در تم‌های تاریک روی زمینهٔ مبتنی‌بر --bg نامرئی می‌شود)
 // فال‌بک دهد. فال‌بک باید --text باشد که همیشه برای خوانایی روی --bg تنظیم شده.
 // اجرا: node test/diffContrast.test.ts
-import { readFileSync } from 'node:fs'
-
-const css = readFileSync(new URL('../src/styles/global.css', import.meta.url), 'utf8')
+import { readFileSync, readdirSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+const cssEntry = fileURLToPath(new URL('../src/styles/global.css', import.meta.url))
+const cssDir = cssEntry.replace(/\.css$/, '')
+const css = [readFileSync(cssEntry, 'utf8')]
+  .concat(readdirSync(cssDir).filter((f) => f.endsWith('.css')).sort()
+    .map((f) => readFileSync(`${cssDir}/${f}`, 'utf8')))
+  .join('\n')
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {

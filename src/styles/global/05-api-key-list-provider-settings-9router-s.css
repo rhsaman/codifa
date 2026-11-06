@@ -1,0 +1,2579 @@
+
+
+/* ── API key list (provider settings, 9router-style fallback) ──────────────
+   One bordered card per key: order badge + input + grouped icon actions.
+   The add-row is dashed so it reads as "new", not saved. */
+.api-key-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.api-key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 6px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.api-key-row:hover {
+  border-color: color-mix(in srgb, var(--border) 55%, var(--accent) 45%);
+}
+
+.api-key-row:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.api-key-row.add {
+  background: transparent;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--text) 26%, transparent);
+}
+
+.api-key-row.add:focus-within {
+  border-color: var(--accent);
+  border-style: solid;
+}
+
+.api-key-order {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.api-key-order.new {
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.api-key-row .api-key-input {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+}
+
+.api-key-row .api-key-input:focus {
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.api-key-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.api-key-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 3px;
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.api-key-actions .icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.api-key-actions .icon-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.api-key-actions .icon-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.api-key-actions .icon-btn.on {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.api-key-actions .icon-btn.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+
+.api-key-actions .btn.tiny.primary {
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* ── Models catalog card (provider settings) ───────────────────────────────
+   A bordered card grouping the fetch action + live status, matching the
+   settings-group language (border + hover lift, no floating pill). */
+.models-catalog-card {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.models-catalog-card:hover {
+  border-color: color-mix(in srgb, var(--border) 60%, var(--accent) 40%);
+}
+
+.models-catalog-card .hint {
+  margin: 0;
+}
+
+.models-catalog-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.fetch-models-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 15px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.fetch-models-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+}
+
+.fetch-models-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.fetch-models-btn:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.fetch-models-btn.busy {
+  cursor: wait;
+}
+
+.fetch-models-icon.spin {
+  animation: fetch-models-spin 0.9s linear infinite;
+}
+
+@keyframes fetch-models-spin {
+  to { transform: rotate(360deg); }
+}
+
+.fetch-models-status {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.fetch-models-status.ok {
+  color: var(--success);
+}
+
+.fetch-models-status.fail {
+  color: var(--danger);
+}
+
+.fetch-models-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.api-key-actions .btn.tiny.primary:disabled {
+  opacity: 0.4;
+}
+
+/* ردیف «افزودن مدل دستی»: input + دکمه Add در یک خط */
+.manual-model-row {
+  display: flex;
+  gap: 6px;
+}
+
+.manual-model-row input {
+  flex: 1;
+}
+
+/* ---- Context-window picker (custom providers) ----
+   A snapping slider over human-scaled stops with tick labels, a live
+   formatted readout, and an exact-value field for windows off the scale.
+   Replaces the bare number input next to the model id. */
+.ctx-picker {
+  margin-top: 12px;
+  max-width: var(--field-max-w, 560px);
+}
+
+.ctx-picker-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.ctx-picker-value {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.ctx-picker-value.unset {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.ctx-picker-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.ctx-picker-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* The RangeSlider centers its 16px track in a 16px box; the tick row below
+     needs its own lane. */
+  padding-top: 2px;
+}
+
+.ctx-picker-ticks {
+  position: relative;
+  height: 15px;
+  margin-top: 3px;
+  font-size: 9.5px;
+  line-height: 1;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.ctx-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  opacity: 0.7;
+  transition:
+    color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+/* Edge stops anchor to the track ends instead of centering, so "4K" and
+   "2M" never overflow the picker's box. */
+.ctx-tick:first-child {
+  transform: none;
+}
+
+.ctx-tick:last-child {
+  transform: translateX(-100%);
+}
+
+.ctx-tick.on {
+  color: var(--accent);
+  opacity: 1;
+  font-weight: 700;
+}
+
+.ctx-picker-exact {
+  flex: 0 0 112px;
+  height: 36px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.manual-model-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.manual-model-chip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name remove"
+    "ctx reasoning";
+  gap: 4px 6px;
+  align-items: center;
+  min-width: 0;
+  padding: 6px 6px 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--mono, monospace);
+  direction: ltr;
+}
+.manual-model-chip:hover {
+  border-color: var(--accent-dim, var(--border));
+}
+
+/* خط اول کارت: اسم کامل مدل + دکمه حذف — جای هر دو ثابت است تا با اسم
+ * طولانی، × هرگز به خط دوم نیفتد. */
+.manual-model-name {
+  grid-area: name;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.manual-model-chip .manual-model-remove {
+  grid-area: remove;
+  justify-self: end;
+  margin-inline-end: 2px;
+}
+
+/* اینپوت مقدار کانتکست و دکمه reasoning — ردیف دوم کارت مدل دستی. */
+.manual-model-ctx-input {
+  grid-area: ctx;
+  min-width: 0;
+  width: 100%;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+}
+.manual-model-chip .manual-model-reasoning {
+  grid-area: reasoning;
+  justify-self: end;
+}
+
+.manual-model-reasoning {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 8px;
+  opacity: 0.85;
+  font-family: var(--font, inherit);
+}
+.manual-model-reasoning-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+.manual-model-reasoning-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.manual-model-reasoning:hover {
+  opacity: 1;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.manual-model-reasoning.on {
+  opacity: 1;
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+.manual-model-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim, var(--text));
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 50%;
+}
+
+.manual-model-remove:hover {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.cred-inline-fallback {
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+
+.oauth-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.oauth-signin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 10px 18px;
+  border: 1px solid color-mix(in srgb, var(--text) 18%, var(--border));
+  border-radius: 999px;
+  background: #ffffff;
+  color: #1d1d1f;
+  font-weight: 600;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
+  transition:
+    box-shadow 0.15s ease,
+    transform 0.15s ease,
+    filter 0.15s ease;
+}
+
+.oauth-signin-btn:hover:not(:disabled) {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+  filter: brightness(0.97);
+}
+
+.oauth-signin-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.oauth-signin-btn:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.oauth-glogo {
+  flex: 0 0 auto;
+}
+
+.oauth-btn-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid rgba(0, 0, 0, 0.18);
+  border-top-color: #4285f4;
+  animation: oauth-spin 0.8s linear infinite;
+}
+
+@keyframes oauth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- searchable model picker ---- */
+.model-picker {
+  position: relative;
+}
+
+.model-picker-input-row {
+  position: relative;
+}
+
+.model-picker-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  outline: none;
+}
+
+.model-picker-input:focus {
+  border-color: var(--accent);
+}
+
+.model-picker-list {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.model-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.model-picker-item:hover,
+.model-picker-item.active {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.model-picker-item.selected {
+  font-weight: 600;
+}
+
+.model-picker-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: ltr;
+  text-align: left;
+}
+
+.model-picker-section {
+  padding: 6px 10px 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.model-picker-section:not(:first-child) {
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 8px;
+}
+
+.model-picker-empty {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.model-picker-custom {
+  align-self: flex-start;
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.provider-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.provider-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  cursor: pointer;
+  user-select: none;
+}
+
+.provider-tab.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.provider-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.provider-tab-dot.ok {
+  background: var(--success, #22c55e);
+  box-shadow: 0 0 4px color-mix(in srgb, var(--success, #22c55e) 50%, transparent);
+}
+
+.provider-tab-dot.off {
+  background: color-mix(in srgb, var(--text-dim) 40%, transparent);
+}
+
+.provider-tab-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.provider-tab.add {
+  border-style: dashed;
+  color: var(--text-dim);
+}
+
+.provider-tab-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.provider-tab-remove:hover {
+  color: var(--danger);
+}
+
+.model-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.model-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  max-width: 100%;
+}
+
+.model-tag.current {
+  border-color: var(--accent);
+}
+
+.model-tag-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+
+.model-tag-remove:hover {
+  color: var(--danger);
+}
+
+.model-add-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.model-add-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.model-add-input:focus {
+  border-color: var(--accent);
+}
+
+/* --- Settings model picker --- */
+.model-select {
+  width: 100%;
+  position: relative;
+}
+
+/* Combo box variant (subagent picker): the trigger IS the search input, so
+   there's no separate search field that only shows up after opening. */
+.model-select-combo-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.model-select-combo-input {
+  width: 100%;
+  padding: 8px 30px 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  cursor: text;
+  transition:
+    border-color 0.14s,
+    box-shadow 0.14s;
+}
+
+.model-select-combo-input::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.model-select-combo-input:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.model-select.combo.open .model-select-combo-input {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+.model-select-combo-chevron {
+  position: absolute;
+  right: 11px;
+  font-size: 10px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.model-select-dropdown.combo {
+  margin-top: 6px;
+  max-height: 320px;
+}
+
+/* Small provider status dot reused across pickers (composer, tools). */
+.pm-provider-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 20%, transparent);
+}
+
+/* Read-only "Active model" display (the model is chosen in the composer). */
+.active-model-display {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  font-family: inherit;
+  opacity: 0.75;
+}
+
+.model-select-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  gap: 8px;
+}
+
+.model-select-btn .chevron {
+  font-size: 10px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.model-select-btn:hover {
+  border-color: var(--accent);
+}
+
+.model-select-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  z-index: 100;
+  max-height: 260px;
+  display: flex;
+  flex-direction: column;
+}
+
+.model-select-search {
+  margin: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.model-select-search:focus {
+  border-color: var(--accent);
+}
+
+.model-select-list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 0 4px 4px;
+}
+
+.model-select-item {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-select-item:hover {
+  background: var(--hover);
+}
+
+.model-select-item.current {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.model-select-item.add {
+  color: var(--accent);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 6px 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.ok {
+  background: var(--success);
+}
+
+.status-dot.fail {
+  background: var(--danger);
+}
+
+.badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.badge-provider {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.badge.context-cap {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+/* Provider balance chip on the app bar's right end. Kept self-contained:
+   the chip may also render as a fallback outside the titlebar portal (see
+   ChatPanel), so the font-size here must NOT depend on a `.titlebar`
+   ancestor. */
+.titlebar-balance {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  justify-content: center;
+}
+
+.titlebar-balance-icon {
+  flex: 0 0 auto;
+  opacity: 0.9;
+}
+
+/* Click-to-refresh: the balance is no longer auto-polled, so the user
+   refreshes it on demand. Reset native <button> styles so the chip still
+   looks like a chip, and add a hover state so the affordance is visible. */
+.titlebar-balance-clickable {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 0 6px;
+  margin: 0;
+  height: auto;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.titlebar-balance-clickable:hover {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.titlebar-balance-clickable:active {
+  background: color-mix(in srgb, var(--text) 13%, transparent);
+}
+
+.titlebar-balance-clickable.refreshing .titlebar-balance-icon {
+  animation: titlebar-balance-spin 0.9s linear infinite;
+}
+
+@keyframes titlebar-balance-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.context-meter-ring {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+}
+
+.context-meter-ring svg {
+  display: block;
+  width: 24px;
+  height: 24px;
+  transform: rotate(-90deg);
+}
+
+.context-meter-ring-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0;
+  margin: 0;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  pointer-events: none;
+  user-select: none;
+}
+
+.context-meter-ring-label.triple {
+  font-size: 6.5px;
+  letter-spacing: -0.04em;
+}
+
+.ctx-ring-btn.warn .context-meter-ring-label {
+  color: var(--thinking, #e2b93d);
+}
+
+.context-meter-ring-track {
+  fill: none;
+  stroke: color-mix(in srgb, var(--text) 16%, transparent);
+  stroke-width: 2.5;
+}
+
+.context-meter-ring-fill {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.3s ease;
+}
+
+.context-meter-cost {
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+/* Per-model token + cost chips in the context meter (main + sub-agents). */
+.context-meter-models {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+}
+
+.context-meter-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(128, 128, 128, 0.15);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- composer context ring + "Context windows" breakdown popover ---- */
+.ctx-ring-wrap {
+  position: relative;
+  display: inline-flex;
+  /* Lives in the composer footer next to the mode pill and the model picker,
+     so it only needs a hair of gap and never stretches. */
+  margin-inline-start: 2px;
+  margin-inline-end: 0;
+  flex: 0 0 auto;
+}
+
+.ctx-ring-btn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.ctx-ring-btn:hover,
+.ctx-ring-btn[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+}
+
+.ctx-ring-btn.warn .context-meter-ring-fill {
+  stroke: var(--thinking, #e2b93d);
+}
+
+.ctx-ring-empty {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 16%, transparent);
+}
+
+.context-popover {
+  z-index: var(--z-usage-popover);
+  min-width: 260px;
+  max-width: 340px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
+  animation: ctx-pop-in 0.16s ease-out;
+  -webkit-app-region: no-drag;
+  direction: ltr;
+  text-align: left;
+}
+
+/* Slides up from the ring: keeps the -100% lift during the whole
+ * animation so the popover never flashes below the circle first. */
+@keyframes ctx-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(calc(-100% + 10px));
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(-100%);
+  }
+}
+
+.ctx-pop-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.ctx-pop-total {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+.ctx-pop-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+
+.ctx-pop-bar span {
+  display: block;
+  height: 100%;
+  transition: width 0.2s ease;
+}
+
+.ctx-pop-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ctx-pop-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px 10px;
+  font-size: 12px;
+}
+
+.ctx-pop-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+.ctx-pop-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim);
+}
+
+.ctx-pop-pct {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+  text-align: right;
+  /* Fixed track so percentages line up as their own column. */
+  min-width: 44px;
+}
+
+.ctx-pop-tok {
+  color: var(--text-dim);
+  font-weight: 400;
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-pop-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* Per-chat auto-compaction control inside the context popover: the slider
+   overrides Settings → General for THIS chat only; the meta row either
+   explains the default or offers the reset. */
+.ctx-pop-compact-ctl {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.ctx-pop-compact-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.ctx-pop-compact-pct {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.ctx-pop-compact-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  min-height: 16px;
+}
+
+.ctx-pop-compact-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+.ctx-pop-override-tag {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+
+.ctx-pop-compact-reset {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.ctx-pop-compact-reset:hover {
+  color: var(--accent);
+}
+
+/* Manual compact button inside the context popover. */
+.ctx-pop-compact {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.ctx-pop-compact:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.ctx-pop-compact:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.mention-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- dir toggle ---- */
+.dir-toggle {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.dir-toggle:hover {
+  border-color: var(--text-dim);
+}
+
+/* ---- checkpoints panel (Undo to checkpoint) ---- */
+.checkpoints-panel {
+  position: relative;
+}
+
+.checkpoints-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  inset-inline-end: 0;
+  min-width: 240px;
+  max-width: 320px;
+  max-height: 320px;
+  overflow-y: auto;
+  z-index: 60;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-size: 12px;
+}
+
+.checkpoints-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  padding: 2px 4px 8px;
+  color: var(--text-dim);
+}
+
+.checkpoints-refresh {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 4px;
+}
+
+.checkpoints-refresh:hover {
+  color: var(--text);
+}
+
+.checkpoints-empty {
+  color: var(--text-dim);
+  padding: 8px 4px;
+  text-align: center;
+}
+
+.checkpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 6px;
+}
+
+.checkpoint-row:hover {
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.checkpoint-restore {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.checkpoint-restore:hover:not(:disabled) {
+  border-color: var(--text-dim);
+}
+
+.checkpoint-restore:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.checkpoint-meta {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.checkpoints-error {
+  color: var(--danger);
+  padding: 6px 4px 2px;
+  font-size: 11px;
+}
+
+/* ---- git panel ---- */
+.git-panel {
+  position: relative;
+}
+
+/* هر فایل = یک آکاردئون: ردیف فایل + دیف بازشونده‌ی زیر همان فایل. */
+.git-file-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-badge {
+  margin-inline-start: 3px;
+  font-size: 9px;
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 8px;
+  padding: 0 4px;
+}
+
+.git-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  inset-inline-end: 0;
+  width: 380px;
+  max-height: 480px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 25%);
+  padding: 8px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* بخش اسکرول‌شوننده (فایل‌ها + diff + log) — فرم commit بیرونش می‌ماند. */
+.git-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.git-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 4px;
+}
+
+.git-branch {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--fg);
+  cursor: pointer;
+  text-align: start;
+}
+
+.git-file:hover {
+  background: var(--hover);
+}
+
+.git-file.selected {
+  background: var(--hover);
+  outline: 1px solid var(--accent);
+}
+
+.git-xy {
+  flex: none;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  min-width: 22px;
+  text-align: center;
+  direction: rtl;
+}
+
+.git-xy.st-new { color: #4ade80; background: color-mix(in srgb, #4ade80 12%, transparent); }
+.git-xy.st-add { color: #4ade80; background: color-mix(in srgb, #4ade80 12%, transparent); }
+.git-xy.st-mod { color: #facc15; background: color-mix(in srgb, #facc15 12%, transparent); }
+.git-xy.st-del { color: #f87171; background: color-mix(in srgb, #f87171 12%, transparent); }
+.git-xy.st-ren { color: #38bdf8; background: color-mix(in srgb, #38bdf8 12%, transparent); }
+.git-xy.st-conf { color: #fb923c; background: color-mix(in srgb, #fb923c 12%, transparent); }
+
+.git-diff-wrap {
+  margin: 4px 0;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--code-bg, var(--hover));
+}
+
+.git-diff-wrap .diff-side {
+  max-height: 260px;
+}
+
+.git-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: ltr;
+}
+
+/* بخش undo داخل پنل گیت — آکاردئونی مثل ردیف‌های فایل. */
+.git-undo-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-top: 1px solid var(--border);
+  margin-top: 6px;
+  padding-top: 6px;
+}
+
+.git-undo-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  text-align: start;
+}
+
+.git-undo-toggle:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.git-undo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-inline-start: 16px;
+}
+
+.git-commit-form {
+  display: flex;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+  flex: none;
+}
+
+.git-commit-form input {
+  flex: 1;
+  min-width: 0;
+  background: var(--hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.git-commit-btn {
+  flex: none;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.git-commit-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.git-notice {
+  color: var(--ok, var(--accent));
+  font-size: 11px;
+  padding: 4px 2px 0;
+}
+
+.git-log {
+  border-top: 1px solid var(--border);
+  margin-top: 6px;
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-log-row {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  align-items: baseline;
+}
+
+.git-hash {
+  flex: none;
+  font-family: var(--mono);
+  color: var(--accent);
+}
+
+.git-subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- message attachments ---- */
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chat-messages[data-dir="rtl"] .msg-attachments {
+  align-items: flex-end;
+  justify-content: flex-start;
+}
+
+/* ---- message images ---- */
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.msg-image {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  max-width: 220px;
+}
+
+.msg-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 160px;
+  object-fit: cover;
+}
+
+.msg-image-ph {
+  display: block;
+  padding: 14px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.msg-image.zoomable {
+  cursor: zoom-in;
+}
+
+.msg-image.zoomable:hover {
+  border-color: var(--accent);
+}
+
+.msg-image.zoomable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- fullscreen image viewer (Codex-style, via FullscreenModal) ---- */
+/* The pan content normally sizes to its children (min-width/height: 100%),
+   so the `height: 100%` on .image-fullscreen and `max-height: 100%` on the img
+   resolve to auto and a large image renders at natural size, clipped by the
+   viewport. A definite size here lets those percentages resolve so the image
+   fits the modal at zoom 1; drag/Ctrl+wheel still pan and zoom from there. */
+.fullscreen-modal-body.image-fs-body .fullscreen-pan-content {
+  width: 100%;
+  height: 100%;
+}
+
+.image-fullscreen {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 16px;
+}
+
+.image-fullscreen img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius);
+}
+
+/* ---- markdown inline images (rendered via mdComponents.img) ---- */
+.md-image-wrap {
+  display: block;
+  margin: 0.5em 0;
+  max-width: 100%;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+.md-image-wrap img {
+  display: block;
+  max-width: 100%;
+  max-height: 560px;
+  object-fit: contain;
+  cursor: zoom-in;
+  transition: max-height 0.2s ease;
+}
+
+.md-image-wrap img:hover {
+  filter: brightness(1.04);
+}
+
+.md-image-caption {
+  padding: 4px 10px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  word-break: break-word;
+  background: color-mix(in srgb, var(--bg-alt) 80%, transparent);
+  border-top: 1px solid var(--border);
+  width: 100%;
+}
+
+/* ---- markdown image error fallback ---- */
+.md-image-errored {
+  border-style: dashed;
+  background: var(--bg-alt);
+}
+
+.md-image-fallback {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- markdown video embeds (YouTube / Vimeo via mdComponents.a) ---- */
+.md-video-card {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+  margin: 0.5em 0;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: #000;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.md-video-card:hover {
+  border-color: var(--accent, #3b82f6);
+}
+
+.md-video-thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
+.md-video-thumb-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 48px;
+  background: #1a1a2e;
+}
+
+.md-video-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+  border-radius: 50%;
+  pointer-events: none;
+  transition:
+    background 0.15s ease,
+    transform 0.15s ease;
+}
+
+.md-video-card:hover .md-video-play {
+  background: rgba(255, 0, 0, 0.85);
+  transform: translate(-50%, -50%) scale(1.08);
+}
+
+.md-video-label {
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text);
+  font-family: var(--font-sans);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- @mention popup (slash commands / skill & MCP picker) ---- */
+.composer-input-wrap {
+  position: relative;
+}
+
+.mention-popup {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: 340px;
+  overflow-y: auto;
+  background: color-mix(in srgb, var(--bg-alt) 92%, transparent);
+  border: none;
+  border-radius: 18px;
+  box-shadow: var(--shadow-pop);
+  text-align: left;
+  padding: 6px;
+  animation: ask-slide-up 0.14s ease-out;
+  backdrop-filter: blur(22px) saturate(1.2);
+}
+
+.mention-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 8px 9px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+.mention-head-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--link) 16%, var(--bg-input));
+  color: var(--link);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.mention-head-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.mention-head-count {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-input));
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.mention-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  margin: 0 0 4px;
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+  border-radius: 12px 12px 0 0;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+  transition: box-shadow 0.14s;
+}
+
+.mention-search:focus {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--link) 20%, transparent);
+}
+
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.mention-item:hover,
+.mention-item.active,
+.mention-item.kbd {
+  background: var(--accent-dim);
+}
+
+.mention-item.kbd:not(:hover) {
+  /* Keyboard-selected item: blue ring instead of var(--accent), which renders
+     as a white outline in the dark theme. */
+  outline: 1px solid color-mix(in srgb, var(--link) 50%, transparent);
+  outline-offset: -1px;
+}
+
+.mention-icon {
+  color: var(--text-dim);
+  font-weight: 700;
+}
+
+/* Circular tinted badge in front of each command/skill row, colour-coded by
+   kind so the two sources read apart at a glance without needing to parse
+   the hint text. */
+.mention-icon-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1;
+  background: var(--bg-input);
+  color: var(--text-dim);
+}
+
+.mention-icon-badge.cmd {
+  color: var(--accent);
+  font-weight: 800;
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-input));
+}
+
+.mention-rel {
+  direction: ltr;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Skill names in the @mention popup stand out from their description so the
+   title stays readable even when the hint is long. */
+.mention-item.skill .mention-rel {
+  color: var(--link);
+}
+
+/* MCP connector cards rendered as a grid of on/off toggles. */
+.mcp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+  gap: 8px;
+  padding: 4px 2px 2px;
+}
+
+/* Legacy full-text tint is superseded by the backdrop token highlight above.
+   Kept as a no-op fallback so plain-text slash lines never go invisible if
+   the backdrop is absent. */
+.composer-input.slash-active {
+  font-weight: 400;
+}
+
+.composer-input-stack:not(.slash-rich) .composer-input.slash-active {
+  color: var(--text);
+}
+
+/* ---- prompt history popup (ArrowUp): terminal-style rows above the input ---- */
+.history-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 6px;
+  font-family: var(--font-mono);
+  background: color-mix(in srgb, var(--bg-alt) 92%, black);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+}
+
+.hist-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hist-section-label {
+  padding: 6px 8px 2px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--success);
+  opacity: 0.8;
+}
+
+.hist-card {
+  padding: 5px 8px;
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+
+.hist-card:hover,
+.hist-card.kbd {
+  border-color: transparent;
+  border-left-color: var(--success);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+}
+
+.hist-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.hist-card-icon {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--success);
+}
+
+/* Slash commands keep the accent glyph on the terminal prompt line. */
+.hist-card-icon.cmd {
+  color: var(--accent);
+}
+
+/* Skills keep the link-colored @ glyph so @ rows read apart from $ prompts. */
+.hist-card-icon.skill {
+  color: var(--link);
+}
+
+.hist-card-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hist-card.kbd .hist-card-title,
+.hist-card:hover .hist-card-title {
+  color: var(--text);
+}
+
+/* Second row: the full prompt text, dimmed like terminal output. */
+.hist-card-sub {
+  margin-top: 1px;
+  padding-left: 21px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hist-hint {
+  padding: 6px 8px 2px;
+  font-size: 11px;
+  text-align: left;
+  color: var(--text-dim);
+  opacity: 0.7;
+  border-top: 1px dashed var(--hairline);
+  margin-top: 4px;
+}
+
+.history-pin {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.history-pin:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.history-pin.on {
+  color: var(--accent);
+}
+
+.mention-item.mcp-toggle {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 4%, var(--bg-input));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
+  transition: background 0.15s;
+}
+
+/* MCP connector cards are toggles, not menu items — hover feedback is a
+   subtle surface lift only (no border, no keyboard outline), so they still
+   read as plain tool cards rather than menu rows. */
+.mention-item.mcp-toggle:hover,
+.mention-item.mcp-toggle.kbd {
+  background: color-mix(in srgb, var(--text) 7%, var(--bg-input));
+}
+
+.mention-item.mcp-toggle.kbd:not(:hover) {
+  outline: none;
+}
+
+.mention-item.mcp-toggle .mention-rel {
+  width: 100%;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1.25;
+  /* Card titles may wrap to two lines instead of overflowing the grid cell. */
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text);
+}
+
+/* Card footer row: switch sits at the bottom-right of the card. */
+.mention-item.mcp-toggle .mcp-switch {
+  align-self: flex-end;
+}
+
+/* A permission the card needs is missing. Warning-colored text, not a badge:
+   it is an explanation of why the switch will not work, so it reads as prose
+   and wraps to as many lines as the card gives it. */
+.mention-item.mcp-toggle .mcp-warn {
+  width: 100%;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--warning, #d9a514);
+  white-space: normal;
+}
+
+/* The way out of the warning above, right next to it: raise macOS's own prompt
+   so the app lands in the System Settings list the message points at. */
+.mention-item.mcp-toggle .mcp-warn-grant {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mention-item.mcp-toggle .mcp-warn-grant:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Which signing identity macOS bound the grant to. An ad-hoc build gets a new
+   one per compile, so naming it is the only way to find the right row. */
+.mention-item.mcp-toggle .mcp-warn-id {
+  display: block;
+  margin-top: 2px;
+  opacity: 0.75;
+  word-break: break-all;
+}
+
+.mcp-switch {
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
+.mcp-switch-track {
+  position: relative;
+  display: block;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  transition: background 0.18s;
+}
+
+.mcp-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 1px 3px color-mix(in srgb, #000 45%, transparent);
+  transition:
+    left 0.18s,
+    background 0.18s;
+}
+
+.mention-item.mcp-toggle.on .mcp-switch-track {
+  background: var(--link);
+}
+
+.mention-item.mcp-toggle.on .mcp-switch-knob {
+  left: 18px;
+  background: #fff;
+}
+
+/* Enabled cards get a subtle link-tinted surface so the on-state reads at a
+   glance across the grid, without any border on the tool itself. */
+.mention-item.mcp-toggle.on {
+  background: color-mix(in srgb, var(--link) 9%, var(--bg-input));
+}
+
+.mention-empty {
+  padding: 12px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.mention-group {
+  padding: 8px 9px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  position: sticky;
+  top: 44px;
+  background: color-mix(in srgb, var(--bg-alt) 92%, transparent);
+}
+
+/* ---- attachment chips ---- */
+/* ---- attachment chips (inside composer, above textarea) ---- */
+.composer-inner>.attachment-chips {
+  padding: 8px 14px 0;
+}
+
+/* ---- edit-target badge (composer, above the input) ---- */
+/* Pinned while an update session is open — "پلاگین · update · name". The × is
+   the ONLY way the session ends: folder and mode fall back to the chat's own. */
+.edit-target-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 14px 0;
+  padding: 5px 6px 5px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-input));
+  border: 1px solid color-mix(in srgb, var(--link) 35%, transparent);
+  font-size: 12px;
+  line-height: 1.2;
+  width: fit-content;
+  max-width: 100%;
+  flex: 0 0 auto;
+}
+
+.edit-target-glyph {
+  display: inline-flex;
+  color: var(--link);
+  font-size: 11px;
+}
+
+.edit-target-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.edit-target-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.edit-target-x {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.edit-target-x:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* Base pill — no outline; a soft raised surface with an inner top highlight. */
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  border-radius: 10px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.15),
+    0 4px 12px -6px rgba(0, 0, 0, 0.3);
+}
+
+/* File attachment chips render FileIcon next to the path; no pin glyph. */
+
+/* Input file badge: small compact pill — icon + name + X.
+   Completely override base attachment-chip: no gradient, no shadow, tiny. */
+.attachment-chip.file-chip {
+  position: relative;
+  gap: 1px;
+  padding: 4px 6px 4px 5px;
+  border: none;
+  background: var(--bg-alt);
+  max-width: 160px;
+  border-radius: 6px;
+  box-shadow: none;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  line-height: 1;
+  align-self: flex-start;
+}
+
+.attachment-chip.file-chip:hover {
+  background: color-mix(in srgb, var(--bg-panel) 70%, var(--text) 12%);
+}
+
+/* Composer file chips render FileIcon (13px tile) next to the name. */
+.attachment-chip.file-chip .file-icon-svg {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+}
+
+.chip-file-name {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  background: none;
+  border: none;
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.chip-x:hover {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+}
+
+/* Messages typed while the agent is working: steer chips (already delivered to
+   the running agent) and queue chips (auto-send after the current turn). Both
+   use the theme accent so they read as part of the app's palette. */
+.attachment-chip.queued-chip {
+  border: none;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 10%, var(--bg-panel)));
+  max-width: 56ch;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 35%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.15),
+    0 4px 14px -6px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.attachment-chip.queued-chip.steer-chip {
+  border: none;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 10%, var(--bg-panel)));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 35%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.15),
+    0 4px 14px -6px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.queued-chips {
+  padding-bottom: 2px;
+}

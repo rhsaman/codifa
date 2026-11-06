@@ -58,8 +58,26 @@ useStore.setState({
 })
 // ران‌ها از API می‌آیند؛ برای SSR فقط سورس و CSS را قفل می‌کنیم
 const fs = await import("node:fs")
+
+// global.css is an index over src/styles/global/NN-*.css (split without
+// changing the cascade); concatenate all parts so stylesheet assertions see
+// the full text.
+async function readFullCss(p: string | URL): Promise<string> {
+  const fs = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const path = typeof p === 'string' ? p : fileURLToPath(p)
+  const parts: string[] = []
+  if (fs.existsSync(path) && fs.statSync(path).isFile()) parts.push(fs.readFileSync(path, 'utf8'))
+  const dir = path.replace(/\.css$/, '')
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.css')).sort()) {
+      parts.push(fs.readFileSync(`${dir}/${f}`, 'utf8'))
+    }
+  }
+  return parts.join('\n')
+}
 const inboxSrc = fs.readFileSync("src/components/ScheduleInbox.tsx", "utf8")
-const css = fs.readFileSync("src/styles/global.css", "utf8")
+const css = fs.readFullCss("src/styles/global.css")
 
 console.log("۱) InboxMarkdown از dir استور استفاده می‌کند (نه auto):")
 {

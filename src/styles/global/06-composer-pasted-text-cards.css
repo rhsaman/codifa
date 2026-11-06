@@ -1,0 +1,2663 @@
+
+
+/* ---- composer pasted-text cards ---- */
+/* A long paste becomes a collapsed card above the input (Claude-style paste
+   chip): dim clamped preview starting with a wall-clock timestamp, a PASTED
+   badge + edit button on the foot row, and a floating X on the top edge. */
+.paste-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.paste-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 320px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-panel) 88%, var(--text) 4%);
+  border: 1px solid color-mix(in srgb, var(--border) 80%, var(--text) 20%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 6px 16px -8px rgba(0, 0, 0, 0.35);
+}
+
+/* Reply-quote card ("Replying to …"): shares the paste-card frame but gets a
+   light accent tint, because the plain panel fill was indistinguishable from the
+   chat bubble behind it. The tint stays at the codebase's standard card level
+   (≈14%, like tool cards) rather than a heavy wash: themes whose accent is
+   near-white (Onyx) turned a strong wash into a flat grey slab. Everything
+   derives from theme vars, so each palette tints the card with its own accent. */
+.paste-card.reply-card {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 18%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 6px 16px -8px rgba(0, 0, 0, 0.35);
+}
+
+.paste-card.reply-card .paste-card-preview {
+  /* Solid --text (not a dim mix): on the accent-tinted card a dimmed colour
+     fell to ~3.3:1 in nord/light. The quote must stay readable. */
+  color: var(--text);
+  opacity: 0.92;
+}
+
+.paste-card.reply-card .paste-card-badge {
+  /* One step stronger than the default badge chip (text 7%): the card body is
+     now accent-tinted, so the label needs a touch more lift to read as a chip. */
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.paste-card.reply-card .paste-card-x {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.paste-card-preview {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 96px;
+  overflow: hidden;
+}
+
+.paste-card-time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--text-dim) 80%, transparent);
+}
+
+.paste-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.paste-card-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 4px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.paste-card-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.paste-card-edit:hover {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+/* X floats ON the card's top edge (half outside), like a dismissible popover. */
+.paste-card-x {
+  position: absolute;
+  top: -9px;
+  inset-inline-end: -9px;
+  width: 22px;
+  height: 22px;
+  font-size: 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  z-index: 1;
+}
+
+/* Queued / steer bubbles fold long text exactly like a user bubble: same
+   max-height clamp, toggle button below the text (indented with it). */
+.queued-bubble-text.clamped {
+  max-height: 180px;
+  overflow: hidden;
+}
+
+.queued-bubble .msg-expand {
+  align-self: flex-start;
+}
+
+.chat-messages[data-dir="rtl"] .queued-bubble .msg-expand {
+  margin-right: 30px;
+}
+
+/* Pending messages rendered as bubbles at the END of the transcript (replaces
+   the old chips above the composer). Distinct from real sent messages: dashed
+   border + tinted background + pending icon/label, so a queued item never
+   reads as an already-delivered user message. */
+.queued-bubbles {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0 6px;
+}
+
+.queued-bubble {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-radius: 16px;
+  padding: 12px 14px;
+  padding-inline-start: 18px;
+  background: color-mix(in srgb, var(--link) 7%, var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--link) 20%, var(--border));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 1px 2px rgba(0, 0, 0, 0.18);
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.queued-bubble:hover {
+  border-color: color-mix(in srgb, var(--link) 34%, var(--border));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 4px 16px -8px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+.queued-bubble:focus-within {
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border));
+}
+
+/* soft accent bar on the leading edge */
+.queued-bubble::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 6px;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(to bottom,
+      var(--link),
+      color-mix(in srgb, var(--link) 30%, transparent));
+  pointer-events: none;
+}
+
+.queued-bubble.steer {
+  background: color-mix(in srgb, var(--success) 7%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--success) 20%, var(--border));
+}
+
+.queued-bubble.steer:hover {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 4px 16px -8px color-mix(in srgb, var(--success) 35%, transparent);
+}
+
+.queued-bubble.steer:focus-within {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+
+.queued-bubble.steer::before {
+  background: linear-gradient(to bottom,
+      var(--success),
+      color-mix(in srgb, var(--success) 30%, transparent));
+}
+
+.queued-bubble-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 24px;
+}
+
+.queued-bubble-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  flex: 0 0 auto;
+  background: color-mix(in srgb, var(--link) 13%, transparent);
+  color: var(--link);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--link) 22%, transparent);
+}
+
+.queued-bubble.steer .queued-bubble-icon {
+  background: color-mix(in srgb, var(--success) 13%, transparent);
+  color: var(--success);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 22%, transparent);
+}
+
+.queued-bubble-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.15px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* animated "pending" dot */
+.queued-bubble-pulse {
+  --pulse: var(--link);
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--pulse);
+  animation: queued-pulse 1.8s ease-out infinite;
+}
+
+.queued-bubble.steer .queued-bubble-pulse {
+  --pulse: var(--success);
+}
+
+@keyframes queued-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse) 45%, transparent);
+  }
+
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .queued-bubble-pulse {
+    animation: none;
+  }
+}
+
+.queued-bubble-x {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  opacity: 0.75;
+  cursor: pointer;
+  transition:
+    opacity 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.queued-bubble-x:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+}
+
+.queued-bubble-text {
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  padding-inline-start: 34px;
+}
+
+.chat-messages[data-dir="rtl"] .queued-bubble-text {
+  text-align: right;
+}
+
+/* action row inside queue/steer aligns with the text column */
+.queued-bubble .msg-actions {
+  padding: 0;
+  padding-inline-start: 34px;
+}
+
+.queued-bubble:focus-within .msg-copy {
+  opacity: 1;
+}
+
+.queued-bubble:has(.msg-edit-wrap) {
+  gap: 10px;
+}
+
+.queued-bubble .msg-edit-wrap {
+  width: 100%;
+  margin: 0;
+}
+
+.queued-bubble .msg-edit-input {
+  min-height: 84px;
+}
+
+/* Narrow sidebar / small viewport: keep comment/queue bubbles inside the
+   transcript instead of overflowing from the inline-start side (right in
+   RTL). Long file paths and LTR attachment rows inside an RTL bubble
+   otherwise push past the container because flex items default to
+   min-width:auto and never shrink. */
+.queued-bubbles {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.queued-bubble {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.queued-bubble-text {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.queued-bubble .msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.queued-bubble .msg-attachments .attachment-chip {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-messages {
+  min-width: 0;
+  overflow-x: clip;
+}
+
+.msg {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* ---- نشانگر thinking در ردیف فوتر پیام (سمت مخالف کپی/usage) ---- */
+.msg-thinking {
+  display: inline-flex;
+  align-items: center;
+  /* بدون direction روی خودِ المان — جهت از کانتینر ارث‌بری می‌شود.
+     The old margin-inline-start:auto parked the pill on the far edge of the
+     whole footer; inside the FIXED status group (always LEFT) it must flow
+     naturally after the group start (user: status always left). */
+  margin-inline-start: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* wrapper داخلی ltr — ترتیب ثابت Thinking → نقطه‌ها → تایمر را در RTL
+   حفظ می‌کند. این المان flex واقعی است که فاصلهٔ بین بچه‌ها را می‌دهد. */
+.msg-thinking-inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.msg-thinking-elapsed {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+/* مدت نهایی هر ترن — کنار بج usage (همیشه قابل مشاهده برخلاف دکمه‌های
+   hover-only). بدون usage در انتهای مخالف فوتر (جای نشانگر live). */
+.msg-elapsed {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+/* ── Clock + turn duration: ONE unit, parked where the Working pill sits ──
+   Measured target (RTL): `.msg-thinking` sits at footer-left + 4px. Earlier
+   versions gave the two readouts separate `order`s and separate auto margins,
+   so they fought over the row's single free space and drifted ~140px apart
+   (timer at 18px, clock at 208px) instead of sitting side by side. The wrapper
+   now owns the parking; the readouts inside are plain siblings with a fixed
+   gap, so they can never separate.
+   `margin-inline-start: auto` must resolve against the ROW's direction, so the
+   wrapper carries no `dir` (the digits pin LTR on the inner spans). */
+.msg-clocks {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  /* Same slot the retry/status line and the Working pill occupy: the row's
+     far end, away from the usage badge + action buttons. */
+  margin-inline-start: auto;
+  order: 9;
+  flex-shrink: 0;
+}
+
+/* A live retry/status line owns that slot instead — the pair then tucks back
+   toward the buttons so the two never overlap. */
+.msg-actions:has(.msg-retry-inline) .msg-elapsed {
+  margin-inline-start: 0;
+  order: 2;
+}
+
+.msg-elapsed,
+.msg-time {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+}
+
+.msg-elapsed {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.8;
+  gap: 4px;
+}
+
+/* The stopwatch glyph is the ONLY decoration in this pair — the sent-time
+   clock deliberately has none (it was removed on request), so the two readouts
+   stay visually distinct: glyph = duration, bare digits = when it was sent. */
+.msg-elapsed-icon {
+  flex-shrink: 0;
+  opacity: 0.65;
+}
+
+.msg-time {
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.55;
+  gap: 4px;
+}
+
+/* Month+day chip ahead of the clock: dimmer and slightly tracked-out so it
+   reads as CONTEXT, not as a second time. Same-day messages omit it entirely. */
+.msg-time-date {
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  opacity: 0.72;
+}
+
+.msg-time-hm {
+  font-variant-numeric: tabular-nums;
+}
+
+/* No glyphs: the user asked for the clock icon to go, and the mono digits
+   already read as a time without decoration. */
+
+/* ۳ نقطه لودینگ — از سمت راست شروع می‌کنند به پر شدن (نقطهٔ اول = سمت راست
+   زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.
+   ترتیب بچه‌ها در TSX به‌صورت ltr ثابت است (نقطهٔ اول همیشه سمت راست)،
+   پس انیمیشن صریحاً از راست شروع می‌شود و نیازی به direction نیست. */
+.msg-thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.msg-thinking-dots .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.2;
+  animation: msg-thinking-dot 1.4s ease-in-out infinite;
+}
+
+/* نقطهٔ اول (سمت راست) زودتر روشن می‌شود، سپس دوم و سوم — پر شدن متوالی از راست. */
+.msg-thinking-dots .dot:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.msg-thinking-dots .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.msg-thinking-dots .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes msg-thinking-dot {
+
+  0%,
+  100% {
+    opacity: 0.2;
+    transform: scale(0.7);
+  }
+
+  40% {
+    opacity: 1;
+    transform: scale(1.3);
+  }
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ---- thinking block ---- */
+.thinking-block {
+  border: none;
+  border-left: 3px solid color-mix(in srgb, var(--thinking) 55%, transparent);
+  border-radius: 12px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 96%, var(--thinking) 6%),
+      var(--bg-panel));
+  margin: 4px 0;
+  overflow: hidden;
+}
+
+.thinking-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 5px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.thinking-head:hover {
+  background: color-mix(in srgb, var(--thinking) 6%, transparent);
+}
+
+.thinking-dot {
+  color: var(--thinking);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+/* While no reasoning text has arrived yet, a small gold spinner stands in
+   for the sparkle so the pin reads as "the agent is thinking". */
+.thinking-dot .spinner {
+  width: 11px;
+  height: 11px;
+  border-width: 1.5px;
+  border-color: color-mix(in srgb, var(--thinking) 30%, transparent);
+  border-top-color: var(--thinking);
+}
+
+@keyframes thinking-pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.55;
+    transform: scale(0.88);
+  }
+}
+
+.thinking-label {
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thinking-head .chev {
+  flex: 0 0 auto;
+}
+
+.thinking-text {
+  padding: 4px 12px 2px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  min-height: 56px;
+  max-height: 320px;
+  overflow-y: auto;
+  border-top: 1px dashed color-mix(in srgb, var(--thinking) 25%, transparent);
+}
+
+/* Drag from the bottom edge to resize the thinking area (56–320px). */
+.thinking-resizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 10px;
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+  transition: background 0.15s;
+}
+
+.thinking-resizer:hover,
+.thinking-resizer:active {
+  background: color-mix(in srgb, var(--thinking) 8%, transparent);
+}
+
+.thinking-resizer-grip {
+  width: 28px;
+  height: 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--text) 20%, transparent);
+  transition: background 0.15s;
+}
+
+.thinking-resizer:hover .thinking-resizer-grip,
+.thinking-resizer:active .thinking-resizer-grip {
+  background: var(--thinking);
+}
+
+/* ---- tool cards ---- */
+.tool-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Single tool call card — always fully expanded (non-collapsible). */
+.tool-card {
+  --tool-color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+/* Claude-app style: state is shown by a quiet border tint, not a glow. */
+.tool-card.running {
+  border-color: color-mix(in srgb, var(--tool-color) 45%, var(--border));
+}
+
+.tool-card.error {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.tool-card.denied {
+  border-color: color-mix(in srgb, var(--thinking) 40%, var(--border));
+}
+
+/* Explore card: same sub-agent layout, but every COLOR comes from the
+   standard tool-card styles — only layout overrides live here. */
+.tool-card.explore {
+  border-radius: 14px;
+}
+
+.tool-card.explore .tool-card-head {
+  padding: 10px 14px;
+  gap: 10px;
+}
+
+.tool-card.explore .tool-card-head .tool-name {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+}
+
+.tool-card.explore .tool-card-head .tool-cmd.tool-task {
+  font-weight: 400;
+}
+
+.tool-card.explore .tool-card-head .tool-sub-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-card.explore .tool-sub-list {
+  position: relative;
+  margin: 0 8px 10px;
+  padding: 4px;
+  border-radius: 10px;
+}
+
+/* Single-line rows: label + path stay on one line with real ellipsis. */
+.tool-card.explore .tool-sub-row .tool-sub-name {
+  font-weight: 600;
+}
+
+.tool-card.explore .tool-sub-row .tool-sub-args {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 400;
+}
+
+.tool-card.explore .tool-sub-row .tool-sub-summary {
+  max-width: 16ch;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-card.explore .tool-sub-row .tool-ms {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+/* Flat divider rows replace the old tree spine + branch ticks. */
+.tool-card.explore .tool-sub-row {
+  position: relative;
+  border-radius: 8px;
+}
+
+.tool-card.explore .tool-sub-row+.tool-sub-row {
+  border-top: 1px solid var(--hairline);
+}
+
+/* Tool heads keep LTR item order (status/meta on the right) in every chat
+   direction — same convention as .trace-row-head and .edit-group-row. */
+.tool-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: default;
+  text-align: left;
+  direction: ltr;
+  user-select: none;
+}
+
+/* Trailing meta (timer, diff stats, Review, chevron) as one group pinned to
+   the right edge — a lone auto margin on the group, so the pin holds even
+   when the timer is absent (write cards render no elapsed time). */
+.tool-card-head-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* Explore cards are collapsible (start collapsed): the head becomes a
+   toggle and the chevron hints at the nested sub-call list. */
+.tool-card-head.collapsible {
+  cursor: pointer;
+  transition: background 0.14s;
+}
+
+.tool-card-head.collapsible:hover {
+  background: color-mix(in srgb, var(--tool-color) 7%, transparent);
+}
+
+.tool-card-head.collapsible:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--tool-color) 45%, transparent);
+  outline-offset: -2px;
+}
+
+.tool-card-head .chev {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-dim);
+  font-size: 10px;
+  opacity: 0.8;
+  flex: 0 0 auto;
+  transition:
+    transform 0.15s,
+    color 0.15s;
+}
+
+.tool-card-head.collapsible:hover .chev {
+  color: var(--accent);
+}
+
+/* Claude-app style: tool name is a quiet mono label, not a saturated pill —
+   the accent stays reserved for status/interaction, not decoration. */
+.tool-card-head .tool-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* Single edit rows (Edited/Wrote + filename + diff stats + Review): the name
+   group must shrink with a real ellipsis in narrow panes instead of sliding
+   under the trailing stats. The end cluster never shrinks or wraps. */
+.tool-card-head.write-head .tool-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.tool-card-head.write-head .tool-verb {
+  flex: 0 0 auto;
+}
+
+.tool-card-head.write-head .tool-file {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.tool-card-head.write-head .tool-file-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-card-head.write-head .tool-card-head-end {
+  flex: 0 0 auto;
+}
+
+.tool-card-head.write-head .tool-diff-stats,
+.tool-card-head.write-head .tool-review-btn,
+.tool-card-head.write-head .tool-ms {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* Write heads already show the file in .tool-file: a second full-path chip
+   (ToolPathSpan) or leftover arg chips would crowd narrow panes and slide
+   under the diff stats, so they never render side by side with the name. */
+.tool-card-head.write-head .tool-path,
+.tool-card-head.write-head .tool-args {
+  display: none;
+}
+
+.tool-card-head.write-head .tool-file .file-icon-svg {
+  flex: 0 0 auto;
+}
+
+/* Engine / model / sub-count badge: quiet neutral chip. */
+.tool-card-head .tool-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border: none;
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+/* Web-search provider badge: themed accent chip (uses theme --accent). */
+.tool-engine-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.tool-engine-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.tool-card-head .tool-cmd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.tool-card-head .tool-path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.tool-card-head .tool-path+.tool-path {
+  margin-left: 3px;
+}
+
+.tool-card-head .tool-path.tool-more {
+  font-style: italic;
+  opacity: 0.75;
+}
+
+/* The skill a `load_skill` call pulled in — the head's only statement of it,
+   since the label just says "Load Skill". Accent-tinted so it reads as the
+   payload of the call, not as another arg chip. */
+.tool-card-head .tool-skill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 24ch;
+  min-width: 0;
+}
+
+.tool-ms {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  opacity: 0.85;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+/* Elapsed-time reads as a quiet meta pill in card/group heads (sub-rows keep
+   the plain inline form). */
+.tool-card-head .tool-ms,
+.tool-group-head .tool-ms {
+  opacity: 1;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.chev {
+  transition: transform 0.15s;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.chev.open {
+  transform: rotate(180deg);
+}
+
+/* Status glyphs become small tinted circles instead of bare text. The hue
+   stays exactly the theme's semantic mix (--status-color) — only the
+   contrast is boosted: a stronger fill, a crisper ring and a soft outer glow
+   so ✓ / ⏹ / ✗ read clearly against the card surface. */
+.status-ok,
+.status-err,
+.status-denied {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 11px;
+  line-height: 1;
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+/* Claude-app style: flat glyphs, no filled circle or glow — color alone
+   carries the state, derived from the theme accent toward each semantic hue. */
+.status-ok {
+  --status-color: color-mix(in srgb, var(--accent) 60%, var(--success));
+  color: var(--status-color);
+}
+
+.status-err {
+  --status-color: color-mix(in srgb, var(--accent) 60%, var(--danger));
+  color: var(--status-color);
+}
+
+.status-denied {
+  --status-color: color-mix(in srgb, var(--accent) 60%, var(--thinking));
+  color: var(--status-color);
+}
+
+/* The running spinner inside a tool call uses the full theme accent so it
+   stays bright even inside muted group/explore cards. Slightly larger than
+   the base spinner so it reads clearly at the head of a card. */
+.tool-card .spinner,
+.tool-group .spinner,
+.tool-sub-row .spinner {
+  width: 13px;
+  height: 13px;
+  border-width: 2px;
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-top-color: var(--accent);
+}
+
+.tool-card-body {
+  /* هم‌تراز با .tool-card-head (12px افقی) */
+  padding: 9px 12px 10px;
+  border-top: 1px solid var(--border);
+  /* چاهک فرورفتهٔ مشتق از خود تم: کمی تیره‌تر از قاب کارت تا نوشته‌ها
+     (SUMMARY/ARGS) از head متمایز شوند، بدون هاردکد رنگ خارج از پالت */
+  background: var(--bg-inset);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ---- unified tool trace ---- */
+/* Claude.ai-style trace panel: a single quiet card with a sparkle ✱ header,
+   a status sentence + elapsed time, and a list of plain rows underneath.
+   The whole run shares one border so a multi-step turn (5-10 calls) reads as
+   one connected sequence instead of a stack of floating cards. */
+.tool-trace {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+/* Children inside .tool-trace: no border/radius/bg of their own — the OUTER
+   .tool-trace card owns the frame. A hairline divider between rows (skipped
+   before the first) is what makes a multi-step turn read as one continuous
+   list instead of a stack of floating rows — matches Claude.ai's own trace
+   panel, where every step in a turn sits inside one bordered card. */
+.tool-trace>.trace-row,
+.tool-trace>.tool-group {
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  border-radius: 0;
+  background: none;
+  margin: 0;
+}
+
+.tool-trace>.trace-row:first-child,
+.tool-trace>.tool-group:first-child,
+.tool-trace>.trace-narration:first-child {
+  border-top: none;
+}
+
+/* ---- grouped read-only tool calls (see ToolGroupView) ---- */
+/* Same family as .tool-card but with its own counter pill + chevron, so the
+   group reads as "a summary you can expand", not a single call. */
+/* ---- grouped read-only tool calls (see ToolGroupView) ----
+   When collapsed the group is just a text line — no border, no background,
+   matching Claude.ai where trace summaries sit inline with the conversation.
+   The border only appears when expanded to frame the detail rows. */
+.tool-group {
+  --tool-color: color-mix(in srgb, var(--accent) 70%, var(--bg));
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+}
+
+/* When expanded: no border on the container — only individual rows have borders. */
+.tool-group.open {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+}
+
+.tool-group.open>.trace-head {
+  border: none;
+  background: transparent;
+  border-radius: 0;
+}
+
+.tool-group.open>.trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: none;
+}
+
+.tool-group.open>.trace-list>.trace-row {
+  /* divider row — no card border */
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  border-radius: 0;
+}
+
+.tool-group.open.running {
+  /* no special border needed — each row handles its own */
+}
+
+.tool-group.open.denied {
+  /* no special border needed — each row handles its own */
+}
+
+.tool-group.open.error {
+  /* no special border needed — each row handles its own */
+}
+
+/* ——— Trace head (Claude.ai style) ———
+   a small ✱ accent, a one-line status sentence,
+   the elapsed time on the right, and a chevron that rotates when expanded. */
+.trace-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  text-align: left;
+  direction: ltr;
+  user-select: none;
+  border-radius: 0;
+}
+
+.trace-head:hover {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.trace-sparkle {
+  color: var(--accent, #e87040);
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+
+.trace-sparkle-sm {
+  color: var(--accent, #e87040);
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+  width: 14px;
+  height: 14px;
+  opacity: 0.7;
+}
+
+/* Bullet indicator for sub-items inside expanded groups */
+.trace-row-bullet {
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-dim);
+  width: 16px;
+  flex: 0 0 16px;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Terminal trace rows swap the plain bullet for the shell-prompt glyph in
+   the theme accent, so command rows read at a glance like file rows do. */
+.trace-row-term-icon {
+  color: var(--accent);
+  opacity: 0.9;
+}
+
+/* Container for tool-name pills inside the trace head. Reserved at least
+   1/3 of the head width for the badges (sized to content when they need
+   more), so they never fight a long caption for space. nowrap + visible
+   overflow: pills stay on ONE row and are never clipped — the caption
+   ellipsizes instead. */
+.trace-head-pills {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  min-width: 33.33%;
+  flex-wrap: nowrap;
+  overflow: visible;
+}
+
+/* The model's narration line inside the group head — fills the space after
+   the pills, single line with ellipsis. Claude.ai shows the last caption as
+   the summary title (collapsed or expanded); the expanded panel repeats it
+   as its first row. */
+.trace-head-caption {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.75;
+}
+
+/* The model's narration line as its OWN row inside the trace card (above the
+   tool row/group it precedes) — Claude.ai interleaves narration and tool rows
+   inside one card. Quiet plain text, no chrome. Like .trace-row it carries a
+   TOP hairline so it reads as its own row, separated from the tool above it;
+   the tool row below brings its own border-top divider (no double line). */
+.trace-narration {
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  opacity: 0.85;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+}
+
+.trace-status-text {
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.trace-time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.6;
+  flex: 0 0 auto;
+}
+
+.trace-chev {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  opacity: 0.4;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+  transition: opacity 0.15s ease;
+}
+
+.trace-head:hover .trace-chev {
+  opacity: 0.7;
+  color: var(--accent);
+}
+
+/* Right-side cluster inside trace-head: time + count + chevron stay together */
+.trace-head-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* ——— Trace list + rows (Claude.ai flat-list style) ——— */
+/* The expanded panel below the trace head: a simple vertical stack of quiet
+   rows. No timeline spine, no circles — just icon + text + time + chevron. */
+.trace-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.trace-row {
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: default;
+  transition: background 0.12s;
+  direction: ltr;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Clickable head row: pill + detail on left, ms + status + chevron on far right */
+.trace-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  direction: ltr;
+  transition: background 0.1s ease;
+}
+
+.trace-row-head:hover {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+/* Push ms + status + chevron to the far right */
+
+/* Expanded state: subtle highlight + bottom border for the expand panel */
+.trace-row.expanded {
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  border-top-color: color-mix(in srgb, var(--accent) 18%, var(--border));
+}
+
+.trace-row.expanded>.trace-row-head {
+  border-bottom: none;
+  border-radius: 0;
+}
+
+/* Each trace-row is a flat divider row — not a card. */
+.trace-row {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+}
+
+.trace-row.running {
+  color: var(--text);
+}
+
+.trace-row.error {
+  color: var(--danger, #e74c3c);
+}
+
+.trace-row.denied {
+  color: var(--warning, #d9a514);
+}
+
+/* Tool name pill: compact mono badge — lets the eye scan rows fast. */
+.trace-pill {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  line-height: 1.3;
+}
+
+/* Claude.ai-style: inside an actual row (single/narrated/sub-row head) the
+   tool label reads as plain leading text on the line, not a separate badge
+   — matches the flat "Edit File", "Ran a command" rows in Claude's own trace
+   UI. Scoped to row heads only; the collapsed multi-call group header
+   (.trace-head-pills) keeps the pill look since it's summarizing several
+   tools by count at once, not a single action line. */
+.trace-row-head>.trace-pill {
+  font-family: inherit;
+  font-weight: 500;
+  font-size: inherit;
+  color: var(--text);
+  padding: 0;
+  border-radius: 0;
+  background: none;
+}
+
+.trace-pill-count {
+  font-weight: 400;
+  opacity: 0.6;
+  font-size: 10px;
+}
+
+/* Sub-agent pill (explore/task): carries the short description of what that
+   run is looking for, so several PARALLEL explores stay distinguishable in
+   the group header instead of merging into one "Explore ×2" count. */
+.trace-pill-sub {
+  max-width: 260px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.trace-pill-sub.running {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+.trace-pill-desc {
+  font-family: inherit;
+  font-weight: 400;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 190px;
+}
+
+/* Detail / args text: fills remaining space after the label, on the same
+   line — e.g. "Edit File" + "ChatMessage.tsx". Slightly muted so the eye
+   still lands on the label first, but no longer clipped to half the row: a
+   real filename or path should get the room it needs. */
+.trace-row-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.75;
+  font-size: inherit;
+}
+
+.trace-row-engine {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  line-height: 1.6;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+  white-space: nowrap;
+  opacity: 0.9;
+  user-select: none;
+}
+
+.trace-row-end {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.trace-row-ms {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.55;
+}
+
+/* Elapsed time stays visible after a call finishes, left of the chevron. */
+
+/* Status icons: check/x use SVG, styled inline */
+.status-ok {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  color: var(--success, #34d399);
+}
+
+.status-err {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  color: var(--danger, #e74c3c);
+}
+
+.trace-row.done .status-ok {
+  display: none;
+}
+
+.trace-row.running .status-ok {
+  color: var(--text);
+}
+
+.trace-row-chev {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  opacity: 0.45;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+  transition: opacity 0.15s ease;
+}
+
+.trace-row-head:hover .trace-row-chev {
+  opacity: 0.6;
+  color: var(--accent);
+}
+
+/* Chevron wrapper inside ToolSingleRow (standalone) */
+.trace-row-single,
+.trace-row.single {
+  border-top: 1px solid var(--hairline);
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* ——— edit_file / write_file — flat row, no card ——— */
+.trace-row.edit-file {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  margin: 0;
+  overflow: visible;
+}
+
+.trace-row.edit-file+.trace-row.edit-file {
+  margin-top: 4px;
+}
+
+/* header هدر edit_file */
+.trace-row.edit-file>.trace-row-head {
+  cursor: default;
+  gap: 6px;
+}
+
+.trace-row.edit-file .trace-pill {
+  background: color-mix(in srgb, var(--accent, #4a9eff) 16%, transparent);
+  color: var(--accent, #4a9eff);
+  font-weight: 600;
+}
+
+.trace-row.edit-file .trace-row-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+/* پنل expanded */
+.trace-row.edit-file .trace-row-expand {
+  /* هم‌تراز با .trace-row-head (12px) — نه صفر، تا SUMMARY/ARGS/DIFF
+     به لبهٔ کارت نچسبند */
+  padding: 0 12px;
+}
+
+/* بخش‌های SUMMARY / ARGS / DIFF */
+.trace-row.edit-file .trace-expand-key {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent, #4a9eff);
+  background: color-mix(in srgb, var(--accent, #4a9eff) 10%, transparent);
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+}
+
+.trace-row.edit-file .trace-expand-val {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+/* Diff block */
+.trace-row.edit-file .trace-expand-pre {
+  font-size: 11px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg, #1a1a1a) 70%, transparent);
+  border: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+  overflow-x: auto;
+}
+
+.trace-row.edit-file .trace-expand-diff {
+  color: var(--text-dim);
+}
+
+.trace-row.edit-file .trace-expand-diff :global(.diff-add),
+.trace-row.edit-file .trace-expand-diff-add {
+  color: #4ade80;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.trace-row.edit-file .trace-expand-diff :global(.diff-del),
+.trace-row.edit-file .trace-expand-diff-del {
+  color: #f87171;
+  text-decoration: line-through;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+/* فاصله بین بخش‌ها */
+.trace-row.edit-file .trace-expand-section {
+  padding: 6px 0;
+}
+
+.trace-row.edit-file .trace-expand-section+.trace-expand-section {
+  border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+  padding-top: 8px;
+  margin-top: 4px;
+}
+
+/* ——— Side-by-side diff columns ——— */
+.edit-file-expand {
+  padding: 0;
+  background: none;
+}
+
+/* ریشه‌ی واکنش‌گرای دیف: عرض کانتینر را برای سوییچ تک/دوستونی می‌سنجد. */
+.diff-responsive {
+  width: 100%;
+  min-width: 0;
+  container-type: inline-size;
+}
+
+.diff-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /* پس‌زمینهٔ ستون‌ها باید مثل نمای تک‌ستونی شفاف بماند (ته‌رنگ .review-diff
+     از پشت دیده شود) — رنگ گپ گرید کل ناحیه را تیره می‌کرد؛ جداکننده با
+     border-left ستون After داده می‌شود. */
+  border-radius: 8px;
+  /* هر ستون اسکرول افقی مستقل خودش را دارد (.diff-col-code) تا ستون After
+     هیچ‌وقت از کادر بیرون نرود و بریده دیده نشود. */
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* خط جداکنندهٔ عمودی بین دو ستون Before|After. */
+.diff-hunk-pair .diff-col-after {
+  border-left: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+}
+
+/* در عرض کم، ستون‌ها زیر هم می‌افتند (سقوط به تک‌ستون). */
+.diff-responsive[data-layout="unified"] .diff-columns {
+  grid-template-columns: 1fr;
+}
+
+/* جداکنندهٔ «N unmodified lines» بین دو هانک (سبک کدکس). */
+.diff-gap {
+  grid-column: 1 / -1;
+  padding: 3px 12px;
+  font-size: 10.5px;
+  font-style: italic;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  text-align: center;
+  user-select: none;
+}
+
+/* سرستون چسبان Before|After بالای نمای دوستونی — هم‌عرض با ستون‌های هانک‌ها. */
+.diff-columns-head {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-width: 0;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  /* هم‌رنگ پس‌زمینهٔ ستون‌ها تا هدر چسبان لکهٔ تیره‌تر نسازد. */
+  background: var(--bg, #1e1e2e);
+  border-bottom: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+}
+
+.diff-columns-head .diff-col-header {
+  border-bottom: 0;
+}
+
+/* یک هانک = دو ستون before|after کنار هم در گرید پنل Review.
+   در حالت دوستونی هر ستون حداقل نصف پهنای کانتینر را می‌گیرد تا ستون
+   After زیر Before نرود و با اسکرول افقی والد دیده شود؛ در حالت تک‌ستونی
+   (عرض کم) ستون‌ها زیر هم می‌افتند. */
+.diff-hunk-pair {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-width: 0;
+}
+
+.diff-responsive[data-layout="unified"] .diff-hunk-pair {
+  grid-template-columns: 1fr;
+  min-width: 0;
+}
+
+/* هدر هانک داخل جفت دوستونی باید هر دو ستون را بگیرد تا ستون‌های Before/After سر جای خود بمانند. */
+.diff-hunk-pair .diff-u-meta {
+  grid-column: 1 / -1;
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.diff-responsive[data-layout="unified"] .diff-columns {
+  min-width: 0;
+}
+
+.diff-line-empty {
+  background: transparent;
+  opacity: 0.35;
+}
+
+/* سایدبای‌ساید واقعا واکنش‌گرا: وقتی کانتینر دیف باریک است (حتی اگر layout
+   اجباری side-by-side باشد) ستون‌ها زیر هم می‌افتند تا متن تنگ و بریده نشود. */
+@container (max-width: 767px) {
+  .diff-columns-head,
+  .diff-hunk-pair {
+    grid-template-columns: 1fr;
+  }
+  .diff-hunk-pair .diff-col-after {
+    border-left: 0;
+    border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+  }
+}
+
+/* ستون سایدبای‌ساید هیچ‌وقت از گرید بیرون نمی‌زند؛ اسکرول افقی فقط داخل هر pre است. */
+.diff-col {
+  overflow: hidden;
+  isolation: isolate;
+  background: transparent;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* هر ستون دیف یک بلوک مستقل است: محتوای بلند ستون Before هیچ‌وقت
+   روی ستون After نمی‌لغزد؛ اسکرول افقی فقط داخل pre همان ستون است. */
+.diff-hunk-pair .diff-col {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.diff-col-code {
+  max-width: 100%;
+  min-width: 0;
+}
+.diff-col-code .diff-line {
+  width: max-content;
+  min-width: 100%;
+  box-sizing: border-box;
+}
+.diff-col-code .diff-u-text {
+  min-width: 0;
+  flex: 1 0 auto;
+  white-space: pre;
+}
+
+.diff-columns .diff-u-num {
+  flex: 0 0 auto;
+}
+
+.diff-col-header {
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+}
+
+.diff-col-before {
+  color: var(--text);
+}
+
+.diff-col-after {
+  color: var(--text);
+}
+
+.diff-col-code {
+  margin: 0;
+  padding: 6px 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.diff-line {
+  display: flex;
+  align-items: stretch;
+  white-space: pre;
+  padding: 0 10px;
+  min-height: 1.5em;
+  min-width: 0;
+}
+
+/* Full-row tint (faint green/red, git-diff style) instead of the old underline.
+   The gutter bar + −/+ sign below stay as a second cue. */
+.diff-line-del {
+  background: color-mix(in srgb, #f85149 9%, transparent);
+  color: var(--text);
+}
+
+.diff-line-add {
+  background: color-mix(in srgb, #3fb950 9%, transparent);
+  color: var(--text);
+}
+
+/* Side-by-side cells get the same −/+ marker as the unified rows. */
+.diff-line-del .diff-u-gutter {
+  color: #f85149;
+  border-left-color: #f85149;
+}
+
+.diff-line-add .diff-u-gutter {
+  color: #3fb950;
+  border-left-color: #3fb950;
+}
+
+/* ——— Diff stats badge (header) ——— */
+.trace-row-diff-stats {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent, #e87040);
+  background: color-mix(in srgb, var(--accent, #e87040) 10%, transparent);
+  border-radius: 4px;
+  padding: 1px 6px;
+  flex: 0 0 auto;
+}
+
+/* ——— Revert button (header) ——— */
+.trace-row-revert {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--hairline, rgba(128, 128, 128, 0.12));
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.14s;
+  flex: 0 0 auto;
+}
+
+.trace-row-revert:hover {
+  background: color-mix(in srgb, var(--accent, #e87040) 10%, transparent);
+  color: var(--text);
+  border-color: var(--accent, #e87040);
+}
+
+.trace-row-expand {
+  /* هم‌تراز با .trace-row-head (12px) تا محتوای DURATION/SUMMARY/ARGS
+     به لبهٔ کارت نچسبد */
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 12px;
+  border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.08));
+  /* سطح بدنه مشتق از خود تم (--bg-inset): نوشته‌ها (DURATION/SUMMARY/ARGS)
+     از head و پس‌زمینهٔ چت متمایز می‌شوند */
+  background: var(--bg-inset);
+}
+
+.trace-expand-section {
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 6px 0;
+}
+
+.trace-expand-section+.trace-expand-section {
+  border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+}
+
+.trace-expand-key {
+  display: block;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  opacity: 0.6;
+  margin-bottom: 3px;
+}
+
+.trace-expand-val {
+  display: block;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.trace-expand-pre {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 0;
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* خروجی ترمینال (run_terminal): متن بلند با اسکرول عمودی، تمام‌عرض پنل */
+.trace-terminal-output {
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Result lists and file chips (grep/glob/read rows) can run to hundreds of
+   entries: cap the list and scroll it inside the row instead of stretching the
+   chat — the full data is one scroll away, not a click away in the panel. */
+.file-results {
+  max-height: 240px;
+  overflow: auto;
+}
+
+.trace-expand-diff {
+  color: var(--text-dim);
+}
+
+/* Spinner inside a running trace-row replaces the tool icon. */
+.trace-row.running .trace-row-icon .spinner,
+.trace-row-head .trace-row-icon .spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--text-dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+/* ——— Collapsed preview (ToolCascade) ——— */
+.tool-cascade {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 8px 10px 10px;
+  border-top: 1px solid color-mix(in srgb, var(--tool-color, var(--accent)) 30%, transparent);
+  background: color-mix(in srgb,
+      var(--bg-hover) 72%,
+      var(--tool-color, var(--accent)) 28%);
+}
+
+.tool-cascade-item {
+  position: relative;
+  margin-top: -3px;
+  border: 1px solid var(--hairline);
+  border-radius: 9px;
+  background: var(--bg-hover);
+  overflow: hidden;
+  transition:
+    opacity 0.25s ease,
+    border-color 0.25s ease,
+    box-shadow 0.25s ease;
+  /* NO `will-change: transform` here: nothing in this card animates its
+     transform (the transitions above are opacity/border/shadow), but the hint
+     is a permanent PROMISE to the compositor, so every rendered tool call got
+     its own compositor layer plus backing store — dirty graphics memory scaled
+     with tool-call count instead of viewport size. Measured on a long session
+     that is hundreds of MB of "owned unmapped (graphics)" in the renderer. */
+}
+
+/* oldest card sits flush at the top of the cascade */
+.tool-cascade-item:first-child {
+  margin-top: 0;
+}
+
+/* newest card pops: a touch stronger edge, still flat. */
+.tool-cascade-item:last-child {
+  border-color: color-mix(in srgb, var(--text) 12%, var(--hairline));
+}
+
+/* depth: older calls sit further back, slightly dimmed */
+.tool-cascade-item:nth-child(2) {
+  opacity: 1;
+}
+
+.tool-cascade-item:nth-child(3) {
+  opacity: 1;
+}
+
+.tool-cascade-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline));
+}
+
+/* Collapsed preview: same flat rows, no stacked mini-cards. */
+.tool-card.explore .tool-cascade {
+  background: none;
+  border-top: 1px solid var(--hairline);
+  padding: 4px 8px 8px;
+}
+
+.tool-card.explore .tool-cascade-item {
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  margin-top: 0;
+}
+
+.tool-card.explore .tool-cascade-item+.tool-cascade-item {
+  border-top: 1px solid var(--hairline);
+}
+
+/* Remaining tool args rendered as inline key:value chips in the card head —
+   clean and readable, never a raw JSON blob. */
+.tool-card-head .tool-args {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0 10px;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.tool-card-head .tool-arg {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tool-card-head .tool-arg-key {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.tool-card-head .tool-arg-key::after {
+  content: ":";
+}
+
+.tool-card-head .tool-arg-val {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.tool-summary {
+  font-size: 11.5px;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.web-results {
+  /* Caution tone for the "this row/page did not really load" markers, derived
+     from real theme tokens: --danger and --thinking are both defined in :root
+     and overridden per theme. The codebase's --warning is never DEFINED, so
+     relying on it silently fell back to a hardcoded hex. */
+  --web-caution: color-mix(in srgb, var(--danger) 55%, var(--thinking) 45%);
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Fetch summary above the link list: "N results · M fetched". A web_search
+   whose pages all failed to fetch still looks identical to a perfect one
+   without this line — the model just answered from 200-char snippets. */
+.web-results-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding-inline-start: 2px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-dim, #8a8a8a);
+  opacity: 0.85;
+}
+
+.web-results-count {
+  font-family: var(--font-mono, monospace);
+}
+
+.web-results-sep {
+  opacity: 0.5;
+}
+
+.web-results-fetched {
+  font-family: var(--font-mono, monospace);
+  color: color-mix(in srgb, var(--thinking) 65%, var(--text));
+}
+
+/* Nothing fetched at all is the alarming case, not just a number. */
+.web-results-fetched.none {
+  color: var(--web-caution, color-mix(in srgb, var(--danger) 55%, var(--thinking) 45%));
+  font-weight: 600;
+}
+
+.trace-row-inline-results .web-results-head {
+  margin-top: 0;
+}
+
+/* When the link list sits inside a compact one-line tool row, force it onto
+   its own line at the bottom-left. */
+.trace-row .web-results {
+  flex-basis: 100%;
+  margin-top: 4px;
+}
+
+/* ── Generated media previews (generate_image / edit_image / generate_video /
+   edit_video tool cards) ─────────────────────────────────────────────────── */
+.media-results {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.media-result-thumb {
+  max-width: 220px;
+  max-height: 150px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  object-fit: cover;
+}
+
+/* Generated media inside the chat: CENTERED, with a hover edit affordance
+   that opens the Media editor (right-hand viewer). */
+.md-image-wrap.md-media-wrap {
+  position: relative;
+  display: flex !important;
+  flex-direction: column;
+  align-items: center;
+  /* Centered in BOTH directions: fit-content + auto margins beats any
+     text-align: right the surrounding RTL paragraph applies. */
+  width: fit-content !important;
+  margin-inline: auto !important;
+  max-width: 100%;
+}
+
+.md-media-wrap .md-image-caption {
+  text-align: center;
+}
+
+.md-media-wrap .md-media-edit {
+  position: absolute;
+  top: 8px;
+  inset-inline-end: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(15, 15, 20, 0.72);
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.md-media-wrap:hover .md-media-edit,
+.md-media-wrap:focus-within .md-media-edit {
+  opacity: 1;
+}
+
+.md-media-wrap .md-media-edit:hover {
+  background: rgba(30, 30, 40, 0.9);
+}
+
+.media-result-video,
+.md-video-inline {
+  max-width: min(100%, 420px);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #000;
+  display: block;
+}
+
+.md-video-inline {
+  width: 100%;
+}
+
+/* ── Media editor (viewer kind `media`) ──────────────────────────────────── */
+.media-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  height: 100%;
+  overflow: auto;
+}
+
+.media-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.media-editor-path {
+  font-size: 12px;
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.media-editor-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.media-editor-canvas {
+  min-height: 220px;
+  max-height: 60vh;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background:
+    repeating-conic-gradient(rgba(255, 255, 255, 0.035) 0% 25%, transparent 0% 50%)
+    50% / 20px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+
+.media-editor-img {
+  max-width: 100%;
+  max-height: 60vh;
+  user-select: none;
+}
+
+.media-editor-selection {
+  border: 1.5px dashed var(--accent, #7aa2f7);
+  background: color-mix(in srgb, var(--accent, #7aa2f7) 12%, transparent);
+  pointer-events: none;
+}
+
+.media-editor-video {
+  max-height: 55vh;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #000;
+}
+
+.media-editor-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.media-editor-hint {
+  font-size: 11.5px;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ask-the-agent box: a real composer surface, not a lookalike input. */
+.media-editor-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: color-mix(in srgb, var(--panel, #17171c) 60%, transparent);
+}
+
+.media-editor-ask-input {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 8px 10px;
+}
+
+.media-editor-ask-input:focus {
+  outline: none;
+  border-color: var(--accent, #7aa2f7);
+}
+
+.media-editor-ask .btn {
+  align-self: flex-end;
+}
+
+.media-editor-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-top: 4px;
+}
+
+.media-editor-queue-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.media-editor-queue-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.media-editor-queue-path {
+  font-size: 11.5px;
+  opacity: 0.85;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-editor-status {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.media-editor-status.ok {
+  border-color: color-mix(in srgb, var(--ok, #2bd576) 45%, var(--border));
+}
+
+.media-editor-status.err {
+  border-color: color-mix(in srgb, var(--danger, #f55) 55%, var(--border));
+  color: var(--danger, #f55);
+}
+
+/* CODEX-style inline web results: the hits of a `web_search` / `fetch_url` row
+   hang at the bottom of that row's own expanded body. Aligned to the head's
+   12px gutter (.trace-row-head / .trace-row-expand) so the list reads as part
+   of the row. */
+.trace-row-inline-results {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 12px 6px;
+}
+
+/* …but inside the expand body the 12px gutter already comes from
+   .trace-row-expand, so the list must not add a second one. */
+.trace-row-expand .trace-row-inline-results {
+  padding: 0;
+}
+
+.trace-row-inline-results .web-results {
+  margin: 0;
+}
+
+.web-result {
+  overflow: hidden;
+}
+
+.web-result-link {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elev));
+  text-decoration: none;
+  color: var(--text);
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.web-result-link:hover {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.web-result-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.web-result-favicon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.web-result-favicon img {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+
+.web-result-glyph {
+  font-size: 12px;
+  line-height: 1;
+}
+
+.file-results {
+  list-style: none;
+  margin: 6px 0 4px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding-inline-start: 2px;
+}
+
+.file-result {
+  display: flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+
+.file-result-glyph {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--link, #7aa2f7);
+  opacity: 0.85;
+}
+
+.file-result-glyph svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.file-result-path {
+  flex: 0 0 auto;
+  color: var(--link, #7aa2f7);
+  font-family: var(--mono, monospace);
+}
+
+.file-result-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim, #8a8a8a);
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.web-result-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.web-result-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.web-result-snippet {
+  font-size: 11px;
+  color: var(--text-dim, #8a8a8a);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.web-result-host {
+  flex: 0 0 auto;
+  align-self: center;
+  max-width: 130px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-dim, #8a8a8a);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 999px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.web-result-arrow {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-dim, #8a8a8a);
+  transition:
+    color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.web-result-link:hover .web-result-arrow {
+  color: var(--accent);
+  transform: translate(1px, -1px);
+}
+
+/* Per-row "snippet" marker: only shown when the real page could NOT be
+   fetched, so the useful rows stay visually quiet. */
+.web-result-fetched {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--web-caution, color-mix(in srgb, var(--danger) 55%, var(--thinking) 45%));
+  background: color-mix(in srgb, var(--thinking) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--thinking) 35%, transparent);
+  border-radius: 999px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
+/* "+N more" for the web list: expands IN PLACE (these are clickable links,
+   unlike file paths which open in the side panel). */
+.web-result-more-btn {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 2px 2px 0;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.85;
+  cursor: pointer;
+  transition: color 0.16s ease, opacity 0.16s ease;
+}
+
+.web-result-more-btn:hover {
+  color: var(--accent);
+  opacity: 1;
+  text-decoration: underline;
+}
+
+.web-result-more-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+.revert-btn {
+  align-self: flex-start;
+  font-size: 11px;
+  padding: 3px 10px;
+}
+
+.reverted-tag {
+  font-size: 11px;
+  color: var(--success);
+}

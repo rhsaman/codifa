@@ -1,0 +1,2328 @@
+
+
+/* ---- artifacts page (every document the agent built) ---- */
+/* Fills the pane like the artifact preview: header strip, then the list owns
+   every remaining pixel and scrolls inside itself. */
+.artifacts-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.artifacts-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: color-mix(in srgb, var(--bg-panel) 30%, transparent);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.artifacts-panel-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.artifacts-panel-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.artifacts-refresh {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.artifacts-refresh:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.artifacts-error {
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+  color: var(--error);
+  font-size: 12px;
+}
+
+.artifacts-loading {
+  padding: 20px 12px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* The empty state centres itself in the pane instead of hugging the header. */
+.artifacts-panel .viewer-empty {
+  margin: auto;
+  padding: 24px;
+}
+
+.artifacts-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+}
+
+.artifacts-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.artifacts-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  direction: ltr;
+  cursor: pointer;
+}
+
+.artifacts-open:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.artifacts-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+}
+
+.artifacts-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.artifacts-meta {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.artifacts-time {
+  flex: 0 0 auto;
+  width: 34px;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The page reuses the Review search box verbatim (one search UI for every
+   panel); only the padding follows this page's own 8px list gutter. */
+.artifacts-panel > .review-search-row {
+  padding: 8px 8px 8px;
+}
+
+/* Row action: a trash icon that turns into its own inline confirm, so deleting
+   a document never relies on a modal. */
+.artifacts-delete {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 0 9px;
+  border: 0;
+  border-left: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.artifacts-delete:hover {
+  color: var(--danger, #e5534b);
+  background: color-mix(in srgb, var(--danger, #e5534b) 12%, transparent);
+}
+
+/* The second click: now it really deletes, so it must not look like the
+   harmless icon that got the user here. */
+.artifacts-delete.active {
+  color: var(--danger, #e5534b);
+  background: color-mix(in srgb, var(--danger, #e5534b) 18%, transparent);
+  font-weight: 600;
+}
+
+.artifacts-delete:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* Docked panels fill the viewer group (no floating card). The docked wrapper
+   must not participate in layout at all — as a plain flex item it would size
+   to content (min-height: auto) and the lists inside would never scroll.
+   display: contents drops the box so the aside flexes against .viewer-content
+   directly. */
+.review-docked-wrap {
+  display: contents;
+}
+
+.review-panel.review-docked-panel {  position: static;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  animation: none;
+}
+
+/* Docked headers/rows never shrink — the file list owns all scrolling. */
+.review-panel.review-docked-panel > .review-header,
+.review-panel.review-docked-panel > .review-search-row,
+.review-panel.review-docked-panel > .review-rev-row,
+.review-panel.review-docked-panel > .trace-subheader {
+  flex: 0 0 auto;
+}
+
+.reading-mode.reading-docked {
+  position: static;
+  inset: auto;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.reading-mode.reading-docked .reading-mode-panel.reading-docked-panel {
+  position: static;
+  width: auto;
+  max-width: none;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  animation: none;
+}
+
+/* ---- Editor tab bars: chats vs viewers are visually distinct ----
+   Each group carries its own identity color drawn from the active theme:
+   chats use --accent, viewers use --link. Everything below derives from
+   --group so all themes stay harmonious automatically. */
+.tab-bar {
+  --group: var(--accent);
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 10px 12px 0;
+  /* Tabs never scroll: they squeeze to fit and the tab-list chevron at the
+     bar's start reaches everything (searchable menu + recently closed). */
+  overflow-x: hidden;
+  border-bottom: 1px solid color-mix(in srgb, var(--group) 32%, var(--border));
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--group) 13%, transparent),
+      color-mix(in srgb, var(--group) 4%, transparent) 55%,
+      transparent 100%),
+    var(--bg-alt);
+}
+
+/* Slim horizontal scrollbar: thumb revealed only while the bar is hovered
+   (or its thumb is hovered), so overflowing tabs stay discoverable without
+   permanent chrome. The scrollbar itself only exists when tabs overflow. */
+.tab-bar:hover {
+  scrollbar-color: color-mix(in srgb, var(--group) 32%, transparent) transparent;
+}
+.tab-bar::-webkit-scrollbar {
+  height: 6px;
+}
+.tab-bar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.tab-bar::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+.tab-bar:hover::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--group) 32%, transparent);
+}
+.tab-bar:hover::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--group) 55%, transparent);
+}
+
+.tab-bar.chat-tabs {
+  --group: var(--accent);
+}
+
+.tab-bar.viewer-tabs {
+  --group: var(--link);
+}
+
+/* Row wrapper around the chat tab bar + panel actions: the border runs under
+   the whole row (bar + actions) so the actions sit on the same rule line as
+   the tabs instead of floating above it. */
+.chat-tabs-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  min-width: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  /* Frameless window: dragging from the empty stretch between tabs and the
+     actions moves the window (buttons opt out below). */
+  -webkit-app-region: drag;
+}
+
+.chat-tabs-row button {
+  -webkit-app-region: no-drag;
+}
+
+.chat-tabs-row .tab-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-bottom: none;
+}
+
+/* Same treatment for the viewer tab strip: it is the header of the viewer
+   column, so its empty stretch drags the window too. */
+.tab-bar.viewer-tabs {
+  -webkit-app-region: drag;
+}
+
+.tab-bar.viewer-tabs button {
+  -webkit-app-region: no-drag;
+}
+
+.editor-tab {
+  position: relative;
+  display: inline-flex;
+  /* Tabs are divs (role="tab"), not buttons — without this the window drag
+     region on the tab-bar rows swallows their clicks in Electron. */
+  -webkit-app-region: no-drag;
+  /* Tabs squeeze instead of scrolling: shrink proportionally when the bar
+     runs out of room (the tab-list chevron reaches the full list). */
+  flex: 0 1 auto;
+  min-width: 44px;
+  align-items: center;
+  gap: 8px;
+  max-width: 220px;
+  padding: 4px 8px 5px 12px;
+  border: 1px solid color-mix(in srgb, var(--group) 14%, transparent);
+  border-bottom: 0;
+  border-radius: 12px 12px 0 0;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--group) 5%, transparent);
+  cursor: default;
+  white-space: nowrap;
+  user-select: none;
+  transition:
+    background 0.18s ease,
+    color 0.15s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.editor-tab:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--group) 13%, var(--bg-hover));
+  border-color: color-mix(in srgb, var(--group) 30%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px -10px color-mix(in srgb, var(--group) 55%, transparent);
+}
+
+.editor-tab.active {
+  color: var(--text);
+  font-weight: 650;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--group) 24%, var(--bg-panel)),
+      color-mix(in srgb, var(--bg-panel) 90%, transparent));
+  border-color: color-mix(in srgb, var(--group) 45%, var(--border));
+  box-shadow:
+    0 8px 20px -12px color-mix(in srgb, var(--group) 60%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* Identity bar along the top edge of the active tab. */
+.editor-tab.active::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 12px;
+  right: 12px;
+  height: 3px;
+  border-radius: 0 0 4px 4px;
+  background: linear-gradient(90deg,
+      transparent,
+      var(--group) 22%,
+      var(--group) 78%,
+      transparent);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--group) 70%, transparent);
+  pointer-events: none;
+}
+
+.editor-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--bg-panel);
+  pointer-events: none;
+}
+
+.editor-tab-label {
+  overflow: hidden;
+  /* Clip hard instead of appending "…": the ellipsis glyph cost characters
+     the title itself could still show (same policy as .chat-item-title). */
+  text-overflow: clip;
+  min-width: 0;
+  /* A mid-drag squeeze must never re-wrap the label into two lines — that
+     was the "tabs jumble apart while dragging" layout break. */
+  white-space: nowrap;
+}
+
+/* Floating clone that follows the cursor during a replayed (WKWebView) drag —
+   the OS drag image the polyfill cannot provide. Position is driven inline
+   (translate3d); the !important set beats whatever the source element's own
+   classes say so the ghost always reads as a clean, full-opacity copy. */
+.dnd-ghost {
+  position: fixed !important;
+  left: 0 !important;
+  top: 0 !important;
+  margin: 0 !important;
+  z-index: 2147483000;
+  pointer-events: none !important;
+  opacity: 0.92 !important;
+  will-change: transform;
+  box-shadow: 0 14px 34px -12px rgba(0, 0, 0, 0.55) !important;
+  /* The ghost tracks the cursor 1:1 — any inherited transform transition
+     (the tab bars animate their slide with one) would make it lag like a
+     rubber band. */
+  transition: none !important;
+}
+
+/* VSCode-style close: revealed on hover or when the tab is active. */
+.editor-tab-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 7px;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease;
+}
+
+.editor-tab:hover .editor-tab-close,
+.editor-tab.active .editor-tab-close {
+  opacity: 0.6;
+}
+
+.editor-tab-close:hover {
+  opacity: 1;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  transform: scale(1.06);
+}
+
+.editor-tab-close:focus-visible {
+  opacity: 1;
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.editor-tab-new {
+  border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 11px;
+  margin-bottom: 3px;
+  border-radius: 999px;
+  transition: all 0.15s ease;
+}
+
+.editor-tab-new:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: none;
+}
+
+/* Chat fullscreen toggle next to the new-tab button. */
+.editor-tab-full {
+  border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+  padding: 5px 9px;
+  margin-bottom: 3px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  transition: all 0.15s ease;
+}
+
+.editor-tab-full svg {
+  width: 13px;
+  height: 13px;
+}
+
+.editor-tab-full:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.editor-tab-full[aria-pressed="true"] {
+  color: var(--accent);
+  border-style: solid;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* Status dots in their own theme color. */
+.editor-tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.editor-tab-dot.busy {
+  background: var(--accent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: trace-pulse 1.6s ease-in-out infinite;
+}
+
+.editor-tab-dot.pending {
+  background: var(--thinking);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--thinking) 60%, transparent);
+}
+
+.editor-tab-dot.unread {
+  background: var(--success);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--success) 60%, transparent);
+}
+
+/* Viewer kind icons tinted from the theme palette. */
+.viewer-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: 7px;
+  font-size: 12px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.viewer-tab-icon {
+  background: color-mix(in srgb, var(--link) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--link) 26%, transparent);
+  color: var(--link);
+}
+
+/* Chat tabs: flat floating pills, no shadow. */
+.tab-bar.chat-tabs {
+  gap: 6px;
+  padding: 6px 12px;
+  align-items: center;
+  background: transparent;
+  border-bottom: 1px solid var(--hairline);
+  mask-image: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab {
+  min-height: 26px;
+  max-width: 210px;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 4px 8px;
+  padding-inline-start: 11px;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  /* `transform` slides a tab one slot aside during a drag reorder — the
+     animated landing preview. Keep it in the transition list. */
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.2s cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: transparent;
+  color: var(--text);
+  box-shadow: none;
+  transform: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab.active {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab.active::before,
+.tab-bar.chat-tabs .editor-tab.chat-tab.active::after {
+  display: none;
+}
+
+.tab-bar.chat-tabs .editor-tab-new,
+.tab-bar.chat-tabs .editor-tab-full,
+.viewer-pane-full {
+  margin: 0;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+/* The pane fullscreen button sits directly in the header row (stretch would
+   grow it) — keep it centered like the + and panel buttons. */
+.viewer-pane-head > .viewer-pane-full {
+  align-self: center;
+}
+
+.tab-bar.chat-tabs .editor-tab-new:hover,
+.tab-bar.chat-tabs .editor-tab-full:hover,
+.viewer-pane-full:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab-full[aria-pressed="true"],
+.tab-bar.chat-tabs .editor-tab-full[aria-pressed="true"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+
+
+.tab-bar.chat-tabs .editor-tab-dot.busy,
+.tab-bar.chat-tabs .editor-tab-dot.pending,
+.tab-bar.chat-tabs .editor-tab-dot.unread {
+  box-shadow: none;
+  animation: none;
+}
+
+.tab-bar.chat-tabs .editor-tab-dot.busy {
+  animation: trace-pulse 1.6s ease-in-out infinite;
+}
+
+/* Ask/permission badges on chat tabs — the same shield/? language as
+   `.chat-item-pending` in the sidebar, sized for the tighter tab space. */
+.tab-bar.chat-tabs .chat-item-pending {
+  width: 14px;
+  height: 14px;
+}
+
+.tab-bar.chat-tabs .editor-tab-close:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.dragging {
+  box-shadow: none;
+  transform: none;
+  opacity: 0.6;
+}
+
+/* Drop feedback in the chat bar: no insertion line — the dragged tab is
+   re-ordered into its landing slot (inline CSS `order` set by ChatTabBar, so the
+   DOM node never moves mid-drag) and drawn as a muted landing slot, so the user
+   sees the tab itself arriving where it will land. */
+.tab-bar.chat-tabs .editor-tab.drop-before::after,
+.tab-bar.chat-tabs .editor-tab.drop-after::after {
+  display: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab.drop-preview {
+  opacity: 0.72;
+  transform: none;
+  box-shadow: none;
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: -2px;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    outline-color 0.12s ease;
+}
+
+/* Viewer tabs: same flat pill shape as chat tabs, no shadow. */
+.tab-bar.viewer-tabs {
+  gap: 6px;
+  padding: 6px 12px;
+  direction: ltr;
+  align-items: center;
+  background: transparent;
+  border-bottom: 1px solid var(--hairline);
+  overflow-x: hidden;
+}
+
+/* Side pane header: the viewer tab bar shares one row with the panel and
+   collapse buttons. The border runs under the whole row and the empty stretch
+   drags the frameless window. */
+.viewer-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+  border-bottom: 1px solid var(--hairline);
+  -webkit-app-region: drag;
+}
+
+.viewer-pane-head button {
+  -webkit-app-region: no-drag;
+}
+
+.viewer-pane-head .tab-bar.viewer-tabs {
+  flex: 0 1 auto;
+  min-width: 0;
+  border-bottom: none;
+}
+
+.viewer-pane-spacer {
+  flex: 1 1 auto;
+  min-width: 8px;
+}
+
+.viewer-pane-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  margin-left: auto;
+  -webkit-app-region: no-drag;
+}
+
+/* ---- Tab-list chevron + searchable tab menu (both tab bars) ----
+   The bars never scroll; this list is how every tab stays reachable. */
+.tab-list-wrap {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px 6px 8px;
+}
+
+/* Chat tab row: the chevron must sit level with the tabs (the wrap's default
+   6px bottom padding leaves its glyph ~3px below the tab label's center). */
+.chat-tabs-row .tab-list-wrap {
+  padding-bottom: 9px;
+}
+
+.viewer-pane-head .tab-list-wrap {
+  padding: 0 0 0 8px;
+  align-self: center;
+}
+
+.tab-list-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.tab-list-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.tab-list-menu {
+  /* Rendered inside drag-region rows — the menu (and its search input) must
+     stay interactive. */
+  -webkit-app-region: no-drag;
+  width: 400px;
+  max-width: calc(100vw - 24px);
+  max-height: min(540px, calc(100vh - 90px));
+  overflow-y: auto;
+  z-index: 80;
+  padding: 10px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, var(--text) 4%);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.42);
+}
+
+.tab-list-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.tab-list-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  padding: 0;
+}
+
+.tab-list-section {
+  margin-bottom: 4px;
+}
+
+.tab-list-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  padding: 8px 8px 4px;
+}
+
+.tab-list-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 9px;
+  padding: 1px 6px 1px 2px;
+  color: var(--text);
+}
+
+.tab-list-item:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.tab-list-item.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.tab-list-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 7px 8px;
+  border-radius: 8px;
+  text-align: start;
+}
+
+.tab-list-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-dim);
+}
+
+.tab-list-item.active .tab-list-icon {
+  color: var(--accent);
+}
+
+.tab-list-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-list-age {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  padding-right: 2px;
+}
+
+.tab-list-close {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+}
+
+.tab-list-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.tab-list-empty {
+  padding: 16px 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+.tab-list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab-list-footer:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.tab-list-footer:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Toolbar row at the menu top: search + tool icons (window-mode toggle,
+   bulk tab close) share one line so neither costs the tab bar any space. */
+.tab-list-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.tab-list-toolbar .tab-list-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.tab-list-tool-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.tab-list-tool-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* Window-mode toggle while multi-window is ON: accent, like the other
+   pressed toggles in the app. */
+.tab-list-tool-btn[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.tab-list-tool-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+
+
+/* Empty viewer tabs: collapse the tab strip so nothing claims vertical room
+   in the rail. The flexible spacer stays visible so the layout below the page
+   icons does not shift when the last tab closes. */
+.tab-bar.viewer-tabs:empty {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 0;
+  border-bottom: none;
+}
+
+/* Keep the flexible spacer when tabs are empty so the icons above it do not
+   migrate to the bottom edge. */
+.viewer-pane-head:has(.tab-bar.viewer-tabs:empty) .viewer-pane-spacer {
+  display: block;
+  flex: 1 1 auto;
+}
+
+
+
+/* "Open tab" screen — the empty side pane (same entries as the + menu). */
+.viewer-chooser {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 24px;
+  text-align: center;
+}
+
+.viewer-chooser-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.viewer-chooser-sub {
+  margin: 0 0 16px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.viewer-chooser-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(420px, 100%);
+}
+
+.viewer-chooser-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: start;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    color 0.14s ease;
+}
+
+.viewer-chooser-item svg {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+.viewer-chooser-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text);
+}
+
+.viewer-chooser-item:hover svg {
+  color: var(--accent);
+  opacity: 1;
+}
+
+/* Default panel for the empty side pane: inline viewer-tab list (Schedules,
+   Todos) rendered as the pane body when no tabs are open. Same card language
+   as the "Open tab" chooser so the dark theme stays consistent. Rendered by
+   the side-pane container when the tab list is empty; falls back to the
+   chooser cards when the list has no entries. */
+.viewer-default-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px 16px;
+}
+.viewer-default-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(420px, 100%);
+  margin-inline: auto;
+}
+.viewer-default-panel-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: start;
+  width: 100%;
+}
+.viewer-default-panel-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* Panel mode body: the todos / sub-agents / schedules sections stacked in
+   the side pane. */
+.panel-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 16px;
+}
+
+/* Full pane pages (todos, schedule): one card per page, capped to a readable
+   width so a wide pane never stretches a card from edge to edge. The scroll
+   box and the outer padding stay on `.panel-pane`. */
+.panel-page .panel-page-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-width: 760px;
+  min-width: 0;
+  margin: 0 auto;
+}
+
+/* The todos page's resting hint: every card renders NOTHING while empty, so
+   this line is the container's only child exactly then — `:only-child` is the
+   whole gate. Any real card on screen pushes it out of that state and hides
+   it, with no extra state anywhere. */
+.todos-page-empty {
+  display: none;
+  min-height: 34vh;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px 20px;
+}
+
+.todos-page-empty:only-child {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.todos-page-empty-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.todos-page-empty-text {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  max-width: 42ch;
+  overflow-wrap: anywhere;
+}
+
+.tab-bar.viewer-tabs .editor-tab-full {
+  margin-left: auto;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab {
+  flex: 0 1 auto;
+  min-width: 44px;
+  min-height: 26px;
+  max-width: 210px;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 4px 8px;
+  padding-inline-start: 11px;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  /* `transform` slides a tab one slot aside during a drag reorder — the
+     animated landing preview. Keep it in the transition list. */
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.2s cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: transparent;
+  color: var(--text);
+  box-shadow: none;
+  transform: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.active {
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--link) 26%, transparent);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.active::before,
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.active::after {
+  display: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab-label {
+  direction: ltr;
+  white-space: nowrap;
+}
+
+.tab-bar.viewer-tabs .editor-tab-close:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab.dragging {
+  box-shadow: none;
+  transform: none;
+  opacity: 0.6;
+}
+
+.viewer-tab-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: none;
+}
+
+.viewer-tab.kind-trace .viewer-tab-icon {
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
+  color: var(--thinking);
+}
+
+.viewer-tab.kind-inbox .viewer-tab-icon {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
+}
+
+.viewer-tab.kind-review .viewer-tab-icon {
+  background: color-mix(in srgb, var(--link) 14%, transparent);
+  color: var(--link);
+}
+
+.viewer-tab.kind-schedule .viewer-tab-icon {
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
+  color: var(--thinking);
+}
+
+/* Drag & drop reorder states. */
+.editor-tab.dragging {
+  opacity: 0.5;
+  cursor: default;
+  transform: scale(0.96);
+  box-shadow: 0 8px 22px -10px rgba(0, 0, 0, 0.5);
+}
+
+.editor-tab:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.editor-tab.drop-before::after,
+.editor-tab.drop-after::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  width: 2.5px;
+  border-radius: 2px;
+  background: var(--group);
+  box-shadow: none;
+  pointer-events: none;
+}
+
+.editor-tab.drop-before::after {
+  left: -3.5px;
+}
+
+.editor-tab.drop-after::after {
+  right: -3.5px;
+}
+
+/* Docked inbox: reuse the overlay markup but render it static in-flow. */
+.viewer-inbox-wrap {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.viewer-inbox-wrap .schedule-inbox-overlay {
+  position: static;
+  inset: auto;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.viewer-inbox-wrap .schedule-inbox-backdrop {
+  display: none;
+}
+
+.viewer-inbox-wrap .schedule-inbox {
+  position: static;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.viewer-inbox-wrap .schedule-inbox-head {
+  flex: 0 0 auto;
+}
+
+.viewer-inbox-wrap .schedule-inbox-resize-handle {
+  display: none;
+}
+
+/* Docked inbox closes via its viewer tab — the inner X is redundant. */
+.viewer-inbox-wrap .schedule-inbox-close {
+  display: none;
+}
+
+/* The docked overlay keeps the popped-up variant's --z-review-overlay (95);
+   without its own stacking context that subtree painted OVER the icon rail
+   (z 2), so the inbox tab swallowed the chevron/+ icons and the other tabs.
+   confine it, exactly like the review docked panel. */
+.viewer-inbox-wrap {
+  position: relative;
+  z-index: 0;
+  isolation: isolate;
+}
+
+.viewer-inbox-wrap .schedule-inbox-overlay {
+  z-index: auto;
+}
+
+/* Docked panels use the ViewerTabBar fullscreen button — hide inner ones. */
+.viewer-inbox-wrap .viewer-fullscreen-btn,
+.review-docked-panel .viewer-fullscreen-btn,
+.viewer-inbox-wrap .review-header-btn[title="Fullscreen"],
+.viewer-inbox-wrap .review-header-btn[title="Exit fullscreen"],
+.review-docked-panel .review-header-btn[title="Fullscreen"],
+.review-docked-panel .review-header-btn[title="Exit fullscreen"],
+.viewer-inbox-wrap button[aria-label="Fullscreen"],
+.viewer-inbox-wrap button[aria-label="Exit fullscreen"] {
+  display: none !important;
+}
+
+/* Narrow headers: rows wrap when the pane is narrow, inline when it fits —
+   the source selector no longer claims a full row of its own (that rule
+   predates the dropdown and stacked the whole header even at wide widths). */
+.review-header {
+  flex-wrap: wrap;
+  row-gap: 6px;
+  overflow: visible;
+}
+
+.review-header .review-source {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible;
+}
+
+.review-header .review-source-btn {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.review-header .trace-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-header .trace-tab-count {
+  flex: 0 0 auto;
+}
+
+.review-header .review-header-actions {
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+/* Plan header is a single short title + copy: keep both on ONE row instead
+   of the narrow-header full-width source that drops actions underneath.
+   Also drop the tab-switcher pill backdrop — with a single static title it
+   reads as a stray border around the word Plan. */
+.review-header .plan-panel-source {
+  flex: 1 1 auto;
+  max-width: none;
+  background: transparent;
+  padding: 0;
+}
+
+/* Docked two-column mode: cap the task list so the message column always
+   keeps the majority of the width. */
+.viewer-inbox-wrap .schedule-inbox-list {
+  flex-basis: 200px;
+  max-width: 36%;
+}
+
+/* Narrow viewer (small monitor or slim split): stack the inbox vertically —
+   task list becomes a horizontal chip strip on top so the message column
+   keeps its full width instead of being squeezed to a sliver. */
+@container viewer (max-width: 619px) {
+  .viewer-inbox-wrap .schedule-inbox-body {
+    flex-direction: column;
+    overflow-y: auto;
+    /* در حالت ستونی، اسکرولر کل صفحه همین‌جاست — نوارش هم سمت راست بماند
+       (چیدمان column با direction عوض نمی‌شود). */
+    direction: ltr;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-overlay[dir="rtl"] .schedule-inbox-body > *,
+  .viewer-inbox-wrap .schedule-inbox-overlay[data-dir="rtl"] .schedule-inbox-body > * {
+    direction: rtl;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-list {
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: stretch;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: 0;
+    border-bottom: 1px solid var(--hairline);
+    max-width: none;
+    max-height: 118px;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-item {
+    flex: 0 0 180px;
+    justify-content: center;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-orphan-toggle {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-chat {
+    flex: 1 1 auto;
+    overflow-y: visible;
+  }
+}
+
+@media (max-width: 900px) {
+  .viewer-group {
+    min-width: 280px;
+  }
+
+  .chat-group {
+    min-width: 0;
+  }
+}
+
+/* Narrow viewer: keep breathing room so plan/diff text never glues to the edge.
+   Top padding still clears the floating plan copy button. */
+@container viewer (max-width: 420px) {
+  .plan-panel-body {
+    padding: 44px 12px 20px;
+  }
+
+  .review-header {
+    padding: 8px;
+  }
+
+  .review-file-row {
+    padding: 6px 8px;
+  }
+}
+
+/* ——— In-app virtual browser (Chrome-style shell) ——— */
+.browser-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg, #141519);
+  color: var(--text, #e8e8ea);
+}
+
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: color-mix(in srgb, var(--bg-panel, #313244) 30%, transparent);
+}
+
+.browser-tool-btn {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim, #9aa0a6);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    transform 0.1s ease,
+    opacity 0.15s ease;
+}
+
+.browser-tool-btn svg {
+  display: block;
+}
+
+.browser-tool-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text, #e8e8ea) 11%, transparent);
+  color: var(--text, #e8e8ea);
+}
+
+.browser-tool-btn:active:not(:disabled) {
+  transform: scale(0.9);
+}
+
+.browser-tool-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent, #89b4fa) 65%, transparent);
+  outline-offset: 1px;
+}
+
+.browser-tool-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Reload keeps spinning while a navigation is in flight. */
+.browser-tool-btn--spin svg {
+  animation: browser-spin 0.8s linear infinite;
+}
+
+@keyframes browser-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Overflow "..." menu (like the image): dark popup below the button. */
+.browser-menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.browser-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 230px;
+  padding: 6px;
+  border-radius: 12px;
+  background: var(--bg-panel, #2b2d31);
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.5));
+  z-index: 30;
+}
+
+.browser-menu[hidden] {
+  display: none;
+}
+
+.browser-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text, #e8eaed);
+  font-size: 12.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.12s ease;
+}
+
+.browser-menu-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text, #ffffff) 9%, transparent);
+}
+
+.browser-menu-item:disabled {
+  color: var(--text-dim, #9aa0a6);
+  opacity: 0.7;
+  cursor: default;
+}
+
+/* Session-cookie import dialog (Browser panel ⋮ → Import session cookies).
+   The "log in outside, keep the session inside" path for sites whose bot
+   defense rejects every login form the virtual browser submits. */
+.browser-cookie-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.browser-cookie-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(460px, calc(100% - 48px));
+  padding: 16px;
+  border-radius: 14px;
+  background: var(--bg-panel, #1a1a1a);
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  box-shadow: var(--shadow-pop, 0 12px 36px rgba(0, 0, 0, 0.55));
+}
+
+.browser-cookie-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text, #e8eaed);
+}
+
+.browser-cookie-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim, #9aa0a6);
+}
+
+.browser-cookie-hint code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-inset, rgba(255, 255, 255, 0.06));
+  font-size: 11.5px;
+}
+
+.browser-cookie-domain,
+.browser-cookie-text {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  background: var(--bg-inset, rgba(255, 255, 255, 0.05));
+  color: var(--text, #e8eaed);
+  font-size: 12.5px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.browser-cookie-text {
+  resize: vertical;
+  min-height: 84px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.browser-cookie-domain:focus,
+.browser-cookie-text:focus {
+  outline: none;
+  border-color: var(--accent, #6ea8fe);
+}
+
+.browser-cookie-msg {
+  font-size: 12px;
+  color: var(--danger, #ff7b72);
+  white-space: pre-wrap;
+}
+
+.browser-cookie-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.browser-cookie-btn {
+  padding: 7px 14px;
+  border-radius: 9px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  background: transparent;
+  color: var(--text, #e8eaed);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.browser-cookie-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text, #ffffff) 9%, transparent);
+}
+
+.browser-cookie-btn--primary {
+  background: var(--accent, #4c8dff);
+  border-color: transparent;
+  color: #fff;
+}
+
+.browser-cookie-btn--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent, #4c8dff) 86%, #fff);
+}
+
+.browser-cookie-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.browser-menu-item-icon {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  color: var(--text-dim, #9aa0a6);
+}
+
+/* Omnibox pill: leading icon (lock/search/globe) lives in the wrap so the
+   input itself stays transparent; focus-within draws the accent ring. */
+.browser-omnibox-wrap {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 14px 0 32px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text, #e8e8ea) 6%, transparent);
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.browser-omnibox-wrap:hover {
+  background: color-mix(in srgb, var(--text, #e8e8ea) 9%, transparent);
+}
+
+.browser-omnibox-wrap:focus-within {
+  border-color: color-mix(in srgb, var(--accent, #89b4fa) 55%, transparent);
+  background: color-mix(in srgb, var(--text, #e8e8ea) 9%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #89b4fa) 16%, transparent);
+}
+
+.browser-omnibox-icon {
+  position: absolute;
+  left: 11px;
+  display: inline-flex;
+  color: var(--text-dim, #9aa0a6);
+  pointer-events: none;
+}
+
+.browser-omnibox {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text, #e8e8ea);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.browser-omnibox::placeholder {
+  color: var(--text-dim, #9aa0a6);
+  opacity: 0.8;
+}
+
+/* Chrome-style thin progress line right under the toolbar: always in the
+   layout (no shift), fades in while a navigation is running. */
+.browser-progress {
+  flex: 0 0 auto;
+  position: relative;
+  height: 2px;
+  margin-top: -1px;
+  overflow: hidden;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.browser-progress--on {
+  opacity: 1;
+}
+
+.browser-progress::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -30%;
+  width: 30%;
+  background: linear-gradient(90deg, transparent, var(--accent, #89b4fa) 55%, transparent);
+  animation: browser-progress-slide 1s ease-in-out infinite;
+}
+
+@keyframes browser-progress-slide {
+  to {
+    left: 100%;
+  }
+}
+
+
+
+.browser-width-ruler {
+  flex: 1 1 auto;
+  min-width: 80px;
+  height: 24px;
+  position: relative;
+  overflow: visible;
+  border-radius: 6px;
+  background: #1e1f24;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  cursor: ew-resize;
+  outline: none;
+}
+
+.browser-width-ruler--full {
+  flex: none;
+  width: 100%;
+  height: 28px;
+  border-radius: 0;
+  border: none;
+  background-color: #202124;
+  background-image: repeating-linear-gradient(to right, rgba(255, 255, 255, 0.12) 0 1px, transparent 1px 20px);
+  background-size: 100% 5px;
+  background-repeat: no-repeat;
+  background-position: bottom;
+}
+
+.browser-width-ruler:focus-visible {
+  outline: none;
+}
+
+.browser-width-ruler[data-disabled="true"] {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.browser-ruler-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30px;
+  transform: translateX(-50%);
+  background: transparent;
+  cursor: pointer;
+}
+
+.browser-ruler-tick::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 13px;
+  bottom: 3px;
+  width: 1px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.browser-ruler-tick:hover::after {
+  background: #fff;
+}
+
+.browser-ruler-tick-label {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.65);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.browser-ruler-thumb {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.14);
+  border-left: 1px solid #fff;
+  border-right: 1px solid #fff;
+  border-radius: 1px;
+  cursor: ew-resize;
+}
+
+.browser-ruler-tip {
+  position: absolute;
+  top: -26px;
+  transform: translateX(-50%);
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: #3c4043;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #e8eaed;
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  z-index: 5;
+}
+
+
+
+.browser-stage {
+  flex: 1;
+  min-height: 0;
+  /* No scrollbars: the frame is always scaled to fit (max-width/height 100%),
+     and a scrollbar would change the content box, re-triggering the fit
+     observer in a loop that snaps the viewport back to the pane width. */
+  overflow: hidden;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12px;
+  background: #0e0f12;
+  outline: none;
+}
+
+.browser-stage:focus-visible {
+  box-shadow: none;
+}
+
+.browser-stage-inner {
+  position: relative;
+  width: 100%;
+}
+
+.browser-stage-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+  cursor: crosshair;
+  user-select: none;
+}
+
+.browser-status {
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  font-size: 11px;
+  color: var(--text-dim, #9aa0a6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-status--error {
+  color: var(--error, #e5484d);
+}
+
+/* ——— Virtual browser: responsive frame fit ———
+   Higher specificity (.browser-panel prefix) so the fit wins regardless of
+   declaration order: the frame letterboxes inside the stage (fits BOTH axes
+   of any panel size), the device row wraps instead of truncating the size
+   label, and the toolbar mouse toggle gets an active accent. */
+.browser-panel .browser-stage {
+  align-items: center;
+}
+
+/* The frame's box is set inline from the emulated viewport scaled by the
+   fit zoom (see frameZoom). It must NOT be stretched to the pane: stretching
+   made every viewport change invisible, so the ruler appeared to do nothing. */
+.browser-panel .browser-stage-inner {
+  height: auto;
+  display: block;
+  flex: 0 0 auto;
+  /* Safety net: the inline size is the DESIRED frame size, but it must never
+     overflow the pane. Clamping here keeps the frame fitted even before the
+     pane measurement lands, and object-fit keeps the page undistorted. */
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.browser-panel .browser-stage-img {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+}
+
+
+
+.browser-panel .browser-tool-btn--on {
+  background: color-mix(in srgb, var(--link, #6ea8fe) 22%, transparent);
+  border-color: color-mix(in srgb, var(--link, #6ea8fe) 45%, transparent);
+  color: var(--link, #6ea8fe);
+}
+
+/* Chrome-like polish: single omnibox, tidy device row, clean stage. */
+.browser-panel {
+  gap: 0;
+}
+
+.browser-toolbar {
+  gap: 6px;
+}
+
+
+
+.browser-stage {
+  position: relative;
+}
+
+.browser-stage:focus {
+  outline: none;
+}
+
+.browser-stage-inner {
+  position: relative;
+  width: 100%;
+}
+
+.browser-stage-img {
+  display: block;
+}
+
+.browser-panel .viewer-empty {
+  margin: auto;
+  padding: 24px;
+  text-align: center;
+}
+
+/* Install notice: shown in the stage while no automation browser exists yet.
+   Centred, narrow measure, copy then action then progress. */
+.browser-install {
+  max-width: 380px;
+  margin: auto;
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.browser-install-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #e0def4);
+}
+
+.browser-install-body {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim, #b0abc8);
+}
+
+.browser-install-btn {
+  padding: 7px 16px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  border-radius: 8px;
+  background: var(--bg-panel, rgba(255, 255, 255, 0.04));
+  color: var(--text, #e0def4);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.browser-install-btn:hover:not(:disabled) {
+  border-color: var(--accent, #ebbcba);
+}
+
+.browser-install-btn:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.browser-install-bar {
+  width: 220px;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--hairline, rgba(255, 255, 255, 0.09));
+}
+
+.browser-install-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent, #ebbcba);
+  transition: width 0.3s ease;
+}
+
+.browser-install-error {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--danger, #e5484d);
+  word-break: break-word;
+}
+
+/* ── File-type icons & clickable file chips ────────────────────────────────
+   Every file name in the UI (chat inline code, code-block heads, tool rows,
+   viewer tabs, diff list) renders a small tinted squircle tile
+   with the extension monogram for its extension. FileIcon emits pure SVG
+   (no DOM text node), so text-extracting parents (CodeBlock over markdown
+   children) read only the file name back. File paths render dimmer than
+   body text and carry NO underline/highlight — the icon alone marks them
+   as files. The icon always sits on the LEFT of the path: every icon+path
+   row forces dir=ltr, so RTL chat never mirrors the order. */
+.file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  vertical-align: -2px;
+}
+
+.file-icon-svg {
+  display: block;
+  flex: 0 0 auto;
+  border-radius: 30%;
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.35));
+}
+
+/* Clickable file chip: icon on the left + dimmed path, no underline. */
+.file-chip {
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  margin: 0;
+  font: inherit;
+  color: var(--text-dim);
+  opacity: 0.85;
+  cursor: pointer;
+  border-radius: 4px;
+  /* inline-flex would derive its baseline from the SVG icon's margin box
+     (an SVG has no text baseline), lifting the whole chip above the text
+     line. Center on the line so icon + path sit inside the prose line. */
+  vertical-align: middle;
+  text-align: start;
+  max-width: 100%;
+}
+
+.file-chip:hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  opacity: 1;
+}
+
+.file-chip:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--text) 40%, transparent);
+}
+
+.file-chip-name {
+  text-decoration: none;
+  /* One line, ellipsized at the chip's max-width — wrapping inside the
+     chip would grow it into a two-line box in the middle of a prose
+     line; the full path stays on the chip's title. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* Code-block head path becomes a chip: keep the head layout, add affordance. */
+.code-block-path-open {
+  cursor: pointer;
+  opacity: 0.85;
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+}
+
+.code-block-path-open:hover {
+  opacity: 1;
+}
+
+/* Tool rows keep their compact mono look; just align the small badge. */
+.tool-card-head .tool-path {
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+  opacity: 0.85;
+}
+
+.tool-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+/* Wrote/Edited head: verb stays bright, the file part is dimmed; the icon
+   sits directly before the file name (not before the verb). */
+.tool-card-head .tool-name .tool-verb {
+  color: var(--text);
+}
+
+.tool-card-head .tool-name .tool-file {
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+  color: var(--text-dim);
+  opacity: 0.85;
+  min-width: 0;
+}
+
+.tool-card-head .tool-name .tool-file-name {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* Symbol summary icon slot already sized; badge fills it. */
+.codemap-file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Review file list: the ext badge slot now shows the colored icon. */
+.review-file-ext {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 2px;
+  background: none;
+}

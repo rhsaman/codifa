@@ -1,0 +1,2491 @@
+
+
+/* ---- Right panel (داک‌شده مثل Claude) — میزبان todos و بخش‌های آینده ----
+   داخل .app-body داک می‌شود (چت کوچک نمی‌شود؟ نه — داک یعنی چت جا باز می‌کند؛
+   اورلی‌های مطالعه/دیف با زدایندکس بالاتر روی آن می‌نشینند). */
+.right-panel {
+  flex: 0 0 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-alt);
+  border-inline-start: 1px solid var(--hairline);
+  position: relative;
+  z-index: var(--z-right-panel);
+  overflow: hidden;
+}
+
+.right-panel-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: -3px;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+}
+
+.right-panel-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.right-panel-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
+.right-panel-resize-handle:active::after {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.right-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* تودو داخل پنل راست — کارت جمع‌شونده با نوار پیشرفت و ردیف‌های بج‌دار. */
+.sidebar-panel.todos-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 7%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.sidebar-panel.todos-docked .sidebar-panel-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.sidebar-panel.todos-docked .sidebar-panel-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* ---- بخش Terminals پنل راست — ترمینال‌های بک‌گراند ایجنت ---- */
+/* همان کارت داک‌شدهٔ تودوها؛ فقط وقتی ترمینال زنده‌ای هست اصلاً مونت می‌شود. */
+.sidebar-panel.terminals-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 4%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.sidebar-panel.terminals-docked .sidebar-panel-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* شمارندهٔ «N in background» — خنثی و کم‌رنگ، برخلاف قرص رنگی تودوها:
+   وضعیت زندهٔ پس‌زمینه است نه نتیجهٔ کاری که باید تیک بخورد. */
+.terminals-bg-count {
+  margin-inline-start: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.terminals-list {
+  list-style: none;
+  margin: 0;
+  padding: 9px 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.terminals-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  /* Each live terminal sits in its own soft inset card so a row reads as one
+     running process, not as loose text under the header. */
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+}
+
+.terminals-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  margin-top: 1px;
+  /* The icon is the liveness indicator: accent-tinted and breathing while the
+     process runs (the row only mounts for running terminals). */
+  color: var(--accent);
+  animation: terminals-live 1.6s ease-in-out infinite;
+}
+
+@keyframes terminals-live {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.terminals-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* خودِ دستور — توضیح ردیف است؛ دستور بلند در یک خط با سه‌نقطه تمام می‌شود و
+   کل متن (دستور + cwd + مسیر لاگ) در tooltip هست. */
+.terminals-command {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: ltr;
+  text-align: start;
+}
+
+.terminals-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.terminals-elapsed {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ردیف خروج‌یافته (فقط تا پایان پنجرهٔ grace می‌ماند): بدون تپشِ زنده‌بودن —
+   آیکونِ ساکت و کم‌رنگ، تا «تمام‌شده» از «در حال اجرا» یک‌نگاهی تفکیک شود. */
+.terminals-item.exited .terminals-icon {
+  animation: none;
+  color: var(--text-dim);
+  opacity: 0.55;
+}
+
+.terminals-exit {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* خروج ناموفق — همان قرمزی که hover دکمهٔ Stop دارد */
+.terminals-exit.bad {
+  color: var(--danger);
+}
+
+.terminals-stop {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+/* Hover reveals the destructive affordance: the stop is quiet until pointed
+   at, then reads as "this kills the process". */
+.terminals-stop:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+  color: var(--danger);
+}
+
+.terminals-stop:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* مربع توپرِ دکمهٔ Stop — همان نشان zcode */
+.terminals-stop-square {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+/* ---- بخش «این ترن» (اسکیل/MCP/پلاگین) زیر تودوها در پنل راست ---- */
+.sidebar-panel.usage-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 4%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.turn-usage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+}
+
+.turn-usage-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.turn-usage-label {
+  /* Row: label left, "used/total" right — the counter is the one thing worth
+     scanning, since a turn can carry ten skills and use one. */
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.turn-usage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* یک چیپ بهازای هر اسکیل/کانکتور/پلاگین — نقطهٔ توپر یعنی همین ترن واقعاً
+   استفادهاش کرده، نقطهٔ تُهی یعنی فقط در دسترسش بوده. */
+.turn-usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+
+.turn-usage-chip:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: color-mix(in srgb, var(--text) 20%, transparent);
+}
+
+.turn-usage-chip.used {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.turn-usage-chip.used:hover {
+  background: color-mix(in srgb, var(--accent) 17%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+}
+
+.turn-usage-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 60%, transparent);
+}
+
+.turn-usage-chip.used .turn-usage-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.turn-usage-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-usage-meta {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Owner (plugin) suffix — dimmer than the name, behind a hairline divider, so
+   the row still reads as ONE skill ("Ponytail │ Dev Kit"). */
+.turn-usage-chip .turn-usage-meta {
+  padding-inline-start: 5px;
+  border-inline-start: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  opacity: 0.8;
+}
+
+/* A used chip leads with a filled accent dot and a brighter border: the eye
+   should land on what the turn actually ran, not on the attached inventory. */
+.turn-usage-chip.used .turn-usage-name {
+  font-weight: 600;
+}
+
+.turn-usage-count {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+/* The turn's actual payload — first group in the card and the only one tinted:
+   "what this turn ran with" must read before the attached inventory below it. */
+.turn-usage-group-used {
+  padding: 7px 9px 8px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.turn-usage-group-used .turn-usage-label {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-dim));
+}
+
+/* ---- بخش زمان‌بندی (بالای تودوها در پنل راست) ---- */
+.sidebar-panel.schedule-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 7%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.schedule-add-btn {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 6px;
+}
+
+.schedule-add-btn:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.schedule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px 10px;
+}
+
+.schedule-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.schedule-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.schedule-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: 10px;
+  border: none;
+  outline: none;
+  background: var(--bg-input);
+  color: var(--text);
+}
+
+.schedule-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+
+.schedule-input:focus {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text) 22%, transparent);
+}
+
+.schedule-input.schedule-prompt {
+  resize: vertical;
+  min-height: 64px;
+  line-height: 1.6;
+}
+
+.schedule-input.schedule-mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.schedule-select {
+  appearance: none;
+  cursor: pointer;
+}
+
+.schedule-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+
+.schedule-actions .btn {
+  flex: 1 1 0;
+}
+
+.schedule-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.schedule-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  background: var(--bg-input);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.schedule-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--text) 25%, transparent);
+  color: var(--text);
+}
+
+.schedule-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent, #fff);
+}
+
+.schedule-btn.danger:hover:not(:disabled) {
+  border-color: var(--danger, #e5484d);
+  color: var(--danger, #e5484d);
+}
+
+.schedule-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.schedule-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+
+.schedule-icon-btn svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+
+/* Per-task browser-access toggle ON: accent-tinted so "this schedule may
+   browse" is visible at a glance among the other row actions. */
+.schedule-icon-btn.active {
+  color: var(--accent, #4c8dff);
+  background: color-mix(in srgb, var(--accent, #4c8dff) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent, #4c8dff) 45%, transparent);
+}
+
+.schedule-error {
+  font-size: 11px;
+  color: var(--danger, #e5484d);
+}
+
+.schedule-item {
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  padding: 6px 8px;
+}
+
+.schedule-item.disabled {
+  opacity: 0.6;
+}
+
+.schedule-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.schedule-item-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.schedule-item-cron {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.schedule-item-sub {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.schedule-item-body {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Status dot: green = active, dim = paused, pulsing accent = running. */
+.schedule-status-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--success) 60%, transparent);
+}
+
+.schedule-status-dot.paused {
+  background: var(--text-dim);
+  box-shadow: none;
+  opacity: 0.7;
+}
+
+.schedule-status-dot.running {
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: schedule-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes schedule-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.82); }
+}
+
+/* Task card: subtle lift on hover, accent frame while running. */
+.schedule-item {
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.schedule-item:hover {
+  border-color: color-mix(in srgb, var(--text) 22%, transparent);
+}
+
+.schedule-item.running {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--hairline));
+}
+
+.schedule-item-head {
+  border-radius: 8px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  min-width: 0;
+}
+
+
+.schedule-item-head:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Cron badge: mono pill that truncates instead of overflowing. */
+.schedule-item-cron {
+  font-family: var(--font-mono);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  padding: 2px 8px;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Meta line wraps instead of overflowing the narrow panel. */
+.schedule-item-sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  min-width: 0;
+}
+
+.schedule-item-next {
+  min-width: 0;
+}
+
+.schedule-item-meta {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* State pills for paused / running tasks. */
+.schedule-pill {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  white-space: nowrap;
+}
+
+.schedule-pill.running {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* Prompt preview inside the expanded card, clamped to 3 lines. */
+.schedule-item-body .schedule-prompt-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Action toolbar wraps on narrow widths; every button is keyboard-visible. */
+.schedule-toolbar {
+  flex-wrap: wrap;
+}
+
+.schedule-icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.schedule-icon-btn.danger.active {
+  border-color: var(--danger, #e5484d);
+  color: var(--danger, #e5484d);
+  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
+}
+
+/* Two-step delete confirmation inside the card. */
+.schedule-confirm {
+  border: 1px solid color-mix(in srgb, var(--danger, #e5484d) 40%, var(--hairline));
+  background: color-mix(in srgb, var(--danger, #e5484d) 8%, transparent);
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.schedule-confirm-text {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.schedule-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.schedule-confirm-actions .schedule-btn {
+  flex: 1 1 0;
+}
+
+.schedule-btn.danger-solid {
+  background: var(--danger, #e5484d);
+  border-color: var(--danger, #e5484d);
+  color: #fff;
+}
+
+.schedule-btn.danger-solid:hover:not(:disabled) {
+  border-color: var(--danger, #e5484d);
+  color: #fff;
+  filter: brightness(1.06);
+}
+
+/* Expanded error: tinted card instead of bare red text. */
+.schedule-item-body .schedule-error {
+  background: color-mix(in srgb, var(--danger, #e5484d) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger, #e5484d) 35%, transparent);
+  border-radius: 8px;
+  padding: 6px 8px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* Empty / loading states for the schedule list. */
+.schedule-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+  padding: 18px 12px;
+  min-width: 0;
+}
+
+.schedule-empty-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.schedule-empty-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.schedule-empty-text {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  max-width: 28ch;
+  overflow-wrap: anywhere;
+}
+
+.schedule-empty .btn {
+  margin-top: 4px;
+}
+
+.schedule-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 12px 4px;
+}
+
+.schedule-skeleton {
+  height: 34px;
+  border-radius: 10px;
+  background: linear-gradient(90deg,
+      color-mix(in srgb, var(--text) 6%, transparent) 25%,
+      color-mix(in srgb, var(--text) 12%, transparent) 50%,
+      color-mix(in srgb, var(--text) 6%, transparent) 75%);
+  background-size: 200% 100%;
+  animation: schedule-shimmer 1.3s linear infinite;
+}
+
+.schedule-skeleton.short {
+  height: 20px;
+  width: 70%;
+}
+
+.schedule-loading-text {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+@keyframes schedule-shimmer {
+  to { background-position: -200% 0; }
+}
+
+/* Larger hit target for the header add button. */
+.schedule-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+}
+
+.schedule-add-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.schedule-add-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .schedule-status-dot.running,
+  .schedule-skeleton {
+    animation: none;
+  }
+}
+
+/* Create/edit form as a distinct card with header, hints and alert error. */
+.schedule-form-card {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  padding: 10px 12px 12px;
+}
+
+.schedule-form-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.schedule-form-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.schedule-form-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.schedule-form-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.schedule-form-close:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.schedule-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.schedule-required {
+  color: var(--danger, #e5484d);
+}
+
+.schedule-form-card .schedule-error {
+  background: color-mix(in srgb, var(--danger, #e5484d) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger, #e5484d) 35%, transparent);
+  border-radius: 8px;
+  padding: 6px 8px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.schedule-prompt-text {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.schedule-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Button-level spinner (panel Run now — shows for the whole spawned run). */
+.schedule-btn-spinner {
+  width: 12px;
+  height: 12px;
+  display: inline-block;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+/* Live run card in the Inbox: spinner + label instead of "No output". */
+.schedule-run-live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 8px 4px;
+}
+
+.schedule-run-spinner {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+.schedule-runs-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+  padding: 8px 4px;
+}
+
+.schedule-run {
+  font-size: 10px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text-dim);
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 1px solid var(--hairline);
+}
+
+.schedule-run-error,
+.schedule-run-output {
+  flex: 1 1 100%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- Schedule Inbox (کرون‌ها: لیست تسک + چت هر کرون + بج اجرای جدید) ---- */
+.schedule-inbox-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-review-overlay);
+  pointer-events: none;
+}
+
+.schedule-inbox-backdrop {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  background: rgba(0, 0, 0, 0.32);
+}
+
+.schedule-inbox {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: min(calc(60vw - 12px), calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  min-width: 360px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  overflow: hidden;
+  background: var(--bg-alt);
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow: var(--shadow-pop);
+  pointer-events: auto;
+}
+
+/* دستگیرهٔ درگ لبهٔ چپ — تغییرعرض مثل پنل گیت‌دیف. */
+.schedule-inbox-resize-handle {
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: -3px;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+  pointer-events: auto;
+}
+
+.schedule-inbox-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 2px;
+  width: 2px;
+  height: 100%;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.schedule-inbox-resize-handle:hover::after,
+.viewer-inbox-wrap .schedule-inbox-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
+.schedule-inbox-resize-handle:active::after {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.schedule-inbox-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hairline);
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.schedule-inbox-head .review-header-actions {
+  margin-left: auto;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.viewer-inbox-wrap .schedule-inbox-head {
+  min-width: 0;
+  overflow: hidden;
+  flex-wrap: nowrap;
+}
+
+.schedule-inbox-head-spacer {
+  flex: 1 1 auto;
+}
+
+.schedule-inbox-body {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.schedule-inbox-list {
+  flex: 0 0 220px;
+  overflow-y: auto;
+  border-right: 1px solid var(--hairline);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.schedule-inbox-item {
+  text-align: start;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.schedule-inbox-item.active {
+  border-color: color-mix(in srgb, var(--text) 22%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.schedule-inbox-chat {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--bg-alt);
+  /* نوار اسکرول همیشه سمت راست بماند (مثل بقیهٔ پنل‌ها) حتی وقتی اینباکس
+     راست‌به‌چپ است: اسکرولر LTR می‌شود — چیدمان ستونی عوض نمی‌شود، فقط سمت
+     نوار عوض می‌شود. در حالت RTL محتوا با قاعدهٔ بعدی دوباره RTL می‌شود. */
+  direction: ltr;
+}
+
+/* بازگرداندن جهت محتوا فقط در اینباکس راست‌به‌چپ — در حالت LTR فرزندان، ltr
+   ارث می‌برند (رفتار قبلی). */
+.schedule-inbox-overlay[dir="rtl"] .schedule-inbox-chat > *,
+.schedule-inbox-overlay[data-dir="rtl"] .schedule-inbox-chat > * {
+  direction: rtl;
+}
+
+.schedule-inbox-chat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.schedule-inbox-chat-head strong {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.schedule-clear-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.schedule-clear-text {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* پرامپت تسک — کارت خنثی بدون نوار آبی، فونت هم‌اندازهٔ چت. */
+.schedule-inbox-prompt {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.schedule-inbox-prompt-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+/* سربرگ تاشوی پرامپت — کل ردیف کلیک‌پذیر است؛ جمع = یک خط پیش‌نمایش. */
+.schedule-inbox-prompt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: inherit;
+}
+
+.schedule-inbox-prompt-head:hover .schedule-inbox-prompt-label {
+  color: var(--text);
+}
+
+.schedule-inbox-prompt-preview {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.schedule-inbox-prompt-chevron {
+  flex: none;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+
+.schedule-inbox-prompt.open .schedule-inbox-prompt-chevron {
+  transform: rotate(180deg);
+}
+
+/* بدنهٔ مارکداون اینباکس — دقیقاً تایپوگرافی چت، بدون هایلایت آبی. */
+.schedule-inbox-markdown {
+  font-size: var(--chat-font-size);
+  line-height: 1.68;
+  color: var(--text);
+}
+
+/* جهت متن اینباکس مثل چت از dir والد پیروی می‌کند (نه dir="auto" که با شروع
+   لاتین مثل EUR/USD متن فارسی را چپ‌چین می‌کرد). */
+.schedule-inbox-overlay[data-dir="rtl"] .schedule-inbox-markdown,
+.schedule-inbox-overlay[dir="rtl"] .schedule-inbox-markdown {
+  direction: rtl;
+  text-align: right;
+}
+
+.schedule-inbox-overlay[data-dir="ltr"] .schedule-inbox-markdown,
+.schedule-inbox-overlay[dir="ltr"] .schedule-inbox-markdown {
+  direction: ltr;
+  text-align: left;
+}
+
+.schedule-inbox-markdown ::selection {
+  background: color-mix(in srgb, var(--text) 18%, transparent);
+}
+
+/* ستون خواندن اینباکس: بلوک‌های 72ch و بلوک‌های کد به‌صورت سراسری وسط‌چین‌اند
+   (قاعده‌ی .markdown-body و .code-block در بالا) — اینباکس چون کانتینر
+   document است از همان پیش‌فرض استفاده می‌کند و قاعده‌ی خاصی لازم ندارد. */
+
+/* لیست اجراها — چت‌مانند با فاصلهٔ تنفسی. */
+.schedule-inbox-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* کارت یک اجرا — خنثی، بدون نوار آبی؛ وضعیت فقط با بج متنی. */
+.schedule-inbox-run {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 2%, transparent);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.schedule-inbox-run-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.schedule-inbox-status {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-dim);
+}
+
+.schedule-inbox-status.done {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 35%, transparent);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+}
+
+.schedule-inbox-status.error {
+  color: var(--danger, #e5484d);
+  border-color: color-mix(in srgb, var(--danger, #e5484d) 35%, transparent);
+  background: color-mix(in srgb, var(--danger, #e5484d) 10%, transparent);
+}
+
+.schedule-inbox-status.running {
+  color: var(--thinking);
+  border-color: color-mix(in srgb, var(--thinking) 35%, transparent);
+  background: color-mix(in srgb, var(--thinking) 10%, transparent);
+}
+
+.schedule-inbox-time {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.schedule-inbox-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent, #fff);
+  box-shadow: 0 0 0 2px var(--bg-alt);
+}
+
+/* نوار پیشرفت تودوها — تک‌رنگ accent تم تا با همهٔ تم‌ها هماهنگ باشد. */
+.sidebar-todos-progress {
+  height: 4px;
+  margin: 11px 12px 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  overflow: hidden;
+}
+
+.sidebar-todos-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  /* Gradient across the accent family with a soft glow: the bar reads as a
+     live meter, not a flat rule, and the eased width keeps check-offs smooth. */
+  background: linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 65%, var(--thinking)),
+      var(--accent));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 30%, transparent);
+  transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ---- Trace panel (لاگ چت جاری مثل لنگ‌اسمیت): ردیف‌های تاشو + بلوک پرامپت تمیز ---- */
+.trace-panel-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 12px 14px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.trace-panel-step {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.trace-panel-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-dim);
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.trace-panel-step-head:hover {
+  color: var(--text);
+}
+
+.trace-panel-step-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+}
+
+.trace-panel-step-head .trace-copy-btn {
+  flex: 0 0 auto;
+}
+
+.trace-panel-step-chev {
+  flex: 0 0 auto;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.trace-panel-step-title {
+  flex: 0 0 auto;
+}
+
+.trace-panel-step-meta {
+  margin-left: auto;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.trace-panel-step-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.trace-jump-latest {
+  position: absolute;
+  bottom: 14px;
+  inset-inline-end: 20px;
+  z-index: 5;
+  padding: 6px 12px;
+  border-radius: 16px;
+  border: 1px solid var(--hairline);
+  background: var(--bg-alt, #0d1117);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.trace-jump-latest:hover {
+  border-color: var(--accent);
+}
+
+.trace-panel-item {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.trace-panel-item:last-child {
+  border-bottom: 0;
+}
+
+.trace-panel-item.open {
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.trace-panel-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+}
+
+.trace-panel-row:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.trace-panel-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  opacity: 0.7;
+}
+
+.trace-panel-dot.kind-llm {
+  background: var(--accent);
+}
+
+.trace-panel-dot.kind-prompt {
+  background: var(--thinking);
+}
+
+.trace-panel-dot.kind-tool {
+  background: var(--warning);
+}
+
+.trace-panel-dot.kind-fold {
+  background: var(--success);
+}
+
+.trace-panel-title {
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.trace-panel-chip {
+  flex: 0 0 auto;
+}
+
+.trace-panel-time {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.trace-panel-chev {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.trace-panel-body {
+  padding: 8px 8px 10px 22px;
+}
+
+.trace-row-block {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 60%, var(--bg) 40%),
+      var(--bg));
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.trace-row-block.open {
+  border-color: var(--border);
+}
+
+.trace-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  text-align: start;
+}
+
+.trace-kind-badge {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex: 0 0 auto;
+}
+
+.trace-kind-badge.kind-llm {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-prompt {
+  color: var(--thinking);
+  border-color: color-mix(in srgb, var(--thinking) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-tool {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-fold {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+
+.trace-status-chip {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.trace-status-chip.status-done {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+
+.trace-status-chip.status-running {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.trace-status-chip.status-error {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+.trace-block-label {
+  font-size: 10px;
+  font-weight: 800;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-inline-end: auto;
+}
+
+.trace-hit {
+  background: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.trace-hit-active,
+mark.trace-hit-active {
+  background: color-mix(in srgb, var(--accent) 65%, transparent);
+  outline: 1px solid var(--accent);
+}
+
+.trace-row-title {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.trace-row-time {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.trace-row-open {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.trace-row-body {
+  border-top: 1px solid var(--hairline);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.trace-laya-meta,
+.trace-llm-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.trace-meta-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.trace-meta-reason {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+.trace-empty-body {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 8px 2px;
+  font-style: italic;
+}
+
+.trace-meta-error {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.trace-prompt-block {
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.trace-prompt-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.trace-copy-btn {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  color: var(--text);
+  cursor: pointer;
+}
+
+.trace-prompt-text {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.trace-detail-json {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+  background: var(--bg-inset);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.trace-tab-count {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 1px 6px;
+  margin-inline-start: 5px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.review-source-btn:hover .trace-tab-count {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+.review-source-btn.active .trace-tab-count {
+  color: var(--on-accent);
+  background: color-mix(in srgb, var(--on-accent) 22%, transparent);
+  border-color: transparent;
+}
+
+.review-source {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 13px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 4%, var(--bg-alt));
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.review-source::-webkit-scrollbar {
+  display: none;
+}
+
+.review-source-btn {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 6px 9px;
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  color: var(--text-dim);
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.16s ease, color 0.15s ease, border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.review-source-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  transform: translateY(-1px);
+}
+
+.review-source-btn.active {
+  color: var(--on-accent);
+  background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 82%, var(--link)));
+  border-color: transparent;
+  box-shadow: 0 6px 16px -8px color-mix(in srgb, var(--accent) 70%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.trace-tab-label {
+  line-height: 1.4;
+}
+
+.trace-subheader {
+  display: flex;
+  align-items: center;
+  padding: 6px 14px 0;
+}
+
+.trace-subheader-text {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-live-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--success);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--success) 40%, var(--border));
+  white-space: nowrap;
+}
+
+.trace-live-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: trace-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes trace-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+/* ---- Review overlay (مثل حالت مطالعه) — روی چت شناور می‌شود و چت را
+   کوچک نمی‌کند؛ پنل راست همیشه پشت آن می‌ماند. ---- */
+.review-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-review-overlay);
+  pointer-events: none;
+  --review-w: min(calc(50vw - 12px), calc(100vw - 24px));
+}
+
+.review-overlay.fullscreen {
+  --review-w: calc(100vw - 24px);
+}
+
+.review-scrim {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  background: linear-gradient(90deg,
+      rgba(0, 0, 0, 0.32) 0%,
+      rgba(0, 0, 0, 0.16) 45%,
+      rgba(0, 0, 0, 0.04) 100%);
+  opacity: 0;
+  animation: reading-scrim-in 0.3s ease forwards;
+}
+
+.review-overlay-resize-handle {
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: calc(var(--review-w) + 9px);
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+  pointer-events: auto;
+}
+
+.review-overlay-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 2px;
+  width: 2px;
+  height: 100%;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.review-overlay-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
+.review-overlay-resize-handle:active::after {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.review-panel.review-floating-panel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: var(--review-w);
+  max-width: calc(100vw - 24px);
+  height: auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  overflow: hidden;
+  background: var(--bg-alt);
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow: var(--shadow-pop);
+  pointer-events: auto;
+  animation: reading-panel-in 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.review-overlay.fullscreen .review-panel.review-floating-panel {
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  width: auto;
+  max-width: none;
+}
+
+.review-tabs-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
+/* ── Models tab: clean cards with gradient progress ─────────────────── */
+.models-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.models-intro {
+  line-height: 1.6;
+}
+
+.models-msg {
+  color: var(--accent);
+}
+
+.model-card {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 55%, var(--bg) 45%),
+      var(--bg));
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.model-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 1px 2px rgba(0, 0, 0, 0.25),
+    0 14px 32px -14px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.model-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 16px;
+  min-width: 0;
+  border-bottom: 1px solid var(--hairline);
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 94%, var(--accent) 6%),
+      transparent);
+}
+
+.model-card-titles {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.model-card-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.model-card-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.model-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 16px;
+  min-width: 0;
+}
+
+.model-card-body .field-label {
+  margin-top: 2px;
+}
+
+.model-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.model-badge.ready {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+  background: color-mix(in srgb, var(--success) 12%, var(--bg));
+}
+
+.model-badge.downloading {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  animation: chat-streaming-pulse 1.4s ease-in-out infinite;
+}
+
+.model-badge.paused {
+  color: var(--thinking);
+  border-color: color-mix(in srgb, var(--thinking) 45%, var(--border));
+  background: color-mix(in srgb, var(--thinking) 12%, var(--bg));
+}
+
+.model-badge.error {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg));
+}
+
+.model-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--hairline);
+}
+
+.model-progress-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.model-progress-pct {
+  font-size: 18px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.model-progress.paused .model-progress-pct {
+  color: var(--thinking);
+}
+
+.model-progress-meta {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.model-progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, var(--bg-panel));
+  border: 1px solid var(--hairline);
+  overflow: hidden;
+}
+
+.model-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #cba6f7));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 55%, transparent);
+  transition: width 0.4s ease;
+}
+
+.model-progress.paused .model-progress-fill {
+  background: linear-gradient(90deg, var(--thinking), color-mix(in srgb, var(--thinking) 55%, var(--accent)));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--thinking) 45%, transparent);
+}
+
+.model-progress-repo {
+  font-size: 11px;
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-controls {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 560px) {
+  .model-card-head {
+    align-items: flex-start;
+  }
+
+  .model-badge {
+    margin-top: 2px;
+  }
+
+  .model-progress-top {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .model-progress-meta {
+    text-align: start;
+  }
+
+  .model-controls .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+}
+
+/* ============================================================
+   VSCode-style editor split: chat group + viewer group
+   ============================================================ */
+.editor-area {
+  flex: 1 1 auto;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.chat-group {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  min-height: 0;
+}
+
+.chat-group .main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow: hidden;
+  display: flex;
+}
+
+.viewer-group {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  /* May take nearly the whole window — the drag clamp (clampSplitWidth) and
+     the chat group's own min-width keep a usable chat strip beside it. */
+  max-width: calc(100% - 320px);
+  overflow: hidden;
+  position: relative;
+  isolation: isolate;
+  min-height: 0;
+  background: var(--bg-alt);
+  box-shadow: none;
+  /* Animated open/close (width + fade) in BOTH directions: the pane mounts
+     collapsed and expands next frame, and stays mounted through the close
+     transition (App.tsx). `.closing` zeroes the min-width so the collapse
+     can actually reach 0. */
+  transition:
+    flex-basis 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.24s ease;
+}
+
+.viewer-group.closing {
+  min-width: 0;
+  max-width: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.dock-resize-handle {
+  flex: 0 0 6px;
+  width: 6px;
+  margin-left: -3px;
+  margin-right: -3px;
+  cursor: ew-resize;
+  z-index: 20;
+  position: relative;
+}
+
+.dock-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.dock-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
+.dock-resize-handle:active::after {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Viewer fullscreen toggle: chat group hides, viewer takes the full width. */
+.editor-area.viewer-full .chat-group {
+  display: none;
+}
+
+.editor-area.viewer-full .viewer-group {
+  flex: 1 1 auto;
+  max-width: none;
+}
+
+.editor-area.viewer-full .dock-resize-handle {
+  display: none;
+}
+
+/* Chat fullscreen toggle: viewer group hides, chat takes the full width. */
+.editor-area.chat-full .viewer-group,
+.editor-area.chat-full .dock-resize-handle {
+  display: none;
+}
+
+.viewer-content {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  /* Container for width-aware docked layouts (e.g. inbox stacking). */
+  container-type: inline-size;
+  container-name: viewer;
+}
+
+.viewer-empty {
+  padding: 32px 20px;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* ---- artifact preview (sandboxed document tab) ---- */
+/* Fills the viewer group the same way the browser panel does: header strip on
+   top, the document owns every remaining pixel and scrolls inside itself. */
+.artifact-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.artifact-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: color-mix(in srgb, var(--bg-panel) 30%, transparent);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.artifact-panel-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Generated pages are written against a white canvas: keep it so an artifact
+   that omits its own background does not inherit the dark theme and render
+   unreadable text. */
+.artifact-panel-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+
+.artifact-panel-md {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px;
+}
+
+/* ---- artifact card in the transcript ---- */
+.artifact-card {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+  margin: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.artifact-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px 8px 12px;
+  font-size: 12px;
+  direction: ltr;
+}
+
+.artifact-card-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+}
+
+.artifact-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.artifact-card-meta {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.artifact-card-open {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  border-radius: 7px;
+}

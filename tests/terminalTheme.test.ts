@@ -10,9 +10,10 @@
 //      shadows), the `.composition-view` IME popup, and the viewport surface.
 // `--bg-raised` is also checked, because no theme defines it — a literal there
 // stayed Rose Pine under every palette.
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
-const css = readFileSync(new URL('../src/styles/global.css', import.meta.url), 'utf8')
+const css = readCssBundle()
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -125,3 +126,12 @@ if (failed > 0) {
   process.exit(1)
 }
 console.log('\nall checks passed')
+
+function readCssBundle(): string {
+  const entry = fileURLToPath(new URL('../src/styles/global.css', import.meta.url))
+  const dir = entry.replace(/\.css$/, '')
+  return [readFileSync(entry, 'utf8')]
+    .concat(readdirSync(dir).filter((f) => f.endsWith('.css')).sort()
+      .map((f) => readFileSync(`${dir}/${f}`, 'utf8')))
+    .join('\n')
+}

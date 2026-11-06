@@ -437,6 +437,9 @@ export const TEXT_RESULT_TOOLS = new Set([
   // into a result chip — a `Test UI` skill showed `harness.html` /
   // `harness.tsx` rows for files the tool never touched.
   "load_skill",
+  // ask_user answers with "The user answered: ...". Without this the inline
+  // card's result (and historical answer) shows empty after submit.
+  "ask_user",
 ]);
 
 /** Tools whose result is a plain text line/note-list rather than files or a

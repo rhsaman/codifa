@@ -3,8 +3,11 @@ import type { UpdateInfo, UpdateProgress } from '../types/coderApi'
 
 type Phase = 'hidden' | 'available' | 'downloading' | 'installing' | 'done' | 'error'
 
-/** Titlebar update button: appears only when a newer GitHub release exists,
- *  shows download progress while updating, and launches the installer. */
+/** Titlebar update control — sits NEXT TO the settings gear in the window
+ *  strip and only APPEARS when a newer version exists (silent checks run at
+ *  startup and every 30 minutes; the site feed, when set, is checked first).
+ *  Clicking starts the update; the backend verifies the download's sha256
+ *  before anything is launched. */
 export function UpdateButton() {
   const [phase, setPhase] = useState<Phase>('hidden')
   const [latest, setLatest] = useState('')
@@ -15,7 +18,7 @@ export function UpdateButton() {
   useEffect(() => {
     let cancelled = false
     const keep = (p: Phase): Phase =>
-      p === 'downloading' || p === 'installing' || p === 'done' ? p : 'hidden'
+      p === 'downloading' || p === 'installing' || p === 'done' || p === 'error' ? p : 'hidden'
     const check = (): void => {
       window.coder
         .checkForUpdates()
@@ -107,14 +110,14 @@ export function UpdateButton() {
           </>
         ) : phase === 'done' ? (
           <>
-            <svg className="update-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+            <svg className="update-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="m4 12.5 5 5L20 6.5" />
             </svg>
             <span className="update-label">Update ready</span>
           </>
         ) : phase === 'error' ? (
           <>
-            <svg className="update-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <svg className="update-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M12 9v4" />
               <path d="M12 17h.01" />
               <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
@@ -123,7 +126,7 @@ export function UpdateButton() {
           </>
         ) : (
           <>
-            <svg className="update-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <svg className="update-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M12 3v12" />
               <path d="m7 10 5 5 5-5" />
             </svg>

@@ -25,6 +25,27 @@ const full = { id: 'f1', messages: [{ id: 'm1', role: 'user', content: 'hi' }] }
   check('non-empty chat kept with messages', (out[0] as { messages: unknown[] }).messages.length === 1)
 }
 
+// A fork PENDING its first user message holds the compacted system seed, so
+// `messages.length > 0` — the empty-chat rule above alone would persist it the
+// moment the fork was created. Pending forks follow the new-chat rule instead:
+// in-memory until the first user turn.
+{
+  console.log('── emptyChats: pending forks are dropped until the first user message ──')
+  const seed = { id: 's1', role: 'system', content: '[Forked context]' }
+  const pending = { id: 'd1', title: 'New chat', pendingFirstMessage: true, messages: [seed] }
+  const out = sanitizeChats([pending] as never[])
+  check('seeded pending fork filtered out', out.length === 0, out.map((c: { id: string }) => c.id))
+
+  const graduated = { id: 'd1', title: 'فورک', pendingFirstMessage: false, messages: [seed, { id: 'u1', role: 'user', content: 'ادامه بده' }] }
+  const out2 = sanitizeChats([graduated] as never[])
+  check('fork with a user turn is persisted', out2.length === 1 && out2[0].id === 'd1')
+
+  // Belt-and-suspenders: even with the flag stuck on, a user turn commits the fork.
+  const stuckFlag = { id: 'd2', title: 'فورک', pendingFirstMessage: true, messages: [seed, { id: 'u2', role: 'user', content: 'hi' }] }
+  const out3 = sanitizeChats([stuckFlag] as never[])
+  check('a user turn commits the fork even with a stale pending flag', out3.length === 1 && out3[0].id === 'd2')
+}
+
 if (failed) {
   console.error(`FAILED (${failed})`)
   process.exit(1)

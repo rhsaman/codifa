@@ -1166,9 +1166,13 @@ function SidebarContent({
             onClick={(e) => e.stopPropagation()}
           />
         ) : (
-          <span className="chat-item-title-row" dir={detectDir(titleOf(c))}>
+          /* dir lives on the title span only: the row itself stays LTR so
+             the trailing time badge keeps one fixed position (right edge)
+             for both Persian and English titles. */
+          <span className="chat-item-title-row">
             <span
               className="chat-item-title"
+              dir={detectDir(titleOf(c))}
               onDoubleClick={(e) => {
                 e.stopPropagation();
                 startRename(c);

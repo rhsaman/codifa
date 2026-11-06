@@ -4,6 +4,7 @@ import { physicalKey } from '../lib/shortcuts'
 import { applyScroll, scrollDelta } from '../lib/scrollKeys'
 import { isEditableTarget } from '../lib/panePointer'
 import { isPrefixArmed } from '../lib/prefixState'
+import { CloseIcon, ResetZoomIcon } from './ModalIcons'
 
 const MIN_ZOOM = 1
 const MAX_ZOOM = 5
@@ -33,6 +34,7 @@ export function FullscreenModal({
   children,
   bodyClass,
   scrollable = false,
+  actions,
 }: {
   open: boolean
   onClose: () => void
@@ -43,6 +45,10 @@ export function FullscreenModal({
    *  panning/marquee-zooming it. Used for file diffs so long code lines scroll
    *  horizontally/vertically. Mermaid keeps the default pan/zoom behavior. */
   scrollable?: boolean
+  /** Extra buttons pinned to the head bar before the ✕ (e.g. the image
+   *  viewer's download). Rendered outside the pan viewport, so clicks never
+   *  start a drag/zoom. */
+  actions?: ReactNode
 }) {
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
@@ -275,14 +281,29 @@ export function FullscreenModal({
       >
         <div className="fullscreen-modal-head">
           <span className="fullscreen-modal-title">{title}</span>
-          <button
-            className="fullscreen-close"
-            onClick={onClose}
-            aria-label="Close"
-            title="Close (Esc)"
-          >
-            ✕
-          </button>
+          <div className="fullscreen-modal-actions">
+            {actions}
+            {/* Zoom controls sit in the head now (was a floating bar at the
+                bottom); scrollable diffs have no zoom to reset. */}
+            {!scrollable && (
+              <button
+                className="fullscreen-icon-btn"
+                onClick={reset}
+                aria-label="Reset zoom"
+                title="Reset zoom (100%)"
+              >
+                <ResetZoomIcon />
+              </button>
+            )}
+            <button
+              className="fullscreen-icon-btn"
+              onClick={onClose}
+              aria-label="Close"
+              title="Close (Esc)"
+            >
+              <CloseIcon />
+            </button>
+          </div>
         </div>
         <div className={`fullscreen-modal-body ${bodyClass ?? ''}`}>
           <div
@@ -312,13 +333,6 @@ export function FullscreenModal({
               />
             )}
           </div>
-          {!scrollable && (
-            <div className="fullscreen-zoom-bar">
-              <button onClick={reset} aria-label="Reset zoom" title="Reset zoom (100%)">
-                ⟳
-              </button>
-            </div>
-          )}
         </div>
       </div>
     </div>,

@@ -51,7 +51,8 @@ import {
   isEditActivity,
   isSubagentCard,
 } from "./ToolCallView";
-import { ExploreCard } from "./ExploreCard";
+import { ExploreCard, exploreToolCounts } from "./ExploreCard";
+import { AskUserCard } from "./AskUserCard";
 import { MessageImages } from "./MessageImages";
 import "highlight.js/styles/github-dark.min.css";
 import { useViewerTabs } from "../lib/viewerTabs";
@@ -1197,9 +1198,14 @@ function computeLeft(delay: number, startedAt: number | undefined): number {
  *  manual one-click Retry. */
 function InlineRetryLine({
   retry,
+  sub,
   onManualRetry,
 }: {
   retry: NonNullable<ChatMessage["retry"]>;
+  /** Sub-agent line content (user request): while the ladder still cycles the
+   *  line reports WHAT the run is doing — its live model name and the tools it
+   *  has called — instead of the provider error. */
+  sub?: { model: string; tools: string[] };
   onManualRetry?: () => void;
 }) {
   // The countdown re-arms on every NEW retry cycle (attempt/startedAt bump
@@ -1227,6 +1233,11 @@ function InlineRetryLine({
     };
   }, [retry.delay, retry.startedAt, retry.attempt, retry.gaveUp]);
   const gaveUp = retry.gaveUp === true;
+  // A sub-agent line that is still cycling (user request): the error never
+  // shows — the line carries its live model + tool tally instead, so it reads
+  // as status, not failure. Only a terminal give-up keeps the error: the
+  // Retry button beside it needs a reason to make sense.
+  const subLive = sub && !gaveUp ? sub : null;
   // A footer STATUS line (no ladder) rides through the same component: compact
   // progress, an interrupted reply, and plain (non-retried) failures all use
   // this one visual slot, so the footer is the single place state is reported.
@@ -1295,6 +1306,11 @@ function InlineRetryLine({
           ? `failed after ${retry.attempt} tries`
           : "failed"
         : `retry ${cap}`;
+  // The sub-agent line shows the MODEL NAME itself (user request) — the
+  // ladder's live rung, which the backend emits already pointing at the next
+  // model on a fallback — not the words "switched model". If the event carried
+  // no model, degrade to the generic label.
+  const shownLabel = subLive ? subLive.model || label : label;
   // No leading glyph: the row already says "retry 3/10" and the pulsing dots
   // carry the activity. A second ↻ before the counter read as a separate
   // control. After the ladder gives up, the glyph lives INSIDE the Retry button.
@@ -1306,11 +1322,15 @@ function InlineRetryLine({
       ? "progress"
       : gaveUp
         ? "error"
-        : retry.fallback
-          ? "warn"
-          : isStatus
-            ? "info"
-            : "retry";
+        : subLive
+          ? // A live sub-agent line reads as status (accent), never as the
+            // warn/error the word "switched model" + red body used to paint.
+            "info"
+          : retry.fallback
+            ? "warn"
+            : isStatus
+              ? "info"
+              : "retry";
   return (
     // NO `dir` on this span: it is the ABSOLUTELY POSITIONED element, and a
     // `dir` here would make `inset-inline-end` resolve against THAT direction
@@ -1324,7 +1344,7 @@ function InlineRetryLine({
          the pointer jitters, and cannot wrap a multi-sentence provider body —
          which is why hovering "did not show the full error". The card below is
          CSS-only (no portal, no JS), appears instantly, and wraps to 46ch. */
-      data-full-error={fullDetail || retry.reason || undefined}
+      data-full-error={subLive ? undefined : fullDetail || retry.reason || undefined}
     >
       {/* Mirrors the Working pill's proven structure (`.msg-thinking` →
           `.msg-thinking-inner`): the OUTER span only parks the line — it inherits
@@ -1342,7 +1362,11 @@ function InlineRetryLine({
       <span className="msg-retry-inline-row" dir="ltr">
       <span className="msg-retry-inline-head" dir="ltr">
         {who && <span className="msg-retry-inline-who">{who}</span>}
-        <span className="msg-retry-inline-count">{label}</span>
+        <span
+          className={`msg-retry-inline-count${subLive ? " msg-retry-inline-model" : ""}`}
+        >
+          {shownLabel}
+        </span>
         {progressPct !== null && (
           // The number sits in the head; the determinate bar is drawn as the
           // chip's own bottom edge (below), so it adds height, not width, and
@@ -1366,15 +1390,24 @@ function InlineRetryLine({
       )}
       {/* A status row already puts the whole sentence in `label`, so echoing
           `detail` printed it twice ("Undo applied — … Undo applied — …").
-          Only ladder/fallback rows carry a separate reason. */}
-      {detail && !isStatus && (
-        <span
-          className="msg-retry-inline-reason"
-          dir="ltr"
-          data-full-error={fullDetail || detail}
-        >
-          {detail}
+          Only ladder/fallback rows carry a separate reason. A live sub-agent
+          row swaps the reason for the run's tool tally (user request) — the
+          error itself is never shown while the ladder still cycles. */}
+      {subLive && subLive.tools.length > 0 ? (
+        <span className="msg-retry-inline-tools" dir="ltr">
+          {subLive.tools.join(" · ")}
         </span>
+      ) : (
+        detail &&
+        !isStatus && (
+          <span
+            className="msg-retry-inline-reason"
+            dir="ltr"
+            data-full-error={fullDetail || detail}
+          >
+            {detail}
+          </span>
+        )
       )}
       {gaveUp && onManualRetry && (
         <button
@@ -1411,6 +1444,28 @@ function InlineRetryLine({
       )}
     </span>
   );
+}
+
+/** Sub-agent retry content (user request): the live model name and the tools
+ *  the run has called, read off the message's own explore card. `retry.tool`
+ *  is set only for tool-owned (sub-agent) ladders — empty for the main agent —
+ *  so this returns undefined for every ordinary retry/error/status row. Among
+ *  parallel runs of the same tool, the still-running one wins (its tally is
+ *  the one growing while the ladder cycles). */
+function subRetryInfo(
+  retry: NonNullable<ChatMessage["retry"]>,
+  toolActivity: ChatMessage["toolActivity"],
+): { model: string; tools: string[] } | undefined {
+  if (!retry.tool || retry.status) return undefined;
+  const runs = (toolActivity ?? []).filter((a) => a.tool === retry.tool);
+  const run = runs.find((a) => a.status === "running") ?? runs[runs.length - 1];
+  if (!run && !retry.model) return undefined;
+  return {
+    model: retry.model || run?.model || "",
+    tools: run
+      ? exploreToolCounts(run).map((c) => `${c.label} ×${c.count}`)
+      : [],
+  };
 }
 
 function localWords(s: string): number {
@@ -1465,7 +1520,7 @@ export function ThinkingIndicator({
 // ویرایش‌های پشت‌سرهم (edit_file/write_file) در یک گروه ویرایش جدا
 // (ToolEditGroupView) جمع می‌شوند — نه کارت تکی جدا، نه قاطی با گروه
 // ابزارهای فقط‌خواندنی.
-const ALWAYS_VISIBLE_TOOLS = new Set(["edit_file", "write_file"]);
+const ALWAYS_VISIBLE_TOOLS = new Set(["edit_file", "write_file", "ask_user"]);
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of
  *  2+ consecutive read-only/non-mutating tool calls (grep/glob/read/
@@ -2323,6 +2378,26 @@ export function renderSegments(
       );
       return;
     }
+    if (activity.tool === "ask_user") {
+      flush();
+      wrapTrace();
+      flushEdits();
+      const ownerChat = useStore
+        .getState()
+        .chats.find((c) => c.messages.some((m) => m.id === message.id));
+      const liveReq = ownerChat?.pendingAsk ?? null;
+      nodes.push(
+        <AskUserCard
+          key={`ask-${seg.index}`}
+          req={liveReq}
+          activity={activity}
+          messageId={message.id}
+          inline
+          live={!!liveReq}
+        />,
+      );
+      return;
+    }
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool)) {
       flush();
       wrapTrace();
@@ -2802,6 +2877,11 @@ export const ChatMessageView = memo(
           message.interrupted ||
           message.footerStatus ? (
             <InlineRetryLine
+              sub={
+                message.retry
+                  ? subRetryInfo(message.retry, message.toolActivity)
+                  : undefined
+              }
               retry={
                 message.retry ??
                 (message.error && !message.streaming

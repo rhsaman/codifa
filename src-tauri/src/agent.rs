@@ -886,6 +886,12 @@ const MAIN_FOLD_MIN_TOKENS: usize = 20_000;
 /// next round, where they either grown past this floor (they usually do —
 /// the same stale results are still there) or the turn ends first.
 const MAIN_FOLD_MIN_REMOVAL: usize = 4_000;
+/// A tool result this size alone is foldable without the turn-size gate:
+/// traced 6 Nov, `read` results (n=344) averaged 5.4K chars with a p90 of
+/// ~16K (~4K tokens) — 75% of every tool-result character the model received.
+/// 8K chars ≈ 2K tokens is comfortably above the ordinary small result a
+/// short turn must keep verbatim.
+const FOLD_OVERSIZED_RESULT_CHARS: usize = 8_000;
 /// In-turn elision: marker appended to a folded tool-result stub. The model
 /// reads it as a pointer (re-run with narrower args), not as data loss.
 const MAIN_FOLD_MARKER: &str = "[… result elided to save context. Only its beginning is kept — re-run the tool with a narrower pattern/range/file to see the rest again]";
@@ -2966,8 +2972,15 @@ pub enum AgentEvent {
     /// the tool persisted the file but the Todos panel stayed empty.
     Plan { items: Value, chat_id: String },
     /// The agent asked the user a question and is WAITING for the answer
-    /// (POST /ask/respond). The renderer shows its ask popup.
-    Ask { id: String, question: String, options: Value },
+    /// (POST /ask/respond). The renderer shows its ask popup. `sections`
+    /// carries the multi-part form (2-4 related sub-questions in ONE card):
+    /// `Value::Null` when the model used the flat question+options form.
+    Ask {
+        id: String,
+        question: String,
+        options: Value,
+        sections: Value,
+    },
     /// The agent is waiting for permission to run a destructive /
     /// out-of-workspace action (POST /permission/respond).
     Permission {
@@ -3217,8 +3230,9 @@ impl AgentEvent {
                 "version": version,
                 "assets": assets,
             }),
-            AgentEvent::Ask { id, question, options } => json!({
+            AgentEvent::Ask { id, question, options, sections } => json!({
                 "kind": "ask", "id": id, "question": question, "options": options,
+                "sections": sections,
             }),
             AgentEvent::Permission { id, action, path, reason, scope, folder } => json!({
                 "kind": "permission", "id": id, "action": action, "path": path,
@@ -3404,10 +3418,22 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "ask_user",
-            "Ask the user ONE question and WAIT for the answer. Use it when the request is ambiguous or you hit a genuine fork with no clearly-correct default. `options` are short choices; the app shows them as a pick-one card (radio list + Apply button) and the user may also type a free answer.",
+            "Ask the user and WAIT for the answer. Use on ambiguity or a genuine fork with no clearly-correct default. ONE decision: `question` + `options` (2-5 short choices; the app shows a pick-one card; free text allowed too). Related sub-questions feeding the SAME decision: `sections` instead — one card, answered and submitted together. Fill either form, never both.",
             json!({
                 "question": {"type": "string"},
-                "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 short choices"}
+                "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 short choices"},
+                "sections": {
+                    "type": "array",
+                    "description": "2-4 related sub-questions in ONE card; each item {title, options[2-5]}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "options": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["title", "options"]
+                    }
+                }
             }),
         ),
         (
@@ -5130,6 +5156,9 @@ already approved with \"Always allow\".",
     // was invisible in the trace: whether it fired had to be inferred from
     // round counts. One counter makes "did the nudge reach the model" a fact.
     let mut nudges: usize = 0;
+    // How many lone-call batching hints ONE turn may deliver. The lesson is
+    // short; the history bill of repeating it is not (see the delivery site).
+    const MAX_LONE_CALL_HINTS_PER_TURN: usize = 2;
     // Consecutive rounds this turn spent ONLY on locating/reading. Traced on the
     // live corpus, the main agent ran 91 discovery streaks, 31 of them 3 rounds
     // or longer, and the 169 rounds past the third cost 1_548_556 uncached
@@ -5234,11 +5263,56 @@ already approved with \"Always allow\".",
         //   costs an order of magnitude more than the fold saves — so the
         //   fold is DRY-RUNNED on a clone and only applied when the removal
         //   clears the floor.
+        // The OVERSIZED pass runs FIRST and WITHOUT the turn gate: one stale
+        // 16K `read` (~4K tokens) on a mid-size turn rode every following
+        // round because the whole-prompt gate never reached 20K (traced 6 Nov:
+        // read results were 56-75% of all tool-result characters the model
+        // received). Same probe/floor economics as the gated fold — the pass
+        // is only APPLIED when its removal clears MAIN_FOLD_MIN_REMOVAL, and
+        // only while enough calls remain to reuse the saving.
+        let wire_est = estimate_wire_tokens(&messages[1..]);
+        // Cheap pre-filter BEFORE the probe clone (which copies the whole
+        // history): a `tool` result can only fold when its text beats the
+        // oversized floor, and bytes >= chars makes this filter impossible to
+        // drop a true positive (the probe re-measures exactly).
+        let has_oversized = messages.iter().any(|m| {
+            m["role"] == "tool"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.len() > FOLD_OVERSIZED_RESULT_CHARS && !c.contains(MAIN_FOLD_MARKER))
+        });
+        if req.mode != "subagent" && has_oversized && fold_pays_off(max_steps - step) {
+            let mut probe = messages.clone();
+            let mut probe_seen = seen_lookups.clone();
+            let (probe_chars, folded) = fold_oversized_search_results(
+                &mut probe,
+                &mut probe_seen,
+                MAIN_FOLD_KEEP_ROUNDS,
+            );
+            let probe_tokens = probe_chars.div_ceil(4);
+            if folded > 0 && probe_tokens >= MAIN_FOLD_MIN_REMOVAL {
+                let (removed, folded) = fold_oversized_search_results(
+                    &mut messages,
+                    &mut seen_lookups,
+                    MAIN_FOLD_KEEP_ROUNDS,
+                );
+                record_fold(
+                    &trace,
+                    "main-oversized",
+                    step,
+                    step + 1,
+                    (max_steps != usize::MAX).then(|| max_steps - step),
+                    wire_est,
+                    removed,
+                    folded,
+                );
+            }
+        }
         if req.mode != "subagent"
-            && estimate_wire_tokens(&messages[1..]) >= MAIN_FOLD_MIN_TOKENS
+            && wire_est >= MAIN_FOLD_MIN_TOKENS
             && fold_pays_off(max_steps - step)
         {
-            let before = estimate_wire_tokens(&messages[1..]);
+            let before = wire_est;
             // The probe runs on clones of BOTH arguments: `fold_with` also
             // mutates `seen` (it retains/removes the lookups it folds), so
             // handing it the live set would corrupt the dedup state even when
@@ -5307,6 +5381,50 @@ already approved with \"Always allow\".",
             if folded > 0 && probe_tokens >= MAIN_FOLD_MIN_REMOVAL {
                 let (removed, folded) = fold_subagent_tool_results(&mut messages, &mut seen_lookups);
                 record_fold(&trace, "explore", step, step + 1, (max_steps != usize::MAX).then(|| max_steps - step), before, removed, folded);
+            }
+        }
+        // The sub-agent's OWN oversized pass — same shape as the main one: an
+        // explore run's older reads ARE its bulk input (its whole history is
+        // re-sent every round), and its turn gate is the same 20K whole-prompt
+        // threshold that mid-size runs never reach. Reports (explore results)
+        // are excluded here the same way — the run's report is its deliverable.
+        if SUB_FOLD_ENABLED
+            && req.mode == "subagent"
+            && fold_pays_off(max_steps - step)
+        {
+            let has_oversized = messages.iter().any(|m| {
+                m["role"] == "tool"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.len() > FOLD_OVERSIZED_RESULT_CHARS && !c.contains(MAIN_FOLD_MARKER))
+            });
+            if has_oversized {
+                let before = estimate_wire_tokens(&messages[1..]);
+                let mut probe = messages.clone();
+                let mut probe_seen = seen_lookups.clone();
+                let (probe_chars, folded) = fold_oversized_search_results(
+                    &mut probe,
+                    &mut probe_seen,
+                    SUB_FOLD_KEEP_ROUNDS,
+                );
+                let probe_tokens = probe_chars.div_ceil(4);
+                if folded > 0 && probe_tokens >= MAIN_FOLD_MIN_REMOVAL {
+                    let (removed, folded) = fold_oversized_search_results(
+                        &mut messages,
+                        &mut seen_lookups,
+                        SUB_FOLD_KEEP_ROUNDS,
+                    );
+                    record_fold(
+                        &trace,
+                        "explore-oversized",
+                        step,
+                        step + 1,
+                        (max_steps != usize::MAX).then(|| max_steps - step),
+                        before,
+                        removed,
+                        folded,
+                    );
+                }
             }
         }
 
@@ -5590,6 +5708,7 @@ already approved with \"Always allow\".",
         // hinted tool results in one chat, all re-billed every round). Elide the
         // stale ones just before the request; the tool payloads stay intact.
         strip_stale_hints(&mut messages);
+        let stream_started = std::time::Instant::now();
         let acc = match stream_chat(
             &client,
             &cfg,
@@ -5661,6 +5780,28 @@ the Vision model's description instead.\n"
                 // first narration message, with nothing anywhere saying why the
                 // rest of the turn never happened.
                 eprintln!("[turn-end] chat={} step={} stream error: {named}", req.chat_id, step + 1);
+                // The failed attempt IS a burned round: record it, or the
+                // baseline counts successes only and every retry is invisible
+                // (a stream that dies before any usage never reached the llm
+                // row). `kind:"retry"` keeps one kind for all non-productive
+                // attempts; the summary names the side.
+                trace.record(crate::trace::TraceEntry {
+                    kind: "retry".into(),
+                    summary: format!(
+                        "main stream failed at step {} — {}",
+                        step + 1,
+                        &named.chars().take(160).collect::<String>()
+                    ),
+                    model: Some(req.model.clone()),
+                    error: Some(named.clone()),
+                    detail: Some(json!({
+                        "step": step + 1,
+                        "side": "main",
+                        "status": status,
+                        "duration_ms": stream_started.elapsed().as_millis() as u64,
+                    })),
+                    ..Default::default()
+                });
                 if req.headless {
                     // A headless caller (the scheduler) has no SSE client to
                     // receive the Error/Done protocol: it records the run and
@@ -5855,6 +5996,10 @@ the Vision model's description instead.\n"
                 // prefix-cache hits, so it cannot answer "how big was the prompt
                 // the fold was trying to shrink". This can.
                 "wire_tokens_est": estimate_wire_tokens(&messages[1..]) + tools_chars.div_ceil(4),
+                // Wall-clock of THIS model call: the baseline's latency column
+                // (round-elimination must show here as fewer calls, not slower
+                // ones).
+                "duration_ms": stream_started.elapsed().as_millis() as u64,
                 "interrupted": acc.interrupted,
             })),
             ..Default::default()
@@ -7043,6 +7188,9 @@ assumption in your final output, and continue."
                     id: gate.clone(),
                     question: args["question"].as_str().unwrap_or_default().to_string(),
                     options: args["options"].clone(),
+                    // The multi-part form rides through raw: the renderer
+                    // coerces titles/options and drops malformed sections.
+                    sections: args["sections"].clone(),
                 });
                 match await_answer(&gate, &req.chat_id, cancel).await {
                     Some(v) => (
@@ -7890,23 +8038,33 @@ call fetch_url again with offset={next} for the rest]",
         // the escalating lever had fired at all. `lone_call_hints` counts only
         // this one.
         let lone_hint_str = hint.as_deref().map(str::to_string);
+        let hint_is_lone = lone_hint_str
+            .as_deref()
+            .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"));
         if let Some(hint) = hint {
-            if let Some(last) = messages.last_mut() {
-                if last["role"].as_str() == Some("tool") {
-                    if let Some(c) = last["content"].as_str() {
-                        last["content"] = json!(format!("{c}\n\n{hint}"));
-                        nudges += 1;
-                        // Both generators carry the lone-call wording: the
-                        // escalating lever (`single_call_hint`) AND the quiet-round
-                        // fallback (`single_call_hint_text`, reached when the
-                        // streak lever is silent). Counting on the text alone keeps
-                        // ONE counter for both paths, since the cap that used to
-                        // gate it is gone.
-                        if lone_hint_str
-                            .as_deref()
-                            .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
-                        {
-                            lone_call_hints += 1;
+            // The batching hint is a LESSON, not wallpaper: traced 6 Nov, one
+            // session on a model that answers with exactly one tool call per
+            // reply delivered it 103 times while batching stayed at zero —
+            // every delivery rode the tool result and was re-sent on every
+            // following round of the turn (pure cost, zero behavior change).
+            // Two deliveries per turn is the whole lesson: the first teaches
+            // the batch forms, the second escalates. A model that batches
+            // after two needs no third; a model that does not, never will —
+            // and every further copy only taxes the history.
+            if !hint_is_lone || lone_call_hints < MAX_LONE_CALL_HINTS_PER_TURN {
+                if let Some(last) = messages.last_mut() {
+                    if last["role"].as_str() == Some("tool") {
+                        if let Some(c) = last["content"].as_str() {
+                            last["content"] = json!(format!("{c}\n\n{hint}"));
+                            nudges += 1;
+                            // Both generators carry the lone-call wording: the
+                            // escalating lever (`single_call_hint`) AND the quiet-round
+                            // fallback (`single_call_hint_text`, reached when the
+                            // streak lever is silent). Counting on the text alone keeps
+                            // ONE counter for both paths.
+                            if hint_is_lone {
+                                lone_call_hints += 1;
+                            }
                         }
                     }
                 }
@@ -8444,6 +8602,7 @@ fn fold_with(
     keep_rounds: usize,
     explore_budget: usize,
     result_budget: usize,
+    min_result_chars: usize,
 ) -> (usize, usize) {
     // A "round" is one `assistant` message carrying tool_calls, together with
     // the `tool` results that follow it. The boundary is the FIRST of the last
@@ -8498,9 +8657,18 @@ fn fold_with(
         let meta = m["tool_call_id"].as_str().and_then(|id| call_meta.get(id));
         let is_explore = meta.is_some_and(|(name, _)| name == "explore");
         let budget = if is_explore { explore_budget } else { result_budget };
+        // `min_result_chars` is the ELIGIBILITY floor, separate from the head
+        // size: the oversized pass wants "fold only when the result alone is
+        // worth a fold" (>= 8K chars) while still leaving the SHORT stub head,
+        // and the gated passes pass their own budget here so nothing changes.
+        let eligible_below = if is_explore {
+            budget
+        } else {
+            budget.max(min_result_chars)
+        };
         let Some(content) = m["content"].as_str().map(String::from) else { continue };
         let old_chars = content.chars().count();
-        if old_chars <= budget { continue; }
+        if old_chars <= eligible_below { continue; }
         // Char-boundary-safe truncation: byte slicing panics (and with
         // panic=abort kills the app) on a multi-byte Persian character.
         let head: String = content.chars().take(budget).collect();
@@ -8592,6 +8760,7 @@ fn fold_stale_tool_results(
         MAIN_FOLD_KEEP_ROUNDS,
         MAIN_FOLD_EXPLORE_CHARS,
         MAIN_FOLD_RESULT_CHARS,
+        MAIN_FOLD_RESULT_CHARS,
     )
 }
 
@@ -8611,6 +8780,34 @@ fn fold_subagent_tool_results(
         SUB_FOLD_KEEP_ROUNDS,
         SUB_FOLD_RESULT_CHARS,
         SUB_FOLD_RESULT_CHARS,
+        SUB_FOLD_RESULT_CHARS,
+    )
+}
+
+/// A single result this big is worth a fold ON ITS OWN: traced 6 Nov, `read`
+/// results carried 56-75% of every tool-result character sent to the model
+/// (n=344, median 3.8K, p90 ≈16K chars ≈ 4K tokens), and on a turn whose whole
+/// prompt stays under `MAIN_FOLD_MIN_TOKENS` those giants rode EVERY following
+/// round un-folded. This pass ignores the turn gate: any stale non-explore
+/// result above `FOLD_OVERSIZED_RESULT_CHARS` is foldable, with the SHORT main
+/// stub head — the application itself still goes through the same probe and
+/// removal floor as every other fold (see the call sites).
+fn fold_oversized_search_results(
+    messages: &mut [Value],
+    seen: &mut std::collections::HashSet<String>,
+    keep_rounds: usize,
+) -> (usize, usize) {
+    // `usize::MAX` for the explore budget keeps SUB-AGENT REPORTS out of this
+    // pass: a report is the parent's view of the research and the gated fold
+    // already prices it above the turn gate — eliding it early on a small turn
+    // would trade the one artifact the caller works from for bytes.
+    fold_with(
+        messages,
+        seen,
+        keep_rounds,
+        usize::MAX,
+        MAIN_FOLD_RESULT_CHARS,
+        FOLD_OVERSIZED_RESULT_CHARS,
     )
 }
 
@@ -9804,7 +10001,17 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
     let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
     match name {
         "read" => {
-            let file = s("filePath");
+            // `path` rides as the alias the dispatch accepts (tools.rs read
+            // arm) — a guard blind to the alias let the SAME file re-read at
+            // full size three times inside one run (traced: 47,865 chars for
+            // one fixture file) because its key resolved to None and the
+            // repeat-guard never saw the call. Same alias resolution as the
+            // dispatch, so the guard sees exactly the calls that run.
+            let file = if args["filePath"].as_str().is_some_and(|v| !v.trim().is_empty()) {
+                s("filePath")
+            } else {
+                s("path")
+            };
             // `ranges` selects windows AND (since the bare path list was
             // dropped) the files themselves: a multi-file read has an EMPTY
             // filePath, so keying on the file alone would have returned None
@@ -10751,8 +10958,38 @@ async fn run_subagent(
     // finished. The branch id is what lets the banner retire the moment ITS
     // sub-agent makes progress again.
     let emit_raw = emit;
+    // The ladder's OWN trace rows: every retry of this run lands here under
+    // ONE run id. A failed attempt never reaches run_turn's `llm` row (that is
+    // only written after a successful stream), so without this the baseline
+    // could not count the attempts a run actually burned — the mission's
+    // instrumentation asks for exactly that. `kind:"retry"`; the reason and
+    // model name the rung.
+    let trace = crate::trace::TraceStore::new(parent.chat_id.clone())
+        .with_run(TURN_SEQ.fetch_add(1, Ordering::Relaxed));
     let mut emit = |ev: &AgentEvent| match ev {
-        AgentEvent::Retry { .. } | AgentEvent::RetryGiveup { .. } => {
+        ev @ (AgentEvent::Retry { attempt, max_attempts, reason, model, tool, provider_id, fallback, .. }
+        | AgentEvent::RetryGiveup { attempt, max_attempts, reason, model, tool, provider_id, fallback, .. }) => {
+            let giveup = matches!(ev, AgentEvent::RetryGiveup { .. });
+            let reconnecting = matches!(ev, AgentEvent::Retry { reconnecting: true, .. });
+            trace.record(crate::trace::TraceEntry {
+                kind: "retry".into(),
+                summary: format!(
+                    "attempt {attempt}/{max_attempts}{}",
+                    if giveup { " — gave up" } else { "" }
+                ),
+                model: Some(model.clone()),
+                error: Some(reason.clone()),
+                detail: Some(json!({
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "tool": tool,
+                    "provider_id": provider_id,
+                    "reconnecting": reconnecting,
+                    "fallback": fallback,
+                    "giveup": giveup,
+                })),
+                ..Default::default()
+            });
             emit_raw(&AgentEvent::Branch {
                 branch,
                 sub: false,
@@ -13068,6 +13305,11 @@ mod tests {
     fn the_three_free_roots_never_ask_for_permission() {
         // The user's rule: the workspace, the OS temp folder and ~/.codifa are
         // already trusted — a call that stays inside them must run with no popup.
+        // The free-root set is env-dependent (CODER_DATA_DIR moves the store),
+        // and the trace/scenario tests mutate that var under DATA_DIR_LOCK —
+        // this test must hold the same lock or it races them and reads a
+        // temp-dir world in which ~/.codifa is nobody's free root.
+        let _lock = crate::memory::tests::DATA_DIR_LOCK.lock();
         let root = env!("CARGO_MANIFEST_DIR");
         let tmp = std::env::temp_dir();
         let probes: Vec<String> = vec![
@@ -13606,7 +13848,10 @@ mod tests {
             // `run_terminal` learned `commands` and `write_file` learned
             // `files` — each batches a whole step of work into ONE call, which
             // is exactly the trade this ceiling exists to price deliberately.
-            ("main", tool_schemas(false, false), 17_350usize),
+            // Re-based again for `ask_user`'s optional `sections` param: the
+            // multi-part card (~0.3K chars) buys ONE round-trip instead of
+            // several serial ask gates on a multi-facet fork.
+            ("main", tool_schemas(false, false), 17_450usize),
             ("main+browser", tool_schemas(false, true), 24_200),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
@@ -13618,8 +13863,9 @@ mod tests {
             // EAGER inlining of every connector's whole catalogue. That trade is
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
-            ("main+authoring", tool_schemas(true, false), 23_900),
-            ("main+authoring+browser", tool_schemas(true, true), 30_400),
+            // Raised for `ask_user` `sections` (see the `main` note above).
+            ("main+authoring", tool_schemas(true, false), 24_300),
+            ("main+authoring+browser", tool_schemas(true, true), 30_950),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -16653,6 +16899,482 @@ mod tests {
         format!("http://{addr}")
     }
 
+    // ------------------------------------------------------------------
+    // Scenario suite: deterministic per-scenario call/round accounting.
+    // The scripted mock answers each call index from a script (the last
+    // entry repeats), so a scenario's LLM-call count and round shape are
+    // FACTS, not estimates — the baseline the round-elimination work reports
+    // against. Usage events count llm calls; request bodies show the wire.
+    // ------------------------------------------------------------------
+
+    fn sse_body(payloads: &[Value]) -> String {
+        let mut sse = String::new();
+        for p in payloads {
+            sse.push_str(&format!("data: {p}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        )
+    }
+
+    fn tool_call_frame(id: &str, name: &str, arguments: &str) -> Value {
+        tool_call_frame_at(0, id, name, arguments)
+    }
+
+    /// `index` is the provider's WITHIN-REPLY slot: two calls in one reply
+    /// carry different indices, or the accumulator merges them into one.
+    fn tool_call_frame_at(index: u32, id: &str, name: &str, arguments: &str) -> Value {
+        json!({"choices":[{"delta":{"tool_calls":[{"index":index,"id":id,"function":{"name":name,"arguments":arguments}}]}}]})
+    }
+
+    fn finish_frame(reason: &str, input: u64, output: u64) -> Value {
+        json!({"choices":[{"delta":{},"finish_reason":reason}],"usage":{"input_tokens":input,"output_tokens":output}})
+    }
+
+    fn text_frame(s: &str) -> Value {
+        json!({"choices":[{"delta":{"content":s}}]})
+    }
+
+    /// Mock upstream scripted per call index; the LAST script entry repeats
+    /// forever, so an accidental extra call cannot wedge the test.
+    async fn spawn_scripted_mock_upstream(
+        script: Vec<Vec<Value>>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        assert!(!script.is_empty(), "the script needs at least one entry");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let script = std::sync::Arc::new(script);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let tx = tx.clone();
+                let calls = std::sync::Arc::clone(&calls);
+                let script = std::sync::Arc::clone(&script);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = serde_json::from_slice(&buf[head_end + 4..]).unwrap_or(Value::Null);
+                    let _ = tx.send(body);
+                    let call_idx = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let payloads = &script[call_idx.min(script.len() - 1)];
+                    let _ = sock.write_all(sse_body(payloads).as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn scenario_events() -> std::sync::Arc<std::sync::Mutex<Vec<Value>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn count_kind(events: &[Value], kind: &str) -> usize {
+        events.iter().filter(|e| e["kind"] == kind).count()
+    }
+
+    async fn scenario_turn(
+        base: &str,
+        chat: &str,
+        root: &str,
+        events: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) -> Result<(), String> {
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": root,
+            "mode": "build",
+            "prompt": "run the scenario",
+            "history": [],
+            "chat_id": chat,
+            "data_root": root,
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ev_c = events.clone();
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        run_turn(&req, &mut emit, &cancel).await
+    }
+
+    #[tokio::test]
+    async fn a_simple_two_round_turn_costs_two_llm_calls() {
+        // Scenario 1 — the floor: one tool round + one answer round. No call
+        // in this shape is removable without losing the tool's result.
+        let dir = std::env::temp_dir().join(format!("codifa-scen-simple-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello scenario").unwrap();
+        let (base, _rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "read", r#"{"filePath":"a.txt"}"#),
+                finish_frame("tool_calls", 100, 5),
+            ],
+            vec![text_frame("the file says hello"), finish_frame("stop", 120, 8)],
+        ])
+        .await;
+        let events = scenario_events();
+        let res = scenario_turn(&base, "scen-simple", dir.to_str().unwrap(), events.clone()).await;
+        assert!(res.is_ok(), "{res:?}");
+        let ev = events.lock().unwrap();
+        assert_eq!(count_kind(&ev, "usage"), 2, "two rounds = two calls");
+        assert_eq!(count_kind(&ev, "tool"), 1);
+        assert_eq!(count_kind(&ev, "done"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_multi_tool_round_runs_both_calls_in_one_round() {
+        // Scenario 2 — batching: ONE reply carries two independent lookups and
+        // the loop runs BOTH before the next model call. Two tools, still two
+        // llm calls total — the round shape the batch parameters target.
+        let dir = std::env::temp_dir().join(format!("codifa-scen-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello todo list").unwrap();
+        let (base, _rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "read", r#"{"filePath":"a.txt"}"#),
+                tool_call_frame_at(
+                    1,
+                    "c2",
+                    "grep",
+                    r#"{"pattern":"todo","path":".","include":"*.txt"}"#,
+                ),
+                finish_frame("tool_calls", 100, 6),
+            ],
+            vec![text_frame("both lookups done"), finish_frame("stop", 140, 8)],
+        ])
+        .await;
+        let events = scenario_events();
+        let res = scenario_turn(&base, "scen-multi", dir.to_str().unwrap(), events.clone()).await;
+        assert!(res.is_ok(), "{res:?}");
+        let ev = events.lock().unwrap();
+        assert_eq!(count_kind(&ev, "usage"), 2, "one batched round, one answer");
+        let tools: Vec<String> = ev
+            .iter()
+            .filter(|e| e["kind"] == "tool_result")
+            .filter_map(|e| e["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(tools.contains(&"read".to_string()) && tools.contains(&"grep".to_string()), "{tools:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_surfaces_an_error_and_the_turn_completes() {
+        // Scenario 3 — completion contract: a refused tool is NOT silent (the
+        // model sees the refusal and answers around it); the turn still ends
+        // with a real answer instead of stalling or dying.
+        let dir = std::env::temp_dir().join(format!("codifa-scen-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, _rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                // A hallucinated tool name: the loop's unknown-tool gate refuses
+                // it before anything runs.
+                tool_call_frame("c1", "teleport_file", r#"{}"#),
+                finish_frame("tool_calls", 100, 5),
+            ],
+            vec![text_frame("worked around the refusal"), finish_frame("stop", 130, 8)],
+        ])
+        .await;
+        let events = scenario_events();
+        let res = scenario_turn(&base, "scen-fail", dir.to_str().unwrap(), events.clone()).await;
+        assert!(res.is_ok(), "{res:?}");
+        let ev = events.lock().unwrap();
+        assert_eq!(count_kind(&ev, "usage"), 2, "refusal round + answer round");
+        let failed = ev.iter().any(|e| e["kind"] == "tool_result" && e["ok"] == false);
+        assert!(failed, "the refusal must be visible as a failed tool row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_surface_an_error_without_crashing() {
+        // Scenario 4 — weak model output: arguments that are not JSON must
+        // come back to the model as a failed tool row, never as a panic or a
+        // silent skip.
+        let dir =
+            std::env::temp_dir().join(format!("codifa-scen-badargs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, _rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "read", "{invalid json here"),
+                finish_frame("tool_calls", 100, 5),
+            ],
+            vec![text_frame("recovered"), finish_frame("stop", 130, 8)],
+        ])
+        .await;
+        let events = scenario_events();
+        let res = scenario_turn(&base, "scen-badargs", dir.to_str().unwrap(), events.clone()).await;
+        assert!(
+            res.is_ok(),
+            "a malformed-arguments round must not fail the turn: {res:?}"
+        );
+        let ev = events.lock().unwrap();
+        let failed = ev.iter().any(|e| e["kind"] == "tool_result" && e["ok"] == false);
+        assert!(failed, "the parse failure must surface as a failed tool row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_one_call_model_gets_at_most_two_batching_hints_per_turn() {
+        // Scenario 5 — the hint cap: a model that answers with exactly one
+        // tool call per reply (traced 6 Nov: 103 deliveries, zero batching)
+        // gets the lesson TWICE per turn, then silence. Every delivery rode
+        // the tool result and was re-sent on every later round — the cap is
+        // where the pure cost stops. The precise count is asserted on the
+        // hint counter the loop embeds in the trace's llm rows (the event
+        // wire does not carry hint counters), so the turn runs with
+        // CODER_DATA_DIR pointed at a temp store.
+        let prev = std::env::var("CODER_DATA_DIR").ok();
+        let _lock = crate::memory::tests::DATA_DIR_LOCK.lock();
+        let data = std::env::temp_dir().join(format!("codifa-scen-hints-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("CODER_DATA_DIR", &data);
+        let dir = std::env::temp_dir().join(format!("codifa-scen-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let round = || {
+            vec![
+                tool_call_frame("c", "read", r#"{"filePath":"a.txt"}"#),
+                finish_frame("tool_calls", 100, 5),
+            ]
+        };
+        let mut script = vec![round(), round(), round(), round(), round(), round()];
+        script.push(vec![text_frame("done reading"), finish_frame("stop", 200, 8)]);
+        let (base, _rx) = spawn_scripted_mock_upstream(script).await;
+        let events = scenario_events();
+        let chat = format!("scen-hints-{}", std::process::id());
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_str().unwrap(),
+            "mode": "build",
+            "prompt": "run the scenario",
+            "history": [],
+            "chat_id": chat,
+            "data_root": dir.to_str().unwrap(),
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ev_c = events.clone();
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        let res = run_turn(&req, &mut emit, &cancel).await;
+        assert!(res.is_ok(), "{res:?}");
+        // 6 tool rounds + 1 answer = 7 calls; nothing was skipped for the cap.
+        assert_eq!(count_kind(&events.lock().unwrap(), "usage"), 7);
+        let path = data.join("traces").join(format!("{chat}.jsonl"));
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let llm_hints: Vec<u64> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|r| r["kind"] == "llm")
+            .filter_map(|r| r["detail"]["lone_call_hints"].as_u64())
+            .collect();
+        let total = llm_hints.last().copied().unwrap_or(0);
+        assert!(
+            total <= 2,
+            "the cap allows 2 deliveries per turn; last counter = {total} (rows: {llm_hints:?})"
+        );
+        match prev {
+            Some(v) => std::env::set_var("CODER_DATA_DIR", &v),
+            None => std::env::remove_var("CODER_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn subagent_retries_are_visible_in_the_trace() {
+        // Scenario 6 — instrumentation: a failing slot makes the ladder burn
+        // attempts that NEVER produce an llm row; the kind:"retry" rows are
+        // what makes them countable (the mission's baseline asks for retries,
+        // not just successes).
+        let prev = std::env::var("CODER_DATA_DIR").ok();
+        let _lock = crate::memory::tests::DATA_DIR_LOCK.lock();
+        let data = std::env::temp_dir().join(format!("codifa-scen-retry-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("CODER_DATA_DIR", &data);
+        let dir =
+            std::env::temp_dir().join(format!("codifa-scen-retry-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Main call succeeds and delegates; the explore SLOT always 500s.
+        let base = spawn_failing_mock_upstream(500, "slot exploded").await;
+        let (main_base, _mrx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame(
+                    "c1",
+                    "explore",
+                    r#"{"description":"look","prompt":"what files exist"}"#,
+                ),
+                finish_frame("tool_calls", 100, 5),
+            ],
+            vec![text_frame("gave up on the research"), finish_frame("stop", 140, 8)],
+        ])
+        .await;
+        let chat = format!("scen-retry-{}", std::process::id());
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{main_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_str().unwrap(),
+            "mode": "build",
+            "prompt": "research the area",
+            "history": [],
+            "chat_id": chat,
+            "data_root": dir.to_str().unwrap(),
+            "headless": true,
+            "subagent_models": {"explore": "slot-prov/slot-mock/x"},
+            "providers": {"slot-prov": {"kind": "custom", "baseUrl": format!("{base}/v1"), "apiKeys": ["sk"]}},
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = scenario_events();
+        let ev_c = events.clone();
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+        let ev = events.lock().unwrap();
+        let retries = count_kind(&ev, "retry");
+        assert!(retries >= 2, "the ladder must retry a dead slot: {retries}");
+        assert!(
+            ev.iter().any(|e| e["kind"] == "retry_giveup"),
+            "an always-failing slot must end in a giveup"
+        );
+        // The trace file carries the retry rows (kind:"retry"), giveup flagged.
+        let path = data.join("traces").join(format!("{chat}.jsonl"));
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let rows: Vec<Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let retry_rows: Vec<&Value> = rows.iter().filter(|r| r["kind"] == "retry").collect();
+        assert!(
+            retry_rows.len() >= 2,
+            "retry rows must be in the trace: {} rows total",
+            rows.len()
+        );
+        assert!(
+            retry_rows.iter().any(|r| r["detail"]["giveup"] == true),
+            "the giveup must be flagged"
+        );
+        match prev {
+            Some(v) => std::env::set_var("CODER_DATA_DIR", &v),
+            None => std::env::remove_var("CODER_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_explore_budget_nudge_fires_and_the_report_is_delivered() {
+        // Scenario 7 — completion contract for the sub-agent: after the fixed
+        // step budget the loop asks for the report INSTEAD of more calls, and
+        // the run ends with the report as the explore result (never a silent
+        // budget death).
+        let dir = std::env::temp_dir().join(format!("codifa-scen-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+        }
+        let round = |i: usize| {
+            vec![
+                tool_call_frame("c", "read", &format!(r#"{{"filePath":"f{i}.txt"}}"#)),
+                finish_frame("tool_calls", 100, 5),
+            ]
+        };
+        // Round 1 of the MAIN turn delegates; the SUB turn (same mock) burns
+        // its step budget on reads; the report is the sub's final text.
+        let mut script = vec![vec![
+            tool_call_frame(
+                "c1",
+                "explore",
+                r#"{"description":"look","prompt":"read the fixture files"}"#,
+            ),
+            finish_frame("tool_calls", 100, 5),
+        ]];
+        script.extend([round(0), round(1), round(2), round(3)]);
+        script.push(vec![
+            text_frame("REPORT: all six files read"),
+            finish_frame("stop", 300, 20),
+        ]);
+        let (base, _rx) = spawn_scripted_mock_upstream(script).await;
+        let chat = format!("scen-budget-{}", std::process::id());
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_str().unwrap(),
+            "mode": "build",
+            "prompt": "read the files",
+            "history": [],
+            "chat_id": chat,
+            "data_root": dir.to_str().unwrap(),
+            "subagent_models": {"explore": "main/scenario-model"},
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = scenario_events();
+        let ev_c = events.clone();
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        let res = run_turn(&req, &mut emit, &cancel).await;
+        assert!(res.is_ok(), "{res:?}");
+        let ev = events.lock().unwrap();
+        // The report reaches the parent as the explore tool's result.
+        let reported = ev.iter().any(|e| {
+            e["kind"] == "tool_result"
+                && e["name"] == "explore"
+                && e["result"].as_str().is_some_and(|r| r.contains("REPORT:"))
+        });
+        assert!(
+            reported,
+            "the report must be delivered as the explore result"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
     #[tokio::test]
     async fn headless_turn_surfaces_a_provider_error_as_err() {
         // THE SCHEDULE CONTRACT. A headless run_turn (the scheduler) must hand a
@@ -17913,7 +18635,7 @@ mod tests {
         }
         let mut seen = std::collections::HashSet::new();
         // Keep only the newest round, cut everything older to 100 chars.
-        fold_with(&mut messages, &mut seen, 1, 100, 100);
+        fold_with(&mut messages, &mut seen, 1, 100, 100, 100);
 
         let stale = messages[1]["content"].as_str().unwrap();
         assert!(
@@ -17934,7 +18656,7 @@ mod tests {
 
         // Folding is idempotent: a second pass changes nothing.
         let before = stale.to_string();
-        fold_with(&mut messages, &mut seen, 1, 100, 100);
+        fold_with(&mut messages, &mut seen, 1, 100, 100, 100);
         assert_eq!(messages[1]["content"].as_str().unwrap(), before);
     }
 
@@ -17969,6 +18691,49 @@ mod tests {
     /// inference that cannot tell a fold from mid-turn compaction, and that
     /// measures the shrink AFTER the fact (biased). The numbers it returns now
     /// are what the trace records.
+    #[test]
+    fn the_oversized_pass_elides_only_stale_giants_and_keeps_small_results() {
+        // Traced 6 Nov: `read` carried 56-75% of all tool-result chars (p90
+        // ≈16K) and rode EVERY following round on turns the 20K whole-prompt
+        // gate never reached. The oversized pass must elide exactly the stale
+        // giants — never small results, never the kept rounds, never reports.
+        let giant = "x".repeat(16_000);
+        let small = "s".repeat(3_000);
+        let mut messages: Vec<Value> = Vec::new();
+        // Stale: one giant read, one small read, one giant report (explore).
+        messages.extend(fold_round("c1", "read", &giant));
+        messages.extend(fold_round("c2", "read", &small));
+        messages.extend(fold_round("c3", "explore", &"r".repeat(16_000)));
+        // Two fresh rounds that stay untouched (the keep window).
+        messages.extend(fold_round("c4", "read", &giant));
+        messages.extend(fold_round("c5", "read", &giant));
+        let mut seen = std::collections::HashSet::new();
+        let (removed, folded) =
+            fold_oversized_search_results(&mut messages, &mut seen, MAIN_FOLD_KEEP_ROUNDS);
+        assert_eq!(folded, 1, "only the stale giant read folds; {removed} chars out");
+        assert!(removed >= 12_000, "{removed}");
+        let content = |id: &str| {
+            messages
+                .iter()
+                .find(|m| m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let c1 = content("c1");
+        assert!(c1.contains(MAIN_FOLD_MARKER), "giant read folded: {c1}");
+        assert!(c1.len() < 3_000, "the stub keeps only the short head: {}", c1.len());
+        assert_eq!(content("c2").len(), 3_000, "a small result is never elided");
+        assert_eq!(content("c3").len(), 16_000, "an explore report is out of this pass");
+        assert_eq!(content("c4").len(), 16_000, "kept rounds untouched");
+        assert_eq!(content("c5").len(), 16_000, "kept rounds untouched");
+        // Idempotent: a second pass is a no-op.
+        let (removed2, folded2) =
+            fold_oversized_search_results(&mut messages, &mut seen, MAIN_FOLD_KEEP_ROUNDS);
+        assert_eq!(folded2, 0, "second pass must be a no-op");
+        assert_eq!(removed2, 0, "{removed2}");
+    }
+
     #[test]
     fn fold_with_reports_removed_chars_and_message_count() {
         let big = "y".repeat(10_000);

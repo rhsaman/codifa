@@ -782,7 +782,6 @@ export default function App() {
                 <WindowStripCluster />
                 <WorkspaceMenuButton root={activeChatRoot} />
                 <div id="titlebar-toolbar" />
-                <UpdateButton />
                 {/* Empty stretch that carries the window drag region: the bar
                     itself must stay no-drag so its horizontal scrollbar stays
                     draggable when the pills overflow. Tauri's injected drag

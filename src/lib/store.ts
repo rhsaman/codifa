@@ -285,6 +285,12 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
     // A chat with no messages at all is in-memory only (a fresh tab): never a
     // sidebar row, never a file on disk.
     if (!hasBody) continue
+    // A PENDING fork (seeded but no user turn yet) is in-memory only too: it
+    // has messages, so the `hasBody` check above alone would persist it the
+    // moment the fork was created. The user-message guard is belt-and-suspenders
+    // — addMessage already clears the flag on the first user turn, so a fork
+    // that somehow gained one still persists.
+    if (c.pendingFirstMessage && !c.messages.some((m) => m.role === 'user')) continue
     const clean = { ...c }
     delete clean.pendingAsk
     delete clean.pendingPermission
@@ -1817,7 +1823,16 @@ interface State {
    *  chat's ask request is silently lost and its popup never appears. */
   setChatPendingAsk: (
     chatId: string,
-    req: { id: string; question: string; options: string[]; style?: string } | null,
+    req: {
+      id: string
+      question: string
+      options: string[]
+      style?: string
+      selected?: number[]
+      freeText?: string
+      sections?: { title: string; options: string[] }[]
+      secSelected?: number[][]
+    } | null,
   ) => void
   /** Set/clear a chat's pending `permission` request. Same rationale as
    *  `setChatPendingAsk`: stored on the chat so it survives the ChatPanel
@@ -4831,6 +4846,12 @@ export const useStore = create<State>((set, get) => ({
               // fires while the title is still the untouched placeholder, so
               // the user's FIRST new message here renames the fork for real.
               title: 'New chat',
+              // A fork with no user turn yet is PENDING: it holds only the
+              // system seed, so persisting it would pin every exploratory
+              // fork into the sidebar forever — exactly what an untouched new
+              // chat avoids (sanitizeChats drops empty chats). Cleared by
+              // addMessage as soon as the first user message lands.
+              pendingFirstMessage: true,
               thinkingLevel: src.thinkingLevel,
               updatedAt: Date.now(),
             }
@@ -4895,6 +4916,10 @@ export const useStore = create<State>((set, get) => ({
                   : c.updatedAt,
               title:
                 c.messages.length === 0 && message.role === 'user' ? autoTitle : c.title,
+              // The first user turn graduates a PENDING fork into a real chat:
+              // from here on it persists like everything else.
+              pendingFirstMessage:
+                message.role === 'user' ? false : c.pendingFirstMessage,
             }
           : c,
       )

@@ -1,13 +1,16 @@
-import { useEffect, useRef, useState } from "react";
-import { APP_DIR, useStore } from "../lib/store";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { APP_DIR, useStore, workspaceKey } from "../lib/store";
 import { detectDir, prepareContent } from "../lib/bidi";
 import { collectChatIds } from "../lib/chatTree";
+import { copyToClipboard } from "../lib/clipboard";
 import {
   barFlowSign,
   captureDragSlots,
   edgeScroll,
   inactiveTabIds,
   liveExtents,
+  menuLeft,
+  menuTop,
   slotExtents,
   slotShifts,
   tabForPoint,
@@ -16,6 +19,7 @@ import {
 } from "../lib/tabBar";
 import { TabListButton, CloseTabsIcon, type TabListSection } from "./TabListMenu";
 import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
+import { buildGroups } from "./Sidebar";
 
 function CloseIcon() {
   return (
@@ -263,6 +267,10 @@ export function ChatTabBar() {
         : null,
       pendingAsk: c.pendingAsk ? { question: c.pendingAsk.question } : null,
       unread: s.unreadChats.includes(c.id),
+      // Context-menu fields (same actions as the sidebar's chat menu).
+      root: c.root ?? "",
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt,
     })),
   );
   const [dragId, setDragId] = useState<string | null>(null);
@@ -274,6 +282,45 @@ export function ChatTabBar() {
   const slotsRef = useRef<DragSlots | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
+
+  // Right-click menu on a tab: the SAME actions as the sidebar's chat menu
+  // (pin, rename, copy id, move to group, delete) plus the tab-native
+  // "close tab". `menuMove` swaps the content for the workspace list, exactly
+  // like the sidebar menu's second level.
+  const [menuChatId, setMenuChatId] = useState<string | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [menuMove, setMenuMove] = useState(false);
+  const closeMenu = () => {
+    setMenuChatId(null);
+    setMenuMove(false);
+  };
+  useEffect(() => {
+    if (!menuChatId) return;
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (!(t instanceof Element) || !t.closest(".chat-menu")) {
+        closeMenu();
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuChatId]);
+
+  // Workspace list for "Move to group" — the same grouping the sidebar menu
+  // offers, built from the same helper so the two menus never drift apart.
+  const workspaces = useStore((s) => s.workspaces);
+  const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces);
+  const pinnedChats = useStore((s) => s.pinnedChats);
+  const workspaceColors = useStore((s) => s.workspaceColors);
+  const menuGroups = useMemo(
+    () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats),
+    [chats, workspaces, pinnedWorkspaces, pinnedChats],
+  );
+  const menuChat = menuChatId ? chats.find((c) => c.id === menuChatId) ?? null : null;
+  const menuTargets = menuChat
+    ? menuGroups.filter((g) => g.key !== workspaceKey(menuChat.root))
+    : [];
 
   // Keep the active tab visible when the bar overflows (many open tabs).
   useEffect(() => {
@@ -390,6 +437,20 @@ export function ChatTabBar() {
             onAuxClick={(e) => {
               if (e.button === 1) useStore.getState().closeChatTab(id);
             }}
+            onContextMenu={(e) => {
+              // Same menu as the sidebar's chat row (minus nothing): pin,
+              // rename, copy id, move to group, delete — plus close tab.
+              e.preventDefault();
+              // WebKit grabs the word under the pointer on right-mousedown;
+              // clear it so no stale selection shows behind the menu.
+              document.getSelection()?.removeAllRanges();
+              setMenuMove(false);
+              setMenuChatId(id);
+              setMenuPos({
+                top: menuTop(e.clientY, 240, window.innerHeight),
+                left: menuLeft(e.clientX, 170, window.innerWidth),
+              });
+            }}
             onDragStart={(e) => {
               try {
                 e.dataTransfer.setData("application/x-coder-chat-id", id);
@@ -475,6 +536,123 @@ export function ChatTabBar() {
       >
         +
       </button>
+      {menuChat && menuPos && (
+        menuMove ? (
+          <div
+            className="ws-menu chat-menu"
+            role="menu"
+            style={{ position: "fixed", top: menuPos.top, left: menuPos.left }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="ws-menu-title">Move to group</div>
+            {menuTargets.length === 0 && (
+              <div className="ws-menu-title">No other projects</div>
+            )}
+            {menuTargets.map((g) => (
+              <button
+                key={g.key}
+                className="ws-menu-btn"
+                role="menuitem"
+                onClick={() => {
+                  useStore.getState().setChatRoot(menuChat.id, g.root ?? "");
+                  closeMenu();
+                }}
+              >
+                <span
+                  className="ws-menu-dot"
+                  style={{ background: workspaceColors[g.key] || "var(--accent)" }}
+                />
+                {g.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div
+            className="ws-menu chat-menu"
+            role="menu"
+            style={{ position: "fixed", top: menuPos.top, left: menuPos.left }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className={`ws-menu-btn${pinnedChats.includes(menuChat.id) ? " active" : ""}`}
+              role="menuitem"
+              onClick={() => {
+                useStore.getState().togglePinChat(menuChat.id);
+                closeMenu();
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill={pinnedChats.includes(menuChat.id) ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+              </svg>
+              {pinnedChats.includes(menuChat.id) ? "Unpin" : "Pin to top"}
+            </button>
+            <button
+              className="ws-menu-btn"
+              role="menuitem"
+              onClick={() => {
+                setEditingId(menuChat.id);
+                closeMenu();
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+              </svg>
+              Rename
+            </button>
+            <button
+              className="ws-menu-btn"
+              role="menuitem"
+              title={menuChat.id}
+              onClick={() => {
+                void copyToClipboard(menuChat.id);
+                closeMenu();
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+              Copy chat ID
+            </button>
+            <button
+              className="ws-menu-btn"
+              role="menuitem"
+              onClick={() => setMenuMove(true)}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+              </svg>
+              Move to group
+            </button>
+            <button
+              className="ws-menu-btn danger"
+              role="menuitem"
+              onClick={() => {
+                useStore.getState().deleteChat(menuChat.id);
+                closeMenu();
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+              </svg>
+              Delete
+            </button>
+            <button
+              className="ws-menu-btn danger"
+              role="menuitem"
+              onClick={() => {
+                useStore.getState().closeChatTab(menuChat.id);
+                closeMenu();
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+              Close tab
+            </button>
+          </div>
+        )
+      )}
     </div>
   );
 }

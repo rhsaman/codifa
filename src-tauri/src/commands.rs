@@ -1954,16 +1954,31 @@ pub async fn select_file(app: AppHandle, start_dir: Option<String>) -> Option<Ve
 /// VIRTUAL media path (`media/<chat-slug>/<file>`) the UI carries; it is
 /// resolved against the data root with the same containment rule the serving
 /// route uses, so the dialog can never copy anything outside the media tree.
+///
+/// Alternatively the bytes may arrive inline as a `data:<mime>;base64,…` URL
+/// (`data_url` — chat attachments only exist in the webview's memory): they
+/// are parked in a temp file and served through the same dialog + copy flow,
+/// so the temp file is always removed on every exit path below.
 #[tauri::command]
 pub async fn save_media_as(
     app: AppHandle,
     path: String,
     default_name: Option<String>,
+    data_url: Option<String>,
 ) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    let data_root = crate::state::current_data_root()?;
-    let abs = crate::media_gen::resolve_media_virtual(&data_root.to_string_lossy(), &path).ok()?;
+    let tmp = data_url.as_deref().and_then(data_url_to_temp);
+    let abs = match tmp {
+        Some(ref p) => p.clone(),
+        None => {
+            let data_root = crate::state::current_data_root()?;
+            crate::media_gen::resolve_media_virtual(&data_root.to_string_lossy(), &path).ok()?
+        }
+    };
     if !abs.is_file() {
+        if let Some(ref p) = tmp {
+            let _ = std::fs::remove_file(p);
+        }
         return None;
     }
     let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
@@ -1983,11 +1998,39 @@ pub async fn save_media_as(
     builder.save_file(move |dest| {
         let _ = tx.send(dest.map(|d| d.to_string()));
     });
-    let dest = rx.recv().ok().flatten()?;
-    match std::fs::copy(&abs, &dest) {
-        Ok(_) => Some(dest),
-        Err(_) => None,
+    let dest = rx.recv().ok().flatten();
+    let copied = match &dest {
+        Some(dest) => std::fs::copy(&abs, dest).is_ok(),
+        None => false,
+    };
+    if let Some(ref p) = tmp {
+        let _ = std::fs::remove_file(p);
     }
+    if copied {
+        dest
+    } else {
+        None
+    }
+}
+
+/// Decode a `data:<mime>;base64,…` URL into a uniquely named temp file. The
+/// extension comes from the declared mime so the save dialog's default name
+/// (set separately by the caller) pairs sensibly with it.
+fn data_url_to_temp(data_url: &str) -> Option<PathBuf> {
+    let (meta, payload) = data_url.split_once(',')?;
+    let mime = meta
+        .strip_prefix("data:")
+        .and_then(|m| m.split(';').next())
+        .unwrap_or_default();
+    let ext = mime.rsplit('/').next().filter(|e| !e.is_empty())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!("codifa-save-{}.{}", nanos, ext));
+    std::fs::write(&tmp, bytes).ok()?;
+    Some(tmp)
 }
 
 // --- quit flush handshake ---------------------------------------------------

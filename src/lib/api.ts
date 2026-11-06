@@ -1609,9 +1609,13 @@ export async function requestChatTitle(params: {
         text: params.text,
         chat_id: params.chatId ?? '',
       }),
-      // Long budget so the backend fallback chain (title, compact, main)
-      // fits inside one request; fire-and-forget so it never blocks the turn.
-      signal: AbortSignal.timeout(90_000),
+      // Long budget so the whole backend fallback chain fits inside one
+      // request: each candidate gets a 30s window (a timed-out candidate and
+      // the next one alone already spend 60s), and the chain is the user's own
+      // try order — aborting at 90s killed the later rungs mid-flight, so a
+      // model that would have answered never got the chance. Fire-and-forget:
+      // it never blocks the turn.
+      signal: AbortSignal.timeout(300_000),
     })
     if (!res.ok) {
       console.warn(`[title] sidecar answered ${res.status} — keeping default chat title`)
@@ -1620,10 +1624,16 @@ export async function requestChatTitle(params: {
     const data = (await res.json().catch(() => ({}))) as {
       title?: unknown
       usage?: ChatTitleUsage | null
+      error?: unknown
     }
     const title = typeof data.title === 'string' ? data.title.trim() : ''
-    if (!title) console.warn('[title] empty title reply — keeping default chat title')
-    else console.info('[title] got title:', title, (params.chatId ?? '').slice(-6))
+    if (!title) {
+      // The backend names the FIRST candidate's failure (`error`) on a dead
+      // chain; printing it here is the only place a stuck title is diagnosable
+      // from the renderer at all — rust.log needs shell access.
+      const why = typeof data.error === 'string' && data.error.trim() ? ` — ${data.error}` : ''
+      console.warn(`[title] no title reply — keeping default chat title${why}`)
+    } else console.info('[title] got title:', title, (params.chatId ?? '').slice(-6))
     return { title: title || null, usage: data.usage ?? null }
   } catch (err) {
     console.warn('[title] request failed — keeping default chat title', err)

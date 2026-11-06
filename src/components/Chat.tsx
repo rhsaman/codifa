@@ -1875,8 +1875,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Selected option on the GENERIC ask card: clicking an option marks it
   // (radio style, like ChatGPT's choice cards) and the Apply button submits
   // it — instead of the old instant-send-per-click.
-  const [askSelected, setAskSelected] = useState<number | null>(null);
-
+  
   /**
    * Deliver an ask/permission answer and only clear its card once the backend
    * has accepted it. The old code cleared the card immediately and discarded the
@@ -4404,6 +4403,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Per-turn local state (was shared refs — now locals so concurrent chats
     // don't race). stop() coordinates via chatStopped + chatAborts store.
     let mcpChanged = false;
+    // Whether THIS stream delivered a fatal `error` event. The backend closes
+    // EVERY failed stream with a `done` sentinel, so the done handler cannot
+    // tell "clean completion" from "close after a real error" without this
+    // flag — and a bubble resumed after an earlier attempt's failure must
+    // drop its stale `error: true` when THIS attempt completes cleanly.
+    // Without it a recovered turn kept the badge forever: the full answer
+    // rendered while the footer still read "failed / The turn failed."
+    let sawTurnError = false;
     // Messages that ask to create/install skills or MCP connectors also grant
     // the create_skill/create_mcp tools — in EVERY mode (ask, plan, build).
     // The grant is sticky across the conversation: check the current message AND
@@ -5670,37 +5677,55 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           folder: event.folder,
         });
       } else if (event.kind === "ask") {
-        setAskFreeText("");
         setPlanApprovalSel(0);
-        setAskSelected(null);
-        // Backend options may be non-strings (object/array/null). Coerce all
-        // to string so prepareContent never crashes.
         const rawOpts: unknown[] = Array.isArray(event.options)
           ? event.options
           : [];
-        const options: string[] = rawOpts
-          .map((o: unknown) =>
-            typeof o === "string"
-              ? o
-              : o == null
-                ? ""
-                : typeof o === "object"
-                  ? JSON.stringify(o)
-                  : String(o),
-          )
-          .map((s: string) => s.trim())
-          .filter((s: string) => s.length > 0);
+        const coerceOptions = (raw: unknown[]): string[] =>
+          raw
+            .map((o: unknown) =>
+              typeof o === "string"
+                ? o
+                : o == null
+                  ? ""
+                  : typeof o === "object"
+                    ? JSON.stringify(o)
+                    : String(o),
+            )
+            .map((s: string) => s.trim())
+            .filter((s: string) => s.length > 0);
+        const options = coerceOptions(rawOpts);
+        // Multi-part form: the model may send `sections` (2-4 related
+        // sub-questions) instead of flat options. Coerce each one and drop
+        // malformed entries so the card never renders a blank facet.
+        const rawSections: unknown[] = Array.isArray(event.sections)
+          ? event.sections
+          : [];
+        const sections = rawSections
+          .map((sec: unknown) => {
+            const o = (sec ?? {}) as Record<string, unknown>;
+            return {
+              title: typeof o.title === "string" ? o.title.trim() : "",
+              options: coerceOptions(Array.isArray(o.options) ? o.options : []),
+            };
+          })
+          .filter((s) => s.title.length > 0 && s.options.length > 0);
         useStore.getState().setChatPendingAsk(chat.id, {
           id: event.id ?? "",
           question: typeof event.question === "string" ? event.question : "",
           options,
           style: typeof event.style === "string" ? event.style : undefined,
+          sections: sections.length > 0 ? sections : undefined,
+          selected: [],
+          secSelected: sections.length > 0 ? sections.map(() => []) : undefined,
+          freeText: "",
         });
         // Silent in live voice: the answer is spoken and the mic is open.
         ringTurnAlarm("alert");
       } else if (event.kind === "error") {        // A late backend error arriving after an explicit Stop must not re-arm
         // the retry banner — the user already cancelled this turn.
         if (shouldIgnoreLateRetryEvent(chatStopped.get(chat.id) === true)) return;
+        sawTurnError = true;
         // A backend error while the summarizer was supposedly running means the
         // compact can't complete either — never leave the "Compacting context"
         // banner stuck next to the error. Clear it defensively (the backend's
@@ -5731,6 +5756,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // `error: true` keeps the failed-turn styling without rendering text.
         store.updateMessage(assistantMsg.id, {
           error: true,
+          // The reason rides ON the message too, not only inside `retry`:
+          // `sanitizeChats` strips `retry` on persist and the thinking handler
+          // clears it when a resumed attempt starts working, so without this
+          // the footer fell back to the generic "The turn failed." and the
+          // real provider error (e.g. "ollama returned no content") was lost.
+          errorReason,
           // A failed turn's usage is the last request before the drop — often
           // inflated to ~100% (the reason the provider cut the stream). Don't
           // persist it: the meter must fall back to the last completed turn.
@@ -6046,12 +6077,42 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             useStore.getState().updateMessage(assistantMsg.id, { retry: null });
           }
         }
+        // A recovered turn must not keep wearing its failed-turn badge: the
+        // stale `error: true` was set by an EARLIER attempt on this same
+        // bubble (auto-retry/drain resumes continue into it), while THIS
+        // stream just completed cleanly — full answer, tools and usage. Only
+        // an error seen on THIS stream (the backend closes every failed
+        // stream with a `done` sentinel) or an abort keeps the badge.
+        // Traced 6 Nov: the TTS-voices turn failed once mid-run, the ladder's
+        // resume delivered the complete reply, and the footer still read
+        // "failed / The turn failed." — `error` is only cleared on the MANUAL
+        // retry path, never on a successful resume.
+        const recovered =
+          !sawTurnError &&
+          (event as { aborted?: boolean }).aborted !== true &&
+          curMsg?.error === true;
+        if (recovered) {
+          useStore.getState().updateMessage(assistantMsg.id, {
+            error: false,
+            errorReason: undefined,
+            // A still-attached reconnecting banner belonged to the failed
+            // attempt; this stream just succeeded, so it retires too.
+            // Terminal banners (gaveUp/watchdog/fallback) carry information
+            // and are left for their own paths.
+            ...(curMsg.retry &&
+            curMsg.retry.gaveUp !== true &&
+            curMsg.retry.watchdog !== true
+              ? { retry: null }
+              : {}),
+          });
+        }
         // Turn-finished alarm: the alert sound only on a successful
         // completion — a turn that ended in a backend failure (an inline
         // `error` event always precedes this `done` sentinel) stays silent,
         // as does live voice (the answer is spoken, and an open mic would
-        // hear a chime as the user talking).
-        if (curMsg?.error !== true) ringTurnAlarm("alert");
+        // hear a chime as the user talking). A turn that RECOVERED (badge
+        // cleared above) counts as successful and rings it.
+        if (curMsg?.error !== true || recovered) ringTurnAlarm("alert");
       }
     };
 
@@ -11079,6 +11140,184 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               retry/status slot — there are no banners above the composer. */}
             </>
           )}
+        {/* Pending permission gate rendered INLINE at the end of the
+            conversation: the old popup anchored above the composer floated
+            over the last messages; the user asked for it in the transcript,
+            like the inline ask card. */}
+        {permissionReq &&
+          (() => {
+            const fa = detectDir(permissionReq.action) === "rtl";
+            const isConfirm = permissionReq.scope === "confirm";
+            const isComputer = permissionReq.scope === "computer";
+            const isSsh = permissionReq.scope === "ssh";
+            const title = isConfirm
+              ? fa
+                ? "تأیید عملیات"
+                : "Confirm action"
+              : isComputer
+                ? fa
+                  ? "کنترل اپ‌های دسکتاپ"
+                  : "Desktop app control"
+                : isSsh
+                  ? fa
+                    ? "اتصال به سرور (SSH)"
+                    : "SSH server connection"
+                  : fa
+                    ? "دسترسی بیرون از ورکاسپیس"
+                    : "Outside workspace access";
+            const note = isConfirm
+              ? fa
+                ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
+                : "The agent flagged this as important or hard to undo, and is waiting for you."
+              : isComputer
+                ? fa
+                  ? "این به عامل اجازه می‌دهد اپ‌های دیگر را از طریق Accessibility Tree ببیند و کنترل کند."
+                  : "This lets the agent see and control other apps via the Accessibility Tree."
+                : isSsh
+                  ? fa
+                    ? "این به عامل اجازه می‌دهد با SSH به این سرور متصل شود و آنجا دستور اجرا کند. تا زمانی که اجازه ندهید هیچ دستوری روی سرور اجرا نمی‌شود."
+                    : "This lets the agent open an SSH connection to this server and run commands there. Nothing runs on the server until you allow it."
+                  : fa
+                    ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
+                    : "This lets the agent work outside your current workspace.";
+            const folderNote =
+              !isConfirm && !isComputer && permissionReq.folder && !isSsh
+                ? fa
+                  ? "اجازه فقط برای همین پوشه و زیرپوشه‌هایش ثبت می‌شود؛ سایر مسیرهای بیرون از ورک‌اسپیس همچنان مجوز جداگانه می‌خواهند."
+                  : "The grant applies only to this folder and its subfolders; other outside-workspace paths still need a fresh permission."
+                : isSsh
+                  ? fa
+                    ? "اجازه فقط برای همین مقصد (user@host) ثبت می‌شود؛ سرورهای دیگر همچنان مجوز جداگانه می‌خواهند."
+                    : "The grant applies only to this destination (user@host); other servers still need a fresh permission."
+                  : null;
+            const denyLabel = fa ? "رد کردن" : "Deny";
+            return (
+              <div className="perm-card perm-card-inline" dir={fa ? "rtl" : "ltr"}>
+                <div className="ask-card-head">
+                  <span className="ask-card-icon">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                  </span>
+                  <span className="ask-card-title">{title}</span>
+                </div>
+                <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
+                  {prepareContent(permissionReq.action, fa ? "rtl" : "ltr")}
+                </div>
+                {permissionReq.path || permissionReq.folder ? (
+                  <code className="perm-path" dir="ltr">
+                    {permissionReq.path || permissionReq.folder}
+                  </code>
+                ) : null}
+                {permissionReq.reason ? (
+                  <div
+                    className="perm-reason"
+                    dir={detectDir(permissionReq.reason)}
+                  >
+                    {prepareContent(permissionReq.reason, fa ? "rtl" : "ltr")}
+                  </div>
+                ) : null}
+                <div className="perm-note">{note}</div>
+                {folderNote ? <div className="perm-note">{folderNote}</div> : null}
+                <div className="perm-buttons">
+                  <button
+                    type="button"
+                    className="btn perm-deny"
+                    onClick={() => {
+                      void answerPermission(
+                        permissionReq.id,
+                        false,
+                        chatIdRef.current,
+                      );
+                    }}
+                  >
+                    {denyLabel}
+                  </button>
+                  {isConfirm ? (
+                    <button
+                      type="button"
+                      className="btn perm-allow"
+                      onClick={() => {
+                        void answerPermission(
+                          permissionReq.id,
+                          true,
+                          chatIdRef.current,
+                        );
+                      }}
+                    >
+                      {fa ? "تأیید" : "Confirm"}
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="btn perm-allow"
+                        onClick={() => {
+                          void answerPermission(
+                            permissionReq.id,
+                            true,
+                            chatIdRef.current,
+                          );
+                        }}
+                      >
+                        {fa ? "اجازه موقت" : "Allow once"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn perm-allow-always"
+                        onClick={() => {
+                          // scope-aware: "Always allow" persists the grant matching
+                          // the dialog's scope — computer vs ssh vs outside-workspace.
+                          if (permissionReq.scope === "computer") {
+                            useStore.getState().setComputerUse(true);
+                          } else if (permissionReq.scope === "ssh") {
+                            // Per-host grant: the destination (`user@host`)
+                            // lands in trusted-hosts.json and never prompts
+                            // again — NOT the whole outside space, and the
+                            // host string must NOT go through the folder
+                            // trust (it would fail canonicalization).
+                            void trustSshHost(
+                              permissionReq.folder || permissionReq.path || "",
+                            );
+                          } else if (permissionReq.folder) {
+                            // Per-folder grant: only the requested folder's
+                            // subtree stays approved — NOT the whole
+                            // outside-workspace space. The folder is
+                            // backend-normalized (nearest existing parent).
+                            // Persisted too: the in-memory list dies with the
+                            // session, and an "always" grant that asks again
+                            // after every relaunch is not "always".
+                            useStore
+                              .getState()
+                              .addOutsideFolder(permissionReq.folder);
+                            void trustOutsideFolder(permissionReq.folder);
+                          } else {
+                            useStore.getState().setOutsideAllowed(true);
+                          }
+                          void answerPermission(
+                            permissionReq.id,
+                            true,
+                            chatIdRef.current,
+                          );
+                        }}
+                      >
+                        {fa ? "همیشه اجازه بده" : "Always allow"}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </div>
         </div>
 
@@ -11275,283 +11514,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     Submit
                   </button>
                   </span>
-                </div>
-              </div>
-            );
-          })()}
-        {askReq &&
-          askReq.style !== "plan_approval" &&
-          (() => {
-            const fa = detectDir(askReq.question) === "rtl";
-            return (
-              <div className="ask-card" dir={fa ? "rtl" : "ltr"}>
-                <div className="ask-card-head">
-                  <span className="ask-card-icon">
-                    <svg
-                      width="14"
-                      height="14"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01" />
-                    </svg>
-                  </span>
-                  <span className="ask-card-title">
-                    {fa ? "عامل سوالی از شما دارد" : "The agent has a question"}
-                  </span>
-                </div>
-                <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
-                  {prepareContent(askReq.question)}
-                </div>
-                {askReq.options.length > 0 && (
-                  <div className="ask-options">
-                    {askReq.options.map((opt, i) => (
-                      <button
-                        key={i}
-                        type="button"
-                        role="radio"
-                        aria-checked={askSelected === i}
-                        className={`ask-option${askSelected === i ? " selected" : ""}`}
-                        onClick={() =>
-                          // Radio select (ChatGPT choice-card style): a click
-                          // marks the option, the Apply button submits it.
-                          setAskSelected(askSelected === i ? null : i)
-                        }
-                      >
-                        <span className="ask-option-mark" aria-hidden>
-                          {askSelected === i ? "●" : "○"}
-                        </span>
-                        <span className="ask-option-text" dir={detectDir(opt)}>
-                          {prepareContent(opt)}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <div className="ask-freetext">
-                  <textarea
-                    className="ask-input"
-                    rows={2}
-                    autoFocus
-                    dir={detectDir(askFreeText) === "rtl" || fa ? "rtl" : "ltr"}
-                    value={askFreeText}
-                    placeholder={
-                      fa ? "پاسخ خود را بنویسید…" : "Type your answer…"
-                    }
-                    onChange={(e) => setAskFreeText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (
-                        e.key === "Enter" &&
-                        !e.shiftKey &&
-                        (askFreeText.trim() ||
-                          (askSelected !== null && askReq.options[askSelected]))
-                      ) {
-                        e.preventDefault();
-                        void answerAsk(
-                          askReq.id,
-                          askFreeText.trim() || askReq.options[askSelected!],
-                          chatIdRef.current,
-                        );
-                      }
-                    }}
-                  />
-                  <div className="ask-footer">
-                    <button
-                      type="button"
-                      className="btn ask-send"
-                      disabled={
-                        !askFreeText.trim() &&
-                        (askSelected === null || !askReq.options[askSelected])
-                      }
-                      onClick={() => {
-                        void answerAsk(
-                          askReq.id,
-                          askFreeText.trim() || (askSelected !== null ? askReq.options[askSelected] : ""),
-                          chatIdRef.current,
-                        );
-                      }}
-                    >
-                      {fa ? "اعمال انتخاب" : "Apply"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })()}
-        {permissionReq &&
-          (() => {
-            const fa = detectDir(permissionReq.action) === "rtl";
-            const isConfirm = permissionReq.scope === "confirm";
-            const isComputer = permissionReq.scope === "computer";
-            const isSsh = permissionReq.scope === "ssh";
-            const title = isConfirm
-              ? fa
-                ? "تأیید عملیات"
-                : "Confirm action"
-              : isComputer
-                ? fa
-                  ? "کنترل اپ‌های دسکتاپ"
-                  : "Desktop app control"
-                : isSsh
-                  ? fa
-                    ? "اتصال به سرور (SSH)"
-                    : "SSH server connection"
-                  : fa
-                    ? "دسترسی بیرون از ورکاسپیس"
-                    : "Outside workspace access";
-            const note = isConfirm
-              ? fa
-                ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
-                : "The agent flagged this as important or hard to undo, and is waiting for you."
-              : isComputer
-                ? fa
-                  ? "این به عامل اجازه می‌دهد اپ‌های دیگر را از طریق Accessibility Tree ببیند و کنترل کند."
-                  : "This lets the agent see and control other apps via the Accessibility Tree."
-                : isSsh
-                  ? fa
-                    ? "این به عامل اجازه می‌دهد با SSH به این سرور متصل شود و آنجا دستور اجرا کند. تا زمانی که اجازه ندهید هیچ دستوری روی سرور اجرا نمی‌شود."
-                    : "This lets the agent open an SSH connection to this server and run commands there. Nothing runs on the server until you allow it."
-                  : fa
-                    ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
-                    : "This lets the agent work outside your current workspace.";
-            const folderNote =
-              !isConfirm && !isComputer && permissionReq.folder && !isSsh
-                ? fa
-                  ? "اجازه فقط برای همین پوشه و زیرپوشه‌هایش ثبت می‌شود؛ سایر مسیرهای بیرون از ورک‌اسپیس همچنان مجوز جداگانه می‌خواهند."
-                  : "The grant applies only to this folder and its subfolders; other outside-workspace paths still need a fresh permission."
-                : isSsh
-                  ? fa
-                    ? "اجازه فقط برای همین مقصد (user@host) ثبت می‌شود؛ سرورهای دیگر همچنان مجوز جداگانه می‌خواهند."
-                    : "The grant applies only to this destination (user@host); other servers still need a fresh permission."
-                : null;
-            const denyLabel = fa ? "رد کردن" : "Deny";
-            return (
-              <div className="perm-card" dir={fa ? "rtl" : "ltr"}>
-                <div className="ask-card-head">
-                  <span className="ask-card-icon">
-                    <svg
-                      width="14"
-                      height="14"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                    </svg>
-                  </span>
-                  <span className="ask-card-title">{title}</span>
-                </div>
-                <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
-                  {prepareContent(permissionReq.action, fa ? "rtl" : "ltr")}
-                </div>
-                {permissionReq.path || permissionReq.folder ? (
-                  <code className="perm-path" dir="ltr">
-                    {permissionReq.path || permissionReq.folder}
-                  </code>
-                ) : null}
-                {permissionReq.reason ? (
-                  <div
-                    className="perm-reason"
-                    dir={detectDir(permissionReq.reason)}
-                  >
-                    {prepareContent(permissionReq.reason, fa ? "rtl" : "ltr")}
-                  </div>
-                ) : null}
-                <div className="perm-note">{note}</div>
-                {folderNote ? <div className="perm-note">{folderNote}</div> : null}
-                <div className="perm-buttons">
-                  <button
-                    type="button"
-                    className="btn perm-deny"
-                    onClick={() => {
-                      void answerPermission(
-                        permissionReq.id,
-                        false,
-                        chatIdRef.current,
-                      );
-                    }}
-                  >
-                    {denyLabel}
-                  </button>
-                  {isConfirm ? (
-                    <button
-                      type="button"
-                      className="btn perm-allow"
-                      onClick={() => {
-                        void answerPermission(
-                          permissionReq.id,
-                          true,
-                          chatIdRef.current,
-                        );
-                      }}
-                    >
-                      {fa ? "تأیید" : "Confirm"}
-                    </button>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        className="btn perm-allow"
-                        onClick={() => {
-                          void answerPermission(
-                            permissionReq.id,
-                            true,
-                            chatIdRef.current,
-                          );
-                        }}
-                      >
-                        {fa ? "اجازه موقت" : "Allow once"}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn perm-allow-always"
-                        onClick={() => {
-                          // scope-aware: "Always allow" persists the grant matching
-                          // the dialog's scope — computer vs ssh vs outside-workspace.
-                          if (permissionReq.scope === "computer") {
-                            useStore.getState().setComputerUse(true);
-                          } else if (permissionReq.scope === "ssh") {
-                            // Per-host grant: the destination (`user@host`)
-                            // lands in trusted-hosts.json and never prompts
-                            // again — NOT the whole outside space, and the
-                            // host string must NOT go through the folder
-                            // trust (it would fail canonicalization).
-                            void trustSshHost(
-                              permissionReq.folder || permissionReq.path || "",
-                            );
-                          } else if (permissionReq.folder) {
-                            // Per-folder grant: only the requested folder's
-                            // subtree stays approved — NOT the whole
-                            // outside-workspace space. The folder is
-                            // backend-normalized (nearest existing parent).
-                            // Persisted too: the in-memory list dies with the
-                            // session, and an "always" grant that asks again
-                            // after every relaunch is not "always".
-                            useStore
-                              .getState()
-                              .addOutsideFolder(permissionReq.folder);
-                            void trustOutsideFolder(permissionReq.folder);
-                          } else {
-                            useStore.getState().setOutsideAllowed(true);
-                          }
-                          void answerPermission(
-                            permissionReq.id,
-                            true,
-                            chatIdRef.current,
-                          );
-                        }}
-                      >
-                        {fa ? "همیشه اجازه بده" : "Always allow"}
-                      </button>
-                    </>
-                  )}
                 </div>
               </div>
             );

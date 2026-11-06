@@ -673,12 +673,15 @@ body.coder-resizing .terminal-panel {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
+  /* Clip hard instead of appending "…": the ellipsis glyph ate characters
+     that the title itself could still use. */
+  text-overflow: clip;
   white-space: nowrap;
-  /* Direction follows the app bar's ltr/rtl toggle (dir on
-     .chat-item-title-row), NOT auto-detection: RTL mode aligns titles to the
-     right, LTR mode to the left. */
-  text-align: start;
+  /* One alignment for EVERY title (Persian and English): all hug the LEFT
+     edge so a mixed list reads as a single column. Bidi base direction still
+     follows the title's own language (dir on the span via detectDir) — only
+     the alignment is pinned. */
+  text-align: left;
   font-size: 12px;
   font-weight: 500;
 }
@@ -686,7 +689,8 @@ body.coder-resizing .terminal-panel {
 /* Row that keeps the streaming dot inline with the chat title instead of a
    full-width flex child below it (.chat-item is a column layout). The gap on
    .chat-item keeps long titles from colliding with the trailing badges.
-   dir comes from the store's direction toggle via the JSX dir attribute. */
+   The row stays LTR regardless of title language so the time badge always
+   lands on the right edge; direction lives on the title span only. */
 .chat-item-title-row {
   display: flex;
   align-items: center;
@@ -4894,10 +4898,34 @@ body.coder-dragging .chat-split-child {
   color: var(--danger);
 }
 
+/* Sub-agent line (user request): the model name takes the tone colour in the
+   head — it IS the state being reported (which rung the ladder is on) — and
+   the run's tool tally replaces the error text in the reason slot, dim grey
+   like the rest of the line so nothing reads as a failure. */
+.msg-retry-inline-model {
+  color: var(--tone);
+  font-weight: 600;
+}
+
+.msg-retry-inline-tools {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* A touch wider than the reason cap: "Read File ×4 · Search Files ×4" is
+     the whole sentence and must not ellipsize on a normal-width footer. */
+  max-width: 34ch;
+  /* Same slot as the reason it replaces. */
+  order: 10;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
 /* Wrapped onto its own row (narrow footer): the chip spans the row, so the
    reason takes every pixel left instead of its 22ch cap. */
 @container msg-actions (max-width: 34rem) {
-  .msg-retry-inline-reason {
+  .msg-retry-inline-reason,
+  .msg-retry-inline-tools {
     flex: 1 1 0;
     max-width: none;
   }
@@ -12389,6 +12417,16 @@ body.coder-dragging .chat-split-child {
 }
 
 /* ---- fullscreen image viewer (Codex-style, via FullscreenModal) ---- */
+/* The pan content normally sizes to its children (min-width/height: 100%),
+   so the `height: 100%` on .image-fullscreen and `max-height: 100%` on the img
+   resolve to auto and a large image renders at natural size, clipped by the
+   viewport. A definite size here lets those percentages resolve so the image
+   fits the modal at zoom 1; drag/Ctrl+wheel still pan and zoom from there. */
+.fullscreen-modal-body.image-fs-body .fullscreen-pan-content {
+  width: 100%;
+  height: 100%;
+}
+
 .image-fullscreen {
   width: 100%;
   height: 100%;
@@ -16707,6 +16745,46 @@ body.coder-dragging .chat-split-child {
   }
 }
 
+/* Inline variant rendered INSIDE the transcript (ChatMessage segments and the
+   trailing permission gate): the base .ask-card/.perm-card anchor above the
+   composer with position:absolute — in the message flow that would fling the
+   card to the composer's top edge, so go static and let it sit like a bubble. */
+.ask-card-inline,
+.perm-card-inline {
+  position: static;
+  bottom: auto;
+  z-index: auto;
+  max-width: min(560px, 88%);
+  /* Centered in the transcript (the composer popup centered itself the same
+     way), so the card reads the same in LTR and RTL chats. */
+  margin: 10px auto;
+  max-height: none;
+  overflow-y: visible;
+  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  animation: none;
+}
+
+/* Multi-part ask card: stacked facets, each with its own heading and option
+   list; one Apply at the bottom submits every section together. */
+.ask-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.ask-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+
+.ask-section .ask-options {
+  margin-top: 6px;
+}
+
 .ask-card-head {
   display: flex;
   align-items: center;
@@ -19403,25 +19481,58 @@ body.coder-dragging .chat-split-child {
   white-space: nowrap;
 }
 
-.fullscreen-close {
+/* Button cluster on the right of the head: caller `actions` (the image
+   viewer's download) + reset-zoom + close. */
+.fullscreen-modal-actions {
   flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Every head button shares this chrome — a 30×30 tile around a stroke icon
+   (ModalIcons.tsx). Replaces the old text ✕ glyph and the floating bottom
+   zoom bar. */
+.fullscreen-icon-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   background: transparent;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 8px;
-  width: 30px;
-  height: 30px;
   cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
   transition:
     background 0.13s,
     color 0.13s;
 }
 
-.fullscreen-close:hover {
+.fullscreen-icon-btn svg {
+  display: block;
+}
+
+.fullscreen-icon-btn:hover {
   background: var(--bg-input);
   color: var(--text);
+}
+
+.fullscreen-icon-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.fullscreen-icon-btn.ok {
+  color: var(--accent);
+  border-color: currentColor;
+}
+
+.fullscreen-icon-btn.err {
+  color: var(--danger);
+  border-color: currentColor;
 }
 
 .fullscreen-modal-body {
@@ -19464,39 +19575,6 @@ body.coder-dragging .chat-split-child {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   pointer-events: none;
   z-index: 1;
-}
-
-.fullscreen-zoom-bar {
-  position: absolute;
-  bottom: 14px;
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 6px 10px;
-  z-index: 2;
-  color: var(--text);
-  box-shadow: var(--shadow-pop);
-}
-
-.fullscreen-zoom-bar button {
-  background: var(--bg-alt);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  width: 30px;
-  height: 28px;
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-}
-
-.fullscreen-zoom-bar button:hover {
-  background: var(--bg-hover);
 }
 
 .diff-fullscreen-body {
@@ -23638,7 +23716,9 @@ mark.trace-hit-active {
 
 .editor-tab-label {
   overflow: hidden;
-  text-overflow: ellipsis;
+  /* Clip hard instead of appending "…": the ellipsis glyph cost characters
+     the title itself could still show (same policy as .chat-item-title). */
+  text-overflow: clip;
   min-width: 0;
   /* A mid-drag squeeze must never re-wrap the label into two lines — that
      was the "tabs jumble apart while dragging" layout break. */
@@ -32022,4 +32102,440 @@ select:focus-visible {
   text-align: end;
   color: var(--text-dim);
   font-weight: 400;
+}
+
+/* آیکن مفهومی فشرده‌سازی (دو فلش به سمت مرکز) جای ستارهٔ قبلی */
+.msg-retry-inline[data-state="progress"]::before {
+  width: 22px;
+  height: 22px;
+  justify-self: center;
+  background-color: var(--accent);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22v-6M12 8V2M4 12h2M10 12h4M18 12h2M15 19l-3-3-3 3M15 5l-3 3-3-3'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22v-6M12 8V2M4 12h2M10 12h4M18 12h2M15 19l-3-3-3 3M15 5l-3 3-3-3'/%3E%3C/svg%3E") center / contain no-repeat;
+  animation: compact-squeeze 1.6s ease-in-out infinite;
+}
+
+@keyframes compact-squeeze {
+  0%,
+  100% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scaleY(0.82);
+    opacity: 0.7;
+  }
+}
+
+/* آیکن لودینگ چرخان (حلقه) به جای آیکن ثابت */
+.msg-retry-inline[data-state="progress"]::before {
+  -webkit-mask: none;
+  mask: none;
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border-radius: 50%;
+  border: 2.5px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-top-color: var(--accent);
+  animation: compact-spinner 0.8s linear infinite;
+}
+
+@keyframes compact-spinner {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* نوار compact ردیف خودش را می‌گیرد و از اعداد in/out سمت راست فاصله دارد */
+.msg-retry-inline[data-state="progress"] {
+  flex: 1 1 14rem;
+  min-width: 0;
+  max-width: min(22rem, 100%);
+  margin-inline-end: 28px;
+  padding-inline: 6px;
+  /* هرگز آنقدر باریک نشود که متن شکسته شود */
+  min-width: min(14rem, 100%);
+}
+
+/* عرض کم: نوار compact کل ردیف بالای دکمه‌ها و اعداد را می‌گیرد */
+@container msg-actions (max-width: 34rem) {
+  .msg-retry-inline[data-state="progress"] {
+    flex: 1 0 100%;
+    max-width: 100%;
+    margin-inline-end: 0;
+    order: -1;
+  }
+}
+
+@supports not (container-type: inline-size) {
+  @media (max-width: 860px) {
+    .msg-retry-inline[data-state="progress"] {
+      flex: 1 0 100%;
+      max-width: 100%;
+      margin-inline-end: 0;
+      order: -1;
+    }
+  }
+}
+
+/* ریشهٔ مشکل عرض کم: container query نمی‌تواند خودِ container (.msg-actions) را wrap کند.
+   پس وقتی نوار compact هست، همیشه wrap فعال است و گروه وضعیت حداقل عرضش را
+   دارد؛ اگر جا نبود، آیکن‌ها/اعداد in/out اختیاری زیر آن می‌روند. */
+.msg-actions:has(.msg-retry-inline[data-state="progress"]) {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.msg-actions:has(.msg-retry-inline[data-state="progress"]) .msg-actions-status {
+  flex: 1 1 13rem;
+  min-width: min(13rem, 100%);
+}
+
+.msg-actions:has(.msg-retry-inline[data-state="progress"]) .msg-actions-tools {
+  margin-inline-start: auto;
+  /* شمارندهٔ توکن هرگز از کادر بیرون نمی‌زند: در صورت کمبود جا wrap می‌شود */
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.msg-actions-status > .msg-retry-inline[data-state="progress"] {
+  flex: 1 1 auto;
+  margin-inline-end: 12px;
+  max-width: 28rem;
+}
+
+/* یک خط: آیکن → متن → نوار → درصد، همگی هم‌تراز با آیکن‌های سمت راست */
+.msg-retry-inline[data-state="progress"] {
+  grid-template-columns: 20px auto minmax(48px, 1fr) auto;
+  grid-template-rows: auto;
+  column-gap: 10px;
+  row-gap: 0;
+  padding-block: 4px;
+  min-width: min(15rem, 100%);
+}
+
+.msg-retry-inline[data-state="progress"]::before {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.msg-retry-inline[data-state="progress"] .msg-retry-inline-count {
+  grid-column: 2;
+  grid-row: 1;
+  white-space: nowrap;
+}
+
+.msg-retry-inline[data-state="progress"] .msg-retry-inline-bar {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.msg-retry-inline[data-state="progress"] .msg-retry-inline-pct {
+  grid-column: 4;
+  grid-row: 1;
+}
+
+/* ════════ Settings → Plugins & Marketplaces: کارت‌های مدرن ════════ */
+.pm-avatar {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-size: 15px;
+  font-weight: 700;
+  color: hsl(var(--h, 220) 70% 74%);
+  background: hsl(var(--h, 220) 55% 50% / 0.18);
+  border: 1px solid hsl(var(--h, 220) 55% 60% / 0.22);
+}
+
+.pm-count {
+  margin-inline-start: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* ── Plugin bundle cards ── */
+.settings-modal .pm-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-content: start;
+  gap: 10px 8px;
+  padding: 14px;
+  border-radius: 14px;
+  transition: border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.settings-modal .pm-card > * {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.settings-modal .pm-card:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.settings-modal .pm-card .pm-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-modal .pm-card .pm-card-title {
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.settings-modal .pm-card .pm-card-name {
+  max-width: 100%;
+  font-size: 14px;
+}
+
+.pm-card-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.pm-card-state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text-dim) 60%, transparent);
+}
+
+.pm-card:not(.pm-card--off) .pm-card-state {
+  color: var(--success);
+}
+
+.pm-card:not(.pm-card--off) .pm-card-state::before {
+  background: var(--success);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--success) 60%, transparent);
+}
+
+.settings-modal .pm-card .pm-switch {
+  margin-inline-start: auto;
+}
+
+.settings-modal .pm-card .pm-card-desc {
+  min-height: calc(1.55em * 2);
+}
+
+.settings-modal .pm-card .pm-meta {
+  gap: 6px;
+}
+
+.settings-modal .pm-card .pm-meta-item {
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.settings-modal .pm-card .pm-meta-item.zero {
+  opacity: 0.4;
+}
+
+.settings-modal .pm-card .pm-card-open {
+  grid-column: 1;
+  margin-top: 2px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text);
+}
+
+.settings-modal .pm-card .pm-card-open:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+}
+
+.settings-modal .pm-card .pm-card-actions {
+  grid-column: 2;
+  margin: 2px 0 0;
+  align-self: stretch;
+  align-items: stretch;
+}
+
+.settings-modal .pm-card .pm-card-actions .btn.tiny {
+  border-radius: 10px;
+}
+
+/* ── Marketplace: منابع به شکل چیپ، جستجوی بزرگ‌تر، کارت معرفی‌شده ── */
+.settings-modal .market-tabs {
+  gap: 8px;
+}
+
+.settings-modal .market-tab {
+  gap: 0;
+  padding: 2px 4px 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.settings-modal .market-tab + .market-tab::before {
+  display: none;
+}
+
+.settings-modal .market-tab-name::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-inline-end: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  vertical-align: middle;
+}
+
+.settings-modal .market-tab:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.settings-modal .settings-search input[type="search"] {
+  max-width: none;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.settings-modal .market-grid {
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 12px;
+}
+
+.settings-modal .market-card {
+  gap: 10px;
+  padding: 14px;
+  border-radius: 14px;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.settings-modal .market-card:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.settings-modal .market-card.installed {
+  border-color: color-mix(in srgb, var(--success) 30%, var(--border));
+}
+
+.settings-modal .market-card-head {
+  gap: 10px;
+}
+
+.market-card-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.market-card-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-modal .market-card-desc {
+  font-size: 12px;
+  -webkit-line-clamp: 3;
+  min-height: calc(1.5em * 3);
+}
+
+.market-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+  min-height: 18px;
+}
+
+.market-card-cat {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.settings-modal .market-card-installed {
+  margin-inline-start: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--success);
+}
+
+/* ════════ Settings → Storage (و گروه‌های تنظیمات): فشرده‌تر و تمیزتر ════════ */
+/* دکمهٔ اصلی کارت Backup سفید با متن سفید بود — متن باید از رنگ accent سازگار باشد */
+.settings-modal .btn.accent {
+  color: var(--on-accent, #111);
+  font-weight: 600;
+}
+
+.settings-modal .backup-actions .btn.tiny {
+  padding: 7px 14px;
+  border-radius: 9px;
+}
+
+.settings-modal .settings-group {
+  border-radius: 16px;
+  margin-bottom: 16px;
+}
+
+.settings-modal .settings-group-head {
+  align-items: center;
+  padding: 14px 18px;
+}
+
+.settings-modal .settings-group-icon {
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  filter: none;
+}
+
+.settings-modal .settings-group-desc {
+  margin-top: 2px;
+  max-width: none;
+}
+
+.settings-modal .settings-row {
+  padding: 12px 18px;
+}
+
+.settings-modal .settings-row-desc {
+  margin-top: 2px;
+}
+
+.settings-modal .settings-row-stack {
+  gap: 8px;
 }

@@ -68,9 +68,11 @@ export interface CoderApi {
     scope?: string,
   ): Promise<GoogleSignInResult>
   selectFolder(): Promise<string | null>
-  /** Native save dialog for one generated media file (virtual media path).
-   *  Optional: the web bridge has no OS dialog and falls back to a download. */
-  saveMediaAs?(path: string, defaultName?: string): Promise<string | null>
+  /** Native save dialog for one generated media file (virtual media path), or
+   *  for in-memory bytes (`dataUrl`, e.g. chat attachments that never touch
+   *  disk). Optional: the web bridge has no OS dialog and falls back to a
+   *  download. */
+  saveMediaAs?(path: string, defaultName?: string, dataUrl?: string): Promise<string | null>
   /** Posts one OS notification through the native notification plugin.
    *  Optional: only the desktop shell has it — WKWebView's Web Notification
    *  API is a silent no-op, while the browser (serve mode) uses the web API. */

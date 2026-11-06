@@ -722,6 +722,14 @@ export interface PluginSession {
   mcpConfig?: Record<string, McpServerConfig>
 }
 
+/** One facet of a multi-part `ask_user` card: its own heading and choices.
+ *  The model fills `sections` (instead of flat question+options) when one
+ *  decision has several independent sub-questions. */
+export interface AskSection {
+  title: string
+  options: string[]
+}
+
 export interface Chat {
   id: string
   title: string
@@ -762,7 +770,21 @@ export interface Chat {
    *  lose the request (and the popup would never appear) if the user isn't
    *  looking at this exact chat when the `ask` event arrives, or switches away
    *  and back while the agent is still waiting for a response. */
-  pendingAsk?: { id: string; question: string; options: string[]; style?: string } | null
+  pendingAsk?: {
+    id: string
+    question: string
+    options: string[]
+    style?: string
+    selected?: number[]
+    freeText?: string
+    /** Multi-part form: 2-4 related sub-questions shown in ONE card; every
+     *  section is answered before the card submits them all in one answer.
+     *  Present only when the model used `sections` instead of flat options. */
+    sections?: AskSection[]
+    /** Per-section selection (parallel to `sections`), persisted like
+     *  `selected` so the card survives chat switches. */
+    secSelected?: number[][]
+  } | null
   /** A pending `permission` request from a RUNNING agent turn. Same rationale
    *  as `pendingAsk`: lives on the chat so it survives the ChatPanel remount
    *  on chat switch. `folder` = the backend-normalized approved folder (the
@@ -832,6 +854,13 @@ export interface Chat {
   /** Total number of messages in the full on-disk transcript. Lets the UI say
    *  how much history remains without loading it. */
   bodyTotal?: number
+  /** Runtime-only: a freshly FORKED chat that has not seen its first user
+   *  message yet. It holds only the compacted system seed, so persisting it
+   *  would pin every exploratory fork into the sidebar forever — the same
+   *  "in-memory until first send" treatment an untouched new chat already gets
+   *  (sanitizeChats drops empty chats). Cleared in addMessage as soon as a user
+   *  message lands; never serialized. NOT the composer's saved `draft` above. */
+  pendingFirstMessage?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -1013,6 +1042,10 @@ export interface SidecarEvent {
   /** ask_user: the question text and, when multiple-choice, its options */
   question?: string
   options?: string[]
+  /** ask_user multi-part form: 2-4 related sub-questions in ONE card, each its
+   *  own heading + choices. Present only when the model sent `sections`
+   *  instead of flat options (same shape as Chat['pendingAsk']['sections']). */
+  sections?: AskSection[]
   /** 'plan_approval' marks the deterministic end-of-plan approval card
    *  (Approve / edit / dismiss); absent for regular agent questions. */
   style?: string

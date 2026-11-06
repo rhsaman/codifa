@@ -463,7 +463,12 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Option<&[Value
             // 0 of 25 frames carried `usage` without this field, exactly one
             // did with it. A gateway that rejects the field instead of
             // ignoring it gets one retry without it (`stream_with_key`).
-            body["stream_options"] = json!({ "include_usage": true });
+            // Google rejects unknown extras (incl. stream_options) with a 400,
+            // so only OpenAI-compatible receivers get the field — its absence
+            // there just costs one retry via `stream_with_key`.
+            if !google {
+                body["stream_options"] = json!({ "include_usage": true });
+            }
             // Ask the model to emit INDEPENDENT tool calls in ONE assistant
             // message instead of serialising one call per round trip.
             //

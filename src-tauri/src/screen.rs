@@ -21,7 +21,28 @@ use serde_json::Value;
 /// Escape a Rust string for embedding inside an AppleScript double-quoted
 /// literal (backslashes first, then quotes).
 pub fn applescript_literal(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    // AppleScript literals live inside double-quotes, so a stray quote or
+    // backslash would end the literal early. Newline / carriage return /
+    // other control characters are just as dangerous — they terminate the
+    // statement on a fresh line and make osascript fail with a syntax error —
+    // so strip them instead of trying to escape (AppleScript has no \n).
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+            out.push(ch);
+        } else if ch == '\n' || ch == '\r' {
+            // Line feed inside a literal is the most common failure (multi-
+            // line text). Replace with space so typing survives; the caller can
+            // still split on it afterwards if needed.
+            out.push(' ');
+        } else if (ch as u32) < 0x20 || ch == '\u{7f}' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// One display, in POINTS (the coordinate space events and window geometry use)

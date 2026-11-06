@@ -210,6 +210,21 @@ fn v_is_warm(read: Option<u64>) -> bool {
     read.unwrap_or(0) > 0
 }
 
+/// Round shape + failures of one trace: solo = a round whose reply carried
+/// exactly ONE tool call (the shape the batch parameters exist to merge),
+/// multi = two or more. Retries are attempts that burned a round-trip without
+/// producing an llm row (stream death, a rung the ladder moved off) — they
+/// were invisible in traces until the `kind:"retry"` rows existed.
+#[derive(Default)]
+struct Rounds {
+    solo: usize,
+    multi: usize,
+    tool_calls: usize,
+    retries: usize,
+    giveups: usize,
+    durations_ms: Vec<usize>,
+}
+
 #[derive(Default)]
 struct ToolStat {
     calls: usize,
@@ -304,6 +319,7 @@ fn report(path: &Path) {
     // model ignored it" from "the lever never ran" — the exact confusion that
     // made the textual single-call hint look effective for eight phases.
     let mut lever_fires: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut rounds = Rounds::default();
 
     for row in &rows {
         let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
@@ -331,6 +347,25 @@ fn report(path: &Path) {
                 }
             }
             "llm" => {
+                let tc = row
+                    .get("detail")
+                    .and_then(|d| d.get("tool_calls"))
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if tc > 1 {
+                    rounds.multi += 1;
+                } else {
+                    rounds.solo += 1;
+                }
+                rounds.tool_calls += tc;
+                if let Some(ms) = row
+                    .get("detail")
+                    .and_then(|d| d.get("duration_ms"))
+                    .and_then(Value::as_u64)
+                {
+                    rounds.durations_ms.push(ms as usize);
+                }
                 *calls_per_run.entry(run.unwrap_or(0)).or_default() += 1;
                 if let Some(r) = run {
                     rows_per_run.entry(r).or_default().push(row.clone());
@@ -359,6 +394,18 @@ fn report(path: &Path) {
                     }
                 }
             }
+            "retry" => {
+                rounds.retries += 1;
+                if row
+                    .get("detail")
+                    .and_then(|d| d.get("giveup"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    rounds.giveups += 1;
+                }
+            }
+
             "tool" => {
                 let detail = row.get("detail").cloned().unwrap_or(Value::Null);
                 let name = detail
@@ -642,6 +689,22 @@ fn report(path: &Path) {
     // fresh (the state right after a fold reset or a prompt edit). The two
     // averaged into one number describe neither, and the not-reported rows
     // stay their own bucket.
+    // Round shape + failures: the per-scenario numbers the baseline reports.
+    // solo/multi come from each llm row's own tool_calls length; retries are
+    // the attempts that never produced an llm row at all.
+    let mut durs = rounds.durations_ms.clone();
+    let med = median(&mut durs);
+    println!(
+        "   R) rounds        : solo={} multi={} (tool calls={})",
+        rounds.solo, rounds.multi, rounds.tool_calls
+    );
+    println!(
+        "      failures      : retries={} giveup={}",
+        rounds.retries, rounds.giveups
+    );
+    if med > 0 {
+        println!("      median call   : {med} ms");
+    }
     println!("   H2) cold/warm    : all   {}", total_usage.cold_warm_line());
     if main.calls > 0 {
         println!("      main          : {}", main.cold_warm_line());

@@ -50,7 +50,7 @@ let titleCalls = 0
   throw new Error('unexpected fetch ' + u)
 }
 
-const { useStore, forkSeedMessage } = await import('../src/lib/store.ts')
+const { useStore, forkSeedMessage, sanitizeChats } = await import('../src/lib/store.ts')
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -101,6 +101,21 @@ console.log('1) a fork carries a compacted seed, never the transcript:')
   )
   check('fork holds no copied user turn', !fork.messages.some((m) => m.role === 'user'))
   check('fork is far smaller than the source', fork.messages.length < src.messages.length)
+  check(
+    'fork starts pending (no user turn yet)',
+    fork.pendingFirstMessage === true,
+    (fork as { pendingFirstMessage?: boolean }).pendingFirstMessage,
+  )
+  check(
+    'pending fork is NOT persisted yet',
+    !sanitizeChats(useStore.getState().chats).some((c) => c.id === forkId),
+    sanitizeChats(useStore.getState().chats).map((c) => c.id),
+  )
+  check(
+    'forking switches to the forked chat',
+    useStore.getState().activeChatId === forkId,
+    useStore.getState().activeChatId,
+  )
 }
 
 console.log('2) the fork title regenerates from the first NEW message:')
@@ -130,6 +145,16 @@ console.log('2) the fork title regenerates from the first NEW message:')
   check('generated title applied to the fork', applied, {
     title: useStore.getState().chats.find((c) => c.id === forkId)?.title,
   })
+  const forkAfter = useStore.getState().chats.find((c) => c.id === forkId)
+  check(
+    'first user message clears the pending flag',
+    forkAfter?.pendingFirstMessage === false,
+    forkAfter?.pendingFirstMessage,
+  )
+  check(
+    'graduated fork is persisted',
+    sanitizeChats(useStore.getState().chats).some((c) => c.id === forkId),
+  )
 }
 
 console.log('3) a fork of a still-streaming turn is not itself streaming:')

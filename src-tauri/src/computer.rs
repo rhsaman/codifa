@@ -435,10 +435,35 @@ pub fn run(args: &Value) -> Result<Outcome, String> {
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or("`text` is required for action=type")?;
-            screen::osascript(&format!(
-                "tell application \"System Events\" to keystroke \"{}\"",
-                screen::applescript_literal(text)
-            ))?;
+            // AppleScript keystroke "…" cannot carry a raw newline — the
+            // source becomes a syntax error. So split the payload into lines and
+            // emit a dedicated `keystroke return` between them. Each line is still
+            // escaped through applescript_literal, so quotes/backslashes can't
+            // leak out of the string.
+            let normalized = text.replace("\r\n", "\n").replace("\r", "\n");
+            let lines: Vec<&str> = normalized.split('\n').collect();
+            let mut script = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    if !script.is_empty() {
+                        script.push('\n');
+                    }
+                    script.push_str("tell application \"System Events\" to keystroke return");
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                if !script.is_empty() {
+                    script.push('\n');
+                }
+                script.push_str(&format!(
+                    "tell application \"System Events\" to keystroke \"{}\"",
+                    screen::applescript_literal(line)
+                ));
+            }
+            if !script.is_empty() {
+                screen::osascript(&script)?;
+            }
             format!("typed {} characters", text.chars().count())
         }
         "key" => {

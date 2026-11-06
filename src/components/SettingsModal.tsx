@@ -782,7 +782,10 @@ function MarketplaceEditor() {
           catalogue that failed to load left nowhere to type. */}
       <div className="field">
           <div className="field-head">
-            <label>All plugins from every marketplace</label>
+            <label>
+              All plugins from every marketplace
+              {matches.length > 0 ? <span className="pm-count">{matches.length}</span> : null}
+            </label>
             <span className="plugin-spacer" />
             <button
               className="btn tiny secondary"
@@ -848,9 +851,21 @@ function MarketplaceEditor() {
                   const have = installedKeys.has(key)
                   const installing = isRowInstalling(key)
                   return (
-                    <div key={key} className="market-card">
+                    <div key={key} className={`market-card${have ? ' installed' : ''}`}>
                       <div className="market-card-head">
-                        <span className="market-card-name" dir="ltr">{entry.name}</span>
+                        <span
+                          className="pm-avatar"
+                          style={{ '--h': providerHue(entry.name) } as CSSProperties}
+                          aria-hidden="true"
+                        >
+                          {(entry.name.trim()[0] ?? '?').toUpperCase()}
+                        </span>
+                        <div className="market-card-info">
+                          <span className="market-card-name" dir="ltr" title={entry.name}>{entry.name}</span>
+                          <span className="market-card-sub" dir="ltr">
+                            {entry.author ? entry.author : entry.category ?? ''}
+                          </span>
+                        </div>
                         <button
                           className={`btn tiny ${have ? 'secondary' : ''}`}
                           disabled={installing}
@@ -862,7 +877,12 @@ function MarketplaceEditor() {
                       {entry.description ? (
                         <div className="market-card-desc">{entry.description}</div>
                       ) : null}
-                      {have ? <div className="market-card-installed">Installed</div> : null}
+                      <div className="market-card-foot">
+                        {entry.category && entry.author ? (
+                          <span className="market-card-cat">{entry.category}</span>
+                        ) : null}
+                        {have ? <span className="market-card-installed">✓ Installed</span> : null}
+                      </div>
                     </div>
                   )
                 })}
@@ -1009,7 +1029,10 @@ function PluginBundleEditor() {
   return (
     <div className="field">
       <div className="field-head">
-        <label>Plugins</label>
+        <label>
+          Plugins
+          {plugins !== null ? <span className="pm-count">{plugins.length}</span> : null}
+        </label>
         <button className="btn tiny" onClick={() => void refresh()} disabled={busy !== ''}>
           Refresh
         </button>
@@ -1047,7 +1070,7 @@ function PluginBundleEditor() {
         </div>
       </div>
       {error ? <div className="hint error-text">{error}</div> : null}
-      {plugins !== null && plugins.length > 12 ? (
+      {plugins !== null && plugins.length > 4 ? (
         <div className="settings-search">
           <input
             type="search"
@@ -1067,41 +1090,30 @@ function PluginBundleEditor() {
           {visiblePlugins.map((p) => (
             <div key={p.slug} className={`pm-card${p.enabled ? '' : ' pm-card--off'}`}>
               <div className="pm-card-head">
+                <span
+                  className="pm-avatar"
+                  style={{ '--h': providerHue(p.name) } as CSSProperties}
+                  aria-hidden="true"
+                >
+                  {(p.name.trim()[0] ?? '?').toUpperCase()}
+                </span>
                 <div className="pm-card-title">
-                  {/* A real on/off switch, not a checkbox: the state is a power
-                      toggle for the whole bundle, so it reads as one. */}
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={p.enabled}
-                    aria-label={`${p.enabled ? 'Turn off' : 'Turn on'} ${p.name}`}
-                    disabled={busy === p.slug}
-                    className={`pm-switch${p.enabled ? ' on' : ''}`}
-                    onClick={() => void flip(p)}
-                  >
-                    <span className="pm-switch-knob" />
-                  </button>
-                  <span className="pm-card-name">{p.name}</span>
+                  <span className="pm-card-name" title={p.name}>{p.name}</span>
+                  <span className="pm-card-state">{p.enabled ? 'Active' : 'Off'}</span>
                 </div>
-                <div className="pm-card-actions">
-                  {p.source_repo ? (
-                    <button
-                      className="btn tiny secondary"
-                      disabled={busy === p.slug}
-                      title={`Re-read ${p.source ?? p.source_repo}`}
-                      onClick={() => void reinstall(p)}
-                    >
-                      Update
-                    </button>
-                  ) : null}
-                  <button
-                    className="btn tiny secondary pm-danger"
-                    disabled={busy === p.slug}
-                    onClick={() => void remove(p)}
-                  >
-                    Delete
-                  </button>
-                </div>
+                {/* A real on/off switch, not a checkbox: the state is a power
+                    toggle for the whole bundle, so it reads as one. */}
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={p.enabled}
+                  aria-label={`${p.enabled ? 'Turn off' : 'Turn on'} ${p.name}`}
+                  disabled={busy === p.slug}
+                  className={`pm-switch${p.enabled ? ' on' : ''}`}
+                  onClick={() => void flip(p)}
+                >
+                  <span className="pm-switch-knob" />
+                </button>
               </div>
               {p.description ? <div className="pm-card-desc">{p.description}</div> : null}
               {/* The one-glance census of this bundle: how much of EACH part it
@@ -1109,30 +1121,24 @@ function PluginBundleEditor() {
                   is information too: it says this bundle brings no connectors,
                   so the model gets no MCP tools from it. */}
               <div className="pm-meta">
-                <span className="pm-meta-item">
-                  <b>{(p.skills ?? []).length}</b>
-                  {(p.skills ?? []).length === 1 ? 'skill' : 'skills'}
-                </span>
-                <span className="pm-meta-item">
-                  <b>{(p.commands ?? []).length}</b>
-                  cmd
-                </span>
-                <span className="pm-meta-item">
-                  <b>{(p.agents ?? []).length}</b>
-                  {(p.agents ?? []).length === 1 ? 'agent' : 'agents'}
-                </span>
-                <span className="pm-meta-item">
-                  <b>{(p.mcp ?? []).length}</b>
-                  MCP
-                </span>
-                <span className="pm-meta-item">
-                  <b>{(p.scripts ?? []).length}</b>
-                  {(p.scripts ?? []).length === 1 ? 'script' : 'scripts'}
-                </span>
-                <span className="pm-meta-item">
-                  <b>{(p.hooks ?? []).length}</b>
-                  {(p.hooks ?? []).length === 1 ? 'hook' : 'hooks'}
-                </span>
+                {(
+                  [
+                    ['skill', 'skills', p.skills],
+                    ['cmd', 'cmd', p.commands],
+                    ['agent', 'agents', p.agents],
+                    ['MCP', 'MCP', p.mcp],
+                    ['script', 'scripts', p.scripts],
+                    ['hook', 'hooks', p.hooks],
+                  ] as const
+                ).map(([one, many, arr]) => {
+                  const n = (arr ?? []).length
+                  return (
+                    <span key={many} className={`pm-meta-item${n === 0 ? ' zero' : ''}`}>
+                      <b>{n}</b>
+                      {n === 1 ? one : many}
+                    </span>
+                  )
+                })}
               </div>
               {/* One way in, not an expander: what a bundle CONTAINS is a page
                   of its own — an inline `<details>` turned the grid card into a
@@ -1160,6 +1166,25 @@ function PluginBundleEditor() {
                   ▶
                 </span>
               </button>
+              <div className="pm-card-actions">
+                {p.source_repo ? (
+                  <button
+                    className="btn tiny secondary"
+                    disabled={busy === p.slug}
+                    title={`Re-read ${p.source ?? p.source_repo}`}
+                    onClick={() => void reinstall(p)}
+                  >
+                    Update
+                  </button>
+                ) : null}
+                <button
+                  className="btn tiny secondary pm-danger"
+                  disabled={busy === p.slug}
+                  onClick={() => void remove(p)}
+                >
+                  Delete
+                </button>
+              </div>
             </div>
           ))}
         </div>
@@ -1706,8 +1731,6 @@ export function SettingsModal({
   const setDataPath = useStore((s) => s.setDataPath)
   const backupPath = useStore((s) => s.backupPath)
   const setBackupPath = useStore((s) => s.setBackupPath)
-  const updateFeedUrl = useStore((s) => s.updateFeedUrl)
-  const setUpdateFeedUrl = useStore((s) => s.setUpdateFeedUrl)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -1927,11 +1950,6 @@ export function SettingsModal({
   useEffect(() => {
     setBackupDirInput(backupPath)
   }, [backupPath])
-  // Same mirror pattern for the update-feed URL ('' = GitHub only).
-  const [feedUrlInput, setFeedUrlInput] = useState(updateFeedUrl)
-  useEffect(() => {
-    setFeedUrlInput(updateFeedUrl)
-  }, [updateFeedUrl])
   const [backingUp, setBackingUp] = useState(false)
   const [backupPct, setBackupPct] = useState(0)
   const [backupLabel, setBackupLabel] = useState('')
@@ -3832,20 +3850,14 @@ export function SettingsModal({
               </span>
               <div>
                 <div className="settings-group-title">Tool result cache</div>
-                <div className="settings-group-desc">
-                  Tool outputs (searches, reads, runs) are cached in memory and
-                  reused within the TTL window.
-                </div>
+                <div className="settings-group-desc">Reuse recent tool outputs.</div>
               </div>
             </div>
 
             <div className="settings-row">
               <div className="settings-row-label">
                 <div className="settings-row-title">Cache TTL</div>
-                <div className="settings-row-desc">
-                  How long <b>tool outputs</b> stay cached. Default: <code>60min</code> —
-                  persists automatically.
-                </div>
+                <div className="settings-row-desc">Default 60 min</div>
               </div>
               <div className="settings-row-control">
                 <input
@@ -3885,9 +3897,7 @@ export function SettingsModal({
               </span>
               <div>
                 <div className="settings-group-title">Data & maintenance</div>
-                <div className="settings-group-desc">
-                  Where your data lives and how to reset it.
-                </div>
+                <div className="settings-group-desc">Where your data lives.</div>
               </div>
             </div>
 
@@ -3895,9 +3905,7 @@ export function SettingsModal({
               <div className="settings-row-label">
                 <div className="settings-row-title">Data path</div>
                 <div className="settings-row-desc">
-                  Where all app data lives — settings, chats, models, skills.
-                  Moving the path copies every file over.{' '}
-                  Default&nbsp;<code>~/.codifa</code>.
+                  Default&nbsp;<code>~/.codifa</code>
                 </div>
               </div>
               <div className="data-path-row">
@@ -3937,11 +3945,7 @@ export function SettingsModal({
               <div>
                 <div className="settings-group-title">Backup</div>
                 <div className="settings-group-desc">
-                  One <code>codifa-backup-&lt;date&gt;.zip</code> with ALL settings — providers,
-                  API keys, chats, plugins, plans and uploads — plus the install key that
-                  unlocks the keys on any machine. Traces and caches are re-created on demand.
-                  Every run writes a new archive — earlier ones are kept. Keep the zip safe:
-                  whoever holds it holds your API keys.
+                  One zip with all settings, keys, chats and plugins. Keep it safe.
                 </div>
               </div>
             </div>
@@ -3949,10 +3953,7 @@ export function SettingsModal({
             <div className="settings-row settings-row-stack">
               <div className="settings-row-label">
                 <div className="settings-row-title">Backup location</div>
-                <div className="settings-row-desc">
-                  Where the archive is written. Empty = the data path{' '}
-                  (<code dir="ltr">{dataPath || '~/.codifa'}</code>).
-                </div>
+                <div className="settings-row-desc">Empty = data path</div>
               </div>
               <div className="data-path-row">
                 <input
@@ -4033,16 +4034,24 @@ export function SettingsModal({
               )}
             </div>
 
-            <div className="settings-row settings-row-stack">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Restore</div>
-                <div className="settings-row-desc">
-                  Pick a <code>codifa-backup-….zip</code> — its manifest is read and shown
-                  before anything is touched. Restoring overwrites matching files with the
-                  archive's contents (files not in the archive are kept), then the app
-                  restarts to apply it.
-                </div>
+          </div>
+
+          {/* ===== Restore ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 12a9 9 0 1 0 3-6.7" />
+                  <path d="M3 4v5h5" />
+                </svg>
+              </span>
+              <div>
+                <div className="settings-group-title">Restore</div>
+                <div className="settings-group-desc">Pick a backup zip. The app restarts after restore.</div>
               </div>
+            </div>
+
+            <div className="settings-row settings-row-stack">
               <div className="backup-actions">
                 <button
                   className="btn tiny"
@@ -4064,12 +4073,11 @@ export function SettingsModal({
                   </div>
                   <div className="hint" style={restorePick.secretsKey ? { color: 'var(--accent)' } : undefined}>
                     {restorePick.secretsKey
-                      ? 'API keys: the install key travels with this archive — your provider keys will unlock here too (any machine, any OS). Keep the zip safe: it unlocks those keys.'
-                      : 'API keys: this archive carries no install key (older backup). Provider keys restore only on a machine that already holds the matching key.'}
+                      ? 'API keys will unlock here too.'
+                      : 'No install key in this archive — API keys restore only on a machine that has it.'}
                   </div>
                   <div className="hint" style={{ color: 'var(--danger)' }}>
-                    Restoring overwrites current settings, chats and plugins with the archive's
-                    contents (files not in the archive are kept). The app restarts to apply it.
+                    Overwrites current settings, chats and plugins.
                   </div>
                   <div className="backup-progress-actions">
                     <button className="btn tiny danger" onClick={confirmRestore}>
@@ -4105,61 +4113,6 @@ export function SettingsModal({
                   {restoreMsg}
                 </div>
               )}
-            </div>
-          </div>
-
-          {/* ===== App updates ===== */}
-          <div className="settings-group">
-            <div className="settings-group-head">
-              <span className="settings-group-icon">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <path d="m7 10 5 5 5-5" />
-                  <path d="M12 15V3" />
-                </svg>
-              </span>
-              <div>
-                <div className="settings-group-title">App updates</div>
-                <div className="settings-group-desc">
-                  Where new versions are checked — the titlebar button polls here
-                  on startup and every 30 minutes. Downloads are verified against
-                  the feed's sha256 before anything is launched.
-                </div>
-              </div>
-            </div>
-
-            <div className="settings-row settings-row-stack">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Update feed</div>
-                <div className="settings-row-desc">
-                  A static JSON feed on your own site, checked <b>before</b> GitHub
-                  releases — so a version you publish on the site updates every
-                  install. Empty = GitHub releases only.{' '}
-                  <code>{'{ "version": "2.1.0", "notes": "…", "assets": [{ "name": "Codifa_2.1.0_aarch64.dmg", "url": "https://…", "sha256": "…" }] }'}</code>
-                </div>
-              </div>
-              <div className="data-path-row">
-                <input
-                  value={feedUrlInput}
-                  onChange={(e) => {
-                    setFeedUrlInput(e.target.value)
-                    setUpdateFeedUrl(e.target.value)
-                  }}
-                  placeholder="https://your-site.example/codifa-updates.json"
-                  dir="ltr"
-                  aria-label="Custom update feed URL"
-                />
-                <button
-                  className="btn tiny"
-                  onClick={() => {
-                    setFeedUrlInput('')
-                    setUpdateFeedUrl('')
-                  }}
-                  disabled={!feedUrlInput.trim()}
-                >
-                  Clear
-                </button>
-              </div>
             </div>
           </div>
 

@@ -51,8 +51,8 @@ const bridge: CoderApi = {
       scope: scope ?? null,
     }),
   selectFolder: () => invoke<string | null>('select_folder'),
-  saveMediaAs: (path: string, defaultName?: string) =>
-    invoke<string | null>('save_media_as', { path, defaultName }),
+  saveMediaAs: (path: string, defaultName?: string, dataUrl?: string) =>
+    invoke<string | null>('save_media_as', { path, defaultName, dataUrl: dataUrl ?? null }),
   selectFile: (startDir?: string) =>
     invoke<string[] | null>('select_file', { startDir: startDir ?? null }),
   importFile: (absPath) => invoke<string | null>('import_file', { absPath }),

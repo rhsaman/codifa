@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { useStore } from "../lib/store";
+import { APP_DIR, useStore } from "../lib/store";
 import { clearOrphanScheduleRuns, clearScheduleRuns, listAllScheduleRuns, listScheduleRuns, listSchedules } from "../lib/api";
 import { finishedRunIds, unseenRunCount, unseenRunCountForTask } from "../lib/schedule-notify";
-import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { useVimScroll } from "../lib/useVimScroll";
 import { applyScroll, scrollDelta } from "../lib/scrollKeys";
@@ -12,7 +9,7 @@ import { physicalKey } from "../lib/shortcuts";
 import { isPrefixArmed } from "../lib/prefixState";
 import { isEditableTarget, markVimRegion, snapshotIntent } from "../lib/panePointer";
 import { focusChatInput } from "../lib/chatFocus";
-import { mdComponents } from "./ChatMessage";
+import { ChatBubble } from "./ChatBubble";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
@@ -63,25 +60,29 @@ function mergeRunsDesc(a: ScheduleRun[], b: ScheduleRun[]): ScheduleRun[] {
   return [...m.values()].sort((x, y) => (y.started_at || 0) - (x.started_at || 0));
 }
 
+/** ترتیب کارت‌های گرید اینباکس — بر اساس جدیدترین پیام: تسکی که تازه‌ترین ران
+ *  را دارد بالاست؛ تسک‌های بدون ران آخر می‌مانند (میان خودشان: created_at
+ *  نزولی تا ترتیب قطعی باشد). */
+export function sortGridByLatestRun(
+  schedules: ScheduledTask[],
+  latestRun: Map<string, ScheduleRun>,
+): ScheduledTask[] {
+  const at = (t: ScheduledTask): number => latestRun.get(t.id)?.started_at ?? 0;
+  return [...schedules].sort((a, b) => {
+    const ta = at(a);
+    const tb = at(b);
+    if (ta > 0 !== (tb > 0)) return ta > 0 ? -1 : 1;
+    if (ta > 0 && ta !== tb) return tb - ta;
+    return (b.created_at ?? 0) - (a.created_at ?? 0);
+  });
+}
+
 /** پیش‌نمایش کوتاه پرامپت: متن کامل هرگز به DOM نمی‌رود — یک خط nowrap با
  *  چند KB متن bidi مخلوط، هر reflow (مثلاً درگ عرض) را به سنگین‌ترین عملیات
  *  صفحه تبدیل می‌کند. محدود به ۲۴۰ کاراکتر + علامت ادامه. */
 export function promptPreview(prompt: string, max = 240): string {
   const flat = prompt.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
-}
-
-/** رندر مارکداون خروجی کرون دقیقاً با همان رندر چت (فونت، جهت، کد، جدول). */
-function InboxMarkdown({ text }: { text: string }) {
-  const dir = useStore((s) => s.dir);
-  const prepared = useMemo(() => prepareContent(text, dir), [text, dir]);
-  return (
-    <div className="chat-message markdown-body schedule-inbox-markdown" dir={dir}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-        {prepared}
-      </ReactMarkdown>
-    </div>
-  );
 }
 
 /** اتصال کلیدهای vim به اینباکس — کامپوننت جدا تا هوک دقیقاً همزمان با mount
@@ -144,7 +145,11 @@ function InboxRunCard({ run }: { run: ScheduleRun }) {
           Running…
         </div>
       ) : run.output ? (
-        <InboxMarkdown text={run.output.slice(0, 8000)} />
+        <ChatBubble
+          id={run.id}
+          content={run.output.slice(0, 8000)}
+          className="schedule-inbox-bubble"
+        />
       ) : (
         !run.error && <div className="schedule-runs-empty">No output</div>
       )}
@@ -152,7 +157,8 @@ function InboxRunCard({ run }: { run: ScheduleRun }) {
   );
 }
 
-/** کارت گرید یک تسک: نام + بج دیده‌نشده، کرون، اجرای بعدی، وضعیت آخرین ران. */
+/** کارت گرید یک تسک: نام، کرون، اجرای بعدی و در پاورقی تعداد پیام‌های جدید
+ *  (به‌جای pill وضعیت Done) + اسپینر ران زنده + Failed برای خطای خوانده‌شده. */
 function GridCard({
   task,
   unseen,
@@ -174,7 +180,6 @@ function GridCard({
     >
       <span className="schedule-grid-card-top">
         <span className="schedule-grid-card-name">{task.name}</span>
-        {unseen > 0 && <span className="schedule-inbox-badge">{unseen}</span>}
       </span>
       {!task.enabled && <span className="schedule-grid-paused">Paused</span>}
       <span className="schedule-grid-card-meta">
@@ -189,15 +194,21 @@ function GridCard({
         ) : (
           <span className="schedule-grid-count">No runs yet</span>
         )}
-        {lastRun && lastRun.status !== "running" && (
-          <span className={`schedule-grid-status ${lastRun.status}`}>
-            {runStatusFa(lastRun.status)}
+        {unseen > 0 && (
+          <span
+            className="schedule-grid-status new"
+            title={`${unseen} new message${unseen === 1 ? "" : "s"}`}
+          >
+            {unseen} new
           </span>
         )}
         {lastRun && lastRun.status === "running" && (
           <span className="schedule-grid-status running">
             <span className="schedule-run-spinner" aria-hidden="true" /> running
           </span>
+        )}
+        {unseen === 0 && lastRun && lastRun.status === "error" && (
+          <span className="schedule-grid-status error">{runStatusFa(lastRun.status)}</span>
         )}
         {tokens > 0 && (
           <span className="schedule-grid-count" title={`${tokens} tokens`}>
@@ -210,7 +221,8 @@ function GridCard({
 }
 
 /** Inbox کرون‌ها — دو صفحه:
- *  • GRID: کارت هر تسک (+ کارت اجراهای حذف‌شده‌ها)؛ کلیک → صفحهٔ همان تسک.
+ *  • GRID: کارت هر تسک (+ کارت اجراهای حذف‌شده‌ها) مرتب بر اساس جدیدترین پیام
+ *    (آخرین ران هر کارت، نزولی — sortGridByLatestRun)؛ کلیک → صفحهٔ همان تسک.
  *  • DETAIL: پیام‌های یک تسک (یا اجراهای حذف‌شده‌ها) با تاریخچهٔ صفحه‌بندی‌شده.
  *  قواعد: پیام‌ها فقط مالِ تسک انتخاب‌شده‌اند؛ Clear در هدر نمای فعال را پاک
  *  می‌کند؛ تاریخچه با کرسر صفحه‌بندی می‌شود تا رم bounded بماند.
@@ -224,7 +236,7 @@ export function ScheduleInbox() {
   const setSelected = useStore((s) => s.setScheduleInboxSelected);
   const seen = useStore((s) => s.scheduleRunsSeen);
   const markSeen = useStore((s) => s.markScheduleRunsSeen);
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   const [runs, setRuns] = useState<ScheduleRun[]>([]);
   const [taskRuns, setTaskRuns] = useState<ScheduleRun[] | null>(null);
   const [taskHasMore, setTaskHasMore] = useState(false);
@@ -425,9 +437,9 @@ export function ScheduleInbox() {
     void loadTaskRuns(selectedTask.id);
   }, [open, selectedTask, loadTaskRuns]);
 
-  useEffect(() => {
-    if (open && runs.length > 0) markSeen(finishedRunIds(runs));
-  }, [open, runs, markSeen]);
+  // NOTE: صرفِ بازکردن اینباکس ران‌ها را دیده‌شده علامت نمی‌زند — فقط بازکردن
+  // صفحهٔ خودِ تسک (loadTaskRuns/refreshTaskRuns) پیام‌های همان تسک را دیده
+  // می‌زند، تا بج «N new» هر کارت تا وقتی واقعا خوانده نشده سر جایش بماند.
 
   const onChatScroll = useCallback(() => {
     const el = pageRef.current;
@@ -496,6 +508,47 @@ export function ScheduleInbox() {
   if (!open) return null;
   const unseen = unseenRunCount(runs, seen);
   const detail = orphanView || !!selectedTask;
+
+  // کارت‌های گرید در یک صفِ بر اساس جدیدترین پیام: هر تسک با زمان آخرین رانش و
+  // کارت «تسک‌های حذف‌شده» با جدیدترین ران یتیم — همه نزولی؛ وقتی ران جدید
+  // می‌رسد (refresh هر ۱۵ ثانیه) کارتش خودبه‌خود بالا می‌آید.
+  const gridItems: { at: number; el: React.ReactNode }[] = sortGridByLatestRun(
+    schedules,
+    latestRunByTask,
+  ).map((t) => ({
+    at: latestRunByTask.get(t.id)?.started_at ?? 0,
+    el: (
+      <GridCard
+        key={t.id}
+        task={t}
+        unseen={unseenRunCountForTask(runs, seen, t.id)}
+        lastRun={latestRunByTask.get(t.id) ?? null}
+        onClick={() => setSelected(t.id)}
+      />
+    ),
+  }));
+  if (orphanRuns.length > 0) {
+    gridItems.push({
+      at: orphanRuns[0]?.started_at ?? 0,
+      el: (
+        <button
+          type="button"
+          className="schedule-grid-card schedule-grid-card--orphan"
+          title="Runs of tasks you deleted — their history is kept until cleared"
+          onClick={() => setOrphanView(true)}
+        >
+          <span className="schedule-grid-card-top">
+            <span className="schedule-grid-card-name">Deleted tasks</span>
+            <span className="schedule-inbox-badge">{orphanRuns.length}</span>
+          </span>
+          <span className="schedule-grid-card-meta">
+            history kept — click to view, Clear removes it
+          </span>
+        </button>
+      ),
+    });
+  }
+  gridItems.sort((a, b) => b.at - a.at);
 
   return (
     <div className="schedule-inbox-overlay" dir={dir}>
@@ -614,31 +667,7 @@ export function ScheduleInbox() {
               <div className="schedule-runs-empty">No scheduled tasks yet</div>
             ) : (
               <div className="schedule-inbox-grid">
-                {schedules.map((t) => (
-                  <GridCard
-                    key={t.id}
-                    task={t}
-                    unseen={unseenRunCountForTask(runs, seen, t.id)}
-                    lastRun={latestRunByTask.get(t.id) ?? null}
-                    onClick={() => setSelected(t.id)}
-                  />
-                ))}
-                {orphanRuns.length > 0 && (
-                  <button
-                    type="button"
-                    className="schedule-grid-card schedule-grid-card--orphan"
-                    title="Runs of tasks you deleted — their history is kept until cleared"
-                    onClick={() => setOrphanView(true)}
-                  >
-                    <span className="schedule-grid-card-top">
-                      <span className="schedule-grid-card-name">Deleted tasks</span>
-                      <span className="schedule-inbox-badge">{orphanRuns.length}</span>
-                    </span>
-                    <span className="schedule-grid-card-meta">
-                      history kept — click to view, Clear removes it
-                    </span>
-                  </button>
-                )}
+                {gridItems.map((it) => it.el)}
               </div>
             )
           ) : orphanView ? (
@@ -682,7 +711,13 @@ export function ScheduleInbox() {
                       <polyline points="6 9 12 15 18 9" />
                     </svg>
                   </button>
-                  {promptOpen && <InboxMarkdown text={selectedTask.prompt} />}
+                  {promptOpen && (
+                    <ChatBubble
+                      id={`prompt:${selectedTask.id}`}
+                      content={selectedTask.prompt}
+                      className="schedule-inbox-bubble"
+                    />
+                  )}
                 </div>
                 {clearError && <div className="schedule-error">{clearError}</div>}
                 {loading && <div className="schedule-runs-empty">Loading…</div>}

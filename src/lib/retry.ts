@@ -3,6 +3,23 @@ import type { ChatMessage, MessageSegment } from '../types'
 export type RetrySource = 'message' | 'banner'
 
 /**
+ * Adaptive delay before an automatic re-send.
+ *
+ * First retry lands quickly (a blip is usually gone in a second or two), then
+ * the wait grows while the failure persists, capped at 60s so a long provider
+ * outage does not turn into a request storm. The ladder is bounded by its
+ * attempt count, not by a wall clock, so a merely slow model is never cut off.
+ */
+export const RETRY_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 30_000, 60_000] as const
+
+/** Delay before retry number `attempt` (1-based). Values above the last rung
+ *  stay at the 60s cap. */
+export function retryBackoffMs(attempt: number): number {
+  const index = Number.isFinite(attempt) ? Math.floor(attempt) - 1 : 0
+  return RETRY_BACKOFF_MS[Math.max(0, Math.min(RETRY_BACKOFF_MS.length - 1, index))]
+}
+
+/**
  * Resolve the OWNING user message for a restart-from-scratch retry.
  *
  * - `id` on a user message → that message itself (empty content → null).
@@ -64,6 +81,7 @@ function findFailedAssistant(messages: ChatMessage[], userMsgId: string): ChatMe
       m.role === 'assistant' &&
       (m.retry ||
         m.error ||
+        m.interrupted ||
         (typeof m.content === 'string' && m.content.includes('[Interrupted before finishing'))),
   )
 }
@@ -157,14 +175,6 @@ export function resetStreamForRetry(
  */
 export function isKeepTextRetry(reconnecting: boolean | undefined, fallback: boolean | undefined): boolean {
   return reconnecting === true || fallback === true
-}
-
-/** Whether a message's retry info renders as the compact footer line instead
- *  of the transcript-end banner. The chat-error ladder, the sub-agent ladders
- *  and the watchdog all mark their retry `inline` — the banner slot stays
- *  reserved for the stall hint. */
-export function isInlineRetry(retry: unknown): boolean {
-  return !!retry && typeof retry === 'object' && (retry as { inline?: boolean }).inline === true
 }
 
 /**
@@ -327,40 +337,4 @@ export function retryRetiredByEvent(
   const owner = (retry.tool ?? '').trim()
   if (!owner) return false
   return (event.tool ?? '').trim() === owner
-}
-
-/**
- * Pick the message whose retry banner must be rendered (newest first).
- *
- * Lives here rather than inline in Chat.tsx so the dismissal rule is testable.
- *
- * - `retiring`: the ~100 ms auto-fade skip-list. A banner that is fading out
- *   must leave the scan immediately, otherwise it wins again and re-mounts in
- *   a loop.
- * - `dismissed`: messages whose banner the user closed with the ✕ button during
- *   the CURRENT turn. A live sub-agent ladder re-sets `message.retry` on every
- *   attempt, so without this the banner popped straight back — which is why the
- *   ✕ used to be implemented as "cancel the retry" (and wrongly killed the
- *   whole stream). The dismissal holds until the next turn starts.
- */
-export function findRetryBannerMessage<
-  T extends { id: string; retry?: object | null },
->(
-  messages: T[],
-  retiring: ReadonlySet<string>,
-  dismissed: ReadonlySet<string>,
-): T | null {
-  return (
-    [...messages]
-      .reverse()
-      .find(
-        (m) =>
-          m.retry &&
-          // Inline retries render on the message itself (the compact footer
-          // line); the banner slot must stay free for them.
-          !isInlineRetry(m.retry) &&
-          !retiring.has(m.id) &&
-          !dismissed.has(m.id),
-      ) ?? null
-  )
 }

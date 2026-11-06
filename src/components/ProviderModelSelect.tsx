@@ -223,8 +223,9 @@ export function ProviderModelSelect(props?: {
 
   // تب «Checked»: مدل‌های تیک‌دار = نتیجهٔ ✓ زندهٔ این نشست + لیست ماندگار
   // checkedModels (بعد از ری‌استارت وضعیت زنده idle است و همین لیست تب را
-  // پر می‌کند). نتیجهٔ fail زنده همیشه بیرون می‌ماند حتی اگر در لیست ذخیره
-  // باشد تا در همان تیک، افکت سینک آن را از لیست هم حذف کند.
+  // پر می‌کند). نتیجهٔ
+  // fail زنده همیشه بیرون می‌ماند حتی اگر در لیست ذخیره باشد تا در همان
+  // تیک، افکت سینک آن را از لیست هم حذف کند.
   const checkedKeys = useMemo(
     () => new Set(checkedModels.map((c) => `${c.providerId}/${c.model}`)),
     [checkedModels],
@@ -481,14 +482,12 @@ export function ProviderModelSelect(props?: {
 
   /** ردیف مدل در پنل راست — `prefixed` یعنی پیشوند نام پروایدر هم نمایش داده
    *  شود (تب‌های چند-پروایدر: Recent/Checked/جستجو)؛ `dismissible` دکمهٔ ✕
-   *  حذف نتیجهٔ ✓ را اضافه می‌کند (تب Checked)؛ `persistentOk` یعنی مدل در
-   *  لیست ذخیره‌شدهٔ checked است (بعد از ری‌استارت ✓ سبز نشان بدهد). */
+   *  حذف نتیجهٔ ✓ را اضافه می‌کند (تب Checked). */
   const modelRow = (
     p: ProviderConfig,
     m: string,
     prefixed: boolean,
     dismissible = false,
-    persistentOk = false,
   ) => {
     const isCurrent = p.id === shownProviderId && m === shownModel;
     return (
@@ -516,7 +515,7 @@ export function ProviderModelSelect(props?: {
             <RemoveIcon />
           </button>
         )}
-        <ModelTestButton cfg={p} model={m} persistentOk={persistentOk} />
+        <ModelTestButton cfg={p} model={m} />
       </div>
     );
   };
@@ -794,9 +793,7 @@ export function ProviderModelSelect(props?: {
                           tabSearch.checked.map(({ p, models }) => (
                             <div key={p.id}>
                               {groupHeader(p, models.length)}
-                              {models.map((m) =>
-                                modelRow(p, m, false, true, checkedKeys.has(`${p.id}/${m}`)),
-                              )}
+                              {models.map((m) => modelRow(p, m, false, true))}
                             </div>
                           ))}
                         {paneProvider &&
@@ -909,9 +906,7 @@ export function ProviderModelSelect(props?: {
                         {checkedGroups.map(({ p, models }) => (
                           <div key={p.id}>
                             {groupHeader(p, models.length)}
-                            {models.map((m) =>
-                              modelRow(p, m, false, true, checkedKeys.has(`${p.id}/${m}`)),
-                            )}
+                            {models.map((m) => modelRow(p, m, false, true))}
                           </div>
                         ))}
                         {checkedGroups.length === 0 && (

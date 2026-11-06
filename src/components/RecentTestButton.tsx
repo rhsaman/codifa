@@ -1,5 +1,5 @@
 import type { MouseEvent } from "react";
-import { useModelTests, type MixedTestEntry } from "../lib/useModelTests";
+import { isGroupTestable, useModelTests, type MixedTestEntry } from "../lib/useModelTests";
 import { TestBoltsIcon } from "./ModelTestButton";
 
 /** دکمهٔ تست گروهی برای لیست‌های مختلط (چند-پروایدر): سربرگ تب «Recent» و
@@ -20,16 +20,22 @@ export function RecentTestButton({
 }) {
   const { getMixedSummary, runMixed } = useModelTests();
   const s = getMixedSummary(entries);
+  // مدل‌های پروایدرهایی که تست گروهیشان خاموش است در این دکمه شرکت دارند؛
+  // دکمهٔ تکیِ خودشان دست‌نخورده می‌ماند.
+  const testable = entries.filter((e) => isGroupTestable(e.cfg)).length;
+  const skipped = entries.length - testable;
+  const noneTestable = entries.length > 0 && testable === 0;
 
   const onClick = (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
-    if (s.running || entries.length === 0) return;
+    if (s.running || testable === 0) return;
     runMixed(entries, runKey);
   };
 
-  const title =
-    entries.length === 0
+  const title = noneTestable
+    ? `Group test is off for every provider in this list — turn it on in Settings → Providers`
+    : entries.length === 0
       ? `No ${label} models to test`
       : s.running
         ? `Testing ${label} models… (${s.done}/${s.total} done)`
@@ -37,13 +43,16 @@ export function RecentTestButton({
           ? `All ${s.total} ${label} models OK`
           : s.fail > 0
             ? `${label}: ${s.ok} OK · ${s.fail} failed — ${s.firstFail}`
-            : `Test all ${entries.length} ${label} models`;
+            : skipped > 0
+              ? `Test ${testable} ${label} models (${skipped} skipped — group test is off for their provider)`
+              : `Test all ${entries.length} ${label} models`;
 
   return (
     <button
       type="button"
-      className={`pm-recent-test${s.running ? " testing" : ""}`}
+      className={`pm-recent-test${s.running ? " testing" : ""}${noneTestable ? " off" : ""}`}
       onClick={onClick}
+      disabled={noneTestable}
       title={title}
       aria-label={`Test all ${label} models`}
     >

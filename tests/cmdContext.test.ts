@@ -1,6 +1,6 @@
 // Unit tests for the `update` context fragments (src/lib/cmdContext.ts).
 //
-// Why it matters: `/mcp update` and `/artifact update` hand the edit to the
+// Why it matters: `/plugin update` and `/artifact update` hand the edit to the
 // model. Neither record can be READ back by any tool it has — `create_mcp`
 // replaces the whole connector config and `read` refuses paths outside the
 // project root (connectors live in the app's data folder), while the artifact

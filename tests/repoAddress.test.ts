@@ -44,30 +44,29 @@ console.log('3) trimming does not change the answer:')
   check('padded name', looksLikeRepoAddress('  eurusd  ') === false)
 }
 
-console.log('4) the composer asks the SAME question for /skill and /mcp install:')
+console.log('4) the composer routes a bare plugin name to create, not install:')
 {
-  // `/plugin install eurusd` was fixed first; the skill and MCP branches kept
-  // sending "install from this repo" for a bare name, which the backend answers
-  // with "cannot read a repo from …" after spending a whole turn. The composer
-  // must route a NAME to create and only an ADDRESS to install, for all three.
+  // `/plugin install eurusd` used to reach the backend and fail with "cannot
+  // read a repo from …", which reads as a bug when the user simply named a
+  // bundle they wanted made. `/plugin install` is the only install path left:
+  // standalone `/skill` and `/mcp` commands were removed, so the same trap can
+  // no longer exist there.
   const src = readFileSync('src/components/Chat.tsx', 'utf8')
   check(
-    'the skill/mcp install branch consults the heuristic',
-    /if \(verb === "install" && tail\.length > 0\) \{[\s\S]{0,700}?looksLikeRepoAddress\(first\)/.test(src),
-  )
-  check(
-    'an address-shaped argument still sends the install prompt',
-    src.includes('Install a skill from this repo: "${first}"') &&
-      src.includes('Install an MCP connector bundle from this repo: "${first}"'),
+    'the plugin install branch consults the heuristic',
+    /if \(sub === "install" && arg\) \{[\s\S]{0,700}?if \(!looksLikeRepoAddress\(arg\)\)/.test(src),
   )
   check(
     'a bare name sends a CREATE prompt instead of a doomed install',
-    src.includes('Create a skill named "${first}"') &&
-      src.includes('Create an MCP connector named "${first}"'),
+    src.includes('Create a plugin named "${arg}"'),
   )
   check(
-    'the created skill prompt forbids the repo path that would fail',
-    src.includes('Do not pass "repo" — there is no repository here'),
+    'the standalone /skill command is gone',
+    !/case "\/skill":/.test(src) && !src.includes('Install a skill from this repo:'),
+  )
+  check(
+    'the standalone /mcp command is gone',
+    !/case "\/mcp":/.test(src) && !src.includes('Install an MCP connector bundle from this repo:'),
   )
   // `/artifact` has no `install` sub-command at all (a document is authored, not
   // read from a repo), so the same trap cannot exist there — assert that rather

@@ -144,7 +144,7 @@ fn chats_root(data_root: &Path) -> PathBuf {
 /// Deliberately mirrors `plans::safe_file` (the rule the legacy per-chat files
 /// and `appstate::chat_file` use) so a migrated body lands on the SAME path an
 /// older build would have written, instead of creating a duplicate file.
-fn safe_id(raw: &str) -> String {
+pub(crate) fn safe_id(raw: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in raw.trim().chars() {
@@ -641,6 +641,12 @@ pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
                         let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
                         if dead.iter().any(|d| d.as_str() == Some(id)) {
                             let _ = fs::remove_file(body_path(&data_root, row));
+                            // Same cascade as `save_state`'s delete branch:
+                            // traces, checkpoints, media, artifacts and plans
+                            // all die with the chat, not just the body file.
+                            if !id.is_empty() {
+                                crate::appstate::cleanup_deleted_chat(&data_root, id);
+                            }
                         }
                     }
                 }
@@ -683,7 +689,12 @@ pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
 /// this when a chat is opened, so a session with hundreds of chats only ever
 /// holds the bodies of the few the user is actually looking at.
 #[tauri::command]
-pub async fn chat_get(app: AppHandle, id: String) -> Option<Value> {
+pub async fn chat_get(
+    app: AppHandle,
+    id: String,
+    before: Option<usize>,
+    limit: Option<usize>,
+) -> Option<Value> {
     tauri::async_runtime::spawn_blocking(move || {
         let data_root = get_data_root(&app);
         let doc = read_all(&app);
@@ -701,7 +712,36 @@ pub async fn chat_get(app: AppHandle, id: String) -> Option<Value> {
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .filter(|v| v.is_object());
         match body {
-            Some(b) => Some(b),
+            Some(mut b) => {
+                // Paged read: `limit` asks for at most that many messages
+                // ending at `before` (exclusive). No `before` means the tail,
+                // which is what opening a chat needs. The response carries the
+                // absolute start/count so the renderer can page backwards
+                // without ever holding the whole transcript.
+                //
+                // No `limit` keeps the old full-body contract for callers that
+                // genuinely need every message (sending a turn, compaction).
+                if let Some(limit) = limit {
+                    let total = b
+                        .get("messages")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let end = before.map(|n| n.min(total)).unwrap_or(total);
+                    let start = end.saturating_sub(limit);
+                    let slice = b
+                        .get("messages")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a[start..end].to_vec())
+                        .unwrap_or_default();
+                    if let Some(obj) = b.as_object_mut() {
+                        obj.insert("messages".to_string(), Value::Array(slice));
+                        obj.insert("bodyStart".to_string(), Value::from(start as u64));
+                        obj.insert("bodyTotal".to_string(), Value::from(total as u64));
+                    }
+                }
+                Some(b)
+            }
             // The index row exists but its body file is gone (an external
             // delete, a half-copied data root). Report the row so the UI shows
             // the chat as empty instead of dropping it from the sidebar.

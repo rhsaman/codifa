@@ -117,6 +117,14 @@ export function mergeFetchedModels(
  * Entries are written under the id the provider reported AND under the bare id
  * the picker stores (`bareModelId`), because `modelContextWindow` looks up both
  * forms (NVIDIA reports "nvidia/<model>" while the picker stores the bare id).
+ *
+ * The map is PRUNED to the current catalog on every fetch: a key whose bare
+ * form no longer belongs to a fetched or user-added model is dropped, so the
+ * persisted map cannot grow monotonically with every rename/removal the
+ * provider does (measured on a real profile: stale keys had pushed one
+ * provider's maps past 355 KB of settings.json). An empty catalog returns the
+ * previous map untouched — a flaky fetch that reported nothing must never
+ * wipe every known window.
  */
 export function mergeContextMap(
   p: ProviderConfig,
@@ -124,14 +132,35 @@ export function mergeContextMap(
   reported: Record<string, number>,
   previous: Record<string, number> | undefined,
 ): Record<string, number> {
+  // An empty catalog is "unknown", not "zero models": keep what we had.
+  if (fetched.length === 0) return { ...(previous ?? {}) }
+
+  // The bare ids whose entries may exist, in any key spelling: the fetched
+  // catalog plus the user's manually added models (mirroring
+  // `mergeFetchedModels`'s filter — removed and foreign ids are dead).
+  const removedSet = new Set((p.removedModels ?? []).map((m) => bareModelId(p, m)))
+  const keptBare = new Set<string>()
+  for (const m of fetched) {
+    const bare = bareModelId(p, m)
+    if (!removedSet.has(bare) && !isForeignModelId(p, bare)) keptBare.add(bare)
+  }
+  for (const m of p.addedModels ?? []) {
+    const bare = bareModelId(p, m)
+    if (!removedSet.has(bare) && !isForeignModelId(p, bare)) keptBare.add(bare)
+  }
+
   const out: Record<string, number> = {}
-  // Seed with what we already knew so a model the provider stops reporting a
-  // window for keeps its last known capacity instead of dropping to the 200k
-  // default. A window the provider reports in THIS fetch still wins, even when
-  // it is smaller: the provider's own number is ground truth, and keeping a
-  // stale larger one would overflow the model's real window.
+  // Seed with what we already knew — but ONLY for models still in the kept
+  // set. A model the provider dropped or renamed never comes back in
+  // `fetched`, so its keys are pruned here instead of surviving forever.
+  // A window the provider reports in THIS fetch still wins, even when it is
+  // smaller: the provider's own number is ground truth, and keeping a stale
+  // larger one would overflow the model's real window.
+  const prefix = `${p.id}/`
   for (const [key, value] of Object.entries(previous ?? {})) {
-    if (typeof value === 'number' && value > 0) out[key] = value
+    if (typeof value !== 'number' || value <= 0) continue
+    const bare = key.startsWith(prefix) ? key.slice(prefix.length) : key
+    if (keptBare.has(bare)) out[key] = value
   }
 
   /** The window the provider reported this time, in any of the key spellings. */
@@ -154,9 +183,18 @@ export function mergeContextMap(
   }
 
   for (const m of fetched) {
+    const bare = bareModelId(p, m)
+    if (!keptBare.has(bare)) continue
     const capacity = reportedFor(m) ?? priorFor(m) ?? DEFAULT_CONTEXT_WINDOW
     out[m] = capacity
-    out[bareModelId(p, m)] = capacity
+    out[bare] = capacity
+  }
+  // Manually added models are not in the fetched catalog but stay selectable,
+  // so they keep an entry too (last known window, else the app-wide default).
+  for (const bare of keptBare) {
+    if (out[bare] !== undefined) continue
+    out[bare] = priorFor(bare) ?? DEFAULT_CONTEXT_WINDOW
+    out[`${p.id}/${bare}`] = out[bare]
   }
   return out
 }

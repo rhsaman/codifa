@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useStore } from "../lib/store";
+import { detectDir } from "../lib/bidi";
+import { APP_DIR, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { deleteSchedule, listAllScheduleRuns, listScheduleRuns, listSchedules, runScheduleNow, saveSchedule, stopScheduleRun } from "../lib/api";
 import { formatTokens } from "../lib/context";
@@ -78,7 +79,7 @@ function ScheduleRow(props: {
   // Local flag covers the POST window (before the run row exists); the derived
   // flag takes over the moment the row lands — panel and inbox share it.
   const isRunning = running || !!liveRunning;
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   const selectInbox = useStore((s) => s.setScheduleInboxSelected);
 
   const remove = async () => {
@@ -174,7 +175,7 @@ function ScheduleRow(props: {
     <div className={`schedule-item${task.enabled ? "" : " disabled"}`} dir={dir}>
       <div className="schedule-item-head">
         <span className={`schedule-status-dot${task.enabled ? "" : " paused"}`} aria-hidden="true" />
-        <span className="schedule-item-name" title={task.name}>{task.name}</span>
+        <span className="schedule-item-name" title={task.name} dir={detectDir(task.name)}>{task.name}</span>
         <span className="schedule-item-cron" title={task.cron || undefined}>{task.cron_label || task.cron || "Once"}</span>
       </div>
       <div className="schedule-item-sub">
@@ -189,7 +190,7 @@ function ScheduleRow(props: {
       </div>
       <div className="schedule-item-body">
           {task.prompt ? (
-            <p className="schedule-prompt-text" title={task.prompt}>
+            <p className="schedule-prompt-text" title={task.prompt} dir={detectDir(task.prompt)}>
               {task.prompt}
             </p>
           ) : null}
@@ -257,7 +258,7 @@ function ScheduleRow(props: {
 export function ScheduleSection() {
   const schedules = useStore((s) => s.schedules);
   const setSchedules = useStore((s) => s.setSchedules);
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   const loaded = useStore((s) => s.loaded);
   const [collapsed, setCollapsed] = useState(false);
   const [loading, setLoading] = useState(true);

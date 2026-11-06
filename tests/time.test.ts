@@ -41,7 +41,9 @@ console.log('2) fmtClock (today -> HH:MM, older -> date + time):')
   check('today matches HH:MM', /^\d{2}:\d{2}$/.test(today), today)
   const oldTs = new Date('2020-01-05T03:04:00').getTime()
   const old = fmtClock(oldTs)
-  check('old stamp includes date and time', /\d+\/\d+ \d{2}:\d{2}/.test(old), old)
+  // fmtMonthDay is deliberately locale-pinned to "Nov 2" (en-US short month),
+  // not a numeric "11/2" date.
+  check('old stamp includes date and time', /^[A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$/.test(old), old)
   check('no Persian digits', !/[۰-۹]/.test(old), old)
 }
 

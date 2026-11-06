@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { speakTextStream, splitTtsSentences, type SpeakProviderOpts } from './api'
 import { planDisplay } from './planDoc'
 import type { ChatMessage } from '../types'
+import { fixZwsp, stripBidiMarks } from './bidi'
+import type { LiveVoiceState } from './liveVoiceState'
 
 export type TtsStatus = 'idle' | 'loading' | 'speaking' | 'paused'
 
@@ -840,4 +842,96 @@ export function stripMarkdownForTts(text: string): string {
   out = out.replace(/[ \t]+/g, ' ')
   out = out.replace(/\n{3,}/g, '\n\n')
   return out.trim()
+}
+
+// ── زنجیرهٔ TTS مشترک + گویش مستقل ──────────────────────────────────────────
+// toggleSpeak در ChatMessageView و گویش استقلال اینباکس/مطالعه هر دو به یک
+// زنجیرهٔ پروایدر نیاز دارند (primary + fallbacks). buildTtsChain فریم‌ورک‌فری
+// است: state فروشگاه را به‌عنوان پارامتر می‌گیرد (هستهٔ tts.ts به فروشگاه
+// وابسته نمی‌ماند).
+
+/** زنجیرهٔ پروایدرهای TTS از تنظیمات: primary اول، بعد fallbackها به ترتیب.
+ *  زنجیرهٔ خالی یعنی هیچ پروایدر TTS انتخاب نشده. */
+export function buildTtsChain(st: {
+  settings: { providers?: unknown[] };
+  ttsProviderId?: string;
+  ttsModel?: string;
+  ttsVoice?: string;
+  ttsFallbacks?: Array<{ providerId: string; model?: string; voice?: string }>;
+}): SpeakProviderOpts[] {
+  const providers = (st.settings.providers ?? []) as Array<
+    { id: string; kind: string; baseUrl?: string; apiKeys?: string[]; apiKey?: string }
+  >;
+  const toSpeakOpts = (
+    provider: (typeof providers)[number],
+    model: string | undefined,
+    voice: string | undefined,
+  ): SpeakProviderOpts => ({
+    kind: provider.kind,
+    baseUrl: provider.baseUrl ?? "",
+    apiKeys: [...(provider.apiKeys ?? (provider.apiKey ? [provider.apiKey] : []))],
+    model,
+    voice,
+  });
+  const chain: SpeakProviderOpts[] = [];
+  const primary = providers.find((p) => p.id === st.ttsProviderId);
+  if (primary) chain.push(toSpeakOpts(primary, st.ttsModel, st.ttsVoice));
+  for (const fb of st.ttsFallbacks ?? []) {
+    const p = providers.find((x) => x.id === fb.providerId);
+    if (!p) continue;
+    chain.push(toSpeakOpts(p, fb.model, fb.voice));
+  }
+  return chain;
+}
+
+/** گویش مستقل برای سطوح غیر از ترنسمیت (اینباکس زمان‌بندی، حالت مطالعه):
+ *  همان معنال toggle دکمهٔ گوفتار چت، ولی اینجا چتی هست که بنر خطا به آن
+ *  پین شود — خطای friendly به‌صورت رشته برگردانده می‌شود (null = موفق).
+ *  liveVoice مالک خروجی صوتی است: در جلسهٔ زنده هرگز پخش جدا شروع نمی‌شود. */
+export type TtsSettingsState = {
+  settings: { providers?: unknown[] }
+  ttsProviderId?: string
+  ttsModel?: string
+  ttsVoice?: string
+  ttsFallbacks?: Array<{ providerId: string; model?: string; voice?: string }>
+  liveVoiceState?: LiveVoiceState
+}
+
+/** getState را تزریق بگیرید (ChatBubble: useStore.getState) — هستهٔ tts.ts
+ *  مثل بقیهٔ ماژول به فروشگاه وابستگی استاتیک ندارد. */
+export function useSpeakText(
+  getState: () => TtsSettingsState,
+): {
+  status: TtsStatus
+  speak: (rawText: string) => Promise<string | null>
+  stop: () => void
+} {
+  const { status, toggle, stop } = useTtsPlayback()
+  const getStateRef = useRef(getState)
+  getStateRef.current = getState
+  useEffect(() => () => stop(), [stop])
+  const speak = useCallback(
+    async (rawText: string): Promise<string | null> => {
+      const st = getStateRef.current()
+      if (st.liveVoiceState === 'live' || st.liveVoiceState === 'speaking' || st.liveVoiceState === 'connecting') {
+        return null
+      }
+      const chain = buildTtsChain(st)
+      if (chain.length === 0) {
+        return 'برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید'
+      }
+      const text = stripBidiMarks(fixZwsp(rawText))
+      if (!text.trim()) return 'متن قابل خواندنی برای پخش نیست'
+      try {
+        await toggle(text, chain)
+        return null
+      } catch (err) {
+        const friendly = friendlyTtsError(err)
+        console.warn('speak failed', err)
+        return friendly || null
+      }
+    },
+    [toggle],
+  )
+  return { status, speak, stop }
 }

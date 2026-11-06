@@ -623,7 +623,8 @@ export function FileChip({
       // the same path is idempotent (an in-place refresh).
       onClick={handle}
     >
-      <FileIcon path={path} size={20} />
+      {/* No file-type icon: in flowing prose a colored badge before every
+          path chip is noise (user request) — the pill + name is enough. */}
       <span className="file-chip-name" dir="ltr">
         {label}
       </span>

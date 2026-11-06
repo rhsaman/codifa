@@ -116,7 +116,9 @@ async function browseIndex(body: {
   const q = new URLSearchParams({ repo: body.repo })
   if (body.path) q.set('path', body.path)
   if (body.git_ref) q.set('git_ref', body.git_ref)
-  if (body.refresh) q.set('refresh', '1')
+  // `true` spelled out: the backend's query bool only accepts true/false, and
+  // `1` turned every chip click and Refresh into a 400 before the read began.
+  if (body.refresh) q.set('refresh', 'true')
   // A cold read goes out to GitHub (two API round-trips) and the router runs it
   // on a blocking task, so a slow or rate-limited request must not be able to
   // keep the tab on "Reading the index..." forever: without a deadline the
@@ -252,6 +254,81 @@ export function isRowInstalling(key: string): boolean {
 /** The stable id of one install address — repo, sub-folder and ref. */
 export function marketKey(repo: string, path?: string, gitRef?: string): string {
   return `${repo}|${path ?? ''}|${gitRef ?? ''}`
+}
+
+/** One marketplace address parsed from the single string a user types.
+ *
+ *  `owner/repo@ref/sub-path`: the ref ends at the first `/` after the `@`
+ *  (tags may hold slashes), and everything after it is the sub-folder. The
+ *  Settings form and the `/plugin marketplace add` command share this parser so
+ *  the two can never disagree about what an address means. */
+export interface MarketplaceAddress {
+  repo: string
+  path?: string
+  git_ref?: string
+}
+
+export function parseMarketplaceAddress(raw: string): MarketplaceAddress {
+  let addr = raw.trim()
+  if (!addr) return { repo: '' }
+  let refPart = ''
+  let subPart = ''
+  const at = addr.indexOf('@')
+  if (at > 0 && !addr.startsWith('/')) {
+    const tail = addr.slice(at + 1)
+    const slash = tail.indexOf('/')
+    refPart = slash === -1 ? tail : tail.slice(0, slash)
+    if (slash !== -1) subPart = tail.slice(slash + 1)
+    addr = addr.slice(0, at)
+  }
+  return {
+    repo: addr,
+    ...(subPart.trim() ? { path: subPart.trim() } : {}),
+    ...(refPart.trim() ? { git_ref: refPart.trim() } : {}),
+  }
+}
+
+/** The name a marketplace is shown under everywhere in the UI. */
+export function marketplaceLabel(m: { repo: string; label?: string }): string {
+  return (m.label ?? '').trim() || m.repo
+}
+
+/** Normalise a repo address for comparison only: a copied GitHub URL and the
+ *  short `owner/repo` a marketplace was added with are the same place. */
+function comparableRepo(repo: string): string {
+  return repo
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\/github\.com\//, '')
+    .replace(/^git@github\.com:/, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
+}
+
+/** Every saved marketplace a typed name/address resolves to.
+ *
+ *  Matching is deliberately broad — label, repo, `repo@ref/path`, and the
+ *  install key — because `/plugin marketplace remove` is typed from memory.
+ *  Callers report an ambiguous result instead of guessing. */
+export function findMarketplaces<T extends { repo: string; label?: string; path?: string; git_ref?: string }>(
+  marketplaces: T[],
+  query: string,
+): T[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return []
+  const qRepo = comparableRepo(q)
+  return marketplaces.filter((m) => {
+    const label = (m.label ?? '').trim().toLowerCase()
+    const repo = m.repo.trim().toLowerCase()
+    const address = `${m.repo}${m.git_ref ? `@${m.git_ref}` : ''}${m.path ? `/${m.path}` : ''}`.toLowerCase()
+    return (
+      label === q ||
+      repo === q ||
+      address === q ||
+      marketKey(m.repo, m.path, m.git_ref).toLowerCase() === q ||
+      comparableRepo(m.repo) === qRepo
+    )
+  })
 }
 
 /** How long a dropped install connection is watched before the failure is

@@ -36,6 +36,8 @@ export interface UpdateInfo {
   notes: string
   assetName: string | null
   assetUrl: string | null
+  /** The sha256 the feed pins to this asset — the installer is verified against it. */
+  assetSha256?: string | null
   releaseUrl: string
 }
 
@@ -113,8 +115,14 @@ export interface CoderApi {
   storeGet<T>(key: string): Promise<T | null>
   storeSet(key: string, value: unknown): Promise<boolean>
   /** Fetch ONE chat's message body. The chat list in `settings.json` holds
-   *  index rows, so a transcript is pulled in only when the user opens it. */
-  chatGet<T>(id: string): Promise<T | null>
+   *  index rows, so a transcript is pulled in only when the user opens it.
+   *  With `limit`, only a page ending at `before` (exclusive; omitted = tail)
+   *  is returned and the body carries `bodyStart`/`bodyTotal`. Omitting both
+   *  keeps the full-body contract for operations that need every message. */
+  chatGet<T>(
+    id: string,
+    opts?: { before?: number; limit?: number },
+  ): Promise<T | null>
   getDataPath(): Promise<string>
   hasSettingsFile(): Promise<boolean>
   openExternal(url: string): Promise<void>

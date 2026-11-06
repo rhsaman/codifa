@@ -11,8 +11,6 @@ import {
   resolveRestartUser,
   shouldIgnoreLateRetryEvent,
   isDeterministicTurnError,
-  isInlineRetry,
-  findRetryBannerMessage,
 } from "./retry"
 
 export {}
@@ -197,21 +195,6 @@ console.log('isDeterministicTurnError:')
   check('اتصال قطع‌شده گذراست', !isDeterministicTurnError("error sending request for url (http://x/v1/chat/completions)"))
   check('انقضای بودجه‌ی هدر گذراست', !isDeterministicTurnError("provider sent no response headers within 60s"))
   check('5xx گذراست', !isDeterministicTurnError("503 Service Unavailable"))
-}
-
-// ریترای inline: فقط خط فشرده‌ی فوتر؛ هرگز بنر انتهای ترنسکریپت.
-console.log('isInlineRetry + findRetryBannerMessage:')
-{
-  check('retry بدون inline بنر می‌گیرد', !isInlineRetry({ attempt: 1, maxAttempts: 3, delay: 0, reason: "x" }))
-  check('retry با inline بنر نمی‌گیرد', isInlineRetry({ attempt: 1, maxAttempts: 3, delay: 0, reason: "x", inline: true }))
-  const msgs = [
-    { id: "a", retry: { attempt: 1, maxAttempts: 3, delay: 0, reason: "x", inline: true } },
-    { id: "b", retry: { attempt: 2, maxAttempts: 3, delay: 0, reason: "y" } },
-  ]
-  const picked = findRetryBannerMessage(msgs, new Set(), new Set())
-  // پیام a فقط inline است و از اسکن بنر می‌پرد؛ بنرِ پیام b را برمی‌دارد.
-  check('اسکن بنر، retryهای inline را رد می‌کند', picked?.id === "b")
-  check('اسکن بنر با همه‌ی inlineها null می‌دهد', findRetryBannerMessage([msgs[0]], new Set(), new Set()) === null)
 }
 
 if (failed > 0) {

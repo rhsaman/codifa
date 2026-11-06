@@ -138,14 +138,23 @@ fn redirect_logs_to_file() {
     let dir = home.join(".codifa");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("rust.log");
-    if std::fs::metadata(&path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false) {
-        let _ = std::fs::rename(&path, dir.join("rust.log.1"));
-    }
+    rotate_log(&path, 5 * 1024 * 1024);
     if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         unsafe {
             libc::dup2(f.as_raw_fd(), 1);
             libc::dup2(f.as_raw_fd(), 2);
         }
+    }
+}
+
+/// Rotate an append-only log at launch: past `max_bytes` it becomes `<name>.1`
+/// (one generation kept — the previous log is only a debugging aid). Missing
+/// files are not an error; rename failures (e.g. the old log is held open by
+/// another process) leave the file in place and appending continues.
+#[cfg(unix)]
+fn rotate_log(path: &std::path::Path, max_bytes: u64) {
+    if std::fs::metadata(path).map(|m| m.len() > max_bytes).unwrap_or(false) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
     }
 }
 
@@ -168,6 +177,12 @@ fn main() {
     #[cfg(unix)]
     if webmode::active().is_none() {
         redirect_logs_to_file();
+    }
+    // panic.log is append-only in every mode, so bound it the way rust.log is
+    // bounded at launch: rotate past 1 MB, one generation kept.
+    #[cfg(unix)]
+    if let Some(home) = dirs::home_dir() {
+        rotate_log(&home.join(".codifa").join("panic.log"), 1024 * 1024);
     }
     // Serve mode keeps stdout/stderr attached: the printed `?token=` URL is
     // how the user connects, and a systemd/journald setup captures it anyway.
@@ -315,6 +330,13 @@ fn main() {
                 let pruned = migrate::prune_migrated_stores(&root);
                 if pruned > 0 {
                     println!("[plugins] removed {pruned} leftover store entr(ies) now in bundles");
+                }
+                // Two seeded bundles were renamed after they shipped. Move an
+                // existing folder (and every user addition inside it) before the
+                // seeder runs, or the old name and the new one both survive.
+                let renamed = migrate::rename_builtin_bundles(&root);
+                if renamed > 0 {
+                    println!("[plugins] renamed builtin bundles / updated {renamed} reference(s)");
                 }
                 // Repair the heading stack the old writer left: every editor
                 // save used to prepend one more `# {name}`, and installing a

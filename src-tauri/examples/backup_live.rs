@@ -21,9 +21,19 @@ fn main() {
 
     let started = Instant::now();
     let mut last_pct = 0u32;
+    // The install key travels with the archive when it exists (same source
+    // the command layer uses) — pass None to simulate an older backup.
+    let install_key = std::fs::read(
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("com.codifa.app")
+            .join("secrets.key"),
+    )
+    .ok();
     let res = codifa::backup::build_backup(
         &root,
         &dest,
+        install_key.as_deref(),
         || false,
         |label, pct, done, total| {
             if pct != last_pct {
@@ -49,9 +59,11 @@ fn main() {
     let check = dest.join("restore-check");
     let _ = std::fs::remove_dir_all(&check);
     let restore_started = Instant::now();
-    let moved = codifa::backup::restore_archive(
+    let key_target = dest.join("install-key-check").join("secrets.key");
+    let outcome = codifa::backup::restore_archive(
         std::path::Path::new(&res.path),
         &check,
+        Some(&key_target),
         || false,
         |label, pct, done, total| {
             if pct != last_pct {
@@ -62,10 +74,18 @@ fn main() {
     )
     .expect("restore failed");
     println!(
-        "restored {moved} files into {} in {:.1}s",
+        "restored {} files into {} in {:.1}s (install key: {})",
+        outcome.files,
         check.display(),
-        restore_started.elapsed().as_secs_f32()
+        restore_started.elapsed().as_secs_f32(),
+        if outcome.secrets_restored { "installed" } else { "absent" }
     );
+    if let Some(expected) = &install_key {
+        assert!(
+            outcome.secrets_restored && std::fs::read(&key_target).unwrap() == *expected,
+            "the install key did not travel with the archive"
+        );
+    }
 
     // Diff: every file the backup would collect must exist in the restore with
     // the same bytes.

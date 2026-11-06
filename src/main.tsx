@@ -6,6 +6,7 @@ import { installWebBridge } from './lib/webBridge'
 import { installInputSuppression } from './lib/inputSuppress'
 import { installOverlayScrollbars } from './lib/useDiffScrollbars'
 import './styles/global.css'
+import './styles/right-panel.css'
 
 injectThemeStyles()
 

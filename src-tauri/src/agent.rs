@@ -1362,9 +1362,9 @@ pub struct AgentRequest {
     #[serde(default)]
     pub allow_computer: bool,
     /// True when the turn asks to create/edit a skill or an MCP connector
-    /// (`/create-skill`, `/create-mcp`). The `create_skill` / `create_mcp`
-    /// tools are bound ONLY then, so an ordinary turn cannot silently rewrite
-    /// the user's skill store or connector list.
+    /// (`/plugin create` or `/plugin update`). The `create_skill` /
+    /// `create_mcp` tools are bound ONLY then, so an ordinary turn cannot
+    /// silently rewrite the user's skill store or connector list.
     #[serde(default)]
     pub allow_create: bool,
     /// The composer's Browser switch, the same hard on/off as Computer Use.
@@ -3385,7 +3385,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "update_plan",
-            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Call it ONCE after writing the plan, then again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one.",
+            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Call it ONCE after writing the plan, then again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one. While a long step runs you may report its percent done via the optional \"progress\" field (0-100); the UI draws a small bar.",
             json!({
                 "items": {
                     "type": "array",
@@ -3394,7 +3394,8 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                         "type": "object",
                         "properties": {
                             "content": {"type": "string", "description": "Short imperative item the user can understand, in the user's language: what this step does (and the file it touches). Never bare jargon."},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            "progress": {"type": "number", "description": "Optional 0-100 percent done for the step; the UI renders a progress bar. Omit when unknown."}
                         },
                         "required": ["content", "status"]
                     }
@@ -3403,7 +3404,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "ask_user",
-            "Ask the user ONE question and WAIT for the answer. Use it when the request is ambiguous or you hit a genuine fork with no clearly-correct default. `options` are short choices; the user may also type a free answer.",
+            "Ask the user ONE question and WAIT for the answer. Use it when the request is ambiguous or you hit a genuine fork with no clearly-correct default. `options` are short choices; the app shows them as a pick-one card (radio list + Apply button) and the user may also type a free answer.",
             json!({
                 "question": {"type": "string"},
                 "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 short choices"}
@@ -3542,8 +3543,6 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "enabled": {"type": "boolean", "description": "toggle: value to set; omit to flip"},
                 "root": {"type": "string", "description": "Workspace root the run works in"},
                 "mode": {"type": "string"},
-                "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills attached to every run"},
-                "mcp_servers": {"type": "array", "items": {"type": "string"}, "description": "MCP connector names for every run"},
                 "plugins": {"type": "array", "items": {"type": "string"}, "description": "Plugins every run gets"},
                 "allow_browser": {"type": "boolean", "description": "Let every run of this task use the in-app browser: the shared Chromium with its saved logins (e.g. a posted session cookie), for tasks like posting to Instagram or trading on a web exchange. Default false — set true only when the task really browses."}
             }),
@@ -4099,6 +4098,71 @@ fn applied_change_block(diff: &str) -> String {
 /// sent, so an x/y read off the picture is NOT a screen coordinate. Without the
 /// mapping the model clicks at the pixel it saw in a 1440-wide image on a
 /// 2880-wide screen — off by a factor of two, and it has no way to notice.
+/// How many captures may stay in the conversation at once.
+///
+/// Every past capture is re-encoded as base64 and re-billed as vision tokens
+/// on EVERY following step of the turn — a 2560px screenshot is thousands of
+/// tokens per round, so a long computer-use turn re-sent its whole gallery
+/// every round. The model aims at the LATEST capture and needs at most the one
+/// before it to correct a missed click; anything older is dead weight.
+const MAX_HISTORY_SHOTS: usize = 2;
+
+/// Elide stale screenshot images from the history, oldest first, until at most
+/// `keep` image blocks remain across the shot messages (the ones whose first
+/// text block is the `Screenshot taken:` summary — composer attachments and
+/// `read`-returned images are content the model asked for and are never
+/// touched). An elided block becomes a one-line text note, so the model knows
+/// the picture existed and how to get it back.
+fn elide_stale_screenshots(messages: &mut [Value], keep: usize) {
+    const SHOT_PREFIX: &str = "Screenshot taken:";
+    let mut shot_msgs: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (mi, m) in messages.iter().enumerate() {
+        if m["role"].as_str() != Some("user") {
+            continue;
+        }
+        let Some(blocks) = m["content"].as_array() else {
+            continue;
+        };
+        if !blocks
+            .first()
+            .and_then(|b| b["text"].as_str())
+            .is_some_and(|t| t.starts_with(SHOT_PREFIX))
+        {
+            continue;
+        }
+        let imgs: Vec<usize> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b["type"] == crate::llm::IMAGE_BLOCK_TYPE)
+            .map(|(i, _)| i)
+            .collect();
+        if !imgs.is_empty() {
+            shot_msgs.push((mi, imgs));
+        }
+    }
+    let total: usize = shot_msgs.iter().map(|(_, i)| i.len()).sum();
+    let mut to_elide = total.saturating_sub(keep);
+    for (mi, imgs) in &shot_msgs {
+        if to_elide == 0 {
+            break;
+        }
+        let Some(blocks) = messages[*mi]["content"].as_array_mut() else {
+            continue;
+        };
+        for &bi in imgs {
+            if to_elide == 0 {
+                break;
+            }
+            blocks[bi] = json!({
+                "type": "text",
+                "text": "[older screenshot removed from the wire to save context — \
+action=screenshot takes a fresh one]"
+            });
+            to_elide -= 1;
+        }
+    }
+}
+
 fn shot_summary(shots: &[crate::computer::Shot]) -> String {
     let mut out = String::from("Screenshot taken:");
     for (i, s) in shots.iter().enumerate() {
@@ -5957,11 +6021,33 @@ the Vision model's description instead.\n"
         }
 
         // Record the assistant tool-call message, then execute each call.
+        //
+        // The replay must echo the call EXACTLY as the model emitted it.
+        // Google's OpenAI-compatible endpoint binds Gemini 3's thought
+        // signature to the call and rejects the next round with HTTP 400 when
+        // it is missing, so `extra_content` (and the emitted name, which an
+        // alias canonicalization may have changed) travels back with it. The
+        // canonical name is still what gets executed.
+        let emitted: std::collections::HashMap<&str, &Value> = acc
+            .tool_calls
+            .iter()
+            .filter_map(|tc| tc["id"].as_str().map(|id| (id, tc)))
+            .collect();
         let calls_json: Vec<Value> = tool_calls
             .iter()
             .map(|(id, name, args)| {
-                json!({"id": id, "type": "function",
-                       "function": {"name": name, "arguments": args}})
+                let slot = emitted.get(id.as_str()).copied();
+                let emitted_name = slot
+                    .and_then(|s| s["function"]["name"].as_str())
+                    .unwrap_or(name);
+                let mut call = json!({"id": id, "type": "function",
+                       "function": {"name": emitted_name, "arguments": args}});
+                if let Some(extra) = slot.and_then(|s| s.get("extra_content")) {
+                    if !extra.is_null() {
+                        call["extra_content"] = extra.clone();
+                    }
+                }
+                call
             })
             .collect();
         messages.push(json!({
@@ -7871,6 +7957,11 @@ call fetch_url again with offset={next} for the rest]",
                 ..Default::default()
             });
             messages.push(json!({"role": "user", "content": blocks}));
+            // The captures just pushed are the freshest view of the world;
+            // older ones now cost vision tokens on every following step while
+            // describing a screen that no longer exists. Keep at most
+            // MAX_HISTORY_SHOTS captures in the conversation (see the const).
+            elide_stale_screenshots(&mut messages, MAX_HISTORY_SHOTS);
         }
     }
 
@@ -11382,7 +11473,7 @@ fn default_system_prompt(mode: &str, root: &str) -> String {
 artifact: never paste whole files or large code blocks into your reply — after the edits, \
 say concisely what changed (file, function, short diff-level description) and stop. Scale \
 the report to the size of the change: a one-line fix gets one line, not a write-up. If the \
-user also asked a question, answer it directly and briefly."
+user also asked a question, answer it directly and briefly. Rich output the app renders natively: numeric comparisons -> a ```chart fenced block with a JSON body {{\"type\":\"bar\"|\"line\"|\"pie\",\"title\",\"unit\",\"labels\",\"series\":[{{\"name\",\"values\"}}]}} (2-6 labels); report long-step percent via update_plan's optional \"progress\" (0-100); a genuine fork -> ask_user with 2-5 short options."
         )
     } else if mode == "ask" || mode == "chat" {
         // Ask is the mentoring mode: the user wants an ANSWER, not a report.
@@ -11399,7 +11490,7 @@ short sentences, one concrete example, exact file:line. You cannot write or edit
 here, but READING IS OPEN: files through `explore`, and the shell for any inspection \
 (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck) — only a command that would \
 change the workspace is refused. Describe a needed change as file + the exact old text -> \
-new text and say that Build mode applies it."
+new text and say that Build mode applies it. Rich output the app renders natively: numeric comparisons or data worth seeing at a glance -> a ```chart fenced block whose body is exactly this JSON: {\"type\":\"bar\"|\"line\"|\"pie\",\"title\":\"...\",\"unit\":\"...\",\"labels\":[\"...\"],\"series\":[{\"name\":\"...\",\"values\":[...]}]} (2-6 labels, numeric values, labels in the user's language) - it draws a real chart, better than an ASCII dump or a table. A genuine open choice that changes what you do next -> the ask_user tool with 2-5 SHORT options (the app shows a pick-one card), not a bulleted \"which one?\" question."
             .to_string()
     } else if mode == "plan" {
         // Plan's whole deliverable IS prose, so an unbounded plan sprawls exactly
@@ -13511,8 +13602,12 @@ mod tests {
             // `load_skill` learned the `bundle` drill-in + the `plugin` schema's
             // `list` line grew its slug-detail hint. The step is those schemas
             // themselves; the ~3.5% headroom convention still holds.
-            ("main", tool_schemas(false, false), 16_650usize),
-            ("main+browser", tool_schemas(false, true), 23_100),
+            // Re-based for the batch params the round-elimination work added:
+            // `run_terminal` learned `commands` and `write_file` learned
+            // `files` — each batches a whole step of work into ONE call, which
+            // is exactly the trade this ceiling exists to price deliberately.
+            ("main", tool_schemas(false, false), 17_350usize),
+            ("main+browser", tool_schemas(false, true), 24_200),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -13840,6 +13935,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_screenshots_leave_the_wire_oldest_first() {
+        // Every past capture re-bills as vision tokens on EVERY following
+        // step; the model aims at the latest capture (and the one before it
+        // for aim-correction), so older ones become a text note.
+        let img = |u: &str| json!({"type": crate::llm::IMAGE_BLOCK_TYPE, "data_url": u});
+        let shot_msg = |u: &str| {
+            json!({"role": "user", "content": [json!({"type": "text", "text": "Screenshot taken:\n  after click — 100x100 px."}), img(u)]})
+        };
+        let composer_msg = || {
+            // The user's own attachments are CONTENT: never elided.
+            json!({"role": "user", "content": [json!({"type": "text", "text": "what is in this picture?"}), img("data:attachment")]})
+        };
+        let mut msgs = vec![
+            json!({"role": "system", "content": "s"}),
+            composer_msg(),
+            shot_msg("data:s1"),
+            json!({"role": "assistant", "content": "a"}),
+            shot_msg("data:s2"),
+            shot_msg("data:s3"),
+            shot_msg("data:s4"),
+        ];
+        elide_stale_screenshots(&mut msgs, MAX_HISTORY_SHOTS);
+        let count = |m: &Value| {
+            m["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|b| b["type"] == crate::llm::IMAGE_BLOCK_TYPE)
+                .count()
+        };
+        assert_eq!(count(&msgs[2]), 0, "oldest shot must be elided");
+        assert_eq!(count(&msgs[4]), 0, "second-oldest must be elided");
+        assert_eq!(count(&msgs[5]), 1, "third keeps (within the 2 cap)");
+        assert_eq!(count(&msgs[6]), 1, "newest keeps");
+        assert_eq!(count(&msgs[1]), 1, "a composer attachment is never touched");
+        // The elided blocks say what happened and how to get the image back.
+        let elided = msgs[2]["content"][1]["text"].as_str().unwrap();
+        assert!(elided.contains("removed"), "{elided}");
+        assert!(elided.contains("action=screenshot"), "{elided}");
+        // Nothing to elide under the cap: no message is rewritten.
+        let mut small = vec![shot_msg("data:s1"), shot_msg("data:s2")];
+        elide_stale_screenshots(&mut small, MAX_HISTORY_SHOTS);
+        assert_eq!(count(&small[0]), 1);
+        assert_eq!(count(&small[1]), 1);
+    }
+
+    #[test]
     fn single_call_steps_get_a_batching_hint() {
         let root = env!("CARGO_MANIFEST_DIR");
         let one = |name: &str| vec![("c1".to_string(), name.to_string(), "{}".to_string())];
@@ -13914,7 +14056,7 @@ mod tests {
         for name in ["artifact"] {
             let hint = single_call_hint("agent", &one(name), 1, root)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
-            assert!(hint.contains("IN ORDER"), "{name}: {hint}");
+            assert!(hint.contains("files:[{path, content}]"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
         for name in ["browser_resize", "browser_emulate_media"] {
@@ -13958,7 +14100,7 @@ mod tests {
         assert!(!first.contains("rounds in a row"), "{first}");
         let fifth = single_call_hint("agent", &one, 5, root).unwrap();
         assert!(fifth.contains("5 rounds in a row"), "{fifth}");
-        assert!(fifth.contains("IN ORDER"), "{fifth}");
+        assert!(fifth.contains("Batch NOW"), "{fifth}");
         assert_ne!(first, fifth, "the text must change as the streak grows");
     }
 

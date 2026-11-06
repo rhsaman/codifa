@@ -957,12 +957,15 @@ pub fn marker_origin(dir: &Path) -> Option<String> {
     read_marker(dir).map(|m| m.origin)
 }
 
-/// `true` when a skill folder holds the USER's own text rather than a stale seed.
+/// `true` when the marker PROVES the app seeded this copy (`origin == "seeded"`).
 ///
-/// The rename cleanup asks this: a shipped skill that changed name must not take
-/// a version the user edited with it. Same provenance rule the seeder uses.
-pub fn skill_is_user_owned(dir: &Path) -> bool {
-    read_marker(dir).map(|m| m.origin == "user").unwrap_or(false)
+/// The rename cleanup deletes on this, not on "not user-owned": an UNMARKED
+/// skill (migrated from a legacy store, or written before markers existed) has
+/// unknown provenance — treating it as a stale seed deleted user text that no
+/// backup can bring back. Unmarked skills now survive the cleanup; the worst
+/// case is a stale seed that lingers as noise, which is the safe direction.
+pub fn skill_is_app_seeded(dir: &Path) -> bool {
+    read_marker(dir).map(|m| m.origin == "seeded").unwrap_or(false)
 }
 
 /// Locate the shipped built-in skills directory (the `*.md` files that ship

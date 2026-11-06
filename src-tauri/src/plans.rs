@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use crate::state::now_ms;
 
 /// Sanitize a path component (mirrors state_db._safe_file).
-fn safe_file(name: &str, fallback: &str) -> String {
+pub(crate) fn safe_file(name: &str, fallback: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in name.trim().chars() {

@@ -91,7 +91,8 @@ const bridge: CoderApi = {
   getPathForFile: (file: File) => droppedPaths.get(file.name) ?? '',
   storeGet: <T>(key: string) => invoke<T | null>('store_get', { key }),
   storeSet: (key, value) => invoke<boolean>('store_set', { key, value }),
-  chatGet: <T>(id: string) => invoke<T | null>('chat_get', { id }),
+  chatGet: <T>(id: string, opts?: { before?: number; limit?: number }) =>
+    invoke<T | null>('chat_get', { id, ...opts }),
   getDataPath: () => invoke<string>('get_data_path'),
   hasSettingsFile: () => invoke<boolean>('has_settings_file'),
   openExternal: (url) => invoke<void>('open_external', { url }),

@@ -36,7 +36,7 @@
 const { formatNextRunFa, runStatusFa, cronToPresetValue } = await import(
   "../src/components/SchedulePanel"
 )
-const { unseenRunCount, unseenRunCountForTask, pickInboxTask } = await import("../src/components/ScheduleInbox")
+const { unseenRunCount, unseenRunCountForTask, pickInboxTask, sortGridByLatestRun } = await import("../src/components/ScheduleInbox")
 const {
   scheduleRunTokenTotal,
   taskTokenTotals,
@@ -222,6 +222,39 @@ console.log("13) the badge's plumbing is actually mounted (regression: the badge
   check("no second poller: the old titlebar button is gone", !inboxSrc.includes("ScheduleInboxButton"))
   const css = readFileSync("src/styles/global.css", "utf8")
   check("the dock badge is positioned over its button", /\.viewer-dock-btn\s*\{[^}]*position:\s*relative/.test(css) && /\.viewer-dock-badge\s*\{[^}]*position:\s*absolute/.test(css))
+}
+
+console.log("14) sortGridByLatestRun — گرید اینباکس بر اساس جدیدترین پیام سورت می‌شود:")
+{
+  const t = (id: string, created_at = 0) =>
+    ({ id, name: id, prompt: "", cron: "", enabled: true, root: "", mode: "build", created_at }) as any
+  const latest = new Map<string, any>([
+    ["s1", { id: "r1", schedule_id: "s1", status: "done", started_at: 100 }],
+    ["s2", { id: "r2", schedule_id: "s2", status: "done", started_at: 200 }],
+    ["s3", { id: "r3", schedule_id: "s3", status: "done", started_at: 300 }],
+  ])
+  const ids = (tasks: any[]) => sortGridByLatestRun(tasks, latest).map((x) => x.id).join(",")
+  check("تازه‌ترین ران اول است", ids([t("s1"), t("s2"), t("s3")]) === "s3,s2,s1")
+  // ترتیب ورودی مهم نیست — پیام جدید کارت را بالا می‌برد:
+  check("ترتیب ورودی بی‌اثر است", ids([t("s3"), t("s1"), t("s2")]) === "s3,s2,s1")
+  check("تسک بدون ران آخر می‌ماند", ids([t("idle", 999), t("s1"), t("s3")]) === "s3,s1,idle")
+  const idleIds = sortGridByLatestRun([t("i1", 10), t("i2", 20)], new Map()).map((x) => x.id).join(",")
+  check("بدون ران: created_at نزولی", idleIds === "i2,i1")
+  // ران قدیمی (started_at=0 از داده‌های legacy) مثل بدون‌ران رفتار می‌کند:
+  const legacy = new Map<string, any>([["s1", { id: "r0", schedule_id: "s1", status: "done", started_at: 0 }]])
+  check("ران با started_at=0 بالا نمی‌رود", sortGridByLatestRun([t("s1"), t("i2", 5)], legacy).map((x) => x.id).join(",") === "i2,s1")
+}
+
+console.log("15) the grid card shows per-card unseen counts instead of Done (and opening the inbox marks nothing seen):")
+{
+  const inboxSrc = readFileSync("src/components/ScheduleInbox.tsx", "utf8")
+  check("the card footer has the new-count pill", inboxSrc.includes("schedule-grid-status new"))
+  check("the Done status pill is gone from the grid card", !/\$\{lastRun\.status\}/.test(inboxSrc))
+  check("opening the inbox no longer marks every run seen", !inboxSrc.includes("markSeen(finishedRunIds(runs))"))
+  check("viewing a task's page still marks its runs seen", inboxSrc.includes("markSeen(finishedRunIds(one))"))
+  const css = readFileSync("src/styles/global.css", "utf8")
+  check("the new-count pill has its own accent style", /\.schedule-grid-status\.new\s*\{/.test(css))
+  check("the green Done pill style is unused by the grid card now", !inboxSrc.includes("schedule-grid-status done"))
 }
 
 if (failed > 0) {

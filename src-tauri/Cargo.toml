@@ -43,6 +43,9 @@ libc = "0.2"
 # Full-app backup (Settings → Storage): the data root is packed into a
 # codifa-backup-*.zip on every platform the app ships for.
 zip = "9.0.5"
+# Updater integrity: the downloaded installer must match the sha256 its feed
+# pins before it is ever launched.
+sha2 = "0.10"
 # Phase 2: native HTTP router (light endpoints) + proxy to the Python sidecar
 # "ws": the web-mode terminal WebSocket (/ws/terminal), see webapi.rs.
 axum = { version = "0.7", features = ["http1", "multipart", "ws"] }

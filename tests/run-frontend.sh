@@ -96,6 +96,7 @@ thinking|tests/thinking.test.ts|--packages=external --external:electron
 ensureSidecar|tests/ensureSidecar.test.ts|--packages=external --external:electron
 marketplaceBrowse|tests/marketplaceBrowse.test.ts|--packages=external --external:electron
 marketplaceDefaults|tests/marketplaceDefaults.test.ts|-
+marketplaceSearch|tests/marketplaceSearch.test.ts|--packages=external --external:electron
 installTracker|tests/installTracker.test.ts|--packages=external --external:electron
 repoAddress|tests/repoAddress.test.ts|-
 cmdContext|tests/cmdContext.test.ts|-
@@ -104,21 +105,27 @@ voice|tests/voice.test.ts|-
 liveVoiceLease|tests/liveVoiceLease.test.ts|
 webResults|tests/webResults.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 engineBadge|tests/engineBadge.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
-retryBanner|tests/retryBanner.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+inlineRetry|tests/inlineRetry.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 streamChatReconnect|tests/streamChatReconnect.test.ts|--packages=external --external:electron
 thinkingIndicator|tests/thinkingIndicator.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 contextBudget|tests/contextBudget.test.ts|--packages=external --external:electron
 compactChat|tests/compactChat.test.ts|--packages=external --external:electron
 emptyChats|tests/emptyChats.test.ts|--packages=external --external:electron
 messageWindow|tests/messageWindow.test.ts|-
+messageViewEqual|tests/messageViewEqual.test.ts|-
 transcriptWindow|tests/transcriptWindow.test.ts|-
 renderCap|tests/renderCap.test.ts|-
 queue-during-compact|tests/queue-during-compact.test.ts|--packages=external --external:electron
 chatLeaks|tests/chatLeaks.test.ts|--packages=external --external:electron
 compactDedupe|tests/compactDedupe.test.ts|--packages=external --external:electron
+chatBodyPaging|tests/chatBodyPaging.test.ts|--packages=external --external:electron
 sidebar|tests/sidebar.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:src/lib/store=./src/lib/store --external:electron
 usage|tests/usage.test.ts|-
 bidi|tests/bidi.test.ts|-
+ltrIslands|tests/ltrIslands.test.ts|-
+ltrIslandCode|tests/ltrIslandCode.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+chatBubble|tests/chatBubble.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+chartBlock|tests/chartBlock.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 fileTypes|tests/fileTypes.test.ts|-
 tabBar|src/lib/tabBar.test.ts|
 slash|src/lib/slash.test.ts|--packages=external --external:electron

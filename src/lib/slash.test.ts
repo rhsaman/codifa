@@ -11,6 +11,7 @@ import {
   migrateCommandNames,
   forgetCommands,
   SUBCOMMANDS,
+  MARKETPLACE_SUBCOMMANDS,
   slashBody,
   commandFlags,
   slashFlagAt,
@@ -21,6 +22,7 @@ import {
   stripFlagTokens,
   hasLandedFlag,
   hasLandedValue,
+  isFlagToken,
   recordHistory,
   togglePin,
   historyRows,
@@ -28,6 +30,8 @@ import {
   historyMeta,
   recordCommandUsage,
   loadCommandUsage,
+  loadSubcommandUsage,
+  recordSubcommandUsage,
   sortCommandsByUsage,
   sortByRecentUsage,
   MAX_HISTORY,
@@ -54,8 +58,8 @@ console.log("1) isSlashCommand:")
 
 console.log("2) parseSlashInput:")
 {
-  const p = parseSlashInput("/skill install owner/repo")
-  check("name lowercased", p?.name === "skill", p)
+  const p = parseSlashInput("/plugin install owner/repo")
+  check("name lowercased", p?.name === "plugin", p)
   check("args kept", p?.args === "install owner/repo", p)
   check("bare command", parseSlashInput("/undo")?.name === "undo")
   check("non-slash is null", parseSlashInput("hi") === null)
@@ -65,8 +69,8 @@ console.log("3) prettySlashLabel has no leading slash:")
 {
   check("compact", prettySlashLabel("/compact") === "Compact context")
   check(
-    "skill with args",
-    prettySlashLabel("/skill install owner/repo") === "Skill: install owner/repo",
+    "plugin with args",
+    prettySlashLabel("/plugin install owner/repo") === "Plugin: install owner/repo",
   )
   check("undo", prettySlashLabel("/undo") === "Undo last exchange")
   check("no slash in label", !prettySlashLabel("/clear").startsWith("/"))
@@ -109,8 +113,8 @@ console.log("6) historyRows bottom-anchored (oldest top, pins bottom):")
 
 console.log("7) historyTitle/historyMeta (Codex-style card lines):")
 {
-  check("slash title = raw command name", historyTitle("/skill foo bar") === "skill")
-  check("slash meta = args", historyMeta("/skill foo bar") === "foo bar")
+  check("slash title = raw command name", historyTitle("/plugin foo bar") === "plugin")
+  check("slash meta = args", historyMeta("/plugin foo bar") === "foo bar")
   check("bare command meta = pretty label", historyMeta("/compact") === "Compact context")
   const long = "a fairly long prompt that should be truncated"
   check("plain title truncated with ellipsis", historyTitle(long).endsWith("…") && historyTitle(long).length <= 31, historyTitle(long))
@@ -121,11 +125,11 @@ console.log("8) slashTokenRange (composer token highlight):")
 {
   const r1 = slashTokenRange("/compact foo")
   check("token covers /compact", r1?.start === 0 && r1?.end === 8, r1)
-  const raw2 = "  /skill install foo"
+  const raw2 = "  /plugin install foo"
   const r2 = slashTokenRange(raw2)
   check(
     "leading spaces kept",
-    r2 !== null && raw2.slice(r2.start, r2.end) === "/skill",
+    r2 !== null && raw2.slice(r2.start, r2.end) === "/plugin",
     r2,
   )
   check("plain text is null", slashTokenRange("hello") === null)
@@ -228,19 +232,18 @@ console.log("13) slashCaretAt (multi-level completion):")
 console.log("14) SUBCOMMANDS table drives the menu and help:")
 {
   check("plugin lists install/remove", (SUBCOMMANDS.plugin ?? []).some((s) => s.name === "install") && (SUBCOMMANDS.plugin ?? []).some((s) => s.name === "remove"), SUBCOMMANDS.plugin?.map((s) => s.name))
-  check("skill update takes a name", (SUBCOMMANDS.skill ?? []).find((s) => s.name === "update")?.arg === "name")
+  check("standalone skill command is gone", SUBCOMMANDS.skill === undefined)
+  check("standalone mcp command is gone", SUBCOMMANDS.mcp === undefined)
   check("install takes a repo then free text", (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.arg === "url" && (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.rest === "free")
-  // A value level whose `rest` is `repo` would offer the repo names again for
-  // the sub-folder and the branch — those are free text, not repo references.
-  // Installing a connector bundle was implemented in the dispatcher but missing
-  // from this table, so the menu could not offer it and `/help` hid it.
+  check("install does not complete path/ref with repo names", (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "install")?.rest === "free")
+  check("create is free text", (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "create")?.arg === "free")
+  const market = (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "marketplace")
   check(
-    "mcp offers install too (it was dispatcher-only)",
-    (SUBCOMMANDS.mcp ?? []).some((s) => s.name === "install"),
-    SUBCOMMANDS.mcp?.map((s) => s.name),
+    "marketplace nests add/remove/list",
+    market?.sub?.map((s) => s.name).join(",") === MARKETPLACE_SUBCOMMANDS.map((s) => s.name).join(","),
+    market?.sub,
   )
-  check("install does not complete path/ref with repo names", ["plugin", "skill", "mcp"].every((v) => { const s = (SUBCOMMANDS[v] ?? []).find((x) => x.name === "install"); return s?.rest === "free" }), [SUBCOMMANDS.plugin, SUBCOMMANDS.skill, SUBCOMMANDS.mcp])
-  check("create is free text", (SUBCOMMANDS.mcp ?? []).find((s) => s.name === "create")?.arg === "free")
+  check("plugin search takes free text", (SUBCOMMANDS.plugin ?? []).find((s) => s.name === "search")?.arg === "free")
   check("goal has clear", (SUBCOMMANDS.goal ?? []).some((s) => s.name === "clear"))
 }
 
@@ -263,7 +266,7 @@ console.log("15) slashBody drops the sub-command the menu itself offered:")
     slashBody("/plugin", "یک پلاگین برای فارکس بساز") === "یک پلاگین برای فارکس بساز",
     slashBody("/plugin", "یک پلاگین برای فارکس بساز"),
   )
-  check("an unknown first word is not a sub-command", slashBody("/skill", "frobnicate things") === "frobnicate things")
+  check("an unknown first word is not a sub-command", slashBody("/plugin", "frobnicate things") === "frobnicate things")
   check("empty stays empty", slashBody("/plugin", "   ") === "")
   check("a bare sub-command leaves nothing to describe", slashBody("/schedule", "create") === "")
   // Only the FIRST word: a description may legitimately contain a sub-command
@@ -292,9 +295,9 @@ console.log("16) migrateCommandNames rewrites the stored lists once:")
   g.localStorage = stub
   try {
     migrateCommandNames()
-    check("history renamed", store["coder:promptHistory"].includes("/skill foo") && !store["coder:promptHistory"].includes("create-skill"), store["coder:promptHistory"])
-    check("pins renamed", store["coder:pinnedCommands"].includes("/mcp bar"), store["coder:pinnedCommands"])
-    check("usage renamed", JSON.parse(store["coder:commandUsage"])[0] === "skill", store["coder:commandUsage"])
+    check("history renamed", store["coder:promptHistory"].includes("/plugin create foo") && !store["coder:promptHistory"].includes("create-skill"), store["coder:promptHistory"])
+    check("pins renamed", store["coder:pinnedCommands"].includes("/plugin create bar"), store["coder:pinnedCommands"])
+    check("usage renamed", JSON.parse(store["coder:commandUsage"])[0] === "plugin", store["coder:commandUsage"])
     // Idempotent: a second run must not touch an already-migrated list.
     const before = JSON.stringify(store)
     migrateCommandNames()
@@ -311,7 +314,7 @@ console.log("16) forgetCommands drops the commands of a deleted plugin:")
   // the palette but NOT from the history, the pins and the usage order, so the
   // dead name kept coming back as a pin and as a suggestion.
   const store: Record<string, string> = {
-    "coder:promptHistory": JSON.stringify(["/notes-taker do it", "/compact", "/skill update x"]),
+    "coder:promptHistory": JSON.stringify(["/notes-taker do it", "/compact", "/plugin update x"]),
     "coder:pinnedCommands": JSON.stringify(["/notes-taker", "/plan"]),
     "coder:commandUsage": JSON.stringify(["notes-taker", "compact"]),
   }
@@ -330,12 +333,12 @@ console.log("16) forgetCommands drops the commands of a deleted plugin:")
   try {
     forgetCommands(["notes-taker"])
     check("its history line is gone", !store["coder:promptHistory"].includes("notes-taker"), store["coder:promptHistory"])
-    check("other history lines survive", store["coder:promptHistory"].includes("/compact") && store["coder:promptHistory"].includes("/skill update x"), store["coder:promptHistory"])
+    check("other history lines survive", store["coder:promptHistory"].includes("/compact") && store["coder:promptHistory"].includes("/plugin update x"), store["coder:promptHistory"])
     check("its pin is gone", !store["coder:pinnedCommands"].includes("notes-taker") && store["coder:pinnedCommands"].includes("/plan"), store["coder:pinnedCommands"])
     check("its usage is gone", !JSON.parse(store["coder:commandUsage"]).includes("notes-taker"), store["coder:commandUsage"])
-    // A shared word is not a prefix match: `/skill` must not die with it.
-    forgetCommands(["skill"])
-    check("a built-in is only removed by its own name", !store["coder:promptHistory"].includes("/skill update x"), store["coder:promptHistory"])
+    // A shared word is not a prefix match: `/plugin` must not die with it.
+    forgetCommands(["plugin"])
+    check("a built-in is only removed by its own name", !store["coder:promptHistory"].includes("/plugin update x"), store["coder:promptHistory"])
     check("an empty list is a no-op", (() => {
       const before = JSON.stringify(store)
       forgetCommands([])
@@ -350,8 +353,8 @@ console.log("16) forgetCommands drops the commands of a deleted plugin:")
 console.log("17) schedule --flags: names, values and parsing:")
 {
   check(
-    "schedule offers the three flags",
-    commandFlags("/schedule").map((f) => f.name).join(",") === "--skills,--mcp,--plugins",
+    "schedule offers only the plugins flag",
+    commandFlags("/schedule").map((f) => f.name).join(",") === "--plugins",
     commandFlags("/schedule").map((f) => f.name),
   )
   check("a command without flags offers none", commandFlags("/plugin").length === 0)
@@ -360,21 +363,21 @@ console.log("17) schedule --flags: names, values and parsing:")
     commandFlags("schedule", "update").length === 0 &&
       commandFlags("schedule", "run").length === 0 &&
       commandFlags("schedule", "remove").length === 0 &&
-      commandFlags("schedule", "create").length === 3,
+      commandFlags("schedule", "create").length === 1,
   )
   check(
-    "each flag reads a real value list",
-    commandFlags("/schedule").map((f) => f.values).join(",") === "skill,mcp,plugin",
+    "the flag reads the plugin list",
+    commandFlags("/schedule").map((f) => f.values).join(",") === "plugin",
     commandFlags("/schedule").map((f) => f.values),
   )
 
-  // The flag-name level: `--mcp` typed at value level.
-  const fl = slashFlagAt(slashCaretAt("/schedule create x --mc", 22)!, "/schedule")
-  check("a flag word is recognized while typing", fl?.flag === "--mc", fl)
+  // The flag-name level: `--plu` typed at value level.
+  const fl = slashFlagAt(slashCaretAt("/schedule create x --plu", 23)!, "/schedule")
+  check("a flag word is recognized while typing", fl?.flag === "--plu", fl)
   check("no '=' yet means no typed value", fl?.typed === "", fl)
-  // The value level: `--skills=fo` must complete `fo`, not the whole token.
-  const fv = slashFlagAt(slashCaretAt("/schedule create x --skills=fo", 29)!, "/schedule")
-  check("the flag is found with a value", fv?.flag === "--skills" && fv?.typed === "fo", fv)
+  // The value level: `--plugins=fo` must complete `fo`, not the whole token.
+  const fv = slashFlagAt(slashCaretAt("/schedule create x --plugins=fo", 30)!, "/schedule")
+  check("the flag is found with a value", fv?.flag === "--plugins" && fv?.typed === "fo", fv)
   // A plain argument is not a flag, or the value menu would never open.
   check(
     "a plain value is not a flag",
@@ -391,22 +394,17 @@ console.log("17) schedule --flags: names, values and parsing:")
 
 console.log("18) parseScheduleFlags / stripFlagTokens:")
 {
-  // Repeating the flag ACCUMULATES, so picking several skills builds one list.
-  const rep = parseScheduleFlags("create nightly --skills=a --skills=b,c --mcp=x --plugins=z")
-  check("repeat accumulates", rep.skills.join(",") === "a,b,c", rep.skills)
-  check("mcp is read", rep.mcp_servers.join(",") === "x", rep.mcp_servers)
-  check("plugins is read", rep.plugins.join(",") === "z", rep.plugins)
+  // Repeating the flag ACCUMULATES, so picking several plugins builds one list.
+  const rep = parseScheduleFlags("create nightly --plugins=a --plugins=b,c")
+  check("repeat accumulates", rep.plugins.join(",") === "a,b,c", rep.plugins)
+  check("legacy flags are ignored", parseScheduleFlags("--skills=a --mcp=x").plugins.length === 0)
   const none = parseScheduleFlags("create nightly report")
-  check(
-    "no flags = empty arrays",
-    none.skills.length === 0 && none.mcp_servers.length === 0 && none.plugins.length === 0,
-    none,
-  )
+  check("no flags = empty array", none.plugins.length === 0, none)
   // The description must survive untouched — flags are arguments, not prose.
   check(
     "the description survives minus the flags",
-    stripFlagTokens("create هر روز گزارش بده --skills=a") === "create هر روز گزارش بده",
-    stripFlagTokens("create هر روز گزارش بده --skills=a"),
+    stripFlagTokens("create هر روز گزارش بده --plugins=a") === "create هر روز گزارش بده",
+    stripFlagTokens("create هر روز گزارش بده --plugins=a"),
   )
   check("no flags leaves the text alone", stripFlagTokens("create foo") === "create foo")
   check("an unknown --word is kept", stripFlagTokens("create foo --nope") === "create foo --nope")
@@ -484,20 +482,60 @@ console.log("20) flagPickInsert: what a value pick writes over the typed part:")
 console.log("21) hasLandedFlag: when the flag menu stops auto-opening:")
 {
   check("no flag is not landed", !hasLandedFlag(["create", "nightly", "report"]))
-  check("a bare --flag is open, not landed", !hasLandedFlag(["create", "--skills"]))
-  check("an empty value (--skills=) is open, not landed", !hasLandedFlag(["create", "--skills="]))
-  check("a value word lands the flag", hasLandedFlag(["create", "--skills=brainstorming"]))
-  check("a comma list lands the flag", hasLandedFlag(["create", "--skills=a,b", "nightly"]))
-  check("an em-dash token counts too", hasLandedFlag(["create", "—skills=a,b"]))
+  check("a bare --flag is open, not landed", !hasLandedFlag(["create", "--plugins"]))
+  check("an empty value (--plugins=) is open, not landed", !hasLandedFlag(["create", "--plugins="]))
+  check("a value word lands the flag", hasLandedFlag(["create", "--plugins=brainstorming"]))
+  check("a comma list lands the flag", hasLandedFlag(["create", "--plugins=a,b", "nightly"]))
+  check("an em-dash token counts too", hasLandedFlag(["create", "—plugins=a,b"]))
   check("a non-flag word with = is prose, not landed", !hasLandedFlag(["create", "x=y"]))
 }
 
 console.log("22) hasLandedValue: when the arg-value menu stops auto-opening (the words AFTER the sub-command, as the callers pass prev.slice(2)):")
 {
   check("the fresh word after `update ` is not landed", !hasLandedValue(["schedule", "update"].slice(2)))
-  check("a flag token is not a landed value", !hasLandedValue(["--skills"]))
+  check("a flag token is not a landed value", !hasLandedValue(["--plugins"]))
   check("an id word lands the value", hasLandedValue(["sch-abc"]))
   check("a prose word with = lands it too", hasLandedValue(["x=y"]))
+}
+
+console.log("23) after picking a --plugins value the popup stays closed until ArrowUp:")
+{
+  // The composer's two decisions after a value pick: `pickCmdRow` must NOT
+  // re-seed the palette when the landed token already carries a value, and
+  // ArrowUp must still see a flag level to reopen on demand.
+  const line = "/schedule create nightly --plugins=docker-mcp"
+  const caret = slashCaretAt(line, line.length)!
+  check("the landed token keeps the menu closed (no re-seed)", hasLandedFlag([caret.word]), caret)
+  check("ArrowUp still has a flag level", commandFlags(caret.prev[0], caret.prev[1]).length === 1)
+  check("ArrowUp sees a flag token", isFlagToken(caret.word))
+  const proseLine = "/schedule create nightly report"
+  const prose = slashCaretAt(proseLine, proseLine.length)!
+  check("over prose ArrowUp still offers the next flag", commandFlags(prose.prev[0], prose.prev[1]).length === 1)
+}
+
+{
+  // Sub-level recency: the same record/load contract as the command level,
+  // keyed by the full row path (`verb sub`, `verb parent verb`, `verb sub id`).
+  const store: Record<string, string> = {}
+  const stub = {
+    getItem: (k: string) => (k in store ? store[k] : null),
+    setItem: (k: string, v: string) => { store[k] = String(v) },
+    removeItem: (k: string) => { delete store[k] },
+  }
+  const g = globalThis as Record<string, unknown>
+  const prevStorage = g.localStorage
+  g.localStorage = stub
+  try {
+    const recorded = recordSubcommandUsage("Plugin Search")
+    check("sub usage records lowercase deduped", recorded[0] === "plugin search" && recorded.filter((x) => x === "plugin search").length === 1, recorded)
+    const again = recordSubcommandUsage("schedule run ab12", recorded)
+    check("newest first, capped input intact", again[0] === "schedule run ab12" && again.includes("plugin search"), again)
+    check("empty key leaves the list alone", recordSubcommandUsage("   ", again).length === again.length)
+    check("load reads what was stored", loadSubcommandUsage().includes("plugin search"))
+  } finally {
+    if (prevStorage === undefined) delete g.localStorage
+    else g.localStorage = prevStorage
+  }
 }
 
 if (failed > 0) {

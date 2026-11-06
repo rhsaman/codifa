@@ -22,15 +22,17 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { fixArrowDirections, rehypeArrows } from "../lib/arrowDir";
+import { rehypeLtrIslands, isolateLtrRuns, dirByText } from "../lib/ltrIslands";
 import { copyToClipboard } from "../lib/clipboard";
 import { dedupDocPaths, extractInlinePathParts, filePathFromHref, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
 import { editTargetOf } from "../lib/toolActivity";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
-import { fmtClock, fmtClockFull, fmtClockTime, fmtMonthDay, isToday } from "../lib/time";
+import { fmtClock, fmtClockFull, fmtClockTime, fmtMonthDay, fmtElapsed, isToday } from "../lib/time";
 import { cancelSteer, ensureSidecar, peekSidecarUrl } from "../lib/api";
 import { resolveLocalMedia } from "../lib/mediaUrl";
 import { fallbackReason, humanizeError } from "../lib/errorText";
+import { chatMessageViewPropsEqual } from "../lib/messageViewEqual";
 import { friendlyTtsError, speakableMessageText, useTtsPlayback } from "../lib/tts";
 import type { SpeakProviderOpts } from "../lib/api";
 import { providerDisplayName } from "../lib/provider-meta";
@@ -67,6 +69,8 @@ const ReadingMode = lazy(() =>
 // so the engine lands in its own chunk) and the block paints a static
 // placeholder until the user scrolls it into view.
 import { Mermaid } from "./Mermaid";
+import { ChartBlock } from "./ChartBlock";
+import { MessageActionsBar, MsgClocks } from "./MessageActionsBar";
 
 /** Basename for attachment chips: message bubbles must show "report.pdf",
  *  never the full absolute path (imported uploads live in the app data root
@@ -183,6 +187,21 @@ export function forkChatWithConfirm(messageId: string): void {
   s.forkChatFromMessage(messageId);
 }
 
+/** Render prepared user text as one block per line, each with its own
+ *  direction (detectDir). A line keeps pre-wrap wrapping; an empty line
+ *  becomes a spacer. */
+function perLineDir(text: string): ReactNode {
+  return text.split("\n").map((ln, i) => (
+    // dir = LANGUAGE MAJORITY of the line (dirByText): first-strong flips a
+    // mostly-English line that merely contains a Persian word. Numbers/ranges
+    // get the LTR-island wrapper so ۳٫۷۵–۴٫۰۰٪ never reverses (plain user
+    // text never goes through the markdown pipeline where islands run).
+    <div key={i} className="user-text-line" dir={dirByText(ln)}>
+      {ln ? isolateLtrRuns(ln) : "\u00a0"}
+    </div>
+  ));
+}
+
 function dropPrepared(id: string): void {
   const hit = preparedCache.get(id);
   if (hit) {
@@ -216,7 +235,7 @@ function computePrepared(
   preparedCacheChars += text.length + out.length;
   return out;
 }
-function cachedPrepare(id: string, text: string, dir?: "rtl" | "ltr"): string {
+export function cachedPrepare(id: string, text: string, dir?: "rtl" | "ltr"): string {
   if (!text) return text;
   return computePrepared(id, text, dir);
 }
@@ -264,8 +283,8 @@ function PlanDocCard({
   planDoc: { title: string; body: string };
 }) {
   const [copied, setCopied] = useState(false);
-  // Follow the app's direction + bidi handling, like the chat bubble does.
-  const appDir = useStore((s) => s.dir);
+  // Direction follows the plan body's own language (see detectDir).
+  const appDir = detectDir(planDoc.body);
   const preview = useMemo(() => {
     const text = planDoc.body
       // Code blocks dominate the preview height — collapse them to a marker.
@@ -276,8 +295,8 @@ function PlanDocCard({
       .replace(/^plan\s*:?[ \t]*\n/i, "")
       .trim();
     const clipped = text.length > 600 ? `${text.slice(0, 600).trimEnd()}…` : text;
-    return prepareContent(clipped, appDir);
-  }, [planDoc.body, appDir]);
+    return prepareContent(clipped);
+  }, [planDoc.body]);
   return (
     <div className="plan-doc-card" dir={appDir}>
       <div className="plan-doc-head">
@@ -531,6 +550,13 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
   // A ```mermaid fenced block is rendered as a live diagram, not as code.
   if (lang === "mermaid") {
     return <Mermaid chart={code} />;
+  }
+
+  // A ```chart fenced block (JSON spec) renders as a real chart — bars, line,
+  // pie — like ChatGPT's inline charts. Streaming-safe: an incomplete/unparsable
+  // body falls back to the raw source until it parses (ChartBlock).
+  if (lang === "chart") {
+    return <ChartBlock spec={code} />;
   }
 
   const lines = codeLines.map((_line, i) => {
@@ -864,7 +890,13 @@ export const mdComponents = {
             );
           }
           return (
-            <>
+            // One LTR island around the WHOLE split (chip pieces + links): as
+            // separate siblings each piece is an isolated unit and the RTL
+            // line orders them right-to-left, turning "/plugin install URL"
+            // into "URL … install". Inside a single dir=ltr isolate the
+            // pieces keep their left-to-right command order in both message
+            // directions.
+            <span dir="ltr" className="ltr-island">
               {urlParts.map((p, i) =>
                 typeof p === "string" ? (
                   <code key={i} data-meta={meta}>
@@ -884,7 +916,7 @@ export const mdComponents = {
                   </a>
                 ),
               )}
-            </>
+            </span>
           );
         }
       }
@@ -984,7 +1016,9 @@ export const mdComponents = {
 };
 
 const PROSE_REMARK_PLUGINS = [remarkGfm];
-const PROSE_REHYPE_PLUGINS = [rehypeArrows];
+// rehypeArrows FIRST (it claims the arrows and isolates their operands),
+// then the LTR islands for numbers / Latin word runs / mixed phrases.
+const PROSE_REHYPE_PLUGINS = [rehypeArrows, rehypeLtrIslands];
 
 /** react-markdown blanks the href of every scheme it does not know, which
  *  killed `file://` citations before the `a` override could turn them into
@@ -1007,14 +1041,19 @@ function keepFileUrls(url: string): string {
  *  needed when the text actually changes.
  *
  *  `memo` keeps a parent re-render (dir toggle, sibling stream) from re-parsing
- *  markdown that did not change. */
-const MarkdownProse = memo(function MarkdownProse({ text }: { text: string }) {
+ *  markdown that did not change.
+ *  Exported so ReadingMode renders through the exact same pipeline (plugins,
+ *  components, arrow-direction effect) instead of a bare ReactMarkdown. */
+export const MarkdownProse = memo(function MarkdownProse({ text }: { text: string }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     if (ref.current) fixArrowDirections(ref.current);
   }, [text]);
   return (
-    <div ref={ref} className="chat-message markdown-body" dir="auto">
+    // dir from the WHOLE text (any Persian char → rtl), not dir="auto": a
+    // mostly-Persian message that opens with a Latin word or heading
+    // ("## EUR/USD تحلیل…") must not flip the whole block to LTR.
+    <div ref={ref} className="chat-message markdown-body" dir={detectDir(text)}>
       <ReactMarkdown
         remarkPlugins={PROSE_REMARK_PLUGINS}
         rehypePlugins={PROSE_REHYPE_PLUGINS}
@@ -1037,7 +1076,6 @@ const THINKING_MAX_H = 320;
 const THINKING_DEFAULT_H = 84;
 
 export function ThinkingBlock({ text }: { text: string }) {
-  const dir = useStore((s) => s.dir);
   const [open, setOpen] = useState(false);
   const [height, setHeight] = useState(THINKING_DEFAULT_H);
   const textRef = useRef<HTMLDivElement>(null);
@@ -1113,14 +1151,14 @@ export function ThinkingBlock({ text }: { text: string }) {
             className="thinking-text"
             ref={textRef}
             style={{ height }}
-            dir="auto"
+            dir={detectDir(text)}
             onScroll={(e) => {
               const el = e.currentTarget;
               stickToBottom.current =
                 el.scrollHeight - el.scrollTop - el.clientHeight < 40;
             }}
           >
-            {cachedPrepareText(text, dir)}
+            {cachedPrepareText(text)}
           </div>
           <div
             className="thinking-resizer"
@@ -1139,15 +1177,16 @@ export function ThinkingBlock({ text }: { text: string }) {
 
 
 /** Countdown seconds left in a retry delay. Pure so it can be called from the
- *  `useState` initializer AND from the effect that re-arms the clock when
- *  `startedAt` changes mid-mount (a cycle that ended at 0 must not pin the
- *  next one at 0). */
+ *  `useState` initializer AND from every clock tick (the retry line recomputes
+ *  from the wall clock instead of decrementing a local counter, so background
+ *  sleep or a delayed timer can never make the countdown lie). */
 function computeLeft(delay: number, startedAt: number | undefined): number {
+  if (delay <= 0) return 0;
   // Backend backoff carries jitter as a float (e.g. 16.8277s) — ceil once
   // here so the line never renders a fractional "in 16.82…s".
-  if (!startedAt || delay <= 0) return Math.ceil(delay);
-  const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-  return Math.max(0, Math.ceil(delay) - elapsed);
+  if (!startedAt) return Math.ceil(delay);
+  const deadline = startedAt + delay * 1000;
+  return Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
 }
 
 /** The compact inline retry line — the message-footer replacement for the
@@ -1168,12 +1207,24 @@ function InlineRetryLine({
   // ended at 0 must not pin the next cycle at 0).
   const [left, setLeft] = useState(() => computeLeft(retry.delay, retry.startedAt));
   useEffect(() => {
-    setLeft(computeLeft(retry.delay, retry.startedAt));
+    const tick = () => setLeft(computeLeft(retry.delay, retry.startedAt));
+    tick();
     if (retry.delay <= 0 || retry.gaveUp) return;
-    const t = setInterval(() => {
-      setLeft((l) => (l <= 1 ? 0 : l - 1));
-    }, 1000);
-    return () => clearInterval(t);
+    // 250ms is well below the one-second display step: the shown number flips
+    // on the real second boundary instead of drifting with interval latency.
+    const t = setInterval(tick, 250);
+    // A laptop that slept through the delay must land on the true remaining
+    // time (usually 0) the moment the window is visible again.
+    const sync = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("focus", sync);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", sync);
+    };
   }, [retry.delay, retry.startedAt, retry.attempt, retry.gaveUp]);
   const gaveUp = retry.gaveUp === true;
   // A footer STATUS line (no ladder) rides through the same component: compact
@@ -1216,9 +1267,13 @@ function InlineRetryLine({
     .join(", ");
   const counting = !gaveUp && retry.delay > 0;
   // "retrying…" is GONE: the three pulsing dots already say "in progress", and
-  // the word next to them said it twice. So once the countdown hits zero the
-  // text part simply disappears and only the dots remain.
-  const countdown = counting ? (left > 0 ? `in ${left}s` : "") : "";
+  // the word next to them said it twice. The countdown is just the bare
+  // remaining seconds ("8s", never "in 8s"); once it reaches zero the text
+  // disappears and only the dots remain.
+  // The countdown is the only live control surface: a manual Retry must not
+  // appear while the ladder is still cycling. It is offered only after all
+  // attempts are spent (`gaveUp`), so a manual Retry never abbreviates the cap.
+  const countdown = counting && left > 0 ? `${left}s` : "";
   const cap =
     retry.maxAttempts > 1 ? `${retry.attempt}/${retry.maxAttempts}` : `${retry.attempt}`;
   // The reason is the part that explains WHY the turn is cycling, so it gets its
@@ -1240,14 +1295,9 @@ function InlineRetryLine({
           ? `failed after ${retry.attempt} tries`
           : "failed"
         : `retry ${cap}`;
-  // A fallback notice is INFORMATION, not a failure of the parent turn, so the
-  // ↻ glyph would read wrong — a warning triangle says "something degraded".
-  // A status row (compact/interrupted) is neither, so it gets its own mark.
-  const icon = isStatus ? "·" : retry.fallback ? "⚠" : "↻";
-  // A LIVE cycle keeps the ↻ mark in the line; once the ladder gives up, the
-  // glyph moves INSIDE the Retry button (a lone ↻ floating next to a "Retry"
-  // button read as two unrelated things).
-  const showInlineIcon = !(gaveUp && onManualRetry);
+  // No leading glyph: the row already says "retry 3/10" and the pulsing dots
+  // carry the activity. A second ↻ before the counter read as a separate
+  // control. After the ladder gives up, the glyph lives INSIDE the Retry button.
   // Drives the chip's colour (`--tone` in CSS): one value per kind of row so
   // an error, a live retry, a model switch and a compaction read differently
   // at a glance instead of all sharing one grey line.
@@ -1291,14 +1341,6 @@ function InlineRetryLine({
               `↻ retry 4/10 → reason → dots → Retry` in both locales. */}
       <span className="msg-retry-inline-row" dir="ltr">
       <span className="msg-retry-inline-head" dir="ltr">
-        {/* A compaction row carries no glyph: its determinate bar (below) is
-            the ONLY progress indicator. A spinner beside it said the same thing
-            twice. */}
-        {showInlineIcon && progressPct === null && (
-          <span className="msg-retry-inline-icon" aria-hidden>
-            {icon}
-          </span>
-        )}
         {who && <span className="msg-retry-inline-who">{who}</span>}
         <span className="msg-retry-inline-count">{label}</span>
         {progressPct !== null && (
@@ -1373,41 +1415,6 @@ function InlineRetryLine({
 
 function localWords(s: string): number {
   return s.trim().split(/\s+/).filter(Boolean).length;
-}
-
-function fmtElapsed(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const totalSec = ms / 1000;
-  // بیش از ۶۰ ثانیه: دقیقه + ثانیه (هم‌راستا با fmtTime در ToolCallView)
-  if (totalSec >= 60) {
-    const m = Math.floor(totalSec / 60);
-    const s = Math.round(totalSec % 60);
-    return s > 0 ? `${m}m ${s}s` : `${m}m`;
-  }
-  return `${totalSec.toFixed(1)}s`;
-}
-
-function UsageBadge({
-  input,
-  output,
-  total,
-  live,
-}: {
-  input: number;
-  output: number;
-  total: number;
-  live?: boolean;
-}) {
-  const body = `↑ ${fmtTokens(input)} in · ↓ ${live ? "…" : fmtTokens(output)} out`;
-  return (
-    <span
-      className={`msg-usage${live ? " live" : ""}`}
-      title={`${total.toLocaleString()} tokens total (${input.toLocaleString()} in, ${output.toLocaleString()} out)`}
-      dir="ltr"
-    >
-      {body}
-    </span>
-  );
 }
 
 /**
@@ -1526,7 +1533,6 @@ function UserMessageBubble({
   editingDisabled?: boolean;
   className?: string;
 }) {
-  const dir = useStore((s) => s.dir);
   const [copied, setCopied] = useState(false);
   // Inline edit mode: the bubble text swaps for a textarea with Save/Cancel.
   const [isEditing, setIsEditing] = useState(false);
@@ -1615,9 +1621,13 @@ function UserMessageBubble({
         ) : (
         <div
           className={`chat-message user-text${clamped ? " clamped" : ""}`}
-          dir={dir}
+          dir={detectDir(body)}
         >
-          {cachedPrepare(message.id, body, dir) || "(empty)"}
+          {/* Per-LINE direction (ChatGPT style): the bubble always parks on
+              the user's side, but each line inside follows its own language —
+              English lines render LTR flush-left, Persian lines RTL
+              flush-right, inside one mixed message. */}
+          {perLineDir(cachedPrepare(message.id, body) || "(empty)")}
         </div>
         )}
         {!isEditing && isLong && (
@@ -1664,39 +1674,10 @@ function UserMessageBubble({
         )}
       </div>
       {message.content && !isEditing && (
+        /* Order (LTR visual): Copy — Edit — Regenerate. No fork under the
+           user bubble (user request). The row is direction:ltr (fixed footer
+           geometry), so DOM order == visual order. */
         <div className="msg-actions">
-          {onRetry && (
-            <button
-              className="msg-copy msg-retry"
-              onClick={() => onRetry(message.id)}
-              title="Retry"
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                <path d="M3 3v5h5" />
-              </svg>
-            </button>
-          )}
-          {onEdit && !isEditing && (
-            <button
-              className="msg-copy msg-edit"
-              onClick={startEdit}
-              disabled={editingDisabled}
-              title="Edit message"
-              aria-label="Edit message"
-            >
-              <EditIcon />
-            </button>
-          )}
           <button
             className={`msg-copy ${copied ? "copied" : ""}`}
             onClick={copy}
@@ -1732,29 +1713,39 @@ function UserMessageBubble({
               </svg>
             )}
           </button>
-          <button
-            className="msg-copy msg-fork"
-            onClick={() => forkChatWithConfirm(message.id)}
-            title="Fork chat from here"
-            aria-label="Fork chat from here"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          {onEdit && !isEditing && (
+            <button
+              className="msg-copy msg-edit"
+              onClick={startEdit}
+              disabled={editingDisabled}
+              title="Edit message"
+              aria-label="Edit message"
             >
-              <circle cx="12" cy="18" r="3" />
-              <circle cx="6" cy="6" r="3" />
-              <circle cx="18" cy="6" r="3" />
-              <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
-              <path d="M12 12v3" />
-            </svg>
-          </button>
+              <EditIcon />
+            </button>
+          )}
+          {onRetry && (
+            <button
+              className="msg-copy msg-retry"
+              onClick={() => onRetry(message.id)}
+              title="Regenerate"
+              aria-label="Regenerate — delete this turn and generate it again from scratch"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+              </svg>
+            </button>
+          )}
         </div>
       )}
     </>
@@ -1798,7 +1789,6 @@ export function QueuedCollapsibleText({
   onEdit?: (messageId: string, newText: string) => void;
   editingDisabled?: boolean;
 }) {
-  const dir = useStore((s) => s.dir);
   // Same rule as the user bubble: a long text is clamped in the chat and its
   // full body opens in the side panel.
   const isLong = isCollapsibleText(text);
@@ -1873,7 +1863,7 @@ export function QueuedCollapsibleText({
             className={`queued-bubble-text${isLong ? " clamped" : ""}`}
             dir={detectDir(text)}
           >
-            {cachedPrepare(id, text, dir) || "(empty)"}
+            {cachedPrepare(id, text) || "(empty)"}
           </div>
           {isLong && (
             <button
@@ -1946,15 +1936,44 @@ function SegSteerBubble({
   );
 }
 
+/** One readable line for the folded summary card. The raw text starts with an
+ *  XML-ish `<summary>` wrapper and numbered markdown headings ("1. Task and
+ *  scope:"), which made the preview look like a dump. Tags, list/heading
+ *  markers and bare heading lines are dropped; the first few real sentences are
+ *  joined and capped, so preparing the text stays cheap on huge summaries. */
+function summaryPreviewText(content: string): string {
+  const lines = content
+    .slice(0, 6000)
+    .replace(/<\/?[a-zA-Z_][\w-]*>/g, "\n")
+    .split("\n")
+    .map((l) =>
+      l
+        .replace(/^\s*(?:#{1,6}\s+|[-*•]\s+|\d+[.)]\s+)/, "")
+        .replace(/[*_`]+/g, "")
+        .trim(),
+    )
+    .filter(Boolean);
+  const body = lines.filter((l) => !(l.endsWith(":") && l.length <= 60));
+  return (body.length > 0 ? body : lines).join(" · ").slice(0, 320);
+}
+
 /** Renders a folded context-summary message: the preview stays folded in the
  *  chat and the header opens the full summary in the side panel (like
  *  diff/plan), never inline. Shared by the standalone system-message bubble
  *  and the inline `compact` segment. */
 const SummaryBlock = memo(function SummaryBlock({ message }: { message: ChatMessage }) {
-  const dir = useStore((s) => s.dir);
   const content = message.content || "";
+  const preview = useMemo(() => summaryPreviewText(content), [content]);
+  const words = useMemo(() => (content.trim() ? content.trim().split(/\s+/).length : 0), [content]);
+  // A fork seed is a DIGEST of the source chat, not a compaction of this one:
+  // saying "earlier turns folded into this summary" made the fork look like it
+  // had lost its transcript. It never had one — only this seed was copied.
+  const isFork = content.startsWith("[Forked from");
   const open = () =>
-    useViewerTabs.getState().openText("Context summary", content);
+    useViewerTabs.getState().openText(isFork ? "Forked context" : "Context summary", content);
+  const hint = isFork
+    ? "Original messages were not copied — this is the compacted seed the fork runs on. Click to open it in the side panel."
+    : "Earlier turns were folded into this summary. Click to open it in the side panel.";
   return (
     <div className="summary-block collapsed">
       <div
@@ -1962,7 +1981,7 @@ const SummaryBlock = memo(function SummaryBlock({ message }: { message: ChatMess
         onClick={open}
         role="button"
         tabIndex={0}
-        title="Open the full summary in the side panel"
+        title={hint}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -1970,16 +1989,38 @@ const SummaryBlock = memo(function SummaryBlock({ message }: { message: ChatMess
           }
         }}
       >
-        <span className="summary-chevron">▶</span>
-        <span className="summary-icon">📎</span>
-        <span className="summary-label">Context summary</span>
-        {content && (
-          <span className="summary-preview" dir="auto">
-            {cachedPrepare(message.id, content, dir)}
+        <span className="summary-icon" aria-hidden="true">
+          {isFork ? (
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="6" cy="5" r="2.2" />
+              <circle cx="6" cy="19" r="2.2" />
+              <circle cx="18" cy="8" r="2.2" />
+              <path d="M6 7.2v9.6M18 10.2c0 4-6 3.2-12 7" />
+            </svg>
+          ) : (
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3 3 7.5 12 12l9-4.5L12 3z" />
+              <path d="m3 12 9 4.5 9-4.5" />
+              <path d="m3 16.5 9 4.5 9-4.5" />
+            </svg>
+          )}
+        </span>
+        <span className="summary-main">
+          <span className="summary-title-row">
+            <span className="summary-label">{isFork ? "Forked context" : "Context summary"}</span>
+            {words > 0 && <span className="summary-meta">{words.toLocaleString()} words</span>}
           </span>
-        )}
-        <span className="summary-hint">
-          earlier turns folded into this summary — click to open it
+          {preview && (
+            <span className="summary-preview" dir="auto">
+              {cachedPrepare(`${message.id}:sum`, preview)}
+            </span>
+          )}
+        </span>
+        <span className="summary-open">
+          Open
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M9 6l6 6-6 6" />
+          </svg>
         </span>
       </div>
     </div>
@@ -2163,11 +2204,7 @@ export function renderSegments(
     nodes.push(
       <MarkdownProse
         key={key}
-        text={cachedPrepare(
-          `${message.id}:seg:${key}`,
-          text,
-          useStore.getState().dir,
-        )}
+        text={cachedPrepare(`${message.id}:seg:${key}`, text)}
       />,
     );
   };
@@ -2325,36 +2362,32 @@ export const ChatMessageView = memo(
   function ChatMessageView({
     message,
     onRetry,
+    onResume,
+    onCompactRetry,
     onEdit,
     editingDisabled,
   }: {
     message: ChatMessage;
     onRetry?: (id: string) => void;
+    /** Footer Retry for a failed/interrupted TURN: keeps the transcript and
+     *  continues the same assistant bubble. Distinct from `onRetry`, which is
+     *  the user bubble's Regenerate (truncate + fresh run). */
+    onResume?: (id: string) => void;
+    /** Footer Retry for a failed compaction (re-runs the summarizer). */
+    onCompactRetry?: () => void;
     onEdit?: (messageId: string, newText: string) => void;
     editingDisabled?: boolean;
   }) {
   const isUser = message.role === "user";
-  const dir = useStore((s) => s.dir);
   // Narrow subscriptions: reading the whole settings object re-rendered EVERY
   // message on ANY settings change. Only the mode label is needed for render;
   // TTS config is read lazily from getState() inside toggleSpeak.
   const modeLabelStr = useStore((s) =>
     message.mode ? getMode(s.settings, message.mode).label : "",
   );
-  const [copied, setCopied] = useState(false);
   const { status: ttsStatus, toggle: ttsToggle, stop: ttsStop } = useTtsPlayback();
 
   const modeLabel = (_id: string) => modeLabelStr;
-
-  const copyMessage = async () => {
-    try {
-      await copyToClipboard(stripBidiMarks(fixZwsp(message.content)));
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch (err) {
-      console.warn("copy failed", err);
-    }
-  };
 
   // تصمیم پلی/پاز داخل toggle همگام و اتمیک است (نه با ttsStatus ناهمگام) —
   // کلیک تند هرگز دو پخش همزمان نمی‌سازد. حین پخش → pause درجا، حین pause →
@@ -2473,11 +2506,11 @@ export const ChatMessageView = memo(
   // runs in — the user doesn't want them rendered in the chat. Keep the message
   // in the data (the agent still receives it) but render nothing.
   if (isModeSwitch) return null;
-  // Folded messages (auto/manual compact) stay in the store for history but
-  // must NOT render their full text in the chat — the collapsed SummaryBlock
-  // represents them. Without this guard every folded turn kept dumping its
-  // whole content into the scrollback after a compact.
-  if (message.compacted) return null;
+  // Folded messages (auto/manual compact) STILL render: the summary is a
+  // checkpoint, not a replacement for the transcript. Hiding them made every
+  // chat look like it began at the CONTEXT SUMMARY card and made "Load earlier
+  // messages" count records that could never appear. Windowing (see
+  // `visibleChatMessages` / `sliceWindow`) keeps the mounted DOM bounded.
 
   // A steer confirmed by the backend (steer_applied) is rendered inline inside
   // the assistant message it interrupted — hide its own otherwise-bottom bubble.
@@ -2497,19 +2530,28 @@ export const ChatMessageView = memo(
     if (referenced) return null;
   }
 
+  // The footer carries exactly ONE status at a time. When the notice row is up
+  // (an error, an interrupted reply, a retry/compaction status), the send clock
+  // and the turn stopwatch are hidden: next to a failure they read as a second,
+  // unrelated status — and a stopped run's duration says nothing useful about
+  // the error the user is trying to read.
+  const hasFooterNotice = !!(
+    message.retry ||
+    (message.error && !message.streaming) ||
+    message.interrupted ||
+    message.footerStatus
+  );
+
   // NOT hidden while retrying, even when still empty: the transcript-end retry
   // banner this once deferred to is gone — the retry/status line now lives in
   // THIS message's footer, so hiding the empty message hid the only status the
   // user had (just the Stop button was left).
-  const roleLabel = isUser
-    ? "You"
-    : isSummary
-      ? "Context summary"
-      : message.role === "tool"
-        ? "Tools"
-        : message.mode
-          ? modeLabel(message.mode)
-          : "Assistant";
+  const roleLabel =
+    message.role === "tool"
+      ? "Tools"
+      : message.mode
+        ? modeLabel(message.mode)
+        : "Assistant";
 
   return (
     <div
@@ -2517,29 +2559,21 @@ export const ChatMessageView = memo(
       data-msg-id={message.id}
       data-is-summary={isSummary ? "true" : undefined}
     >
+      {/* Role line: assistant/tool modes keep their label; USER messages drop
+          the "You" + avatar entirely (user request) — the right-parked bubble
+          already says who is speaking. Summary cards carry their own title,
+          so no second "Context summary" line above them. */}
+      {!isSummary && !isUser && (
       <div className="msg-role">
-        {isUser && (
-          <span className="msg-role-avatar" aria-hidden="true">
-            <svg
-              width="10"
-              height="10"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <circle cx="12" cy="8" r="4" />
-              <path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5" />
-            </svg>
-          </span>
-        )}
         {roleLabel}
       </div>
+      )}
 
       {!isUser && message.plan && message.plan.length > 0 && (
-        <div className="plan-block" dir={dir}>
+        <div
+          className="plan-block"
+          dir={detectDir(message.plan.map((p) => p.content).join(" "))}
+        >
           <div className="plan-head">
             <span className="plan-dot">◎</span>
             <span className="plan-label">Plan</span>
@@ -2561,8 +2595,18 @@ export const ChatMessageView = memo(
                       : "○"}
                 </span>
                 <span className="plan-item-content" dir="auto">
-                  {cachedPrepare(`${message.id}:plan:${i}`, item.content, dir)}
+                  {cachedPrepare(`${message.id}:plan:${i}`, item.content)}
                 </span>
+                {typeof item.progress === "number" && item.status !== "completed" && (
+                  /* Optional per-item progress (0-100) the agent may report
+                     alongside update_plan; the backend stores items verbatim. */
+                  <span className="plan-item-progress" dir="ltr" aria-label={`${Math.round(item.progress)}%`}>
+                    <span
+                      className="plan-item-progress-fill"
+                      style={{ width: `${Math.max(0, Math.min(100, item.progress))}%` }}
+                    />
+                  </span>
+                )}
               </li>
             ))}
           </ul>
@@ -2617,7 +2661,7 @@ export const ChatMessageView = memo(
             )}
           </div>
         ) : isUser && message.steerPending ? (
-          <div className="queued-bubble steer" dir={dir}>
+          <div className="queued-bubble steer" dir={detectDir(message.content)}>
             <div className="queued-bubble-head">
               <span className="queued-bubble-icon">
                 <svg
@@ -2699,7 +2743,7 @@ export const ChatMessageView = memo(
         ) : (
           <>
             <div className="msg-bubble">
-              <MarkdownProse text={cachedPrepare(message.id, replyBody, dir)} />
+              <MarkdownProse text={cachedPrepare(message.id, replyBody)} />
             </div>
             {cap.over && (
               <button
@@ -2732,177 +2776,22 @@ export const ChatMessageView = memo(
         message.interrupted ||
         message.footerStatus
       ) && (
-        <div className="msg-actions">
-          {message.usage && (
-            <UsageBadge
-              input={message.usage.inputTokens}
-              output={message.usage.outputTokens}
-              total={message.usage.totalTokens}
-            />
-          )}
-          {message.content && (
-            <>
-              <button
-                className={`msg-copy ${copied ? "copied" : ""}`}
-                onClick={copyMessage}
-                title={copied ? "Copied" : "Copy message"}
-                aria-label={copied ? "Copied" : "Copy message"}
-              >
-                {copied ? (
-                  <svg
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M20 6 9 17l-5-5" />
-                  </svg>
-                ) : (
-                  <svg
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <rect x="9" y="9" width="13" height="13" rx="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </svg>
-                )}
-              </button>
-              <button
-                className="msg-copy msg-fork"
-                onClick={() => forkChatWithConfirm(message.id)}
-                title="Fork chat from here"
-                aria-label="Fork chat from here"
-              >
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <circle cx="12" cy="18" r="3" />
-                  <circle cx="6" cy="6" r="3" />
-                  <circle cx="18" cy="6" r="3" />
-                  <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
-                  <path d="M12 12v3" />
-                </svg>
-              </button>
-              {!isUser && !message.streaming && (
-                <button
-                  className={`msg-copy msg-speak ${ttsStatus === "speaking" ? "speaking" : ""} ${ttsStatus === "loading" ? "loading" : ""} ${ttsStatus === "paused" ? "paused" : ""}`}
-                  onClick={toggleSpeak}
-                  title={
-                    (ttsStatus === "speaking"
-                      ? "توقف موقت"
-                      : ttsStatus === "paused"
-                        ? "ادامه پخش"
-                        : ttsStatus === "loading"
-                          ? "لغو"
-                          : "خواندن با صدا")
-                  }
-                  aria-label={
-                    ttsStatus === "speaking"
-                      ? "Pause"
-                      : ttsStatus === "paused"
-                        ? "Resume"
-                        : ttsStatus === "loading"
-                          ? "Cancel"
-                          : "Speak"
-                  }
-                >
-                  {ttsStatus === "loading" ? (
-                    <svg
-                      className="tts-spinner"
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M21 12a9 9 0 1 1-6.2-8.56" />
-                    </svg>
-                  ) : ttsStatus === "speaking" ? (
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="3"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M9 5v14M15 5v14" />
-                    </svg>
-                  ) : ttsStatus === "paused" ? (
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="currentColor"
-                    >
-                      <path d="M8 5v14l11-7z" />
-                    </svg>
-                  ) : (
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                      <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
-                    </svg>
-                  )}
-                </button>
-              )}
-              {!isUser &&
-                !isSummary &&
-                !message.streaming &&
-                sections.length >= 2 && (
-                  <button
-                    className="msg-copy"
-                    onClick={() => setReading(true)}
-                    title="Reading mode — study each section separately and ask about it"
-                    aria-label="Read"
-                  >
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
-                      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
-                    </svg>
-                  </button>
-                )}
-            </>
-          )}
+        <MessageActionsBar
+          text={message.content}
+          usage={message.usage ?? null}
+          ttsStatus={message.content && !message.streaming ? ttsStatus : undefined}
+          onSpeak={
+            message.content && !message.streaming
+              ? () => {
+                  void toggleSpeak();
+                }
+              : undefined
+          }
+          fork={Boolean(message.content)}
+          onFork={() => forkChatWithConfirm(message.id)}
+          read={!isSummary && !message.streaming && sections.length >= 2}
+          onRead={() => setReading(true)}
+        >
           {/* THE one notice slot — every notice that used to be a banner above
               the composer ends up here: retry ladders, plain failures, an
               interrupted reply, and chat-level footer status (compaction
@@ -2950,7 +2839,15 @@ export const ChatMessageView = memo(
                         percent: message.footerStatus!.percent,
                       })
               }
-              onManualRetry={onRetry ? () => onRetry(message.id) : undefined}
+              onManualRetry={
+                message.retry || message.error || message.interrupted
+                  ? onResume
+                    ? () => onResume(message.id)
+                    : undefined
+                  : message.footerStatus?.action === "compact-retry"
+                    ? onCompactRetry
+                    : undefined
+              }
             />
           ) : (
             message.streaming &&
@@ -2973,67 +2870,15 @@ export const ChatMessageView = memo(
               single auto margin, which is why they drifted ~140px apart instead
               of sitting side by side. The wrapper owns the parking; the two
               readouts inside are plain siblings with a fixed gap.
-              Hidden while a compaction row is up: that row already reports
-              state, and a timer next to it read as a second, unrelated status. */}
-          {!message.streaming &&
-            message.footerStatus?.kind !== "compact" && (
-            <span
-              className="msg-clocks"
-              title={
-                message.turnElapsedMs != null
-                  ? `${fmtClockFull(message.createdAt)} · worked ${fmtElapsed(message.turnElapsedMs)}`
-                  : fmtClockFull(message.createdAt)
-              }
-            >
-              {message.turnElapsedMs != null && (
-                <span className="msg-elapsed" dir="ltr">
-                  {/* The STOPWATCH glyph stays: it is what distinguishes "how long
-                      the turn took" from the sent-time clock beside it. Only the
-                      CLOCK icon was meant to go — removing both lost the
-                      duration/time distinction at a glance. */}
-                  <svg
-                    className="msg-elapsed-icon"
-                    width="11"
-                    height="11"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M10 2h4" />
-                    <path d="M12 14l3-3" />
-                    <circle cx="12" cy="14" r="8" />
-                  </svg>
-                  {fmtElapsed(message.turnElapsedMs)}
-                </span>
-              )}
-              {/* Sent time, split so the DATE can be de-emphasised: the clock is
-                  what the user scans for, the month+day is context. Same-day
-                  messages omit the date entirely (fmtClock already does this), so
-                  the row never carries a redundant "today". */}
-              <span className="msg-time" dir="ltr">
-                {isToday(message.createdAt) ? (
-                  <span className="msg-time-hm">{fmtClock(message.createdAt)}</span>
-                ) : (
-                  <>
-                    <span className="msg-time-date">
-                      {fmtMonthDay(message.createdAt)}
-                    </span>
-                    {/* `fmtClock` already prefixes the date for non-today
-                        timestamps, so use the time-ONLY formatter here — using
-                        it again printed the date twice ("Nov 2 Nov 2 03:03"). */}
-                    <span className="msg-time-hm">
-                      {fmtClockTime(message.createdAt)}
-                    </span>
-                  </>
-                )}
-              </span>
-            </span>
-          )}
-        </div>
+              Hidden whenever ANY notice row is up (error, interruption, retry,
+              compaction): that row already reports state, and a clock/timer
+              beside it read as a second, unrelated status. */}
+          <MsgClocks
+            createdAt={message.createdAt}
+            turnElapsedMs={message.turnElapsedMs}
+            hide={message.streaming || hasFooterNotice}
+          />
+        </MessageActionsBar>
       )}
 
       {reading && (
@@ -3044,52 +2889,9 @@ export const ChatMessageView = memo(
     </div>
   );
   },
-  // Custom comparator: every streamed token rebuilds the active chat object,
-  // so the parent re-renders with a fresh `chat.messages` array. Unchanged
-  // messages keep their object identity (see updateMessage) and skip via the
-  // fast path; the field-wise fallback also skips when the store recreates an
-  // identical record. Only a real content/state change re-parses markdown.
-  (prev, next) => {
-    if (prev.onRetry !== next.onRetry) return false;
-    if (prev.onEdit !== next.onEdit) return false;
-    if (prev.editingDisabled !== next.editingDisabled) return false;
-    const a = prev.message;
-    const b = next.message;
-    if (a === b) return true;
-    return (
-      a.id === b.id &&
-      a.role === b.role &&
-      a.content === b.content &&
-      a.streaming === b.streaming &&
-      a.thinking === b.thinking &&
-      a.thinkingActive === b.thinkingActive &&
-      a.thinkingStartedAt === b.thinkingStartedAt &&
-      a.workingStartedAt === b.workingStartedAt &&
-      a.turnElapsedMs === b.turnElapsedMs &&
-      a.error === b.error &&
-      // `errorReason` and `footerStatus` decide whether the footer renders a
-      // notice at all. Without them here, the prop change created by
-      // `{ ...m, footerStatus }` in Chat.tsx compared EQUAL and the component
-      // skipped re-rendering — the footer notice never appeared.
-      a.errorReason === b.errorReason &&
-      a.footerStatus?.text === b.footerStatus?.text &&
-      a.footerStatus?.kind === b.footerStatus?.kind &&
-      a.retry === b.retry &&
-      a.toolActivity === b.toolActivity &&
-      a.segments === b.segments &&
-      a.plan === b.plan &&
-      a.planDoc === b.planDoc &&
-      a.attachments === b.attachments &&
-      a.images === b.images &&
-      a.usage === b.usage &&
-      a.compacted === b.compacted &&
-      a.mode === b.mode &&
-      a.modeSwitch === b.modeSwitch &&
-      a.steerPending === b.steerPending &&
-      a.steerInterleaved === b.steerInterleaved &&
-      (a as { statusText?: string }).statusText === (b as { statusText?: string }).statusText &&
-      (a as { lspStatus?: unknown }).lspStatus === (b as { lspStatus?: unknown }).lspStatus &&
-      a.interrupted === b.interrupted
-    );
-  },
+  // Custom comparator (see src/lib/messageViewEqual.ts). The percent/attempt/
+  // action fields are part of the equality check: Chat.tsx rebuilds
+  // `footerStatus` once a second during compaction, and without them the tick
+  // compared EQUAL and the progress bar froze at its opening 0%.
+  chatMessageViewPropsEqual,
 );

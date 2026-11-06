@@ -92,6 +92,10 @@ pub struct BackupInfo {
     pub bytes: u64,
     pub version: String,
     pub data_root: String,
+    /// True when the archive carries the install key (`secrets.key`), i.e. the
+    /// encrypted API keys will decrypt after a restore — on THIS machine or on
+    /// any other one. Old archives predate the entry.
+    pub secrets_key: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -99,7 +103,16 @@ pub struct BackupInfo {
 pub struct RestoreResult {
     pub files: u64,
     pub elapsed_ms: u64,
+    /// True when the archive's install key was written to this machine's
+    /// app-data dir (the restored provider keys are decryptable here).
+    pub secrets_restored: bool,
 }
+
+/// Name of the archive entry that carries the install key — the AES key that
+/// unlocks the `enc:v1:` API keys inside the packed settings.json. It lives in
+/// the per-OS app-data dir, OUTSIDE the data root, so it must travel as its
+/// own entry; a restore writes it back there (last step, after the data).
+const SECRETS_ENTRY: &str = "secrets.key";
 
 /// One file bound for the archive: where it is on disk and the path it takes
 /// INSIDE the zip (always `/`-separated, relative to the data root).
@@ -166,6 +179,7 @@ fn read_manifest(path: &Path) -> Result<BackupInfo, String> {
         bytes: doc["bytes"].as_u64().unwrap_or(0),
         version: doc["version"].as_str().unwrap_or_default().to_string(),
         data_root: doc["dataRoot"].as_str().unwrap_or_default().to_string(),
+        secrets_key: doc["secretsKey"].as_bool().unwrap_or(false),
     })
 }
 
@@ -219,10 +233,22 @@ fn run_restore(app: &AppHandle, path: &str) -> Result<RestoreResult, String> {
         );
     };
 
-    let files = restore_archive(&archive, &dest, cancel, on_progress)?;
+    let outcome = restore_archive(
+        &archive,
+        &dest,
+        Some(&crate::secrets::install_key_file(app)),
+        cancel,
+        on_progress,
+    )?;
+    // The written file is the source of truth — make the process-global cache
+    // agree with it immediately (the restart will re-fetch it anyway).
+    if outcome.secrets_restored {
+        crate::secrets::refresh_cached_key(app);
+    }
     Ok(RestoreResult {
-        files,
+        files: outcome.files,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        secrets_restored: outcome.secrets_restored,
     })
 }
 
@@ -261,7 +287,7 @@ fn run_backup(app: &AppHandle, dest_dir: &str) -> Result<BackupResult, String> {
             serde_json::json!({ "label": label, "pct": pct, "files": done, "total": total }),
         );
     };
-    build_backup(&src, &dest, cancel, on_progress).map(|mut res| {
+    build_backup(&src, &dest, crate::secrets::read_install_key(app).as_deref(), cancel, on_progress).map(|mut res| {
         res.elapsed_ms = started.elapsed().as_millis() as u64;
         res
     })
@@ -271,9 +297,17 @@ fn run_backup(app: &AppHandle, dest_dir: &str) -> Result<BackupResult, String> {
 /// `backup_live` example) can drive it against a scratch data root. `cancel`
 /// is polled between files (an in-flight file always completes); a cancelled
 /// or failed run leaves NO partial archive behind.
+///
+/// `install_key` is the raw content of this install's `secrets.key` (the AES
+/// key that unlocks the encrypted API keys in settings.json). It lives outside
+/// the data root, so it travels as its own archive entry — without it a
+/// restore on another machine or OS would leave every provider key
+/// undecryptable. `None` packs an archive without it (still restorable on the
+/// machine that owns the matching key).
 pub fn build_backup(
     src: &Path,
     dest: &Path,
+    install_key: Option<&[u8]>,
     cancel: impl Fn() -> bool,
     mut on_progress: impl FnMut(&str, u32, u64, u64),
 ) -> Result<BackupResult, String> {
@@ -289,6 +323,12 @@ pub fn build_backup(
         n += 1;
         out = dest.join(format!("{BACKUP_STEM}-{stamp}-{n}.zip"));
     }
+    // Written under a `.part` name and renamed into place only when COMPLETE.
+    // The manifest is the FIRST entry, so a truncated archive can still carry a
+    // valid-looking manifest and pass `backup_info` — packing must never leave
+    // a partial file under the real name (an error, a cancel, or a crash all
+    // go through the same cleanup below).
+    let part = out.with_extension("zip.part");
 
     let mut files: Vec<PackFile> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
@@ -297,66 +337,84 @@ pub fn build_backup(
     let total_bytes: u64 = files.iter().map(|f| f.size).sum();
     let total_files = files.len() as u64;
 
-    let zip_file = std::fs::File::create(&out)
-        .map_err(|e| format!("cannot create the archive: {e}"))?;
-    let mut writer = zip::ZipWriter::new(zip_file);
-    // `large_file` turns on zip64, so a single entry past 4 GiB cannot abort a
-    // long-overdue backup.
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .large_file(true);
+    let packed = (|| -> Result<(), String> {
+        let zip_file = std::fs::File::create(&part)
+            .map_err(|e| format!("cannot create the archive: {e}"))?;
+        let mut writer = zip::ZipWriter::new(zip_file);
+        // `large_file` turns on zip64, so a single entry past 4 GiB cannot abort a
+        // long-overdue backup.
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
 
-    let manifest = serde_json::json!({
-        "app": "codifa",
-        "version": env!("CARGO_PKG_VERSION"),
-        "created": chrono::Local::now().to_rfc3339(),
-        "dataRoot": src.to_string_lossy(),
-        "files": total_files,
-        "bytes": total_bytes,
-        "excludedDirs": EXCLUDED_DIRS,
-        "excludedFiles": EXCLUDED_FILES,
-    });
-    writer
-        .start_file("backup.json", options.clone())
-        .map_err(|e| format!("cannot write the manifest: {e}"))?;
-    writer
-        .write_all(manifest.to_string().as_bytes())
-        .map_err(|e| format!("cannot write the manifest: {e}"))?;
-    for d in &dirs {
+        let manifest = serde_json::json!({
+            "app": "codifa",
+            "version": env!("CARGO_PKG_VERSION"),
+            "created": chrono::Local::now().to_rfc3339(),
+            "dataRoot": src.to_string_lossy(),
+            "files": total_files,
+            "bytes": total_bytes,
+            "excludedDirs": EXCLUDED_DIRS,
+            "excludedFiles": EXCLUDED_FILES,
+            "secretsKey": install_key.is_some(),
+        });
         writer
-            .add_directory(d, options.clone())
-            .map_err(|e| format!("cannot add the folder {d}: {e}"))?;
-    }
+            .start_file("backup.json", options.clone())
+            .map_err(|e| format!("cannot write the manifest: {e}"))?;
+        writer
+            .write_all(manifest.to_string().as_bytes())
+            .map_err(|e| format!("cannot write the manifest: {e}"))?;
+        if let Some(key) = install_key {
+            writer
+                .start_file(SECRETS_ENTRY, options.clone())
+                .map_err(|e| format!("cannot write the install key: {e}"))?;
+            writer
+                .write_all(key)
+                .map_err(|e| format!("cannot write the install key: {e}"))?;
+        }
+        for d in &dirs {
+            writer
+                .add_directory(d, options.clone())
+                .map_err(|e| format!("cannot add the folder {d}: {e}"))?;
+        }
 
-    let mut done_files = 0u64;
-    let mut done_bytes = 0u64;
-    for f in &files {
-        if cancel() {
-            drop(writer);
-            let _ = std::fs::remove_file(&out);
-            return Err("Backup cancelled.".into());
+        let mut done_files = 0u64;
+        let mut done_bytes = 0u64;
+        for f in &files {
+            if cancel() {
+                return Err("Backup cancelled.".into());
+            }
+            writer
+                .start_file(&f.rel, options.clone())
+                .map_err(|e| format!("cannot add {} to the archive: {e}", f.rel))?;
+            let mut src_file = std::fs::File::open(&f.abs)
+                .map_err(|e| format!("cannot read {}: {e}", f.abs.display()))?;
+            std::io::copy(&mut src_file, &mut writer)
+                .map_err(|e| format!("cannot pack {}: {e}", f.rel))?;
+            done_files += 1;
+            done_bytes += f.size;
+            let pct = if total_bytes > 0 {
+                ((done_bytes as f64 / total_bytes as f64) * 100.0) as u32
+            } else if total_files > 0 {
+                ((done_files as f64 / total_files as f64) * 100.0) as u32
+            } else {
+                100
+            };
+            on_progress(&f.rel, pct.min(99), done_files, total_files);
         }
         writer
-            .start_file(&f.rel, options.clone())
-            .map_err(|e| format!("cannot add {} to the archive: {e}", f.rel))?;
-        let mut src_file = std::fs::File::open(&f.abs)
-            .map_err(|e| format!("cannot read {}: {e}", f.abs.display()))?;
-        std::io::copy(&mut src_file, &mut writer)
-            .map_err(|e| format!("cannot pack {}: {e}", f.rel))?;
-        done_files += 1;
-        done_bytes += f.size;
-        let pct = if total_bytes > 0 {
-            ((done_bytes as f64 / total_bytes as f64) * 100.0) as u32
-        } else if total_files > 0 {
-            ((done_files as f64 / total_files as f64) * 100.0) as u32
-        } else {
-            100
-        };
-        on_progress(&f.rel, pct.min(99), done_files, total_files);
+            .finish()
+            .map_err(|e| format!("cannot finalize the archive: {e}"))?;
+        Ok(())
+    })();
+
+    if let Err(e) = packed {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
     }
-    writer
-        .finish()
-        .map_err(|e| format!("cannot finalize the archive: {e}"))?;
+    // Complete and CRC-valid: publish under the final name.
+    std::fs::rename(&part, &out)
+        .map_err(|e| format!("cannot publish the archive: {e}"))?;
 
     on_progress("", 100, total_files, total_files);
     Ok(BackupResult {
@@ -377,6 +435,16 @@ fn staging_dir(root: &Path) -> PathBuf {
     ))
 }
 
+/// What a completed restore applied: the file count plus whether the archive's
+/// install key was written to this machine (`secrets_restored`) — the UI
+/// reports the latter, because it decides whether the restored provider keys
+/// will actually decrypt here.
+#[derive(Debug)]
+pub struct RestoreOutcome {
+    pub files: u64,
+    pub secrets_restored: bool,
+}
+
 /// Apply a codifa backup archive over `root`. Two phases:
 ///
 /// 1. extract every entry into `<root>/.restore-staging-<pid>/` — cancel or
@@ -386,15 +454,19 @@ fn staging_dir(root: &Path) -> PathBuf {
 ///    staging folder.
 ///
 /// The manifest (`backup.json`) is metadata, not data-root content, and is
-/// never written into the root. `enclosed_name()` rejects archive entries that
+/// never written into the root. The install key (`secrets.key`) is captured in
+/// phase 1 and written to `secrets_target` — this machine's app-data dir — as
+/// the LAST step, so the restored `enc:v1:` provider keys decrypt on this
+/// install, whatever OS it is. `enclosed_name()` rejects archive entries that
 /// try to escape (`../`), so a hand-tampered archive cannot write outside the
-/// data root. Returns the number of files applied.
+/// data root.
 pub fn restore_archive(
     archive: &Path,
     root: &Path,
+    secrets_target: Option<&Path>,
     cancel: impl Fn() -> bool,
     mut on_progress: impl FnMut(&str, u32, u64, u64),
-) -> Result<u64, String> {
+) -> Result<RestoreOutcome, String> {
     // Cheap validity gate: no manifest, no restore (the command layer checks
     // its content; here we only require it to exist so a random zip cannot be
     // splattered over the data root).
@@ -414,7 +486,7 @@ pub fn restore_archive(
 
     // Phase 1 — extract into staging. Progress is byte-weighted across the
     // archive's uncompressed sizes (uploads dominate, chat files are tiny).
-    let result = (|| -> Result<u64, String> {
+    let result = (|| -> Result<(u64, Option<Vec<u8>>), String> {
         let file = std::fs::File::open(archive)
             .map_err(|e| format!("cannot open the archive: {e}"))?;
         let mut zip = zip::ZipArchive::new(file)
@@ -424,12 +496,13 @@ pub fn restore_archive(
         for i in 0..zip.len() {
             let entry = zip.by_index(i).map_err(|e| format!("cannot read the archive: {e}"))?;
             total_bytes += entry.size();
-            if !entry.is_dir() && !entry.name().is_ok_and(|n| n == "backup.json") {
+            if !entry.is_dir() && !entry.name().is_ok_and(|n| is_meta_entry(&n)) {
                 total_files += 1;
             }
         }
         let mut done_bytes = 0u64;
         let mut done_files = 0u64;
+        let mut install_key: Option<Vec<u8>> = None;
         for i in 0..zip.len() {
             if cancel() {
                 return Err("Restore cancelled.".into());
@@ -439,7 +512,16 @@ pub fn restore_archive(
             // `enclosed_name()` is the traversal guard: `None` = the entry
             // points outside the archive root, skip it.
             let Some(rel) = entry.enclosed_name() else { continue };
-            if rel.as_os_str() == "backup.json" {
+            if entry.name().is_ok_and(|n| is_meta_entry(&n)) {
+                // The install key is captured, not staged: it belongs to the
+                // app-data dir, never inside the data root.
+                if entry.name().is_ok_and(|n| n == SECRETS_ENTRY) {
+                    let mut bytes = Vec::new();
+                    entry
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| format!("cannot read the install key: {e}"))?;
+                    install_key = Some(bytes);
+                }
                 continue;
             }
             let out = staging.join(&rel);
@@ -470,7 +552,7 @@ pub fn restore_archive(
                 total_files,
             );
         }
-        Ok(done_files)
+        Ok((done_files, install_key))
     })();
     if let Err(e) = result {
         // Nothing has touched the live root yet — a cancelled or failed
@@ -478,6 +560,9 @@ pub fn restore_archive(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
+    // The staged file count is recomputed from the live moves below; only the
+    // install key survives this phase.
+    let (_staged_files, install_key) = result.ok().unwrap_or_default();
 
     // Phase 2 — move every staged file onto its live path. Renames within the
     // same volume are atomic and fast; the cancel check between entries bounds
@@ -497,8 +582,52 @@ pub fn restore_archive(
     })();
     let _ = std::fs::remove_dir_all(&staging);
     let moved = outcome?;
+
+    // The install key goes LAST: data and settings.json are already in place,
+    // so any window where the key and the ciphertext disagree is closed
+    // immediately after. A restore that runs with `secrets_target: None` (or
+    // an archive without the entry) keeps this machine's current key.
+    let mut secrets_restored = false;
+    if let (Some(bytes), Some(target)) = (install_key, secrets_target) {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if write_secret_file_atomic(target, &bytes).is_ok() {
+            secrets_restored = true;
+        }
+    }
+
     on_progress("", 100, moved, moved);
-    Ok(moved)
+    Ok(RestoreOutcome {
+        files: moved,
+        secrets_restored,
+    })
+}
+
+/// The two archive-root entries that are metadata, not data-root content.
+fn is_meta_entry(name: &str) -> bool {
+    name == "backup.json" || name == SECRETS_ENTRY
+}
+
+/// Atomic write for the install key: temp + fsync + rename, 0600 on unix.
+fn write_secret_file_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = target.with_extension(format!("key.tmp{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("cannot write the install key: {e}"))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("cannot write the install key: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("cannot write the install key: {e}"))?;
+    }
+    std::fs::rename(&tmp, target)
+        .map_err(|e| format!("cannot publish the install key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Depth-first walk of the staging folder, renaming every file onto its live
@@ -583,8 +712,17 @@ fn collect(
             }
             // Any prior backup in the tree is skipped: with the default
             // destination equal to the data root, re-packing yesterday's zip
-            // would double the archive on every run.
-            if name.starts_with(BACKUP_STEM) && name.ends_with(".zip") {
+            // would double the archive on every run. `.part` covers a crashed
+            // backup's staging file, which is not a restorable archive either.
+            if name.starts_with(BACKUP_STEM)
+                && (name.ends_with(".zip") || name.ends_with(".zip.part"))
+            {
+                continue;
+            }
+            // The archive-root `secrets.key` entry is reserved for the install
+            // key — a data-root file of the same name would collide with it in
+            // the zip, so it never packs.
+            if rel == SECRETS_ENTRY {
                 continue;
             }
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -695,7 +833,7 @@ mod tests {
         seed(&root);
         let dest = temp_root("zip-dest");
         let mut events: Vec<(String, u32, u64, u64)> = Vec::new();
-        let res = build_backup(&root, &dest, || false, |l, p, d, t| {
+        let res = build_backup(&root, &dest, None, || false, |l, p, d, t| {
             events.push((l.to_string(), p, d, t))
         })
         .unwrap();
@@ -745,7 +883,7 @@ mod tests {
         let root = temp_root("cancel");
         seed(&root);
         let dest = temp_root("cancel-dest");
-        let err = build_backup(&root, &dest, || true, |_, _, _, _| {}).unwrap_err();
+        let err = build_backup(&root, &dest, None, || true, |_, _, _, _| {}).unwrap_err();
         assert_eq!(err, "Backup cancelled.");
         let leftovers: Vec<_> = std::fs::read_dir(&dest).unwrap().flatten().collect();
         assert!(leftovers.is_empty(), "partial archive left behind: {leftovers:?}");
@@ -760,8 +898,8 @@ mod tests {
         let root = temp_root("collide");
         seed(&root);
         let dest = temp_root("collide-dest");
-        let first = build_backup(&root, &dest, || false, |_, _, _, _| {}).unwrap();
-        let second = build_backup(&root, &dest, || false, |_, _, _, _| {}).unwrap();
+        let first = build_backup(&root, &dest, None, || false, |_, _, _, _| {}).unwrap();
+        let second = build_backup(&root, &dest, None, || false, |_, _, _, _| {}).unwrap();
         assert_ne!(first.path, second.path, "each run gets its own archive file");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dest);
@@ -775,18 +913,19 @@ mod tests {
         let root = temp_root("rt-src");
         seed(&root);
         let dest = temp_root("rt-zip");
-        let archive = build_backup(&root, &dest, || false, |_, _, _, _| {}).unwrap();
+        let archive = build_backup(&root, &dest, None, || false, |_, _, _, _| {}).unwrap();
 
         let target = temp_root("rt-dst");
         let mut events: Vec<(String, u32, u64, u64)> = Vec::new();
-        let moved = restore_archive(
+        let outcome = restore_archive(
             std::path::Path::new(&archive.path),
             &target,
+            None,
             || false,
             |l, p, d, t| events.push((l.to_string(), p, d, t)),
         )
         .unwrap();
-        assert_eq!(moved, 3, "settings.json + chats/c1.json + plugins/p.json");
+        assert_eq!(outcome.files, 3, "settings.json + chats/c1.json + plugins/p.json");
 
         assert_eq!(
             std::fs::read_to_string(target.join("settings.json")).unwrap(),
@@ -825,7 +964,7 @@ mod tests {
         let root = temp_root("ov-src");
         seed(&root);
         let dest = temp_root("ov-zip");
-        let archive = build_backup(&root, &dest, || false, |_, _, _, _| {}).unwrap();
+        let archive = build_backup(&root, &dest, None, || false, |_, _, _, _| {}).unwrap();
 
         let target = temp_root("ov-dst");
         std::fs::create_dir_all(target.join("chats")).unwrap();
@@ -833,7 +972,7 @@ mod tests {
         std::fs::write(target.join("chats").join("c1.json"), "OLD BODY").unwrap();
         std::fs::write(target.join("chats").join("only-here.json"), "KEEP ME").unwrap();
 
-        restore_archive(std::path::Path::new(&archive.path), &target, || false, |_, _, _, _| {})
+        restore_archive(std::path::Path::new(&archive.path), &target, None, || false, |_, _, _, _| {})
             .unwrap();
 
         assert_eq!(
@@ -859,13 +998,14 @@ mod tests {
         let root = temp_root("cx-src");
         seed(&root);
         let dest = temp_root("cx-zip");
-        let archive = build_backup(&root, &dest, || false, |_, _, _, _| {}).unwrap();
+        let archive = build_backup(&root, &dest, None, || false, |_, _, _, _| {}).unwrap();
 
         let target = temp_root("cx-dst");
         std::fs::write(target.join("settings.json"), "{\"original\":true}").unwrap();
         let err = restore_archive(
             std::path::Path::new(&archive.path),
             &target,
+            None,
             || true,
             |_, _, _, _| {},
         )
@@ -902,12 +1042,119 @@ mod tests {
 
         let err = read_manifest(&zip_path).unwrap_err();
         assert!(err.contains("not a codifa backup"), "got: {err}");
-        let err = restore_archive(&zip_path, &target, || false, |_, _, _, _| {}).unwrap_err();
+        let err = restore_archive(&zip_path, &target, None, || false, |_, _, _, _| {}).unwrap_err();
         assert!(err.contains("not a codifa backup"), "got: {err}");
         assert!(
             !target.join("evil.txt").exists(),
             "a foreign zip must not extract"
         );
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// The install key travels with the archive and lands back in the
+    /// app-data dir on restore — the whole reason a backup restores provider
+    /// API keys on a DIFFERENT machine or OS. The key entry itself must never
+    /// leak into the data root, and the manifest must advertise it.
+    #[test]
+    fn install_key_travels_with_the_archive_and_lands_outside_the_root() {
+        let root = temp_root("key-src");
+        seed(&root);
+        let dest = temp_root("key-zip");
+        let key_bytes = b"raw:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let archive =
+            build_backup(&root, &dest, Some(key_bytes), || false, |_, _, _, _| {}).unwrap();
+
+        // The manifest advertises the key so the UI can too.
+        let info = read_manifest(std::path::Path::new(&archive.path)).unwrap();
+        assert!(info.secrets_key, "manifest marks the install key");
+
+        let target = temp_root("key-dst");
+        let key_target = temp_root("key-appdata").join("com.codifa.app").join("secrets.key");
+        let outcome = restore_archive(
+            std::path::Path::new(&archive.path),
+            &target,
+            Some(&key_target),
+            || false,
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        assert!(outcome.secrets_restored, "the key was installed");
+        assert_eq!(
+            std::fs::read(&key_target).unwrap(),
+            key_bytes,
+            "the key arrives byte-identical"
+        );
+        // The key entry is metadata: never staged into the data root.
+        assert!(
+            !target.join("secrets.key").exists(),
+            "the install key must not leak into the data root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(key_target.parent().unwrap());
+    }
+
+    /// A keyless archive (older backup, or `None` at pack time) restores
+    /// without touching this machine's existing key.
+    #[test]
+    fn a_keyless_archive_keeps_the_current_install_key() {
+        let root = temp_root("nokey-src");
+        seed(&root);
+        let dest = temp_root("nokey-zip");
+        let archive = build_backup(&root, &dest, None, || false, |_, _, _, _| {}).unwrap();
+        assert!(
+            !read_manifest(std::path::Path::new(&archive.path))
+                .unwrap()
+                .secrets_key
+        );
+
+        let target = temp_root("nokey-dst");
+        let key_target = temp_root("nokey-appdata").join("secrets.key");
+        std::fs::write(&key_target, b"raw:CURRENT=").unwrap();
+        let outcome = restore_archive(
+            std::path::Path::new(&archive.path),
+            &target,
+            Some(&key_target),
+            || false,
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        assert!(!outcome.secrets_restored);
+        assert_eq!(
+            std::fs::read(&key_target).unwrap(),
+            b"raw:CURRENT=",
+            "the existing key is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(key_target.parent().unwrap());
+    }
+
+    /// A data-root file named `secrets.key` would collide with the reserved
+    /// archive entry — it is skipped at pack time instead of producing an
+    /// ambiguous zip.
+    #[test]
+    fn a_data_root_secrets_key_file_does_not_collide() {
+        let root = temp_root("collide-key");
+        seed(&root);
+        std::fs::write(root.join("secrets.key"), "user data with the same name").unwrap();
+        let dest = temp_root("collide-key-zip");
+        let key_bytes = b"raw:INSTALLKEY=";
+        let archive =
+            build_backup(&root, &dest, Some(key_bytes), || false, |_, _, _, _| {}).unwrap();
+
+        let file = std::fs::File::open(&archive.path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut found = 0;
+        for i in 0..zip.len() {
+            if zip.by_index(i).unwrap().name().is_ok_and(|n| n == "secrets.key") {
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1, "exactly the install key entry, not a duplicate");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

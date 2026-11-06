@@ -90,12 +90,12 @@ console.log('2) ویرایش تکی → کارت تکی (بدون گروه وی�
   const nameIdx = html.indexOf('tool-file-name')
   check('فعل Edited قبل از بخش فایل است', verbIdx >= 0 && verbIdx < fileIdx,
     { verbIdx, fileIdx })
-  // title حاوی نام فایل است و قبل از آیکن می‌آید — بعد از tool-file-name بگرد.
+  // بدون آیکن برند داخل tool-file (حذف بج‌ها به درخواست کاربر) — اسم فایل
+  // مستقیم بعد از tool-file-name می‌آید.
   const iconChunk = html.slice(fileIdx, nameIdx > 0 ? nameIdx : html.length)
-  check('آیکن svg داخل tool-file و قبل از نام فایل است',
-    fileIdx >= 0 && nameIdx > fileIdx && iconChunk.includes('<svg'),
+  check('بدون آیکن svg داخل tool-file', !iconChunk.includes('<svg'),
     iconChunk.slice(0, 200))
-  check('نام فایل بعد از آیکن می‌آید',
+  check('نام فایل بعد از tool-file-name می‌آید',
     nameIdx > 0 && html.indexOf('solo.ts', nameIdx) > nameIdx)
 }
 

@@ -383,7 +383,8 @@ export function PluginDetail({
           {tab === 'skills' ? (
             skills.length === 0 ? (
               <div className="hint">
-                No skills in this bundle — add one with <code>/skill &lt;description&gt;</code>.
+                No skills in this bundle — add one with{' '}
+                <code>/plugin update {plugin.slug} add a skill …</code>.
               </div>
             ) : (
               skills.map((row) => {

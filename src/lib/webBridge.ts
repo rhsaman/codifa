@@ -305,7 +305,8 @@ const bridge: CoderApi = {
 
   storeGet: <T>(key: string) => call<T | null>('store_get', { key }),
   storeSet: (key, value) => call<boolean>('store_set', { key, value }),
-  chatGet: <T>(id: string) => call<T | null>('chat_get', { id }),
+  chatGet: <T>(id: string, opts?: { before?: number; limit?: number }) =>
+    call<T | null>('chat_get', { id, ...opts }),
   getDataPath: () => call<string>('get_data_path'),
   hasSettingsFile: () => call<boolean>('has_settings_file'),
 
@@ -374,11 +375,16 @@ const bridge: CoderApi = {
   onBackupProgress: () => () => {},
   onRestoreProgress: () => () => {},
   backupInfo: (path) =>
-    call<{ created: string; files: number; bytes: number; version: string; dataRoot: string }>(
-      'backup_info',
-      { path },
-    ),
-  restoreBackup: (path) => call<{ files: number; elapsedMs: number }>('restore_backup', { path }),
+    call<{
+      created: string
+      files: number
+      bytes: number
+      version: string
+      dataRoot: string
+      secretsKey?: boolean
+    }>('backup_info', { path }),
+  restoreBackup: (path) =>
+    call<{ files: number; elapsedMs: number; secretsRestored?: boolean }>('restore_backup', { path }),
   restartApp: async () => {
     // The server process re-execs; the answer may never arrive. Poll /health
     // and reload so the page lands on the fresh server.

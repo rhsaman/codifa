@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import type { ChatMessage, PluginInfo } from "../types";
 import type { SkillRow } from "../lib/api";
 import { ensureSidecar } from "../lib/api";
-import { ensureChatHydrated, useStore } from "../lib/store";
+import { ensureChatTail, useStore } from "../lib/store";
 import { listPlugins } from "../lib/plugins";
+import { PanelChevron, ToolsIcon } from "./PanelIcons";
 import { ensureSkillsList, getSkillsList } from "../lib/skills";
 import {
   skillOwner,
@@ -155,7 +156,12 @@ export function TurnUsageSection({
           }
         }}
       >
-        <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
+        <span className="sidebar-panel-chevron">
+          <PanelChevron collapsed={collapsed} />
+        </span>
+        <span className="sidebar-panel-icon">
+          <ToolsIcon />
+        </span>
         <span className="sidebar-panel-title">This turn's tools</span>
         <span className="sidebar-panel-count">{total}</span>
       </div>
@@ -268,14 +274,15 @@ export function TurnUsagePanel() {
   const chat = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId) ?? null,
   );
-  // The index row carries no `messages` — TodosSection hydrates the active
-  // chat, but this card can mount first (panel reopened, chat just switched)
-  // and would then report an empty turn while the transcript is full. Ask for
-  // the body too; the call resolves immediately when it is already loaded.
+  // The index row carries no `messages` — the transcript panel hydrates the
+  // active chat, but this card can mount first (panel reopened, chat just
+  // switched) and would then report an empty turn. Ask for the NEWEST page
+  // only: this card describes the current turn, which is always in the tail,
+  // and a full hydration here would load the entire history on every switch.
   const needsBody = chat?.hydrated === false;
   const chatId = chat?.id ?? "";
   useEffect(() => {
-    if (chatId && needsBody) void ensureChatHydrated(chatId);
+    if (chatId && needsBody) void ensureChatTail(chatId);
   }, [chatId, needsBody]);
   return <TurnUsageSection messages={needsBody ? [] : (chat?.messages ?? [])} />;
 }

@@ -243,6 +243,12 @@ pub fn daemonize_if_requested() -> bool {
     let dir = runtime_dir();
     let _ = std::fs::create_dir_all(&dir);
     let log_path = dir.join("serve.log");
+    // serve.log is the daemon's append-only stdout/stderr with no writer-side
+    // cap, so bound it at launch like rust.log: rotate past 5 MB, one
+    // generation kept.
+    if std::fs::metadata(&log_path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(&log_path, dir.join("serve.log.1"));
+    }
     let pre_len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
     let exe = match std::env::current_exe() {
         Ok(e) => e,

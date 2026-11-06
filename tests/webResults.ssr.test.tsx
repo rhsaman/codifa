@@ -88,24 +88,22 @@ check('کلاس آیتم فایل', fileHtml.includes('file-result'))
 check('آیکون لینک وب (🔗) نمایش داده نشد', !fileHtml.includes('🔗'))
 check('کلاس لینک وب (web-result-link) نمایش داده نشد', !fileHtml.includes('web-result-link'))
 
-console.log('4b) چیپ فایل: آیکن همیشه سمت چپ مسیر است — در RTL و LTR (dir=ltr):')
+console.log('4b) چیپ فایل: بدون آیکن برند — فقط قرص + نام مسیر (درخواست کاربر):')
 {
   const chipIdx = fileHtml.indexOf('class="file-chip"')
   check('چیپ فایل رندر شد', chipIdx >= 0, fileHtml.slice(0, 400))
-  check('dir=ltr دارد (آیکن در RTL هم سمت چپ می‌ماند)',
+  check('dir=ltr دارد (مسیر همیشه LTR خوانده می‌شود)',
     fileHtml.indexOf('dir="ltr"') >= 0)
-  // title حاوی نام فایل است و قبل از آیکن می‌آید؛ بعد از file-chip-name بگرد.
   const nameIdx = fileHtml.indexOf('file-chip-name', chipIdx)
   check('نام مسیر داخل file-chip-name است', nameIdx > chipIdx,
     fileHtml.slice(chipIdx, chipIdx + 300))
+  // No brand icon INSIDE the chip anymore: the colored badge before every
+  // inline path was noise in flowing prose. The chip opens with the name.
   const iconChunk = fileHtml.slice(chipIdx, nameIdx > 0 ? nameIdx : fileHtml.length)
-  check('آیکن svg قبل از نام مسیر رندر شده است',
-    nameIdx > chipIdx && iconChunk.includes('<svg'), iconChunk.slice(0, 200))
-  // Chip: the visible text is the BASENAME (`foo.ts:12`) — the full path lives
-  // in the chip's title attribute, which sits BEFORE `file-chip-name` in the
-  // markup. So assert the visible label comes after the icon, and that the full
-  // path is still carried by the tooltip above it.
-  check('متن مسیر بعد از آیکن می‌آید',
+  check('بدون آیکن svg داخل چیپ', !iconChunk.includes('<svg'), iconChunk.slice(0, 200))
+  // The visible text is the BASENAME (`foo.ts:12`) — the full path lives in
+  // the chip's title attribute, which sits BEFORE `file-chip-name`.
+  check('نام فایل بعد از file-chip-name می‌آید',
     nameIdx > 0 && fileHtml.indexOf('foo.ts:12', nameIdx) > nameIdx)
   check('مسیر کامل در tooltip چیپ است',
     nameIdx > 0 && fileHtml.indexOf('src/foo.ts', chipIdx) > chipIdx &&

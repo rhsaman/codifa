@@ -67,9 +67,27 @@ pub fn custom_headers(
 /// Parse one `headers` value (array of `{key, value}` or plain `{"k": "v"}`)
 /// into pairs, dropping blank names. Separate from [`custom_headers`] so paths
 /// that carry no provider map (the model list, the probe) can reuse it.
+///
+/// A JSON **string** is decoded first: `GET /models` carries every argument
+/// over the query string, where the renderer can only send the list as text
+/// (`headers=[{"key":…}]`). Without this branch that path silently sent no
+/// row headers at all while chat and the probe sent them.
 pub fn header_pairs(raw: Option<&Value>) -> Vec<(String, String)> {
     let Some(raw) = raw else {
         return Vec::new();
+    };
+    // Bind the decoded value outside the match so the borrowed slice below
+    // outlives it; parse ONCE (a nested string is not decoded again).
+    let decoded;
+    let raw = match raw {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(v) => {
+                decoded = v;
+                &decoded
+            }
+            Err(_) => return Vec::new(),
+        },
+        other => other,
     };
     let pair = |k: Option<&Value>, v: Option<&Value>| -> Option<(String, String)> {
         let name = k.and_then(Value::as_str).map(str::trim)?;
@@ -293,54 +311,6 @@ fn map_messages(kind: &str, messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Convert OpenAI-style messages into Gemini `contents` (+ an optional
-/// `systemInstruction`).
-///
-/// Gemini names the assistant role `model` and needs every message shaped as
-/// `{role, parts:[{text|inlineData}]}`. The old code dumped OpenAI messages
-/// straight into `contents`, so ANY google call was malformed — images or not.
-fn google_contents(messages: &[Value]) -> (Value, Option<Value>) {
-    let mut contents: Vec<Value> = Vec::new();
-    let mut sys_parts: Vec<Value> = Vec::new();
-    for m in messages {
-        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-        let parts: Vec<Value> = match m.get("content") {
-            Some(Value::String(text)) => vec![json!({ "text": text })],
-            Some(Value::Array(blocks)) => blocks
-                .iter()
-                .filter_map(|b| match b.get("type").and_then(Value::as_str) {
-                    Some(IMAGE_BLOCK_TYPE) => b
-                        .get("data_url")
-                        .and_then(Value::as_str)
-                        .and_then(|u| image_part("google", u)),
-                    // Gemini parts are bare `{text}` objects — the neutral
-                    // `{type:"text",text}` block is NOT a valid part.
-                    Some("text") => b.get("text").map(|t| json!({ "text": t })),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        if parts.is_empty() {
-            continue;
-        }
-        if role == "system" {
-            sys_parts.extend(parts);
-            continue;
-        }
-        contents.push(json!({
-            "role": if role == "assistant" { "model" } else { "user" },
-            "parts": parts,
-        }));
-    }
-    let sys = if sys_parts.is_empty() {
-        None
-    } else {
-        Some(json!({ "parts": sys_parts }))
-    };
-    (Value::Array(contents), sys)
-}
-
 /// Whether a reasoning param should be sent at all: the model must be
 /// explicitly reasoning-capable OR the gateway kind auto-thinks, and the
 /// level must map to something (i.e. not empty / "none"). Mirrors the old
@@ -353,11 +323,32 @@ fn reasoning_active(cfg: &LlmConfig) -> Option<&'static str> {
     reasoning_effort_for_kind(&cfg.provider, &cfg.reasoning_level)
 }
 
+/// The `reasoning_effort` token Google's OpenAI-compatible endpoint accepts.
+///
+/// It knows the standard `minimal`/`low`/`medium`/`high` tokens and REJECTS
+/// `xhigh` (the UI's one top level, stored as either `xhigh` or `max`), so the
+/// top level folds onto `high` here. The native endpoint keeps using its
+/// token-budget table instead (see [`thinking_budget_for`]).
+fn google_compat_effort(level: &str) -> Option<&'static str> {
+    match level.trim() {
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        _ => None,
+    }
+}
+
 /// Inject the reasoning parameter into a request body: `reasoning_effort`
-/// for OpenAI-compatible kinds, `generationConfig.thinkingBudget` for Google
-/// and `thinking.budget_tokens` for Anthropic. No-op when reasoning is off or
-/// the model/gateway isn't reasoning-capable.
-fn apply_reasoning(cfg: &LlmConfig, body: &mut Value) {
+/// for OpenAI-compatible kinds (including Google's compat endpoint),
+/// `generationConfig.thinkingBudget` for Google's NATIVE shape, and
+/// `thinking.budget_tokens` for Anthropic. No-op when reasoning is off or the
+/// model/gateway isn't reasoning-capable.
+///
+/// `google_native` picks the Google wire shape: streaming chat uses the
+/// OpenAI-compatible endpoint (which 400s on `generationConfig`), while the
+/// one-shot title/compact/vision calls keep the native `generateContent` body.
+fn apply_reasoning(cfg: &LlmConfig, body: &mut Value, google_native: bool) {
     if !(cfg.auto_think || cfg.model_reasoning) {
         return;
     }
@@ -376,7 +367,7 @@ fn apply_reasoning(cfg: &LlmConfig, body: &mut Value) {
                 });
             }
         }
-        "google" => {
+        "google" if google_native => {
             if let Some(budget) = thinking_budget_for(&cfg.reasoning_level) {
                 // Preserve any generationConfig already set (e.g. maxOutputTokens).
                 match body.get_mut("generationConfig").and_then(Value::as_object_mut) {
@@ -391,6 +382,13 @@ fn apply_reasoning(cfg: &LlmConfig, body: &mut Value) {
                             json!({ "thinkingConfig": { "thinkingBudget": budget } });
                     }
                 }
+            }
+        }
+        "google" => {
+            // OpenAI-compatible wire: the native `generationConfig` is an
+            // unknown field here and fails the whole request with a 400.
+            if let Some(effort) = google_compat_effort(&cfg.reasoning_level) {
+                body["reasoning_effort"] = json!(effort);
             }
         }
         _ => {
@@ -430,17 +428,24 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Option<&[Value
                 .collect::<Vec<_>>());
             body["stream"] = json!(true);
         }
-        "google" => {
-            let (contents, sys) = google_contents(messages);
-            if let Some(sys) = sys {
-                body["systemInstruction"] = sys;
-            }
-            body["contents"] = contents;
-        }
+        // Google streams through its OpenAI-compatible endpoint (see
+        // `gemini_openai_api`). The native shape this arm used to build has no
+        // `tools` field, so the model was told to call tools that were never
+        // declared and answered with `MALFORMED_FUNCTION_CALL`. Its compat
+        // endpoint speaks the exact OpenAI message/tool shape built below —
+        // images included (`image_url`, never Gemini's `inlineData`).
         _ => {
-            body["model"] = json!(cfg.model);
+            let google = cfg.provider == "google";
+            body["model"] = json!(if google {
+                google_model_name(&cfg.model)
+            } else {
+                cfg.model.as_str()
+            });
             body["stream"] = json!(true);
-            body["messages"] = json!(map_messages(cfg.provider.as_str(), messages));
+            body["messages"] = json!(map_messages(
+                if google { "openai" } else { cfg.provider.as_str() },
+                messages
+            ));
             if let Some(t) = cfg.temperature {
                 body["temperature"] = json!(t);
             }
@@ -481,7 +486,8 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Option<&[Value
         }
     }
     apply_prompt_cache(cfg, &mut body);
-    apply_reasoning(cfg, &mut body);
+    // Streaming chat: Google speaks the compat wire (no generationConfig).
+    apply_reasoning(cfg, &mut body, false);
     body
 }
 
@@ -708,6 +714,22 @@ pub fn gemini_native_root(base: &str) -> String {
 /// resolve to `…/v1beta/models/…`.
 pub fn gemini_native_api(base: &str) -> String {
     format!("{}/v1beta", gemini_native_root(base))
+}
+
+/// Gemini's OpenAI-compatible API prefix (`{root}/v1beta/openai`).
+///
+/// Chat streams through this endpoint instead of the native
+/// `streamGenerateContent` shape. The native body has no `tools` field in this
+/// client, while the system prompt tells the model to call `load_skill`,
+/// `use_mcp`, `read`, … — so Gemini tried to emit function calls nobody had
+/// declared and ended the turn with `finishReason: MALFORMED_FUNCTION_CALL`.
+/// Google's compat endpoint takes the SAME OpenAI messages/tools this agent
+/// loop already speaks, returns real tool-call ids and Gemini 3 thought
+/// signatures, and is maintained by Google. It is the same URL the saved
+/// Google base already carries (`…/v1beta/openai`), normalized here so a root
+/// base works too.
+pub fn gemini_openai_api(base: &str) -> String {
+    format!("{}/v1beta/openai", gemini_native_root(base))
 }
 
 /// The bare model id every Gemini URL path expects.
@@ -1206,7 +1228,9 @@ fn one_shot_body(cfg: &LlmConfig, system: &str, user: &str, images: &[String]) -
             }
         }
     }
-    apply_reasoning(cfg, &mut body);
+    // One-shot calls keep Google's NATIVE shape (systemInstruction/contents),
+    // so they keep the native thinking budget too.
+    apply_reasoning(cfg, &mut body, true);
     body
 }
 
@@ -1517,6 +1541,30 @@ pub(crate) fn provider_error_message(v: &Value) -> Option<String> {
     (!msg.is_empty()).then(|| msg.to_string())
 }
 
+/// Span of the next SSE event terminator in `buf`, as `(start, end)`.
+///
+/// The SSE spec ends an event with a blank line, and the line ending may be
+/// LF, CRLF or CR. Splitting only on `"\n\n"` silently skipped every frame of
+/// a CRLF stream — Google's native `streamGenerateContent` endpoint sends
+/// CRLF, so the whole Gemini answer arrived, was never parsed, and the turn
+/// ended at EOF with an empty accumulator (`returned no content — the
+/// provider closed the stream without finishing`).
+fn sse_frame_end(buf: &str) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for terminator in ["\r\n\r\n", "\n\n", "\r\r"] {
+        if let Some(start) = buf.find(terminator) {
+            let end = start + terminator.len();
+            // The EARLIEST terminator closes this frame; the longest spelling
+            // wins an exact tie so a CRLF pair is never read as two CR frames.
+            best = Some(match best {
+                Some((b, e)) if b < start || (b == start && e >= end) => (b, e),
+                _ => (start, end),
+            });
+        }
+    }
+    best
+}
+
 /// Parse one SSE `data:` payload into accumulator updates, forwarding text
 /// deltas to `on_delta` as they arrive. Returns true when the payload ends the
 /// read loop: the `[DONE]` marker, or an error frame — whose reason is latched
@@ -1552,6 +1600,9 @@ fn apply_sse_payload(
                             acc.reasoning_len += t.len();
                         }
                     } else if let Some(t) = v["delta"]["text"].as_str() {
+                        if latch_content_error(acc, t) {
+                            return true;
+                        }
                         acc.text.push_str(t);
                         on_delta(t);
                     }
@@ -1583,27 +1634,6 @@ fn apply_sse_payload(
                 _ => {}
             }
         }
-        "google" => {
-            // Gemini reports reasoning as a part flagged `thought: true`.
-            let part = &v["candidates"][0]["content"]["parts"][0];
-            if part["thought"].as_bool() == Some(true) {
-                if let Some(t) = part["text"].as_str() {
-                    acc.reasoning_len += t.len();
-                }
-            } else if let Some(t) = part["text"].as_str() {
-                acc.text.push_str(t);
-                on_delta(t);
-            }
-            if v["usageMetadata"].is_object() {
-                acc.usage = Some(v["usageMetadata"].clone());
-            }
-            if v["candidates"][0]["finishReason"].is_string() {
-                acc.finish_reason = v["candidates"][0]["finishReason"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-            }
-        }
         _ => {
             let choice = &v["choices"][0];
             // Reasoning deltas: providers name them differently (OpenRouter and
@@ -1619,6 +1649,9 @@ fn apply_sse_payload(
                 acc.reasoning_len += r.len();
             }
             if let Some(t) = choice["delta"]["content"].as_str() {
+                if latch_content_error(acc, t) {
+                    return true;
+                }
                 acc.text.push_str(t);
                 on_delta(t);
             }
@@ -1671,6 +1704,17 @@ fn apply_sse_payload(
                         let cur = slot["function"]["arguments"].as_str().unwrap_or_default();
                         slot["function"]["arguments"] = json!(format!("{cur}{args}"));
                     }
+                    // Google's OpenAI-compatible endpoint returns Gemini's
+                    // thought signature beside every tool call under
+                    // `extra_content.google.thought_signature`. It is REQUIRED
+                    // on the next round: replaying the assistant tool call
+                    // without it is rejected with HTTP 400 ("Function call is
+                    // missing a thought_signature"). Keep the whole provider-
+                    // namespaced object, not the one field, so another gateway
+                    // with its own extra data is covered too.
+                    if !tc["extra_content"].is_null() {
+                        slot["extra_content"] = tc["extra_content"].clone();
+                    }
                 }
             }
             if let Some(fr) = choice["finish_reason"].as_str() {
@@ -1704,6 +1748,17 @@ fn finish_stream(provider: &str, acc: StreamAcc) -> Result<StreamAcc, (u16, Stri
     // outcome here and not a failure.
     if acc.interrupted {
         return Ok(acc);
+    }
+    // A 200 stream whose whole CONTENT is a billing/auth refusal (Pollinations
+    // does this for a drained account): zero usage plus the wording. Without
+    // this the turn "succeeds" and the refusal is stored as the assistant's
+    // answer, while the model test — which only checks non-empty — shows a
+    // green tick. Tool calls are exempt: a model may discuss billing and then
+    // call a tool.
+    if acc.tool_calls.is_empty() && usage_is_zero(acc.usage.as_ref()) {
+        if let Some(msg) = content_error_message(&acc.text) {
+            return Err((0u16, format!("{provider} refused the request: {msg}")));
+        }
     }
     if !acc.text.trim().is_empty() || !acc.tool_calls.is_empty() {
         return Ok(acc);
@@ -1800,14 +1855,14 @@ async fn stream_with_key(
     let base = normalize_base(&cfg.provider, &cfg.base_url);
     let (url, header_name, header_value) = match cfg.provider.as_str() {
         "anthropic" => (format!("{base}/v1/messages"), "x-api-key", key.to_string()),
+        // Google's OpenAI-compatible endpoint: standard messages + tools, so
+        // the agent loop's advertised schemas actually reach the model. The
+        // native streaming shape cannot express them (see
+        // `gemini_openai_api`), and its absence caused MALFORMED_FUNCTION_CALL.
         "google" => (
-            format!(
-                "{}/models/{model}:streamGenerateContent?alt=sse",
-                gemini_native_api(&cfg.base_url),
-                model = google_model_name(&cfg.model)
-            ),
-            "x-goog-api-key",
-            key.to_string(),
+            format!("{}/chat/completions", gemini_openai_api(&cfg.base_url)),
+            "Authorization",
+            format!("Bearer {key}"),
         ),
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
     };
@@ -1964,23 +2019,27 @@ async fn stream_with_key(
         let before_text = acc.text.len();
         let before_reasoning = acc.reasoning_len;
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        // SSE frames are separated by a blank line.
-        while let Some(pos) = buf.find("\n\n") {
-            let frame: String = buf.drain(..pos + 2).collect();
-            for line in frame.lines() {
-                if let Some(payload) = line.strip_prefix("data: ") {
-                    // The parser keeps its text-only sink; this thin adapter is
-                    // what lets the caller receive BOTH kinds of signal from one
-                    // closure (and keeps the parser's unit tests untouched).
-                    // A real frame is progress: push the idle deadline out.
-                    idle_deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(idle_secs);
-                    let mut text_sink = |t: &str| on_event(StreamSignal::Text(t));
-                    // A terminal frame — the `[DONE]` marker or a stream error:
-                    // either way this step's outcome is decided here.
-                    if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut text_sink) {
-                        return finish_stream(&cfg.provider, acc);
-                    }
+        // SSE frames are separated by a blank line; the terminator may be LF,
+        // CRLF (Gemini) or CR. `lines()` strips a trailing `\r`, and the
+        // explicit replace also handles a CR-only stream.
+        while let Some((_, end)) = sse_frame_end(&buf) {
+            let frame: String = buf.drain(..end).collect();
+            for line in frame.replace('\r', "\n").lines() {
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.strip_prefix(' ').unwrap_or(payload);
+                // The parser keeps its text-only sink; this thin adapter is
+                // what lets the caller receive BOTH kinds of signal from one
+                // closure (and keeps the parser's unit tests untouched).
+                // A real frame is progress: push the idle deadline out.
+                idle_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(idle_secs);
+                let mut text_sink = |t: &str| on_event(StreamSignal::Text(t));
+                // A terminal frame — the `[DONE]` marker or a stream error:
+                // either way this step's outcome is decided here.
+                if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut text_sink) {
+                    return finish_stream(&cfg.provider, acc);
                 }
             }
         }
@@ -1993,9 +2052,110 @@ async fn stream_with_key(
             on_event(StreamSignal::Thinking(false));
         }
     }
+    // The last frame may close without its trailing blank line (some gateways
+    // end the socket right after the payload). Parse whatever is left so the
+    // final text/reasoning chunk is not lost; a truncated JSON frame simply
+    // fails to parse and is ignored.
+    if !buf.trim().is_empty() {
+        for line in buf.replace('\r', "\n").lines() {
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.strip_prefix(' ').unwrap_or(payload);
+            let mut text_sink = |t: &str| on_event(StreamSignal::Text(t));
+            if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut text_sink) {
+                break;
+            }
+        }
+    }
     // The socket closed without a terminal frame. Only now can the outcome be
     // judged, because everything streamed before the close is accumulated.
     finish_stream(&cfg.provider, acc)
+}
+
+/// A provider that answers HTTP 200 and puts its refusal in the assistant
+/// CONTENT instead of an error envelope. Pollinations does this for a drained
+/// account: the reply is "The account behind this API key doesn't have enough
+/// credits…", usage is all zeros, and a model test that only checks
+/// "non-empty" therefore shows a green tick while every real turn is refused.
+///
+/// Only strong, billing/auth-shaped phrases count, and callers additionally
+/// require zero usage, so a model that legitimately DISCUSSES credits is not
+/// misread as a failed call.
+pub fn content_error_message(text: &str) -> Option<&str> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 800 {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "have enough credits",
+        "not enough credit",
+        "insufficient credit",
+        "credit balance is too low",
+        "exceeded your current quota",
+        "insufficient_quota",
+        "free usage limit reached",
+        "free tier limit",
+        "out of credits",
+        "no credits",
+        "please top up",
+        "top up or",
+        "account is suspended",
+        "account has been suspended",
+        "payment required",
+        "invalid api key",
+        "incorrect api key",
+    ];
+    NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+        .then_some(t)
+}
+
+/// True when a provider reported usage and every token count is zero. A
+/// content-level refusal (see [`content_error_message`]) is only trusted in
+/// that case; a real answer always bills at least one token.
+fn usage_is_zero(usage: Option<&Value>) -> bool {
+    let Some(u) = usage else {
+        return false;
+    };
+    let keys = [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "promptTokenCount",
+        "candidatesTokenCount",
+        "totalTokenCount",
+    ];
+    let mut seen = false;
+    for key in keys {
+        if let Some(n) = u.get(key).and_then(Value::as_i64) {
+            seen = true;
+            if n != 0 {
+                return false;
+            }
+        }
+    }
+    seen
+}
+
+/// Latch a provider refusal that arrived as ordinary CONTENT before it is
+/// forwarded to the UI. Pollinations answers a drained account with a normal
+/// 200 chunk whose `delta.content` is the billing message; streaming it made
+/// the transcript fill with that text on every retry. Only a complete-looking
+/// first chunk (≥60 chars) is treated this way — a real model's first delta is
+/// a few tokens, so this cannot swallow a normal answer.
+fn latch_content_error(acc: &mut StreamAcc, t: &str) -> bool {
+    if acc.text.is_empty() && t.trim().len() >= 60 {
+        if let Some(msg) = content_error_message(t) {
+            acc.error = Some(msg.to_string());
+            return true;
+        }
+    }
+    false
 }
 
 /// Pull (text, usage) out of a provider response.
@@ -2006,7 +2166,7 @@ fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, Stri
     if let Some(msg) = provider_error_message(v) {
         return Err((0u16, msg));
     }
-    match provider {
+    let (text, usage) = match provider {
         "anthropic" => {
             let text: String = v["content"]
                 .as_array()
@@ -2018,21 +2178,42 @@ fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, Stri
                         .join("")
                 })
                 .unwrap_or_default();
-            Ok(LlmResult { text, usage: Some(v["usage"].clone()) })
+            (text, Some(v["usage"].clone()))
         }
         "google" => {
-            let text = v["candidates"][0]["content"]["parts"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            Ok(LlmResult { text, usage: Some(v["usageMetadata"].clone()) })
+            // Gemini may split the answer across several parts (and can carry
+            // thought/signature parts first); concatenate every text part that
+            // is not reasoning instead of reading only `parts[0]`.
+            let text: String = v["candidates"][0]["content"]["parts"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|p| p["thought"].as_bool() != Some(true))
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            (text, Some(v["usageMetadata"].clone()))
         }
         _ => {
             let choice = &v["choices"][0];
             let text = choice["message"]["content"].as_str().unwrap_or_default().to_string();
-            Ok(LlmResult { text, usage: v["usage"].as_object().map(|_| v["usage"].clone()) })
+            let usage = v["usage"].as_object().map(|_| v["usage"].clone());
+            (text, usage)
+        }
+    };
+    // A 200 whose CONTENT is a billing/auth refusal: the provider used the
+    // normal completion shape, so only zero usage + the wording can tell it
+    // apart from a real answer. Without this a title/compact call would store
+    // the refusal as its result and a model probe would show a green tick.
+    if usage_is_zero(usage.as_ref()) {
+        if let Some(msg) = content_error_message(&text) {
+            return Err((0u16, msg.to_string()));
         }
     }
+    Ok(LlmResult { text, usage })
 }
 
 #[cfg(test)]
@@ -2136,6 +2317,15 @@ mod tests {
         // Plain object shape.
         assert_eq!(
             header_pairs(Some(&json!({"x-opencode-client": "cli"}))),
+            vec![("x-opencode-client".to_string(), "cli".to_string())]
+        );
+        // JSON TEXT — the shape `GET /models` receives over the query string.
+        // It used to fall through to the empty list, so the model list was the
+        // one request that never carried the row's headers.
+        assert_eq!(
+            header_pairs(Some(&json!(
+                r#"[{"key":"x-opencode-client","value":"cli"}]"#
+            ))),
             vec![("x-opencode-client".to_string(), "cli".to_string())]
         );
         assert!(header_pairs(None).is_empty());
@@ -2282,15 +2472,30 @@ mod tests {
     }
 
     #[test]
-    fn google_body_uses_contents_and_has_no_cache_control() {
-        let c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
+    fn google_streams_the_openai_shape_with_its_tools() {
+        // The native streaming body had no way to declare tools. The system
+        // prompt tells the model to call them, so Gemini answered with
+        // `MALFORMED_FUNCTION_CALL`; the compat endpoint takes the same
+        // messages/tools every other provider gets.
+        let mut c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
+        c.model = "models/gemini-flash-latest".into();
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "grep", "description": "search", "parameters": {"type": "object"}}
+        })];
         let msgs = vec![
             json!({"role": "system", "content": "SYS"}),
             json!({"role": "user", "content": "hi"}),
         ];
-        let body = build_request_body(&c, &msgs, None);
-        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
-        assert!(body["contents"].is_array());
+        let body = build_request_body(&c, &msgs, Some(&tools));
+        // OpenAI-compatible shape, with the bare model id.
+        assert_eq!(body["model"], "gemini-flash-latest");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["tools"][0]["function"]["name"], "grep");
+        assert_eq!(body["parallel_tool_calls"], json!(true));
+        // The native fields would be rejected by the compat endpoint.
+        assert!(body.get("contents").is_none());
+        assert!(body.get("systemInstruction").is_none());
         assert!(!body.to_string().contains("cache_control"));
     }
 
@@ -2455,6 +2660,120 @@ mod tests {
     }
 
     #[test]
+    fn sse_frames_end_on_crlf_lf_or_cr() {
+        // Google streams CRLF, most OpenAI-compatible gateways stream LF, and
+        // the spec also allows bare CR. All three must delimit a frame.
+        let crlf = "data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\n\n";
+        let (start, end) = sse_frame_end(crlf).expect("CRLF frame");
+        assert_eq!(&crlf[..start], "data: {\"a\":1}");
+        assert_eq!(&crlf[end..], "data: {\"b\":2}\n\n");
+
+        let lf = "data: {}\n\nrest";
+        assert_eq!(sse_frame_end(lf), Some((8, 10)));
+
+        let cr = "data: {}\r\rrest";
+        assert_eq!(sse_frame_end(cr), Some((8, 10)));
+
+        // A partial frame (no blank line yet) stays buffered.
+        assert_eq!(sse_frame_end("data: {\"candidates\":"), None);
+    }
+
+    #[test]
+    fn a_google_stream_uses_the_compat_endpoint_and_parses_crlf_frames() {
+        // Google's compat SSE may terminate frames with CRLF; the reader used
+        // to split on "\n\n" only, so not a single frame was parsed and a
+        // healthy answer failed as "returned no content".
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi \"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"there\"},",
+            "\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\r\n\r\n",
+        );
+        let (port, rx) = serve_one(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+        ));
+        let c = cfg("google", &format!("http://127.0.0.1:{port}"), &["k"]);
+        let msgs = vec![json!({"role": "user", "content": "u"})];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "grep", "parameters": {"type": "object"}}
+        })];
+        let mut silent = |_sig: StreamSignal<'_>| {};
+        let mut sink: SignalSink<'_> = &mut silent;
+        let acc = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                stream_chat(
+                    &http_client(),
+                    &c,
+                    &msgs,
+                    Some(&tools),
+                    &mut sink,
+                    None,
+                    None,
+                )
+                .await
+            })
+            .expect("a CRLF Gemini stream must parse");
+        assert_eq!(acc.text, "Hi there");
+        assert_eq!(acc.finish_reason, "stop");
+        assert_eq!(acc.usage.as_ref().unwrap()["completion_tokens"], 2);
+
+        // The call reached the OpenAI-compatible endpoint, tools included —
+        // the native endpoint would have silently dropped them.
+        let req = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the request must reach the local server");
+        let wire = String::from_utf8_lossy(&req);
+        let head = wire.to_lowercase();
+        assert!(
+            head.contains("post /v1beta/openai/chat/completions"),
+            "google compat path: {head}"
+        );
+        assert!(head.contains("authorization: bearer k"), "{head}");
+        assert!(wire.contains("\"tools\""), "tools must be declared: {wire}");
+        assert!(wire.contains("\"parallel_tool_calls\":true"), "{wire}");
+    }
+
+    #[test]
+    fn google_compat_tool_calls_keep_their_thought_signature() {
+        // Gemini 3 returns a thought signature beside each tool call and
+        // REJECTS the next round when the replayed call lacks it (HTTP 400,
+        // "Function call is missing a thought_signature"). The accumulator has
+        // to carry the object through, not just id/name/arguments.
+        let mut acc = StreamAcc::default();
+        let mut out: Vec<String> = Vec::new();
+        let mut sink = |t: &str| out.push(t.to_string());
+        apply_sse_payload(
+            "google",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run_terminal","arguments":"{\"command\":"},"extra_content":{"google":{"thought_signature":"sig-1"}}}]}}]}"#,
+            &mut acc,
+            &mut sink,
+        );
+        apply_sse_payload(
+            "google",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}"#,
+            &mut acc,
+            &mut sink,
+        );
+        apply_sse_payload(
+            "google",
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            &mut acc,
+            &mut sink,
+        );
+        let call = &acc.tool_calls[0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "run_terminal");
+        assert_eq!(call["function"]["arguments"], "{\"command\":\"ls\"}");
+        assert_eq!(call["extra_content"]["google"]["thought_signature"], "sig-1");
+        assert_eq!(acc.finish_reason, "tool_calls");
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn sse_payloads_accumulate_openai_deltas() {
         let mut acc = StreamAcc::default();
         let mut deltas: Vec<String> = Vec::new();
@@ -2535,6 +2854,30 @@ mod tests {
         assert_eq!(
             acc.tool_calls[0]["function"]["arguments"].as_str().unwrap(),
             r#"{"pattern":"x"}"#
+        );
+    }
+
+    #[test]
+    fn a_billing_refusal_streamed_as_content_is_latched_before_any_text() {
+        // Pollinations streams the refusal as one ordinary content delta. It
+        // must be latched as the stream's error BEFORE `on_delta`, otherwise
+        // every retry appends the billing message to the chat.
+        let refusal = "The account behind this API key doesn't have enough credits. \
+                       Please top up or complete a quest, then try again.";
+        let payload = json!({
+            "choices": [{"delta": {"content": refusal}, "finish_reason": null}]
+        })
+        .to_string();
+        let mut acc = StreamAcc::default();
+        let mut deltas: Vec<String> = Vec::new();
+        let mut sink = |t: &str| deltas.push(t.to_string());
+        assert!(apply_sse_payload("custom", &payload, &mut acc, &mut sink));
+        assert!(acc.text.is_empty(), "refusal must not become assistant text");
+        assert!(deltas.is_empty(), "refusal must not be forwarded to the UI");
+        assert!(
+            acc.error.as_deref().unwrap_or_default().contains("enough credits"),
+            "{:?}",
+            acc.error
         );
     }
 
@@ -2842,7 +3185,7 @@ mod tests {
         ));
         assert!(!apply_sse_payload(
             "google",
-            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#,
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
             &mut acc,
             &mut sink
         ));
@@ -2911,6 +3254,44 @@ mod tests {
         // A healthy response is untouched.
         let v = json!({"choices": [{"message": {"content": "ok"}}]});
         assert_eq!(extract_completion("custom", &v).unwrap().text, "ok");
+    }
+
+    #[test]
+    fn a_billing_refusal_delivered_as_content_is_an_error_not_a_reply() {
+        // Pollinations answers 200 and puts the refusal in message.content with
+        // usage all zeros. The model test used to tick on this because it only
+        // checked "non-empty", while every real turn showed the refusal as the
+        // assistant's answer.
+        let refusal = "The account behind this API key doesn't have enough credits. \
+                       Please top up or complete a quest, then try again.";
+        let v = json!({
+            "choices": [{"message": {"role": "assistant", "content": refusal}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        });
+        assert_eq!(extract_completion("custom", &v).err().unwrap().1, refusal);
+
+        // The same wording WITH real usage is a model discussing billing, not a
+        // refusal — it must stay a normal answer.
+        let v = json!({
+            "choices": [{"message": {"role": "assistant", "content": refusal}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+        });
+        assert!(extract_completion("custom", &v).is_ok());
+
+        // A normal zero-usage reply is still accepted.
+        let v = json!({
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        });
+        assert_eq!(extract_completion("custom", &v).unwrap().text, "OK");
+
+        // Streaming path: the same refusal must fail the turn instead of
+        // "succeeding" with the refusal stored as the answer.
+        let mut acc = StreamAcc::default();
+        acc.text = refusal.to_string();
+        acc.usage = Some(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
+        let err = finish_stream("custom", acc).unwrap_err().1;
+        assert!(err.contains("refused the request"), "{err}");
     }
 
     #[test]
@@ -3055,18 +3436,31 @@ mod tests {
     }
 
     #[test]
-    fn google_body_gets_a_thinking_budget() {
+    fn google_streams_reasoning_effort_but_the_native_one_shot_keeps_its_budget() {
         let mut c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
         c.model_reasoning = true;
         c.reasoning_level = "medium".into();
         let msgs = vec![json!({"role": "user", "content": "hi"})];
-        let body = build_request_body(&c, &msgs, None);
+
+        // Streaming chat: the compat endpoint REJECTS `generationConfig`
+        // outright, so the standard effort token must be sent instead.
+        let stream = build_request_body(&c, &msgs, None);
+        assert_eq!(stream["reasoning_effort"], "medium");
+        assert!(stream.get("generationConfig").is_none());
+
+        // Its top level has no `xhigh` on the wire; it folds onto `high`.
+        c.reasoning_level = "xhigh".into();
+        assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "high");
+
+        // One-shot title/compact/vision calls keep the NATIVE body, where the
+        // token budget is the correct field (and `reasoning_effort` is not).
+        c.reasoning_level = "medium".into();
+        let one_shot = one_shot_body(&c, "SYS", "hi", &[]);
         assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            one_shot["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             thinking_budget_for("medium").unwrap()
         );
-        // A budget provider must never ALSO send the OpenAI-only token.
-        assert!(body.get("reasoning_effort").is_none());
+        assert!(one_shot.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -3116,29 +3510,10 @@ mod tests {
     }
 
     #[test]
-    fn google_contents_translate_blocks_into_parts() {
-        let msgs = vec![
-            json!({"role": "system", "content": "SYS"}),
-            json!({"role": "user", "content": [
-                { "type": "text", "text": "what is this" },
-                { "type": IMAGE_BLOCK_TYPE, "data_url": PNG_URL },
-            ]}),
-            json!({"role": "assistant", "content": "a button"}),
-        ];
-        let (contents, sys) = google_contents(&msgs);
-        // Gemini spells the assistant role "model" and takes bare {text} parts
-        // (the neutral {type:"text"} block is not a valid part).
-        assert_eq!(contents[0]["role"], "user");
-        assert_eq!(contents[1]["role"], "model");
-        assert_eq!(contents[0]["parts"][0]["text"], "what is this");
-        assert_eq!(contents[0]["parts"][1]["inlineData"]["data"], "AAAA");
-        assert_eq!(contents[1]["parts"][0]["text"], "a button");
-        // The system prompt becomes systemInstruction, never a content turn.
-        assert_eq!(sys.unwrap()["parts"][0]["text"], "SYS");
-    }
-
-    #[test]
-    fn google_body_switches_to_contents_for_images() {
+    fn google_stream_images_use_the_openai_image_url_shape() {
+        // A Google chat image rides the compat message shape, NOT the native
+        // `inlineData` part — sending that would be an unknown content block.
+        // The native shape still serves the one-shot vision it is built for.
         let c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
         let msgs = vec![
             json!({"role": "system", "content": "SYS"}),
@@ -3148,8 +3523,17 @@ mod tests {
             ]}),
         ];
         let body = build_request_body(&c, &msgs, None);
-        assert_eq!(body["contents"][0]["parts"][1]["inlineData"]["data"], "AAAA");
-        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][1]["content"][1]["image_url"]["url"],
+            PNG_URL
+        );
+        assert!(body.get("contents").is_none());
+
+        let one_shot = one_shot_body(&c, "SYS", "describe", &[PNG_URL.into()]);
+        assert_eq!(one_shot["contents"][0]["parts"][1]["inlineData"]["data"], "AAAA");
+        assert_eq!(one_shot["systemInstruction"]["parts"][0]["text"], "SYS");
     }
 
     /// A dead upstream endpoint must not be mistaken for a key problem: the key

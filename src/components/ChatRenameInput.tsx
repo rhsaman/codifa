@@ -55,7 +55,10 @@ export function ChatRenameInput({
     <input
       ref={inputRef}
       className={className ?? "chat-rename-input"}
-      dir={dir}
+      /* dir="auto": the input flips with the TYPED text (Persian → rtl) —
+         a chat title can be either language, and the draft may differ from
+         the current title. */
+      dir="auto"
       value={value}
       aria-label={ariaLabel ?? "Rename chat"}
       onChange={(e) => setValue(e.target.value)}

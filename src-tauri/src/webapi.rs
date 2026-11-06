@@ -52,7 +52,9 @@ pub async fn web_call(Json(body): Json<Value>) -> axum::response::Response {
         }
         "chat_get" => {
             let Some(app) = app() else { return unavailable() };
-            Ok(json!(crate::store::chat_get(app, s("id")).await))
+            let before = arg("before").as_u64().map(|n| n as usize);
+            let limit = arg("limit").as_u64().map(|n| n as usize);
+            Ok(json!(crate::store::chat_get(app, s("id"), before, limit).await))
         }
         "create_backup" => {
             let Some(app) = app() else { return unavailable() };

@@ -44,6 +44,12 @@ import type {
 } from '../types'
 import type { LiveVoiceState } from './liveVoiceState'
 
+/** Fixed direction of the app CHROME (Persian-first, the old RTL/LTR toggle
+ *  was removed). Message text direction is decided per message from its own
+ *  content via detectDir() — like ChatGPT, the bubble sides stay fixed and
+ *  only the text direction follows the language. */
+export const APP_DIR: 'rtl' = 'rtl'
+
 /** Max persisted inbox seen ids — newest win, so the badge store stays bounded. */
 export const MAX_SCHEDULE_RUNS_SEEN = 500
 
@@ -257,13 +263,21 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
     const hasBody = Array.isArray(c.messages) && c.messages.length > 0
     // INDEX ROW (the transcript lives in its own file and is not in memory):
     // persist the metadata verbatim, with `messages` REMOVED. This is the
-    // structural safety net for the split-storage layout — an unhydrated chat
-    // NEVER produces a body write, so a stray mutation on a chat whose body was
-    // never loaded cannot overwrite the real transcript file with a fragment.
-    if (c.hydrated === false) {
-      const { messages: _omitted, hydrated: _h, ...meta } = c as Chat & {
+    // structural safety net for the split-storage layout — neither an
+    // unhydrated chat NOR a paged window may produce a body write, because a
+    // fragment would overwrite the real transcript file.
+    if (c.hydrated === false || (c.bodyStart ?? 0) > 0) {
+      const {
+        messages: _omitted,
+        hydrated: _h,
+        bodyStart: _bs,
+        bodyTotal: _bt,
+        ...meta
+      } = c as Chat & {
         messages?: ChatMessage[]
         hydrated?: boolean
+        bodyStart?: number
+        bodyTotal?: number
       }
       out.push(meta as Chat)
       continue
@@ -274,6 +288,10 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
     const clean = { ...c }
     delete clean.pendingAsk
     delete clean.pendingPermission
+    // Window bookkeeping is runtime-only; the body file stores the full
+    // transcript and the next open derives these again.
+    delete clean.bodyStart
+    delete clean.bodyTotal
     out.push({
       ...clean,
       messages: capCompactedMessages(c.messages.map((m) => {
@@ -960,8 +978,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated || persistSuspended) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+    const { settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+    const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -1058,7 +1076,7 @@ export function setPersistSuspended(v: boolean): void {
 
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
   if (persistSuspended) return Promise.resolve()
-  const { settings, chats, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+  const { settings, chats, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -1074,7 +1092,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+        const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1238,6 +1256,8 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     baseUrl,
     accountId: scoped ? accountId : undefined,
     model: p.model || '',
+    // فقط حالت «خاموش» ذخیره می‌شود؛ نبودِ فیلد یعنی روشن (پیش‌فرض).
+    ...(p.groupTest === false ? { groupTest: false } : {}),
     contextMap: p.contextMap,
     manualContextMap: p.manualContextMap,
     manualReasoningMap: p.manualReasoningMap,
@@ -1296,6 +1316,18 @@ function normalizeRecentModels(raw: unknown): RecentModel[] {
   return [...pinned, ...ordered.filter((r) => !r.pinned)].slice(0, 20)
 }
 
+/** سقف نتایج ✓ تست مدل ذخیره‌شده — تازه‌ترین‌ها می‌مانند. بدون این سقف، هر
+ *  جفتِ (پروایدر، مدل)ِ همیشه‌تست‌شده یک ردیف ابدی در settings.json می‌سازد. */
+export const MAX_CHECKED_MODELS = 200
+
+/** مرتب‌سازی بر اساس تازگی (ناشناس‌ها آخر) و اعمال سقف. */
+function capCheckedModels(list: CheckedModel[]): CheckedModel[] {
+  if (list.length <= MAX_CHECKED_MODELS) return list
+  return [...list]
+    .sort((a, b) => (b.lastOkAt ?? 0) - (a.lastOkAt ?? 0))
+    .slice(0, MAX_CHECKED_MODELS)
+}
+
 /** پذیرش لیست checked ذخیره‌شده — فقط جفت‌های معتبر providerId/model؛
  *  ورودی‌های خراب بی‌سروصدا دور ریخته می‌شوند. */
 function normalizeCheckedModels(raw: unknown): CheckedModel[] {
@@ -1310,7 +1342,7 @@ function normalizeCheckedModels(raw: unknown): CheckedModel[] {
     const lastOkAt = typeof e.lastOkAt === 'number' ? e.lastOkAt : undefined
     out.push({ providerId, model, ...(lastOkAt ? { lastOkAt } : {}) })
   }
-  return out
+  return capCheckedModels(out)
 }
 
 interface State {
@@ -1325,7 +1357,6 @@ interface State {
   builtinMcp: string[]
   root: string
   theme: string
-  dir: 'rtl' | 'ltr'
   recentModels: RecentModel[]
   /** مدل‌های تیک‌دار (تست موفق) — ماندگار، منبع تب Checked پیکر مدل. */
   checkedModels: CheckedModel[]
@@ -1469,8 +1500,6 @@ interface State {
   /** Set the bottom panel's height (drag). Clamped by clampTerminalHeight. */
   setTerminalHeight: (px: number) => void
   setTheme: (theme: string) => void
-  setDir: (dir: 'rtl' | 'ltr') => void
-  toggleDir: () => void
   fontSize: number
   setFontSize: (n: number) => void
   /** Point size for CODE in the side-pane file viewer (Settings → Appearance).
@@ -1494,6 +1523,10 @@ interface State {
    *  "" = the data root itself (~/.codifa unless moved). */
   backupPath: string
   setBackupPath: (p: string) => void
+  /// URL of a static update feed on the user's own site (checked before GitHub
+  /// releases). Empty = GitHub only. See commands.rs `fetch_site_feed`.
+  updateFeedUrl: string
+  setUpdateFeedUrl: (url: string) => void
   /** STT source: a settings.providers id (remote OpenAI-compatible endpoint). */
   sttProviderId: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions. */
@@ -1728,7 +1761,6 @@ interface State {
    *  the ChatPanel remount on chat switch (same rationale as pendingAsk). */
   setChatCompacting: (id: string, compacting: boolean) => void
   setChatCompactProgress: (id: string, progress: Chat['compactProgress']) => void
-  setChatCompactNotice: (id: string, notice: string | null) => void
   setChatCompactError: (id: string, error: string | null) => void
   setChatCmdError: (id: string, error: string | null) => void
   setChatLiveError: (id: string, error: string | null) => void
@@ -1943,8 +1975,28 @@ function approxBytes(v: unknown, depth = 0): number {
 /** Measured weight of each resident body, keyed by chat id (not persisted). */
 const bodyBytes = new Map<string, number>()
 
-/** In-flight body fetches, keyed by chat id (single-flight). */
+/** Messages fetched per body page. The initial page is the NEWEST one; older
+ *  pages are pulled in only while the user scrolls up. */
+const CHAT_BODY_PAGE = 60
+
+/** Serial body work per chat (single-flight AND ordered).
+ *
+ *  A tail page, a full hydration and an "older page" request can overlap (open
+ *  a chat, immediately send, scroll up). Running them in order means the last
+ *  request always operates on the array the previous one produced, instead of
+ *  two responses racing to overwrite `messages`. */
 const hydratePromises = new Map<string, Promise<void>>()
+function queueChatBody(id: string, task: () => Promise<void>): Promise<void> {
+  const prev = hydratePromises.get(id) ?? Promise.resolve()
+  const next = prev.catch(() => {}).then(task)
+  hydratePromises.set(id, next)
+  const settle = () => {
+    if (hydratePromises.get(id) === next) hydratePromises.delete(id)
+  }
+  // Clean up on BOTH outcomes without creating an unhandled rejection.
+  void next.then(settle, settle)
+  return next
+}
 
 /**
  * Apply one loaded body onto the matching chat.
@@ -1952,24 +2004,38 @@ const hydratePromises = new Map<string, Promise<void>>()
  * The body file owns the transcript, but the transient per-chat flags
  * (pendingAsk/pendingPermission/draft/scrollPos) exist ONLY in memory and must
  * not be clobbered by a stale copy from disk.
+ *
+ * `prepend` merges an OLDER page above the current window (scroll-up paging);
+ * otherwise the page replaces the window (initial tail load, full hydration).
  */
-function applyChatBody(body: Chat): void {
+function applyChatBody(body: Chat, prepend = false): void {
   const src = body as Chat & { messages?: ChatMessage[] }
-  const messages = Array.isArray(src.messages) ? src.messages : []
-  // Remember the body's weight for the byte-budget eviction below. Cheap
-  // (string lengths only) and recomputed on every (re)load. Done outside the
-  // state updater so the measurement is not re-run when React replays it.
-  bodyBytes.set(body.id, approxBytes(messages))
+  const page = Array.isArray(src.messages) ? src.messages : []
+  const pageStart = typeof src.bodyStart === 'number' ? src.bodyStart : 0
   useStore.setState((s) => {
     let changed = false
     const chats = s.chats.map((c) => {
       if (c.id !== body.id) return c
       changed = true
+      let messages = page
+      if (prepend) {
+        // A duplicate can only come from a re-request of an already loaded
+        // page; keeping the first (older) copy preserves chronological order.
+        const existing = new Set(c.messages.map((m) => m.id))
+        messages = [...page.filter((m) => !existing.has(m.id)), ...c.messages]
+      }
+      const bodyStart = pageStart
+      const bodyTotal =
+        typeof src.bodyTotal === 'number'
+          ? src.bodyTotal
+          : bodyStart + messages.length
       return {
         ...body,
         mode: src.mode ? normalizeMode(src.mode) : c.mode,
         messages,
-        messageCount: messages.length,
+        bodyStart,
+        bodyTotal,
+        messageCount: bodyTotal,
         hydrated: true,
         pendingAsk: c.pendingAsk ?? null,
         pendingPermission: c.pendingPermission ?? null,
@@ -1980,6 +2046,11 @@ function applyChatBody(body: Chat): void {
     })
     return changed ? { chats } : {}
   })
+  // Remember the LOADED window's weight for the byte-budget eviction below.
+  // Cheap (string lengths only) and recomputed on every page, so a chat that
+  // has paged deep into its history is weighed by what it actually holds.
+  const applied = useStore.getState().chats.find((c) => c.id === body.id)
+  bodyBytes.set(body.id, approxBytes(applied?.messages ?? page))
 }
 
 /** A chat whose transcript a live turn is still appending to.
@@ -2034,6 +2105,8 @@ function evictChatBodies(): void {
             ...c,
             messages: [],
             messageCount: c.messageCount ?? 0,
+            bodyStart: undefined,
+            bodyTotal: undefined,
             hydrated: false,
           } as Chat)
         : c,
@@ -2050,24 +2123,133 @@ export function isChatBodyReady(id: string): boolean {
   return !!c && c.hydrated !== false
 }
 
+/** Load the NEWEST page only. Opening a chat must never parse the whole
+ *  transcript: a multi-megabyte history is paged in as the user scrolls up. */
+export function ensureChatTail(id: string): Promise<void> {
+  const chat = useStore.getState().chats.find((c) => c.id === id)
+  if (!chat || chat.hydrated !== false) return Promise.resolve()
+  return queueChatBody(id, async () => {
+    // The state may have changed while this task waited in the queue.
+    const cur = useStore.getState().chats.find((c) => c.id === id)
+    if (!cur || cur.hydrated !== false) return
+    try {
+      const body = await api.chatGet<Chat>(id, { limit: CHAT_BODY_PAGE })
+      if (body && typeof body === 'object' && !Array.isArray(body)) {
+        applyChatBody(body)
+      } else {
+        markChatBodyEmpty(id)
+      }
+    } catch {
+      /* Leave it unhydrated: the panel keeps showing the loader and a send
+         reports the failure instead of sending a context-free turn. */
+    } finally {
+      evictChatBodies()
+    }
+  })
+}
+
+/** Load ONE page above the current window. Returns how many messages landed.
+ *  Called from the transcript's scroll-to-top / "Load earlier" path. */
+export function loadEarlierChatMessages(
+  id: string,
+  limit = CHAT_BODY_PAGE,
+): Promise<number> {
+  let added = 0
+  return queueChatBody(id, async () => {
+    const cur = useStore.getState().chats.find((c) => c.id === id)
+    if (!cur || cur.hydrated === false) return
+    const start = cur.bodyStart ?? 0
+    if (start <= 0) return
+    try {
+      const body = await api.chatGet<Chat>(id, { before: start, limit })
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        // The body vanished between page requests; stop offering more rather
+        // than leaving a button that can never reveal anything.
+        useStore.setState((s) => ({
+          chats: s.chats.map((c) =>
+            c.id === id ? { ...c, bodyStart: 0 } : c,
+          ),
+        }))
+        return
+      }
+      const src = body as Chat & { messages?: ChatMessage[] }
+      const page = Array.isArray(src.messages) ? src.messages : []
+      added = page.length
+      applyChatBody(body, true)
+    } catch {
+      /* Keep bodyStart untouched so a later scroll can retry. */
+    }
+  }).then(() => added)
+}
+
+/** True when older pages still exist on disk for this chat. */
+export function hasEarlierMessages(id: string): boolean {
+  const c = useStore.getState().chats.find((x) => x.id === id)
+  return !!c && c.hydrated !== false && (c.bodyStart ?? 0) > 0
+}
+
+/** Drop old pages from a fully-loaded chat once the user is back at the
+ *  newest message. The transcript stays complete on disk; scrolling up pages
+ *  it back in. This is what keeps RAM tied to the viewport instead of to the
+ *  longest scroll the user ever performed. */
+export function trimChatBodyWindow(id: string, keep = CHAT_BODY_PAGE * 2): void {
+  // Let a pending body write land first: a partial window is persisted as
+  // metadata only, so trimming before the flush would drop the edit from disk.
+  if (persistTimer) return
+  const c = useStore.getState().chats.find((x) => x.id === id)
+  if (!c || c.hydrated === false || chatIsStreaming(c)) return
+  const drop = c.messages.length - Math.max(1, keep)
+  if (drop <= 0) return
+  const bodyStart = (c.bodyStart ?? 0) + drop
+  const bodyTotal = c.bodyTotal ?? (c.bodyStart ?? 0) + c.messages.length
+  const messages = c.messages.slice(drop)
+  bodyBytes.set(id, approxBytes(messages))
+  useStore.setState((s) => ({
+    chats: s.chats.map((x) =>
+      x.id === id ? { ...x, messages, bodyStart, bodyTotal, messageCount: bodyTotal } : x,
+    ),
+  }))
+}
+
+function markChatBodyEmpty(id: string): void {
+  useStore.setState((s) => ({
+    chats: s.chats.map((c) =>
+      c.id === id
+        ? {
+            ...c,
+            messages: [],
+            bodyStart: 0,
+            bodyTotal: 0,
+            hydrated: true,
+            messageCount: 0,
+          }
+        : c,
+    ),
+  }))
+}
+
 /**
- * Make sure `id`'s message body is in memory (single-flight).
+ * Make sure the WHOLE transcript is in memory (single-flight).
  *
- * Resolves immediately when the chat is already hydrated (or does not exist).
- * Callers that need `messages` — sending a turn, undo/redo, branching — must
- * await this first: an unhydrated chat has an EMPTY `messages` array, and
- * building a request from it would silently drop the whole conversation.
+ * Resolves immediately when the chat is fully hydrated (or does not exist).
+ * Callers that reason about the complete history — sending a turn, undo/redo,
+ * branching, compaction — must await this first: a partial window (or an
+ * unhydrated index row with an EMPTY `messages` array) would silently drop
+ * everything above the viewport.
  */
 export function ensureChatHydrated(id: string): Promise<void> {
   const chat = useStore.getState().chats.find((c) => c.id === id)
   if (!chat) return Promise.resolve()
-  if (chat.hydrated !== false) {
+  if (chat.hydrated !== false && (chat.bodyStart ?? 0) === 0) {
     evictChatBodies()
     return Promise.resolve()
   }
-  const inflight = hydratePromises.get(id)
-  if (inflight) return inflight
-  const p = (async () => {
+  return queueChatBody(id, async () => {
+    const cur = useStore.getState().chats.find((c) => c.id === id)
+    if (!cur || (cur.hydrated !== false && (cur.bodyStart ?? 0) === 0)) {
+      evictChatBodies()
+      return
+    }
     try {
       const body = await api.chatGet<Chat>(id)
       if (body && typeof body === 'object' && !Array.isArray(body)) {
@@ -2077,22 +2259,15 @@ export function ensureChatHydrated(id: string): Promise<void> {
         // outside the app): mark it hydrated-and-empty so the panel renders an
         // empty composer instead of spinning. This state is never persisted
         // (sanitizeChats drops message-less chats).
-        useStore.setState((s) => ({
-          chats: s.chats.map((c) =>
-            c.id === id ? { ...c, messages: [], hydrated: true, messageCount: 0 } : c,
-          ),
-        }))
+        markChatBodyEmpty(id)
       }
     } catch {
-      /* Leave it unhydrated: the panel keeps showing the loader and a send
-         reports the failure instead of sending a context-free turn. */
+      /* Leave it as-is: the panel keeps showing what it has and a send reports
+         the failure instead of sending a context-free turn. */
     } finally {
-      hydratePromises.delete(id)
       evictChatBodies()
     }
-  })()
-  hydratePromises.set(id, p)
-  return p
+  })
 }
 
 function makeChat(mode: AgentMode = 'ask'): Chat {
@@ -2158,7 +2333,6 @@ export const useStore = create<State>((set, get) => ({
   builtinMcp: [],
   root: '',
   theme: DEFAULT_THEME,
-  dir: 'rtl',
   fontSize: 14,
   viewerFontSize: DEFAULT_VIEWER_FONT_SIZE,
   terminalFontSize: DEFAULT_TERMINAL_FONT_SIZE,
@@ -2203,6 +2377,7 @@ export const useStore = create<State>((set, get) => ({
   terminalHeight: typeof window !== 'undefined' ? loadTerminalHeight() : DEFAULT_TERMINAL_HEIGHT,
   dataPath: '',
   backupPath: '',
+  updateFeedUrl: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
   pinnedChats: [],
@@ -2316,7 +2491,6 @@ export const useStore = create<State>((set, get) => ({
       const clean = { ...c }
       delete clean.compacting
       delete clean.compactProgress
-      delete clean.compactNotice
       delete clean.compactError
       delete clean.cmdError
       delete clean.skillNotice
@@ -2633,11 +2807,13 @@ export const useStore = create<State>((set, get) => ({
       settings: loadedSettings,
       builtinMcp: builtins,
       root,
-      dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
       fontSize,
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
       backupPath: typeof (raw as Record<string, unknown>).backupPath === 'string'
         ? ((raw as Record<string, unknown>).backupPath as string).trim()
+        : '',
+      updateFeedUrl: typeof (raw as Record<string, unknown>).updateFeedUrl === 'string'
+        ? ((raw as Record<string, unknown>).updateFeedUrl as string).trim()
         : '',
       // No on-device STT anymore: an empty id means "not selected", never a
       // magic 'local' row (the legacy value is migrated away here).
@@ -2805,12 +2981,14 @@ export const useStore = create<State>((set, get) => ({
     })
     // Pull in the bodies of the chats that are on screen right now (the active
     // tab, every open tab and every visible window). Everything else stays an
-    // index row until the user opens it.
+    // index row until the user opens it. Only the NEWEST page is fetched:
+    // startup used to full-hydrate every restored tab, so a session with a few
+    // long chats parsed the whole history into RAM before the first paint.
     {
       const wanted = new Set<string>(
         [activeId, ...openChatIds, ...visibleChatIds].filter(Boolean) as string[],
       )
-      for (const id of wanted) void ensureChatHydrated(id)
+      for (const id of wanted) void ensureChatTail(id)
     }
   },
 
@@ -3225,16 +3403,6 @@ export const useStore = create<State>((set, get) => ({
     } catch {}
   },
 
-  setDir: (dir) => {
-    set({ dir })
-    get().persist()
-  },
-
-  toggleDir: () => {
-    const next = get().dir === 'rtl' ? 'ltr' : 'rtl'
-    get().setDir(next)
-  },
-
   setFontSize: (fontSize) => {
     const n = Math.min(24, Math.max(10, Math.round(fontSize)))
     document.documentElement.style.setProperty('--chat-font-size', `${n}px`)
@@ -3266,6 +3434,11 @@ export const useStore = create<State>((set, get) => ({
 
   setBackupPath: (backupPath) => {
     set({ backupPath: (backupPath ?? '').trim() })
+    get().persist()
+  },
+
+  setUpdateFeedUrl: (url) => {
+    set({ updateFeedUrl: (url ?? '').trim() })
     get().persist()
   },
 
@@ -3485,7 +3658,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setCheckedModels: (checkedModels) => {
-    set({ checkedModels })
+    set({ checkedModels: capCheckedModels(checkedModels) })
     get().persist()
   },
 
@@ -4706,6 +4879,10 @@ export const useStore = create<State>((set, get) => ({
           ? {
               ...c,
               messages: [...c.messages, full],
+              // Keep the absolute count in step with the appended message so
+              // paging labels/metering never lag one turn behind.
+              bodyTotal: (c.bodyTotal ?? c.messages.length) + 1,
+              messageCount: (c.bodyTotal ?? c.messages.length) + 1,
               // The sidebar sorts by the most recent message activity: sending
               // a user message, or a completed assistant reply, floats the
               // chat to the top of its group. Streaming assistant deltas stay
@@ -5040,12 +5217,6 @@ export const useStore = create<State>((set, get) => ({
     }))
   },
 
-  setChatCompactNotice: (id, compactNotice) => {
-    set((s) => ({
-      chats: s.chats.map((c) => (c.id === id ? { ...c, compactNotice } : c)),
-    }))
-  },
-
   setChatCompactError: (id, compactError) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, compactError } : c)),
@@ -5156,9 +5327,11 @@ export const useStore = create<State>((set, get) => ({
   },
 
   clearChat: (id) => {
-    // Clearing is only meaningful once the transcript is in memory; on an index
-    // row there is nothing to clear and the on-disk body must stay untouched.
-    if (!isChatBodyReady(id)) return
+    // Clearing is only meaningful once the FULL transcript is in memory; on an
+    // index row (or a paged window) there is nothing to clear and the on-disk
+    // body must stay untouched.
+    const target = get().chats.find((c) => c.id === id)
+    if (!target || !isChatBodyReady(id) || (target.bodyStart ?? 0) > 0) return
     // A cleared chat has no history left to undo back into: keeping the stacks
     // would let /redo restore messages into an emptied chat. The stream is
     // aborted too, otherwise the live reply repopulates the "cleared" chat.
@@ -5166,7 +5339,17 @@ export const useStore = create<State>((set, get) => ({
     historyStacks.delete(id)
     set((s) => ({
       chats: s.chats.map((c) =>
-        c.id === id ? { ...c, messages: [], usage: undefined, updatedAt: Date.now() } : c,
+        c.id === id
+          ? {
+              ...c,
+              messages: [],
+              bodyStart: 0,
+              bodyTotal: 0,
+              messageCount: 0,
+              usage: undefined,
+              updatedAt: Date.now(),
+            }
+          : c,
       ),
     }))
     get().persist()
@@ -5180,13 +5363,23 @@ export const useStore = create<State>((set, get) => ({
     // place while send() appends a second identical user bubble.
     const target = s.chats.find((c) => c.messages.some((m) => m.id === messageId))
     if (!target) return false
+    // A truncation must rewrite the whole transcript. On a paged window the
+    // slice would only cut the loaded suffix and the persist would be skipped,
+    // so the edit/regenerate would silently do nothing after a reload.
+    if ((target.bodyStart ?? 0) > 0) return false
     const idx = target.messages.findIndex((m) => m.id === messageId)
     if (idx === -1) return false
     const targetId = target.id
     set((st) => ({
       chats: st.chats.map((c) =>
         c.id === targetId
-          ? { ...c, messages: c.messages.slice(0, idx), updatedAt: Date.now() }
+          ? {
+              ...c,
+              messages: c.messages.slice(0, idx),
+              bodyTotal: idx,
+              messageCount: idx,
+              updatedAt: Date.now(),
+            }
           : c,
       ),
     }))
@@ -5196,8 +5389,11 @@ export const useStore = create<State>((set, get) => ({
 
   compactChat: (id, summary, keep = 0) => {
     // Folding an unloaded transcript would compact an empty message list and
-    // write that emptiness back over the real body file.
-    if (!isChatBodyReady(id)) return
+    // write that emptiness back over the real body file. A PAGED window is
+    // just as bad: summarizing only the visible tail would drop every older
+    // turn from the new summary. Callers hydrate the full body first.
+    const target = get().chats.find((c) => c.id === id)
+    if (!target || !isChatBodyReady(id) || (target.bodyStart ?? 0) > 0) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== id) return c
@@ -5276,9 +5472,9 @@ export const useStore = create<State>((set, get) => ({
         // reply, not above it). Mid-turn, the inline segment above already
         // anchors its VISUAL position — this push just keeps it present in the
         // flat list for folding/history purposes. Array order here is fine
-        // either way: the backend normalizes history order itself (moving
-        // system summaries to the head) before compacting, so it always finds
-        // and merges a prior summary regardless of where it sits.
+        // either way: the backend pulls a prior summary out of the history
+        // wherever it sits (see `summary_body` in compact.rs) and merges it, so
+        // it never gets swallowed into the verbatim tail.
         withSeg.push(summaryMsg)
         return {
           ...c,
@@ -5294,6 +5490,8 @@ export const useStore = create<State>((set, get) => ({
     const s = get()
     const chat = s.chats.find((c) => c.id === s.activeChatId)
     if (!chat || chat.messages.length === 0) return false
+    // Rewriting history needs the full transcript, not a paged window.
+    if ((chat.bodyStart ?? 0) > 0) return false
     // Never rewrite history while this chat is mid-turn: the live reply would
     // keep appending to the truncated list and resurrect the removed exchange.
     // The caller (the /undo command) aborts the stream first; this is the
@@ -5339,6 +5537,8 @@ export const useStore = create<State>((set, get) => ({
     const s = get()
     const chat = s.chats.find((c) => c.id === s.activeChatId)
     if (!chat) return false
+    // Rewriting history needs the full transcript, not a paged window.
+    if ((chat.bodyStart ?? 0) > 0) return false
     if (chat.messages.some((m) => m.streaming)) return false
     const st = stackFor(chat.id)
     // Redo replays only what a preceding undo removed; the undo stack is not

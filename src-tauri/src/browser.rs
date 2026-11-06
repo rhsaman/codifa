@@ -219,7 +219,7 @@ fn candidate_dirs(root: &std::path::Path) -> Vec<PathBuf> {
 /// only component that orders builds; the trailing ones are build metadata (the
 /// patch component of two different majors says nothing). Names without a
 /// number rank lowest so they never win.
-fn build_rank(dir: &std::path::Path) -> u64 {
+pub(crate) fn build_rank(dir: &std::path::Path) -> u64 {
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
@@ -2785,9 +2785,37 @@ fn install_blocking() -> Result<(), String> {
         Ok(())
     })();
 
+    // One build is enough: the retention backstop only removes superseded
+    // builds a day late, so the install reclaims the ~150 MB apiece right now.
+    if result.is_ok() {
+        let keep = root.join(format!("chrome-for-testing-{version}"));
+        prune_other_browser_builds(&root, &keep);
+    }
     let _ = std::fs::remove_file(&zip_path);
     let _ = std::fs::remove_dir_all(&staging);
     result
+}
+
+/// Delete every `chrome-for-testing-*` build under `root` except `keep`.
+/// Best-effort: a build still running (locked on Windows) simply survives and
+/// is picked up by the retention backstop later.
+fn prune_other_browser_builds(root: &std::path::Path, keep: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_dir() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("chrome-for-testing")
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// Stream `url` to `dest`, reporting progress over the first 90% so the

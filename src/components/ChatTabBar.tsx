@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { useStore } from "../lib/store";
-import { prepareContent } from "../lib/bidi";
+import { APP_DIR, useStore } from "../lib/store";
+import { detectDir, prepareContent } from "../lib/bidi";
 import { collectChatIds } from "../lib/chatTree";
 import {
   barFlowSign,
@@ -241,7 +241,7 @@ export function ChatTabListButton() {
 export function ChatTabBar() {
   const openChatIds = useStore((s) => s.openChatIds);
   const activeChatId = useStore((s) => s.activeChatId);
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   const chats = useStore((s) =>
     s.chats.map((c) => ({
       id: c.id,
@@ -430,7 +430,6 @@ export function ChatTabBar() {
             {editingId === id ? (
               <ChatRenameInput
                 initialValue={rawTitle === "New chat" ? "" : rawTitle}
-                dir={dir}
                 className="chat-rename-input editor-tab-rename-input"
                 ariaLabel={`Rename ${title}`}
                 onCommit={(v) => {
@@ -442,7 +441,7 @@ export function ChatTabBar() {
             ) : (
               <span
                 className="editor-tab-label"
-                dir={dir}
+                dir={detectDir(title)}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
                   setEditingId(id);

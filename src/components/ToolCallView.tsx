@@ -40,7 +40,7 @@ import { handleLinkClick } from "../lib/link";
 import { useDragScroll } from "../lib/useDragScroll";
 import { resolveLocalMedia, codifaMediaPath } from "../lib/mediaUrl";
 import { ensureSidecar, peekSidecarUrl } from "../lib/api";
-import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
+import { FileChip, openWorkspaceFile } from "./FileIcon";
 import { createPortal } from "react-dom";
 import { commentFileSelection } from "../lib/fileComments";
 import { toWorkspacePath } from "../lib/fileTree";
@@ -410,7 +410,6 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                   }}
                 >
                   <StatusIcon status={entry.activity.status} />
-                  <FileIcon path={path} size={20} />
                   <span className="edit-group-file" dir="auto">{base}</span>
                   <span className="edit-group-row-end">
                     {stats && (
@@ -625,19 +624,13 @@ function isWebRow(activity: ToolActivity): boolean {
   return activity.tool === "web_search" || activity.tool === "fetch_url";
 }
 
-/** Web rows whose payload is worth showing WITHOUT a click: a `web_search`
- *  row's hits are the answer to the question the user just asked. A `fetch_url`
- *  row only confirms that one URL was read, so it starts collapsed like every
- *  other row — its links still render inside, one click away (see `isWebRow`,
- *  which keeps driving the in-row renderer). */
-function isWebRowOpenByDefault(activity: ToolActivity): boolean {
-  return activity.tool === "web_search";
-}
+/** Web rows start collapsed like every other row; the hits still render inside
+ *  the expanded body, one click away (see `isWebRow`, which keeps driving the
+ *  in-row renderer). */
 
 /** The hits of a `web_search` / `fetch_url` row. Rendered at the bottom of the
  *  row's OWN expanded body — never as a sibling block hanging outside the tool
- *  call — so folding the call tucks the list back inside it. Web rows therefore
- *  start expanded (see `TraceRow` / `ToolSingleRow`). */
+ *  call — so folding the call tucks the list back inside it. */
 const InlineWebResults = memo(function InlineWebResults({
   activity,
 }: {
@@ -1327,7 +1320,6 @@ const DiffPreview = memo(function DiffPreview({
     >
       {/* The head renders even without a path so the ✕ is always reachable. */}
       <div className="diff-preview-head">
-        {path && <FileIcon path={path} size={16} />}
         <span className="diff-preview-path" dir="auto" title={path}>
           {basename}
         </span>
@@ -1994,11 +1986,9 @@ export const ToolGroupView = memo(function ToolGroupView({
    *  summary). */
   captions?: (string | null)[];
 }) {
-  // A run that contains a web call opens by default: the hits live INSIDE those
-  // rows, so a collapsed head would hide the search payload behind a click.
-  const [open, setOpen] = useState(() =>
-    activities.some(({ activity }) => isWebRow(activity)),
-  );
+  // Every run starts collapsed — including runs with web calls, whose hits are
+  // one click away inside the expanded rows.
+  const [open, setOpen] = useState(false);
   const running = activities.some((a) => a.activity.status === "running");
   // Live clock so the group total ticks while any call is still running.
   const now = useRunningClock(running);
@@ -2346,15 +2336,11 @@ const TraceRow = memo(function TraceRow({
   activity: ToolActivity;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  // edit_file / write_file and web SEARCH rows always start open: a diff and a
-  // search result list are the payload of their row, so a collapsed line would
-  // hide them. A fold click still tucks the content inside the call. A
-  // `fetch_url` row stays collapsed by default (see isWebRowOpenByDefault).
+  // edit_file / write_file rows always start open: a diff is the payload of the
+  // row, so a collapsed line would hide it. A fold click still tucks the content
+  // inside the call. Web rows stay collapsed like every other tool.
   const [expanded, setExpanded] = useState(
-    () =>
-      activity.tool === "edit_file" ||
-      activity.tool === "write_file" ||
-      isWebRowOpenByDefault(activity),
+    () => activity.tool === "edit_file" || activity.tool === "write_file",
   );
   const running = activity.status === "running";
   useEffect(() => {
@@ -2647,11 +2633,9 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   messageId?: string;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  // A web row starts EXPANDED: the search hits are its payload, so they should
-  // be visible inside the call from the first paint (a blank one-line row hides
-  // the very thing the user asked for). Folding it tucks the list back into the
-  // collapsed call. Every other tool starts collapsed.
-  const [expanded, setExpanded] = useState(() => isWebRow(activity));
+  // Every row starts collapsed, web included; the search hits live inside the
+  // expanded body, one click away. Folding keeps the list tucked in the call.
+  const [expanded, setExpanded] = useState(false);
   // Edit rows open their diff preview from the `Review ↗` pill (click) and send
   // a plain row click to the side Review panel.
   const preview = useDiffPreview();
@@ -2877,7 +2861,6 @@ function ToolPathSpan({ path }: { path: string }) {
         }
       }}
     >
-      <FileIcon path={path} size={20} />
       {fileBasename(path)}
     </span>
   );
@@ -3081,7 +3064,6 @@ export const ToolCallView = memo(function ToolCallView({
                 {activity.tool === "write_file" ? "Wrote" : "Edited"}
               </span>
               <span className="tool-file" title={writePath}>
-                <FileIcon path={writePath} size={20} />
                 <span className="tool-file-name" dir="ltr">
                   {writePath.split("/").pop() ?? writePath}
                 </span>

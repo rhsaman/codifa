@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { copyToClipboard } from "../lib/clipboard";
+import { detectDir } from "../lib/bidi";
 import { fmtSize } from "../lib/renderCap";
 import { mdComponents } from "./ChatMessage";
+import { rehypeLtrIslands } from "../lib/ltrIslands";
 
 /** Never paint more than this many characters of ONE text: a multi-megabyte
  *  paste would freeze the tab. Copy keeps the FULL text. */
@@ -93,12 +95,15 @@ export function TextViewerPanel({
       )}
       {view === "md" ? (
         <div className="file-viewer-body text-viewer-md">
-          <div className="chat-message markdown-body" dir="ltr">
+          {/* Direction follows the BODY's language (Persian message → rtl) —
+              same rule as the chat bubble this body came from. Content stays
+              verbatim (no prepareContent — see the note below). */}
+          <div className="chat-message markdown-body" dir={detectDir(body)}>
             {/* Rendered verbatim — no prepareContent: bodies embed code and
                 diffs that may legally contain ``` runs, which prepareContent's
                 3-backtick fence splitting would corrupt. react-markdown never
                 executes raw HTML, so untrusted payloads stay inert. */}
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeLtrIslands]} components={mdComponents}>
               {shown}
             </ReactMarkdown>
           </div>

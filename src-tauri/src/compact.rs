@@ -91,23 +91,74 @@ Use this exact template for the summary (markdown, anchored to the conversation)
 
 <summary>
 1. Task and scope:
-   <!-- What the user asked for, verbatim intent, constraints -->
+   What the user asked for, verbatim intent, constraints.
 2. Decisions and approach:
-   <!-- Key technical decisions made and why -->
+   Key decisions made and why.
 3. Work completed (DURABLE LEDGER — never drop an entry):
-   <!-- One bullet per finished item, each with the EXACT path (and line/function
-        when known), the commit hash when one was made, and the outcome.
-        This section is the ONLY record of finished work after compaction: an
-        item missing here WILL be redone from scratch. Copy entries forward
-        verbatim from a previous summary instead of re-summarizing them. -->
+   One bullet per finished item, with the exact outcome and any concrete
+   detail that actually appears in the conversation (file path, URL, number,
+   command, commit hash, document, decision, etc.).
+   This section is the ONLY record of finished work after compaction: an
+   item missing here WILL be redone from scratch. Copy entries forward
+   verbatim from a previous summary instead of re-summarizing them.
 4. Current state:
-   <!-- What exists right now: files, branches, running processes -->
+   What exists right now — the live state of the task (finished items,
+   open files/pages, running processes, held positions, current data,
+   draft, etc.).
 5. Next steps:
-   <!-- What remains, in order, with any blockers -->
+   What remains, in order, with any blockers.
 6. Important context:
-   <!-- Errors hit and fixes, user preferences, gotchas -->
+   Errors hit and fixes, user preferences, constraints, gotchas.
 </summary>
+
+Rules:
+- This is a GENERAL-PURPOSE assistant: the conversation can be about any
+  topic. Summarize what actually happened in its own domain, using its own
+  vocabulary. Never force a coding, repository, trading, or any other
+  framing onto it.
+- Do NOT mention code, repositories, files, commits, tests, branches, or
+  software unless they actually appear in the conversation.
+- Only state facts present in the conversation. Do not invent domains,
+  capabilities, limitations, actions, or user requests that did not occur.
+- Do not include these instructions or any HTML comments in your output.
+- Keep every section, even when empty (write "(none)").
+- Respond in the same language as the conversation.
 "#;
+
+/// The marker the mid-turn caller puts in front of a folded summary.
+const SUMMARY_MARKER: &str = "[Compacted earlier context]";
+
+/// The body of a context summary, when `m` is one — either a manual
+/// `/chat/compact` summary (a `system` message starting with `<summary>`) or
+/// the mid-turn `[Compacted earlier context]` checkpoint (stored as `user`).
+///
+/// `None` for ordinary turns. Summaries must be MERGED into the new summary,
+/// never treated as conversation text: the renderer appends them at the END of
+/// the array, where the backward tail walk would otherwise swallow them into
+/// the verbatim tail. That is why a repeated compact summarized only the one
+/// message after the old summary and then replaced the old summary — dropping
+/// the whole conversation from the new one.
+fn summary_body(m: &Value) -> Option<String> {
+    let content = content_of(m);
+    let trimmed = content.trim();
+    if let Some(rest) = trimmed.strip_prefix(SUMMARY_MARKER) {
+        let body = rest.trim();
+        if !body.is_empty() {
+            return Some(body.to_string());
+        }
+    }
+    if m["role"] == "system" && trimmed.starts_with("<summary>") {
+        // Drop the template wrapper: the merge prompt already wraps the prior
+        // summary in <prior-summary>, and nesting <summary> inside it invites
+        // the model to emit duplicate tags in the new summary.
+        let body = trimmed.strip_prefix("<summary>").unwrap_or(trimmed);
+        let body = body.strip_suffix("</summary>").unwrap_or(body).trim();
+        if !body.is_empty() {
+            return Some(body.to_string());
+        }
+    }
+    None
+}
 
 fn estimate_tokens(text: &str) -> usize {
     // Same heuristic family as agents.py: ~4 chars per token.
@@ -335,6 +386,24 @@ pub async fn compact_history_with_progress(
     let ctx = if ctx == 0 { crate::agent::DEFAULT_CONTEXT_WINDOW } else { ctx };
     let tail_budget = recent_tail_budget(ctx, max_output, None);
 
+    // Pull the prior summary out of the array BEFORE selecting the tail. It is
+    // a checkpoint, not a turn: leaving it in place lets the backward walk
+    // swallow it into `recent`, so the merge prompt never receives it and the
+    // new summary replaces it with only the few messages after it. The manual
+    // route appends the summary at the END and the mid-turn route inserts it as
+    // a `user` note, so position is not a reliable signal — scan every message.
+    let mut existing_summary = String::new();
+    let mut conversation: Vec<Value> = Vec::with_capacity(history.len());
+    for m in history {
+        match summary_body(m) {
+            // The newest summary wins: older ones (if a caller sends them) are
+            // already folded into it.
+            Some(body) => existing_summary = body,
+            None => conversation.push(m.clone()),
+        }
+    }
+    let history = conversation.as_slice();
+
     // Select the recent tail (whole messages, backward walk). Skipped entirely
     // when `summarize_all` is set — see the doc on
     // `compact_history_with_progress` for why the mid-turn caller must not
@@ -385,20 +454,7 @@ pub async fn compact_history_with_progress(
         }
     }
 
-    // Separate any existing "[Compacted earlier context]" summary at the head.
-    const MARKER: &str = "[Compacted earlier context]";
-    let mut existing_summary = String::new();
-    let mut older_turns: Vec<Value> = Vec::new();
-    for t in &older {
-        let content = content_of(t);
-        if t["role"] == "system" {
-            if let Some(idx) = content.find(MARKER) {
-                existing_summary.push_str(content[idx + MARKER.len()..].trim_start_matches('\n'));
-                continue;
-            }
-        }
-        older_turns.push(t.clone());
-    }
+    let older_turns = older;
     if older_turns.is_empty() {
         return Ok(None);
     }
@@ -411,9 +467,12 @@ pub async fn compact_history_with_progress(
     // The verbatim tail rides to the summarizer as context, not as head — cap
     // the head by what the tail ACTUALLY kept (not the full budget), so a
     // short tail leaves the room to the head. With `summarize_all` the tail is
-    // empty and the whole budget goes to the head.
-    let max_head_tokens =
-        usable_tokens(ctx, max_output, None).saturating_sub(tail_tokens + 512).max(1024);
+    // empty and the whole budget goes to the head. A merged prior summary is
+    // part of the prompt too, so its tokens must be reserved as well or a small
+    // window can overflow on head + summary + template.
+    let max_head_tokens = usable_tokens(ctx, max_output, None)
+        .saturating_sub(tail_tokens + estimate_tokens(&existing_summary) + 512)
+        .max(1024);
     // `join("\n\n")` contributes one separator per boundary — count it so the
     // incremental total matches what the joined string really costs.
     let sep_tokens = estimate_tokens("\n\n");
@@ -431,7 +490,7 @@ pub async fn compact_history_with_progress(
         format!(
             "Here is the conversation so far:\n\n<conversation>\n{head_text}\n</conversation>\n\n\
              Create a new anchored summary from the conversation history in the \
-             <conversation> tags above so another coding agent can continue the work.\n\n\
+             <conversation> tags above so the assistant can continue the work.\n\n\
              {SUMMARY_TEMPLATE}"
         )
     } else {
@@ -440,10 +499,12 @@ pub async fn compact_history_with_progress(
              Here is the summary of the conversation before the <conversation> above:\n\n\
              <prior-summary>\n{existing_summary}\n</prior-summary>\n\n\
              Update the prior summary so it reflects the conversation so far, merging new \
-             details into the template.\n{SUMMARY_TEMPLATE}"
+             details into the template. The prior summary is discarded after this: anything \
+             you do not carry into the new summary is lost. Where the conversation and the \
+             prior summary conflict, the conversation wins.\n{SUMMARY_TEMPLATE}"
         )
     };
-    const SYSTEM: &str = "You are a precise summarizer for a coding agent. Produce the anchored summary exactly in the requested template. Keep concrete details: file paths, commands, errors and their fixes.";
+    const SYSTEM: &str = "You are a precise summarizer for a GENERAL-PURPOSE AI assistant. Produce the anchored summary exactly in the requested template. The conversation can be about any topic — coding, research, trading, writing, planning, everyday questions, or anything else. Stay anchored to the conversation's own domain and vocabulary; never invent or force a coding/repository framing. Keep concrete details that actually appear: goals, decisions, names, numbers, dates, URLs, paths, commands and identifiers, errors and their fixes, and the current state. Respond in the same language as the conversation.";
 
     // Summarize on the primary model, then once on the fallback. Every attempt
     // is bounded twice over: `llm::complete` honors the model's own timeout, and
@@ -951,5 +1012,139 @@ mod tests {
             "summarize_all must put the newest messages IN the summarizer prompt — \
              the mid-turn caller has no verbatim tail to keep them on the wire"
         );
+    }
+
+    #[test]
+    fn summary_body_detects_manual_and_mid_turn_summaries() {
+        assert_eq!(
+            summary_body(&json!({
+                "role": "system",
+                "content": "<summary>\nMARK-PRIOR\n</summary>"
+            }))
+            .as_deref(),
+            Some("MARK-PRIOR")
+        );
+        assert_eq!(
+            summary_body(&json!({
+                "role": "user",
+                "content": "[Compacted earlier context]\n\nMARK-PRIOR"
+            }))
+            .as_deref(),
+            Some("MARK-PRIOR")
+        );
+        assert!(summary_body(&json!({ "role": "user", "content": "hello" })).is_none());
+        assert!(summary_body(&json!({ "role": "assistant", "content": "<summary>" })).is_none());
+    }
+
+    /// The user's field failure: a manual `/compact` appends its summary at the
+    /// END of the transcript. A second compact used to swallow that summary into
+    /// the verbatim tail, summarize only the one message after it, then replace
+    /// the old summary — the new summary forgot the entire chat ("چرا بای؟"
+    /// became the whole task). The prior summary must reach the merge prompt.
+    #[tokio::test]
+    async fn a_prior_manual_summary_at_the_tail_is_merged_not_summarized_alone() {
+        let mut model = cfg("custom", "summarizer", "");
+        model.timeout_secs = 5;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        model.base_url = capturing_stub(captured.clone());
+        let history = vec![
+            msg("user", "MARK-USER: analyse the EURUSD chart"),
+            msg("system", "<summary>\nMARK-PRIOR: the user asked for entry, stop and target levels\n</summary>"),
+        ];
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &model,
+            &[],
+            &history,
+            1_000_000,
+            0,
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .expect("the stub answers")
+        .expect("there is a user message to summarize");
+        let body = captured.lock().unwrap().clone();
+        assert!(body.contains("MARK-PRIOR"), "the prior summary must be merged: {body}");
+        assert!(body.contains("<prior-summary>"), "the merge prompt must mark the prior summary: {body}");
+        assert!(body.contains("MARK-USER"), "the new turn must also be summarized: {body}");
+        // The summary is a checkpoint, never a turn kept verbatim: keeping it
+        // would make the renderer preserve the OLD summary next to the new one.
+        assert_eq!(out.keep, 0);
+    }
+
+    /// The manual route now sends the FULL transcript, so a wrong summary from
+    /// an earlier compaction can be repaired: every original turn must reach
+    /// the summarizer, not just the tail after the bad checkpoint.
+    #[tokio::test]
+    async fn a_full_transcript_repairs_a_bad_prior_summary() {
+        let mut model = cfg("custom", "summarizer", "");
+        model.timeout_secs = 5;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        model.base_url = capturing_stub(captured.clone());
+        let history = vec![
+            msg("user", "MARK-OLD-1: analyse the EURUSD chart"),
+            msg("assistant", "MARK-OLD-2: here are the entry and stop levels"),
+            msg("user", "MARK-NEW: what about today?"),
+            msg("assistant", "MARK-ANSWER: today's fundamental and sentiment view"),
+            msg("system", "<summary>\nMARK-BAD: no coding task, no repository\n</summary>"),
+        ];
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &model,
+            &[],
+            &history,
+            1_000_000,
+            0,
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .expect("the stub answers")
+        .expect("there is a transcript to summarize");
+        let body = captured.lock().unwrap().clone();
+        assert!(body.contains("MARK-OLD-1"), "the oldest turn must be recovered: {body}");
+        assert!(body.contains("MARK-OLD-2"), "the older answer must be recovered: {body}");
+        assert!(body.contains("MARK-NEW"), "the newest turn must be included: {body}");
+        assert!(body.contains("MARK-BAD"), "the bad summary must be offered for repair: {body}");
+        assert_eq!(out.keep, 1);
+    }
+
+    /// Mid-turn compaction stores its checkpoint as a `user` message with the
+    /// marker. It must be merged exactly like a manual summary; the old scan
+    /// only looked at `system`, so this form was summarized as ordinary text.
+    #[tokio::test]
+    async fn a_mid_turn_marker_summary_at_the_tail_is_merged() {
+        let mut model = cfg("custom", "summarizer", "");
+        model.timeout_secs = 5;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        model.base_url = capturing_stub(captured.clone());
+        let history = vec![
+            msg("user", "MARK-USER: analyse the market"),
+            msg("assistant", "MARK-ANSWER: here is the analysis"),
+            msg("user", "[Compacted earlier context]\n\nMARK-PRIOR: earlier chart work"),
+        ];
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &model,
+            &[],
+            &history,
+            1_000_000,
+            0,
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .expect("the stub answers")
+        .expect("there is a user message to summarize");
+        let body = captured.lock().unwrap().clone();
+        assert!(body.contains("MARK-PRIOR"), "the mid-turn summary must be merged: {body}");
+        assert!(body.contains("MARK-USER"), "the new turn must also be summarized: {body}");
+        // Only the assistant answer stays verbatim; the summary itself does not
+        // count toward `keep`.
+        assert_eq!(out.keep, 1);
     }
 }

@@ -62,7 +62,9 @@ pub fn schema() -> Value {
             "name": "computer",
             "description": "Control the user's desktop: take a screenshot (any display or one window), \
 move/click/double-click/right-click the mouse, drag, type text, press keys or scroll. A screenshot \
-comes back as an actual image you can look at. Only available when the user enabled Computer Use in \
+comes back as an actual image you can look at, and every CHANGING action (click, type, key, \
+scroll, drag) already returns the screen AFTER it acted — only call action=screenshot for a \
+fresh look when you changed nothing. Only available when the user enabled Computer Use in \
 the composer.",
             "parameters": {
                 "type": "object",
@@ -472,11 +474,52 @@ double_click, right_click, move, drag, type, key or scroll"
             ))
         }
     };
+    // A mutating action CAPTURES THE SCREEN IT CHANGED: the result carries the
+    // "after" picture in the same outcome (the turn loop attaches the pixels to
+    // the next request), so `click → look at it` costs ONE model round instead
+    // of two — the same round-elimination the browser driver's post-action
+    // snapshot applies to page actions. `move` is excluded (nothing changed to
+    // look at), and a failed capture must never fail a SUCCESSFUL action — the
+    // model just falls back to calling action=screenshot itself.
+    if POST_ACTION_SHOT_ACTIONS.contains(&action.as_str()) {
+        match screenshot(&json!({})) {
+            Ok(mut after) => {
+                for s in after.shots.iter_mut() {
+                    s.label = format!("screen after {action}");
+                }
+                return Ok(Outcome {
+                    text,
+                    shots: after.shots,
+                });
+            }
+            Err(_) => {
+                return Ok(Outcome {
+                    text,
+                    shots: Vec::new(),
+                })
+            }
+        }
+    }
     Ok(Outcome {
         text,
         shots: Vec::new(),
     })
 }
+
+/// Actions that CHANGE the screen, so the result carries the "after" capture.
+const POST_ACTION_SHOT_ACTIONS: &[&str] = &[
+    "click",
+    "double_click",
+    "doubleclick",
+    "double-click",
+    "right_click",
+    "rightclick",
+    "right-click",
+    "drag",
+    "type",
+    "key",
+    "scroll",
+];
 
 #[cfg(test)]
 mod tests {

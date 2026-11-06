@@ -915,7 +915,19 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
         Ok(v) => v,
         Err(e) => return bad_request(e),
     };
-    let cache_key = format!("{provider}|{url}");
+    // Parse the row headers BEFORE the cache check: they are part of what a
+    // listing depends on (a gateway can answer differently per client
+    // signature), so two rows sharing a base URL must not share an entry.
+    let extra = crate::llm::header_pairs(q.headers.as_ref());
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    for (name, value) in &extra {
+        std::hash::Hash::hash(name, &mut fingerprint);
+        std::hash::Hash::hash(value, &mut fingerprint);
+    }
+    let cache_key = format!(
+        "{provider}|{url}|{:x}",
+        std::hash::Hasher::finish(&fingerprint)
+    );
     if let Ok(guard) = model_cache().lock() {
         if let Some((at, data)) = guard.get(&cache_key) {
             if at.elapsed() < Duration::from_secs(MODEL_CACHE_SECS) {
@@ -967,7 +979,6 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
     // spell out themselves (a gateway that wants another scheme sets
     // `Authorization`/`x-api-key` itself); reqwest appends, so sending both
     // would duplicate the header. Applied on every retry below too.
-    let extra = crate::llm::header_pairs(q.headers.as_ref());
     let mut headers = extra.clone();
     for (name, value) in auth_headers(&keys[0]) {
         if !crate::llm::has_header(&headers, &name) {

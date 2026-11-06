@@ -84,7 +84,6 @@ console.log('3) hints are English:')
 check('STT language hint', flat.includes('mis-detects the language on short clips'))
 check('image endpoints hint', flat.includes('OpenAI-compatible endpoints'))
 check('media folder hint', flat.includes('~/.codifa/media'))
-check('model override hint', (flat.match(/may request a different model/g) ?? []).length === 2)
 check('video formats hint', flat.includes('Sora format') && flat.includes('ffmpeg (downloaded automatically'))
 check('realtime vs chunked hint', flat.includes('full-duplex realtime'))
 

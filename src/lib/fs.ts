@@ -57,7 +57,8 @@ export const api = {
   getPathForFile: (file: File): string => window.coder.getPathForFile(file),
   storeGet: <T>(key: string): Promise<T | null> => window.coder.storeGet<T>(key),
   storeSet: (key: string, value: unknown): Promise<boolean> => window.coder.storeSet(key, value),
-  chatGet: <T>(id: string): Promise<T | null> => window.coder.chatGet<T>(id),
+  chatGet: <T>(id: string, opts?: { before?: number; limit?: number }): Promise<T | null> =>
+    window.coder.chatGet<T>(id, opts),
   getDataPath: (): Promise<string> => window.coder.getDataPath(),
   hasSettingsFile: (): Promise<boolean> => window.coder.hasSettingsFile(),
   moveDataPath: (p: string): Promise<string> => window.coder.moveDataPath(p),
@@ -75,9 +76,18 @@ export const api = {
   ): (() => void) => window.coder.onBackupProgress(cb),
   backupInfo: (
     path: string,
-  ): Promise<{ created: string; files: number; bytes: number; version: string; dataRoot: string }> =>
-    window.coder.backupInfo(path),
-  restoreBackup: (path: string): Promise<{ files: number; elapsedMs: number }> =>
+  ): Promise<{
+    created: string
+    files: number
+    bytes: number
+    version: string
+    dataRoot: string
+    /** The archive carries the install key — the encrypted API keys will decrypt after restore. */
+    secretsKey?: boolean
+  }> => window.coder.backupInfo(path),
+  restoreBackup: (
+    path: string,
+  ): Promise<{ files: number; elapsedMs: number; secretsRestored?: boolean }> =>
     window.coder.restoreBackup(path),
   onRestoreProgress: (
     cb: (evt: { label: string; pct: number; files: number; total: number }) => void,

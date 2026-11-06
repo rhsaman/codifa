@@ -94,6 +94,23 @@ console.log('۲) استور مشترک useModelTests — runModelTest:')
   await runModelTest(cfg, 'm1')
   check('m1 → ok با پیام OK', getTestEntry(cfg, 'm1').status === 'ok' && getTestEntry(cfg, 'm1').msg.includes('OK'), getTestEntry(cfg, 'm1'))
 
+  // A real chat turn failing on the same provider/model must demote the live
+  // tick: the green ✓ claims the model can serve a turn, so a 429/402 from a
+  // real turn disproves it. This is the reported false-tick path.
+  const { markModelTestFailed } = await import('../src/lib/useModelTests.ts')
+  markModelTestFailed(cfg.id, 'm1', 'key rejected (429): free usage limit reached')
+  check(
+    'خطای چت، ✓ زنده را به fail تبدیل می‌کند',
+    getTestEntry(cfg, 'm1').status === 'fail' && getTestEntry(cfg, 'm1').msg.includes('429'),
+    getTestEntry(cfg, 'm1'),
+  )
+  // Another provider row with the same model id must stay untouched.
+  const otherCfg = { ...cfg, id: 'p-other' }
+  testResponse = { ok: true, status: 200, reply: 'OK' }
+  await runModelTest(otherCfg, 'm1')
+  markModelTestFailed(cfg.id, 'm1', 'boom')
+  check('پروایدر دیگر با همان مدل دست‌نخورده می‌ماند', getTestEntry(otherCfg, 'm1').status === 'ok', getTestEntry(otherCfg, 'm1'))
+
   testResponse = { ok: false, status: 400, detail: 'RuntimeError: boom' }
   await runModelTest(cfg, 'm2')
   check('m2 → fail با پیام خطا', getTestEntry(cfg, 'm2').status === 'fail' && getTestEntry(cfg, 'm2').msg.includes('boom'), getTestEntry(cfg, 'm2'))
@@ -159,6 +176,12 @@ console.log('۴) رندر SSR دکمه‌ها:')
   const html = renderToString(<ModelTestButton cfg={cfg} model="test-model" />)
   check('کلاس pm-model-test در HTML است', html.includes('pm-model-test'), html)
   check('آیکون رعد SVG در حالت idle رندر می‌شود', html.includes('pm-test-bolt'), html)
+  // A model with a persisted "passed earlier" result renders exactly like any
+  // other idle button — the ⚡ bolt, identical across all tabs. Only a live
+  // test may tick (✓); membership in the Checked tab is the "passed before"
+  // marker.
+  const saved = renderToString(<ModelTestButton cfg={cfg} model="saved-model" />)
+  check('نتیجهٔ ذخیره‌شده هم مثل بقیه تب‌ها رعد دارد، نه ✓', saved.includes('pm-test-bolt') && !saved.includes('✓'), saved)
   const phtml = renderToString(<ProviderTestButton cfg={cfg} models={['a', 'b']} />)
   check('کلاس pm-provider-test در HTML است', phtml.includes('pm-provider-test'), phtml)
   check('دکمهٔ پروایدر هم آیکون رعد دارد', phtml.includes('pm-test-bolt'), phtml)

@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderHeader, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import type { MarketplaceSource, PluginInfo } from '../types'
 import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES, setPersistSuspended } from '../lib/store'
@@ -13,6 +13,7 @@ import {
   listPlugins,
   listPluginSkills,
   marketKey,
+  parseMarketplaceAddress,
   subscribeInstallChanges,
   togglePlugin,
 } from '../lib/plugins'
@@ -161,6 +162,13 @@ function ContextSizeSlider({
  *  two bundles (or a bundle and the user's own store) may ship the same name. */
 function skillKey(pluginSlug: string, name: string): string {
   return pluginSlug ? `${pluginSlug}::${name}` : name
+}
+
+/** Stable hue (0–359) per provider name — tints the avatar of each card. */
+function providerHue(name: string): number {
+  let h = 7
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360
+  return h
 }
 
 /** بررسی می‌کنه آیا یک پروایدر تنظیم شده (حداقل یک کلید API دارد). */
@@ -550,26 +558,18 @@ function MarketplaceEditor() {
   }, [kindKeyList, loadIndex])
 
   const addFromForm = () => {
-    let addr = repo.trim()
+    const addr = repo.trim()
     if (!addr) return
-    // One string carries everything: `owner/repo@ref/sub-path`. The ref ends at
-    // the first `/` AFTER the `@` (tags may hold slashes); the rest is the sub.
-    let refPart = ''
-    let subPart = ''
-    const at = addr.indexOf('@')
-    if (at > 0 && !addr.startsWith('/')) {
-      const tail = addr.slice(at + 1)
-      const slash = tail.indexOf('/')
-      refPart = slash === -1 ? tail : tail.slice(0, slash)
-      if (slash !== -1) subPart = tail.slice(slash + 1)
-      addr = addr.slice(0, at)
-    }
+    // One string carries everything: `owner/repo@ref/sub-path`. The parser is
+    // shared with `/plugin marketplace add`, so the form and the command can
+    // never disagree about what an address means.
+    const parsed = parseMarketplaceAddress(addr)
     const source: MarketplaceSource = {
-      repo: addr,
+      repo: parsed.repo,
       kind: 'plugins',
       ...(label.trim() ? { label: label.trim() } : {}),
-      ...(subPart.trim() ? { path: subPart.trim() } : {}),
-      ...(refPart.trim() ? { git_ref: refPart.trim() } : {}),
+      ...(parsed.path ? { path: parsed.path } : {}),
+      ...(parsed.git_ref ? { git_ref: parsed.git_ref } : {}),
     }
     const key = marketKey(source.repo, source.path, source.git_ref)
     if (!marketplaces.some((m) => marketKey(m.repo, m.path, m.git_ref) === key)) {
@@ -1676,7 +1676,16 @@ function MediaFallbackList<R extends { providerId: string; model: string; voice?
   )
 }
 
-export function SettingsModal({ onClose, initialTab }: { onClose: () => void; initialTab?: string }) {
+export function SettingsModal({
+  onClose,
+  initialTab,
+  initialProviderId,
+}: {
+  onClose: () => void
+  initialTab?: string
+  /** Opens Settings → Providers directly on this provider's settings (skips the card list). */
+  initialProviderId?: string
+}) {
   const settings = useStore((s) => s.settings)
   const updateProvider = useStore((s) => s.updateProvider)
   const addProvider = useStore((s) => s.addProvider)
@@ -1697,6 +1706,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setDataPath = useStore((s) => s.setDataPath)
   const backupPath = useStore((s) => s.backupPath)
   const setBackupPath = useStore((s) => s.setBackupPath)
+  const updateFeedUrl = useStore((s) => s.updateFeedUrl)
+  const setUpdateFeedUrl = useStore((s) => s.setUpdateFeedUrl)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -1777,8 +1788,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Which provider's config is being EDITED in this dialog. Deliberately NOT
   // derived from settings.activeProviderId — visiting Settings must never
   // switch the app's active provider / main model.
-  const [editId, setEditId] = useState(settings.activeProviderId)
+  const [editId, setEditId] = useState(
+    initialProviderId && providers.some((p) => p.id === initialProviderId)
+      ? initialProviderId
+      : settings.activeProviderId,
+  )
   const active = providers.find((p) => p.id === editId) ?? providers[0]
+  // Providers tab: a searchable card list first; a provider's settings stay
+  // hidden until its card is opened ('detail'), with a Back button to return.
+  const [provView, setProvView] = useState<'list' | 'detail'>(
+    initialProviderId && providers.some((p) => p.id === initialProviderId) ? 'detail' : 'list',
+  )
+  const [provQuery, setProvQuery] = useState('')
+  const [provFilter, setProvFilter] = useState<'all' | 'ready' | 'nokey'>('all')
 
   const [cfg, setCfg] = useState<ProviderConfig>({ ...active })
   const [saved, setSaved] = useState(false)
@@ -1793,6 +1815,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Draft pair of the header list (header values are shown as text, they are
   // identifiers/signatures rather than long secrets).
   const [newHeader, setNewHeader] = useState({ key: '', value: '' })
+  // The "add" row stays collapsed behind a "+ Add" button under the list; pressing
+  // it opens an empty row, and after adding the new item shows up in the list
+  // with the button back underneath.
+  const [addingKey, setAddingKey] = useState(false)
+  const [addingHeader, setAddingHeader] = useState(false)
   // ورودی «افزودن مدل دستی»: وقتی گیت‌وی فهرست مدل‌هایش را از /models نشان
   // نمی‌دهد (یا فچ شکست می‌خورد)، کاربر می‌تواند id مدل را مستقیم تایپ کند.
   const [manualModel, setManualModel] = useState('')
@@ -1900,12 +1927,26 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   useEffect(() => {
     setBackupDirInput(backupPath)
   }, [backupPath])
+  // Same mirror pattern for the update-feed URL ('' = GitHub only).
+  const [feedUrlInput, setFeedUrlInput] = useState(updateFeedUrl)
+  useEffect(() => {
+    setFeedUrlInput(updateFeedUrl)
+  }, [updateFeedUrl])
   const [backingUp, setBackingUp] = useState(false)
   const [backupPct, setBackupPct] = useState(0)
   const [backupLabel, setBackupLabel] = useState('')
   const [backupFiles, setBackupFiles] = useState<{ done: number; total: number } | null>(null)
   const [backupMsg, setBackupMsg] = useState('')
   const [backupFailed, setBackupFailed] = useState(false)
+  // The archive the last successful run produced — shown as a persistent
+  // "last backup" card (name, size, when) instead of only a one-shot message.
+  const [lastBackup, setLastBackup] = useState<{
+    path: string
+    files: number
+    bytes: number
+    elapsedMs: number
+    at: number
+  } | null>(null)
 
   const browseBackupDir = async () => {
     const picked = await api.selectFolder()
@@ -1931,6 +1972,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     try {
       const res = await api.createBackup(dir)
       const mb = (res.bytes / (1024 * 1024)).toFixed(1)
+      setLastBackup({ path: res.path, files: res.files, bytes: res.bytes, elapsedMs: res.elapsedMs, at: Date.now() })
       setBackupMsg(
         `Backup ready: ${res.path} — ${res.files.toLocaleString()} files, ${mb} MB in ${(res.elapsedMs / 1000).toFixed(1)}s`,
       )
@@ -1959,6 +2001,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     files: number
     bytes: number
     version: string
+    secretsKey: boolean
   } | null>(null)
   const [restoring, setRestoring] = useState(false)
   const [restorePct, setRestorePct] = useState(0)
@@ -1985,6 +2028,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         files: info.files,
         bytes: info.bytes,
         version: info.version,
+        secretsKey: info.secretsKey === true,
       })
     } catch (err) {
       setRestoreMsg((err as Error).message || String(err))
@@ -2007,7 +2051,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     try {
       const res = await api.restoreBackup(path)
       setRestoreMsg(
-        `Restored ${res.files.toLocaleString()} files. Restarting to apply…`,
+        `Restored ${res.files.toLocaleString()} files${res.secretsRestored ? ' — API keys unlock on this machine' : ''}. Restarting to apply…`,
       )
       // Every reader (store, skills, MCP) holds pre-restore state in memory —
       // only a full restart re-loads the restored data from disk.
@@ -2500,6 +2544,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Reset the key draft + visibility when switching providers.
   useEffect(() => {
     setNewKey('')
+    setNewHeader({ key: '', value: '' })
+    setAddingKey(false)
+    setAddingHeader(false)
     setShowKeys({})
     setCredWarn(false)
   }, [editId, active.id])
@@ -2564,6 +2611,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     if (!v) return
     setCfg({ ...cfg, apiKeys: [...cfgKeys, v] })
     setNewKey('')
+    setAddingKey(false)
     setCredWarn(false)
   }
   const removeKey = (idx: number) => {
@@ -2587,6 +2635,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     if (!key) return
     setHeaders([...cfgHeaders, { key, value: newHeader.value.trim() }])
     setNewHeader({ key: '', value: '' })
+    setAddingHeader(false)
   }
 
   // ورودی عددی طول کانتکست فقط برای kind‌هایی معنا دارد که /models‌شان پنجره‌ی
@@ -2648,6 +2697,15 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const handleAdd = () => {
     const id = addProvider()
     setEditId(id)
+    setProvQuery('')
+    setProvView('detail')
+  }
+
+  const openProvider = (id: string) => {
+    const p = providers.find((x) => x.id === id)
+    if (p) setCfg({ ...p })
+    setEditId(id)
+    setProvView('detail')
   }
 
   const handleRemove = (id: string) => {
@@ -2656,6 +2714,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     if (providers.length <= 1) return
     if (window.confirm(`Remove provider “${providerDisplayName(p)}”? Its models will be deleted too.`)) {
       removeProvider(id)
+      setProvView('list')
       if (editId === id) {
         const rest = providers.filter((x) => x.id !== id)
         setEditId(rest[0]?.id ?? '')
@@ -2798,7 +2857,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // switching tabs. Collapsing it to this one boolean keeps the rule simple
   // and visible: buffered tabs always show Cancel+Save, every other tab
   // always shows a single Done button.
-  const hasBufferedEdits = tab === 'providers' || tab === 'modes' || tab === 'auth'
+  const hasBufferedEdits = (tab === 'providers' && provView === 'detail') || tab === 'modes' || tab === 'auth'
   // Auto-save tabs: Done force-flushes any pending state to disk before
   // closing (a change made while a reply is streaming could otherwise be
   // lost) — previously this required an extra, easy-to-miss "Save" click on
@@ -2863,46 +2922,154 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
         {tab === 'providers' && (
         <>
-        <div className="field">
-          <label>Providers</label>
-          <div className="provider-tabs">
-            {providers.map((p) => (
-              <div
-                key={p.id}
-                className={`provider-tab ${p.id === active.id ? 'active' : ''}`}
-                onClick={() => setEditId(p.id)}
-              >
-                <span
-                  className={`provider-tab-dot ${isProviderConfigured(p) ? 'ok' : 'off'}`}
-                  title={isProviderConfigured(p) ? 'Configured' : 'Not configured'}
-                />
-                <span className="provider-tab-name">{providerDisplayName(p)}</span>
-                {!BUILTIN_KINDS.includes(p.kind) && providers.length > 1 && (
-                  <button
-                    className="provider-tab-remove"
-                    title="Remove provider"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      handleRemove(p.id)
-                    }}
-                  >
-                    ×
-                  </button>
-                )}
+        {provView === 'list' && (() => {
+          const q = provQuery.trim().toLowerCase()
+          const matched = q
+            ? providers.filter((p) => `${providerDisplayName(p)} ${p.id} ${p.kind}`.toLowerCase().includes(q))
+            : providers
+          const shown =
+            provFilter === 'all'
+              ? matched
+              : matched.filter((p) => isProviderConfigured(p) === (provFilter === 'ready'))
+          const readyCount = providers.filter((p) => isProviderConfigured(p)).length
+          return (
+            <div className="prov-list">
+              <div className="prov-toolbar">
+                <div className="prov-search">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="M20.2 20.2l-3.9-3.9" />
+                  </svg>
+                  <input
+                    value={provQuery}
+                    onChange={(e) => setProvQuery(e.target.value)}
+                    placeholder="Search providers…"
+                    aria-label="Search providers"
+                    autoComplete="off"
+                    spellCheck={false}
+                    dir="ltr"
+                  />
+                  {provQuery && (
+                    <button type="button" className="prov-search-clear" onClick={() => setProvQuery('')} aria-label="Clear search">
+                      ×
+                    </button>
+                  )}
+                </div>
+                <button type="button" className="btn" onClick={handleAdd}>
+                  + Add provider
+                </button>
               </div>
-            ))}
-            <button className="provider-tab add" onClick={handleAdd}>
-              + Add
-            </button>
-          </div>
-          <div className="hint">
-            Switching providers keeps each one’s name, base URL and saved models. The active model is
-            chosen in the composer; each provider shows its own models.
-          </div>
-        </div>
+              <div className="prov-filters">
+                {([
+                  ['all', 'All', providers.length],
+                  ['ready', 'Configured', readyCount],
+                  ['nokey', 'Needs setup', providers.length - readyCount],
+                ] as const).map(([id, label, n]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`prov-filter${provFilter === id ? ' active' : ''}`}
+                    onClick={() => setProvFilter(id)}
+                  >
+                    {label}
+                    <span>{n}</span>
+                  </button>
+                ))}
+                <span className="prov-count">Click a provider to edit its settings</span>
+              </div>
+              {shown.length > 0 ? (
+                <div className="prov-grid">
+                  {shown.map((p) => {
+                    const configured = isProviderConfigured(p)
+                    const local = providerMeta(p.kind).local
+                    const keys = providerApiKeys(p).length
+                    const modelCount = p.models?.length ?? 0
+                    const name = providerDisplayName(p)
+                    return (
+                      <div
+                        key={p.id}
+                        role="button"
+                        tabIndex={0}
+                        className={`prov-card${configured ? '' : ' unconfigured'}`}
+                        style={{ '--h': providerHue(name) } as CSSProperties}
+                        onClick={() => openProvider(p.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            openProvider(p.id)
+                          }
+                        }}
+                      >
+                        <div className="prov-card-top">
+                          <span className="prov-card-avatar-wrap">
+                            <span className="prov-card-avatar">{name.trim().charAt(0).toUpperCase() || '?'}</span>
+                            <span
+                              className={`prov-status ${configured ? 'ok' : 'off'}`}
+                              title={configured ? 'Configured' : 'Not configured'}
+                            />
+                          </span>
+                          <div className="prov-card-id">
+                            <span className="prov-card-name" title={name}>{name}</span>
+                            <span className={`prov-card-sub${configured ? '' : ' warn'}`}>
+                              {local ? 'Local · no key needed' : keys > 0 ? `${keys} API key${keys === 1 ? '' : 's'}` : 'Needs an API key'}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="prov-card-foot">
+                          <span className="prov-chip">{modelCount} {modelCount === 1 ? 'model' : 'models'}</span>
+                          {p.groupTest === false && (
+                            <span className="prov-chip muted" title="Skipped by group tests; single-model test still works">
+                              Group test off
+                            </span>
+                          )}
+                          <span className="prov-card-arrow" aria-hidden="true">›</span>
+                        </div>
+                        {!BUILTIN_KINDS.includes(p.kind) && providers.length > 1 && (
+                          <button
+                            type="button"
+                            className="prov-card-remove"
+                            title="Remove provider"
+                            aria-label={`Remove ${name}`}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleRemove(p.id)
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="prov-empty">No provider matches “{provQuery.trim()}”.</div>
+              )}
+            </div>
+          )
+        })()}
 
-        {active && (
+        {provView === 'detail' && active && (
           <>
+            <div className="prov-detail-head">
+              <button type="button" className="prov-back" onClick={() => setProvView('list')}>
+                ← Providers
+              </button>
+              <div className="prov-detail-title">
+                <span className="prov-card-avatar">{providerDisplayName(cfg).trim().charAt(0).toUpperCase() || '?'}</span>
+                <span className="prov-detail-name">{providerDisplayName(cfg)}</span>
+                <span
+                  className={`provider-tab-dot ${isProviderConfigured(cfg) ? 'ok' : 'off'}`}
+                  title={isProviderConfigured(cfg) ? 'Configured' : 'Not configured'}
+                />
+              </div>
+              {!BUILTIN_KINDS.includes(active.kind) && providers.length > 1 && (
+                <button type="button" className="btn secondary prov-remove-btn" onClick={() => handleRemove(active.id)}>
+                  Remove
+                </button>
+              )}
+            </div>
+            <div className="prov-section-title">Connection</div>
             {providerMeta(cfg.kind).local ? (
               <div className="env-key-hint ok">
                 <span className="status-dot ok" />
@@ -3070,6 +3237,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       </div>
                     </div>
                   ))}
+                  {addingKey || cfgKeys.length === 0 ? (
                   <div className="api-key-row add">
                     <span className="api-key-order new" title="New key">+</span>
                     <input
@@ -3083,6 +3251,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                           addKey()
                         }
                       }}
+                      autoFocus={cfgKeys.length > 0}
                       placeholder="Paste a new API key — press Enter to add"
                       dir="ltr"
                       autoComplete="off"
@@ -3092,11 +3261,28 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       <button type="button" className={`icon-btn${showKeys[-1] ? ' on' : ''}`} title={showKeys[-1] ? 'Hide' : 'Show'} aria-label={showKeys[-1] ? 'Hide' : 'Show'} onClick={() => setShowKeys((s) => ({ ...s, [-1]: !s[-1] }))}>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
                       </button>
+                      {cfgKeys.length > 0 && (
+                        <button
+                          type="button"
+                          className="btn tiny"
+                          onClick={() => {
+                            setNewKey('')
+                            setAddingKey(false)
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      )}
                       <button type="button" className="btn tiny primary" disabled={!newKey.trim()} onClick={addKey}>
                         Add
                       </button>
                     </div>
                   </div>
+                  ) : (
+                    <button type="button" className="api-add-btn" onClick={() => setAddingKey(true)}>
+                      <span aria-hidden="true">+</span> Add API key
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -3118,7 +3304,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   rows rendered bare, so they stacked flush with no spacing. */}
               <div className="api-key-list">
                 {cfgHeaders.map((h, i) => (
-                  <div key={`${h.key}-${i}`} className="api-key-row api-header-row">
+                  <div key={i} className="api-key-row api-header-row">
                     <input
                       className="api-key-input"
                       value={h.key}
@@ -3158,6 +3344,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </div>
                   </div>
                  ))}
+                {addingHeader ? (
                 <div className="api-key-row add">
                   <span className="api-key-order new" title="New header">+</span>
                   <input
@@ -3170,6 +3357,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         addHeader()
                       }
                     }}
+                    autoFocus
                     placeholder="Header name — e.g. x-opencode-client"
                     dir="ltr"
                     autoComplete="off"
@@ -3191,14 +3379,30 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     spellCheck={false}
                   />
                   <div className="api-key-actions">
+                    <button
+                      type="button"
+                      className="btn tiny"
+                      onClick={() => {
+                        setNewHeader({ key: '', value: '' })
+                        setAddingHeader(false)
+                      }}
+                    >
+                      Cancel
+                    </button>
                     <button type="button" className="btn tiny primary" disabled={!newHeader.key.trim()} onClick={addHeader}>
                       Add
                     </button>
                   </div>
                 </div>
+                ) : (
+                  <button type="button" className="api-add-btn" onClick={() => setAddingHeader(true)}>
+                    <span aria-hidden="true">+</span> Add header
+                  </button>
+                )}
               </div>
             </div>
 
+            <div className="prov-section-title">Models</div>
             <div className="field">
               <label>Models catalog</label>
               <div className="models-catalog-card">
@@ -3311,6 +3515,42 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   </div>
                 )
               })()}
+            </div>
+
+            <div className="prov-section-title">Testing</div>
+            <div className="field">
+              <div className="models-catalog-card prov-test-card">
+                <div className="prov-test-row">
+                  <div className="prov-test-text">
+                    <div className="prov-test-title">Include in group tests</div>
+                    <div className="hint">
+                      {cfg.groupTest === false
+                        ? 'Off — this provider is skipped by Recent, Checked, search results and “test all models”. Each model’s own ⚡ button still works.'
+                        : 'On — this provider’s models are tested together with the group test buttons (Recent, Checked, search results, test all models).'}
+                    </div>
+                  </div>
+                  <label
+                    className="plugin-switch"
+                    title={cfg.groupTest === false ? 'Turn group test on' : 'Turn group test off'}
+                  >
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      checked={cfg.groupTest !== false}
+                      aria-label="Include this provider in group tests"
+                      onChange={(e) => {
+                        // Applies immediately (like the other on/off switches): it is a
+                        // preference, not a credential, so it needs no Save press and
+                        // survives switching to another provider tab.
+                        const on = e.target.checked
+                        setCfg({ ...cfg, groupTest: on })
+                        updateProvider(active.id, { groupTest: on })
+                      }}
+                    />
+                    <span className="plugin-switch-track" />
+                  </label>
+                </div>
+              </div>
             </div>
 
           </>
@@ -3585,7 +3825,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           {/* ===== Result cache ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
-              <span className="settings-group-icon">⚡</span>
+              <span className="settings-group-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                </svg>
+              </span>
               <div>
                 <div className="settings-group-title">Tool result cache</div>
                 <div className="settings-group-desc">
@@ -3632,7 +3876,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           {/* ===== Data & maintenance ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
-              <span className="settings-group-icon">🗂️</span>
+              <span className="settings-group-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <ellipse cx="12" cy="5" rx="9" ry="3" />
+                  <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+                  <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+                </svg>
+              </span>
               <div>
                 <div className="settings-group-title">Data & maintenance</div>
                 <div className="settings-group-desc">
@@ -3677,12 +3927,21 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           {/* ===== Backup ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
-              <span className="settings-group-icon">💾</span>
+              <span className="settings-group-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="4" width="20" height="5" rx="1" />
+                  <path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9" />
+                  <path d="M10 13h4" />
+                </svg>
+              </span>
               <div>
                 <div className="settings-group-title">Backup</div>
                 <div className="settings-group-desc">
-                  One <code>codifa-backup-&lt;date&gt;.zip</code> with settings, chats,
-                  plugins, plans and uploads. Traces and caches are re-created on demand.
+                  One <code>codifa-backup-&lt;date&gt;.zip</code> with ALL settings — providers,
+                  API keys, chats, plugins, plans and uploads — plus the install key that
+                  unlocks the keys on any machine. Traces and caches are re-created on demand.
+                  Every run writes a new archive — earlier ones are kept. Keep the zip safe:
+                  whoever holds it holds your API keys.
                 </div>
               </div>
             </div>
@@ -3710,11 +3969,81 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <button className="btn tiny" onClick={browseBackupDir} disabled={backingUp || restoring}>
                   Browse…
                 </button>
-                <button className="btn tiny" onClick={startBackup} disabled={backingUp || restoring}>
+              </div>
+              <div className="backup-actions">
+                <button className="btn tiny accent" onClick={startBackup} disabled={backingUp || restoring}>
                   {backingUp ? 'Backing up…' : 'Back up now'}
                 </button>
               </div>
-              <div>
+              {backingUp && (
+                <div className="migrate-progress">
+                  <div className="migrate-bar-track">
+                    <div className="migrate-bar-fill" style={{ width: `${backupPct}%` }} />
+                  </div>
+                  <div className="backup-progress-line">
+                    <span className="backup-progress-label" dir="ltr">{backupLabel}</span>
+                    <span className="backup-progress-pct">
+                      {backupPct}%
+                      {backupFiles && backupFiles.total > 0
+                        ? ` · ${backupFiles.done.toLocaleString()}/${backupFiles.total.toLocaleString()} files`
+                        : ''}
+                    </span>
+                  </div>
+                  <div className="backup-progress-actions">
+                    <button className="btn tiny" onClick={() => void api.cancelBackup()}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              {backupMsg && (
+                <div
+                  className="hint"
+                  style={{ color: backupFailed ? 'var(--danger)' : 'var(--accent)', wordBreak: 'break-all' }}
+                >
+                  {backupMsg}
+                </div>
+              )}
+              {lastBackup && !backingUp && (
+                <div className="backup-last">
+                  <span className="backup-last-icon">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                      <path d="m9 11 3 3L22 4" />
+                    </svg>
+                  </span>
+                  <div className="backup-last-meta">
+                    <div className="backup-last-name" dir="ltr">
+                      {lastBackup.path.split(/[\\/]/).pop()}
+                    </div>
+                    <div className="backup-last-sub">
+                      {(lastBackup.bytes / (1024 * 1024)).toFixed(1)} MB ·{' '}
+                      {lastBackup.files.toLocaleString()} files ·{' '}
+                      {(lastBackup.elapsedMs / 1000).toFixed(1)}s ·{' '}
+                      {new Date(lastBackup.at).toLocaleString()}
+                    </div>
+                  </div>
+                  <button
+                    className="btn tiny"
+                    onClick={() => void api.openWorkspaceFolder(backupDirInput.trim() || dataPath || '~/.codifa')}
+                  >
+                    Show folder
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="settings-row settings-row-stack">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Restore</div>
+                <div className="settings-row-desc">
+                  Pick a <code>codifa-backup-….zip</code> — its manifest is read and shown
+                  before anything is touched. Restoring overwrites matching files with the
+                  archive's contents (files not in the archive are kept), then the app
+                  restarts to apply it.
+                </div>
+              </div>
+              <div className="backup-actions">
                 <button
                   className="btn tiny"
                   onClick={pickBackupForRestore}
@@ -3733,12 +4062,17 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     {new Date(restorePick.created).toLocaleString()}
                     {restorePick.version ? ` by v${restorePick.version}` : ''}
                   </div>
+                  <div className="hint" style={restorePick.secretsKey ? { color: 'var(--accent)' } : undefined}>
+                    {restorePick.secretsKey
+                      ? 'API keys: the install key travels with this archive — your provider keys will unlock here too (any machine, any OS). Keep the zip safe: it unlocks those keys.'
+                      : 'API keys: this archive carries no install key (older backup). Provider keys restore only on a machine that already holds the matching key.'}
+                  </div>
                   <div className="hint" style={{ color: 'var(--danger)' }}>
                     Restoring overwrites current settings, chats and plugins with the archive's
                     contents (files not in the archive are kept). The app restarts to apply it.
                   </div>
                   <div className="backup-progress-actions">
-                    <button className="btn tiny" onClick={confirmRestore}>
+                    <button className="btn tiny danger" onClick={confirmRestore}>
                       Restore now
                     </button>
                     <button className="btn tiny" onClick={() => setRestorePick(null)}>
@@ -3771,45 +4105,61 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   {restoreMsg}
                 </div>
               )}
-              {backingUp && (
-                <div className="migrate-progress">
-                  <div className="migrate-bar-track">
-                    <div className="migrate-bar-fill" style={{ width: `${backupPct}%` }} />
-                  </div>
-                  <div className="backup-progress-line">
-                    <span className="backup-progress-label" dir="ltr">{backupLabel}</span>
-                    <span className="backup-progress-pct">
-                      {backupPct}%
-                      {backupFiles && backupFiles.total > 0
-                        ? ` · ${backupFiles.done.toLocaleString()}/${backupFiles.total.toLocaleString()} files`
-                        : ''}
-                    </span>
-                  </div>
-                  <div className="backup-progress-actions">
-                    <button className="btn tiny" onClick={() => void api.cancelBackup()}>
-                      Cancel
-                    </button>
-                  </div>
+            </div>
+          </div>
+
+          {/* ===== App updates ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <path d="m7 10 5 5 5-5" />
+                  <path d="M12 15V3" />
+                </svg>
+              </span>
+              <div>
+                <div className="settings-group-title">App updates</div>
+                <div className="settings-group-desc">
+                  Where new versions are checked — the titlebar button polls here
+                  on startup and every 30 minutes. Downloads are verified against
+                  the feed's sha256 before anything is launched.
                 </div>
-              )}
-              {backupMsg && (
-                <div
-                  className="hint"
-                  style={{ color: backupFailed ? 'var(--danger)' : 'var(--accent)', wordBreak: 'break-all' }}
+              </div>
+            </div>
+
+            <div className="settings-row settings-row-stack">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Update feed</div>
+                <div className="settings-row-desc">
+                  A static JSON feed on your own site, checked <b>before</b> GitHub
+                  releases — so a version you publish on the site updates every
+                  install. Empty = GitHub releases only.{' '}
+                  <code>{'{ "version": "2.1.0", "notes": "…", "assets": [{ "name": "Codifa_2.1.0_aarch64.dmg", "url": "https://…", "sha256": "…" }] }'}</code>
+                </div>
+              </div>
+              <div className="data-path-row">
+                <input
+                  value={feedUrlInput}
+                  onChange={(e) => {
+                    setFeedUrlInput(e.target.value)
+                    setUpdateFeedUrl(e.target.value)
+                  }}
+                  placeholder="https://your-site.example/codifa-updates.json"
+                  dir="ltr"
+                  aria-label="Custom update feed URL"
+                />
+                <button
+                  className="btn tiny"
+                  onClick={() => {
+                    setFeedUrlInput('')
+                    setUpdateFeedUrl('')
+                  }}
+                  disabled={!feedUrlInput.trim()}
                 >
-                  {backupMsg}
-                </div>
-              )}
-              {!backingUp && backupMsg && !backupFailed && (
-                <div>
-                  <button
-                    className="btn tiny"
-                    onClick={() => void api.openWorkspaceFolder(backupDirInput.trim() || dataPath || '~/.codifa')}
-                  >
-                    Show folder
-                  </button>
-                </div>
-              )}
+                  Clear
+                </button>
+              </div>
             </div>
           </div>
 

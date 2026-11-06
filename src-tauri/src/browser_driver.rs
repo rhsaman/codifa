@@ -2396,6 +2396,12 @@ pub fn entries() -> Vec<(&'static str, &'static str, Value)> {
 mod tests {
     use super::*;
 
+    /// The two live tests drive ONE shared Chromium; each click now carries a
+    /// post-action capture, so they are slow enough to interleave (a parallel
+    /// run once stole the other's front tab mid-click). Serialized on this
+    /// lock; poisoned locks fall through so one failure never wedges the rest.
+    static LIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn every_action_has_a_description_and_a_known_name() {
         // The tool schema and the route table are generated from ACTIONS, so a
@@ -2583,6 +2589,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_driver_drives_a_real_page() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let chat = format!("live-{}", std::process::id());
         let page = "data:text/html,<title>T</title><body>\
             <button id=b onclick=\"this.textContent='Clicked'\">Go</button>\
@@ -2744,6 +2751,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_page_summary_and_full_agree_on_refs() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if std::env::var("CODIFA_BROWSER_TESTS").is_err() {
             eprintln!("skipping: set CODIFA_BROWSER_TESTS=1 to run the real-page browser gate");
             return;

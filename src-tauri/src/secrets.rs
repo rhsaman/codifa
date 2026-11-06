@@ -83,6 +83,33 @@ fn write_plain_fallback(app: &tauri::AppHandle, b64: &str) {
     }
 }
 
+/// The plain-file install key's path, for the backup layer.
+///
+/// The key lives OUTSIDE the data root (per-OS app-data dir), which is exactly
+/// why it must be packed into a backup explicitly: without it, a restore on
+/// another machine — or another OS — leaves every `enc:v1:` provider key
+/// undecryptable (they read back as empty strings).
+pub fn install_key_file(app: &tauri::AppHandle) -> PathBuf {
+    plain_key_file(app)
+}
+
+/// The install key's raw file bytes (`raw:<b64>`), if it exists.
+pub fn read_install_key(app: &tauri::AppHandle) -> Option<Vec<u8>> {
+    fs::read(plain_key_file(app)).ok()
+}
+
+/// Re-read the plain-file key into the process-global cache — used after a
+/// restore installed a new key from a backup archive, so handle-free readers
+/// (scheduler, router) decrypt with the NEW key even before the post-restore
+/// restart re-fetches it.
+pub fn refresh_cached_key(app: &tauri::AppHandle) {
+    if let Some(b64) = read_plain_fallback(app) {
+        if let Ok(mut g) = CACHED_KEY.lock() {
+            *g = Some(b64);
+        }
+    }
+}
+
 /// The base64 32-byte AES key (lazily generated + keychain-wrapped once).
 ///
 /// The plain-file cache (0600) is preferred over the keychain: unsigned dev

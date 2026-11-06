@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useStore, workspaceKey } from "../lib/store";
+import { APP_DIR, useStore, workspaceKey } from "../lib/store";
 export { useStore };
 import { themeById } from "../lib/themes";
 import type { Chat, Workspace } from "../types";
 import { api } from "../lib/fs";
-import { prepareContent } from "../lib/bidi";
+import { copyToClipboard } from "../lib/clipboard";
+import { detectDir, prepareContent } from "../lib/bidi";
 import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch } from "../lib/shortcuts";
 import { edgeScroll, liveExtents, menuLeft, menuTop, captureDragSlots, slotExtents, slotShifts, tabForPoint, tabMove, type DragSlots } from "../lib/tabBar";
@@ -468,7 +469,7 @@ function SidebarContent({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
 
   // `buildGroups` walks every chat + sorts; memoize it so it only re-runs when
   // the underlying data actually changes (not on every unrelated re-render such
@@ -1055,6 +1056,21 @@ function SidebarContent({
         <button
           className="ws-menu-btn"
           role="menuitem"
+          title={c.id}
+          onClick={() => {
+            void copyToClipboard(c.id);
+            closeChatMenu();
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+          Copy chat ID
+        </button>
+        <button
+          className="ws-menu-btn"
+          role="menuitem"
           onClick={() => setChatMenuMove(true)}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1117,11 +1133,11 @@ function SidebarContent({
           setChatMenuMove(false);
           setChatMenuId(c.id);
           setChatMenuPos({
-            top: menuTop(e.clientY, 150, window.innerHeight),
-            left: menuLeft(e.clientX, 150, window.innerWidth),
+            top: menuTop(e.clientY, 190, window.innerHeight),
+            left: menuLeft(e.clientX, 170, window.innerWidth),
           });
         }}
-        title={prepareContent(titleOf(c), dir)}
+        title={prepareContent(titleOf(c))}
       >
         {selectingWsKey === gKey && (
           <div className="chat-item-select-wrap">
@@ -1138,7 +1154,7 @@ function SidebarContent({
         {renamingId === c.id ? (
           <input
             className="chat-rename-input"
-            dir={dir}
+            dir="auto"
             autoFocus
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
@@ -1150,7 +1166,7 @@ function SidebarContent({
             onClick={(e) => e.stopPropagation()}
           />
         ) : (
-          <span className="chat-item-title-row" dir={dir}>
+          <span className="chat-item-title-row" dir={detectDir(titleOf(c))}>
             <span
               className="chat-item-title"
               onDoubleClick={(e) => {
@@ -1399,7 +1415,7 @@ function SidebarContent({
                     onClick={(e) => e.stopPropagation()}
                   />
                 ) : (
-                  <span className="sidebar-group-label" dir={dir}>{openGroup.label}</span>
+                  <span className="sidebar-group-label" dir={detectDir(openGroup.label)}>{openGroup.label}</span>
                 )}
                 {renderBadges(openGroup)}
               </button>
@@ -1534,7 +1550,7 @@ function SidebarContent({
                         onClick={(e) => e.stopPropagation()}
                       />
                     ) : (
-                      <span className="sidebar-group-label" dir={dir}>{g.label}</span>
+                      <span className="sidebar-group-label" dir={detectDir(g.label)}>{g.label}</span>
                     )}
                     {isPinned && (
                       <svg

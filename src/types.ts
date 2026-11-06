@@ -114,6 +114,10 @@ export interface ProviderConfig {
   accountId?: string
   model: string
   enabled?: boolean
+  /** شرکت‌دادن پروایدر در «تست گروهی» (Recent / Checked / نتایج جستجو / تست همهٔ
+   *  مدل‌های پروایدر). `false` = از تست گروهی کنار گذاشته می‌شود ولی تست تکیِ
+   *  هر مدلش همچنان کار می‌کند. نبودِ مقدار = روشن (پیش‌فرض). */
+  groupTest?: boolean
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
   contextMap?: Record<string, number>
   /** مقادیر دستی کانتکست که کاربر برای مدل‌های کاستوم وارد کرده؛ بر contextMap اولویت دارد. */
@@ -251,6 +255,10 @@ export interface Settings {
   /** Directory the Settings → Storage backup zip is written to.
    *  Empty = the data root itself (~/.codifa by default). */
   backupPath?: string
+  /** URL of a static update feed on the user's own site — checked before
+   *  GitHub releases. See commands.rs `fetch_site_feed` for the JSON shape.
+   *  Empty = GitHub releases only. */
+  updateFeedUrl?: string
   /** STT source: a settings.providers id (remote OpenAI-compatible endpoint). */
   sttProviderId?: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions (e.g. whisper-1). */
@@ -538,7 +546,7 @@ export interface ChatMessage {
   /** Interleaved render order (text slices + tool call positions). Absent on
    *  messages persisted before this feature; they fall back to legacy layout. */
   segments?: MessageSegment[]
-  plan?: Array<{ id?: string; content: string; status: string }>
+  plan?: Array<{ id?: string; content: string; status: string; progress?: number }>
   /** Full implementation plan document produced by Plan mode (kind:"plan_card").
    *  The chat bubble hides the plan portion of `content` and renders this as a
    *  collapsed Plan card instead; "View full plan" opens it in the Plan viewer
@@ -615,6 +623,11 @@ export interface ChatMessage {
     /** "try 2/3" — only when the run may retry. */
     attempt?: number
     attempts?: number
+    /** One-click recovery this row owns. Absent = informational; the footer
+     *  must NOT show a Retry button for it. `compact-retry` re-runs the
+     *  summarizer, while a failed TURN resumes through the message's own
+     *  `error`/`interrupted` fields. */
+    action?: "compact-retry"
   } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
@@ -765,7 +778,6 @@ export interface Chat {
    *  chat for the same reason as `compacting`: the panel remounts on a chat
    *  switch, and a bare spinner says nothing about whether it will ever end. */
   compactProgress?: ChatCompactProgress | null
-  compactNotice?: string | null
   compactError?: string | null
   cmdError?: string | null
   /** Connectors the model already loaded with `use_mcp`, persisted per chat so
@@ -782,7 +794,7 @@ export interface Chat {
   ttsError?: string | null
   /** Warning that an @mentioned skill was not found (deleted/renamed) — the
    *  'skill' event's `note` field. Per-chat so it survives the ChatPanel
-   *  remount on chat switch (same rationale as compactNotice). */
+   *  remount on chat switch (same rationale as compactProgress). */
   skillNotice?: string | null
   /** Transient feedback for /undo and /redo ("Undid the last exchange.").
    *  Lives on the chat instead of being a permanent assistant turn so the ack
@@ -807,11 +819,19 @@ export interface Chat {
    *  (`chats/<workspace>/<id>.json`), written by the store onto the index row;
    *  the Rust side resolves the body from it. */
   dir?: string
-  /** True once `messages` holds the real transcript. `false` means the body has
-   *  not been fetched yet: the transcript shows a loader instead of an empty
-   *  chat, and message-mutating actions refuse to write — a partial in-memory
-   *  transcript would overwrite the real body file on the next persist. */
+  /** True once `messages` holds a real transcript window. `false` means the
+   *  body has not been fetched yet: the transcript shows a loader instead of an
+   *  empty chat, and message-mutating actions refuse to write — a partial
+   *  in-memory transcript would overwrite the real body file on the next
+   *  persist. */
   hydrated?: boolean
+  /** Absolute index (in the full on-disk transcript) of `messages[0]`.
+   *  Non-zero means older messages still exist on disk and are paged in on
+   *  scroll. Persisting such a window writes metadata only, never the body. */
+  bodyStart?: number
+  /** Total number of messages in the full on-disk transcript. Lets the UI say
+   *  how much history remains without loading it. */
+  bodyTotal?: number
   createdAt: number
   updatedAt: number
 }

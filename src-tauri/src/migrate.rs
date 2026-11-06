@@ -18,6 +18,41 @@ use serde_json::{json, Value};
 /// never repeated. Lives beside the stores it consumed.
 const MIGRATED: &str = ".stores-in-bundles";
 
+/// Atomic text write: temp file + fsync + rename, so a crash or power loss
+/// mid-write can never tear the file.
+///
+/// The rename migration rewrites `settings.json` — the WHOLE store document.
+/// The store layer itself publishes it temp+rename (`store::write_document`),
+/// and a migration must meet the same bar: a torn settings.json reads back as
+/// an empty store, and the next `store_set` would happily persist that
+/// emptiness over the user's providers (encrypted API keys included) and chat
+/// index.
+fn atomic_write_text(path: &Path, text: &str) -> bool {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_file_name(format!("{name}.tmp{}.{unique}", std::process::id()));
+    {
+        use std::io::Write;
+        let Ok(mut f) = std::fs::File::create(&tmp) else {
+            return false;
+        };
+        if f.write_all(text.as_bytes()).is_err() || f.sync_all().is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
 /// Fold `<root>/skills/*` and `<root>/mcp/*.json` into plugin bundles.
 ///
 /// Returns the number of bundles written. Idempotent: a second call does nothing,
@@ -272,6 +307,284 @@ fn settings_mcp_enabled(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Marker that the built-in bundle rename already ran. Without it a plugin the
+/// user later names `docker` (or `builtin-skills`) would be renamed on the next
+/// boot, because the folder name alone cannot tell it from the old seed.
+const BUILTIN_RENAMED: &str = ".builtin-bundles-renamed";
+
+/// Rename the two seeded bundles whose names changed after they first shipped.
+///
+/// The constants alone would leave an existing install with BOTH folders: the
+/// old `builtin-skills`/`docker` bundle keeps its data, and the seeder writes a
+/// fresh `builtin-plugin`/`docker-mcp` beside it. This moves the folder, patches
+/// its manifest and connector keys, and carries user additions along. It also
+/// rewrites saved schedules and the settings snapshot, which refer to the old
+/// names. Idempotent: the marker stops a second boot from touching a bundle the
+/// user made later with one of the old names.
+pub fn rename_builtin_bundles(root: &Path) -> usize {
+    if root.join(BUILTIN_RENAMED).exists() {
+        return 0;
+    }
+    let mut changed = 0;
+    if rename_bundle(root, "builtin-skills", crate::plugins::BUILTIN_BUNDLE_SLUG) {
+        changed += 1;
+    }
+    if rename_bundle(root, "docker", crate::plugins::DOCKER_BUNDLE) {
+        changed += 1;
+    }
+    // Patch identity even when the folder was already renamed on an earlier
+    // boot: an interrupted migration may have moved the folder but not written
+    // the manifest.
+    if patch_manifest_identity(
+        &root.join("plugins").join(crate::plugins::BUILTIN_BUNDLE_SLUG),
+        crate::plugins::BUILTIN_BUNDLE_NAME,
+        crate::plugins::BUILTIN_BUNDLE_SLUG,
+    ) {
+        changed += 1;
+    }
+    if patch_manifest_identity(
+        &root.join("plugins").join(crate::plugins::DOCKER_BUNDLE),
+        crate::plugins::DOCKER_BUNDLE,
+        crate::plugins::DOCKER_BUNDLE,
+    ) {
+        changed += 1;
+    }
+    if patch_docker_connector_key(root) {
+        changed += 1;
+    }
+    changed += rewrite_schedule_refs(root);
+    changed += rewrite_settings_refs(root);
+    // A failed move leaves an old folder behind: keep the marker off so the
+    // next boot retries instead of stranding the user's data under the old name.
+    let leftover = root.join("plugins").join("builtin-skills").is_dir()
+        || root.join("plugins").join("docker").is_dir();
+    if !leftover {
+        let _ = std::fs::write(root.join(BUILTIN_RENAMED), format!("{changed}\n"));
+    }
+    changed
+}
+
+/// Move one plugin folder, merging into the destination when it already exists.
+fn rename_bundle(root: &Path, from: &str, to: &str) -> bool {
+    let base = root.join("plugins");
+    let src = base.join(from);
+    let dst = base.join(to);
+    if !src.is_dir() {
+        return false;
+    }
+    if dst.exists() {
+        // A partially migrated install can hold both. Keep the destination's
+        // files and copy only what is missing, so no user addition is lost.
+        merge_missing(&src, &dst);
+        std::fs::remove_dir_all(&src).is_ok()
+    } else {
+        std::fs::rename(&src, &dst).is_ok()
+    }
+}
+
+/// Recursively copy files the destination does not already have. JSON files
+/// (`plugin.json`, `mcp.json`) are merged by key so a connector or keyword from
+/// the old folder is not dropped just because the destination has the file.
+fn merge_missing(src: &Path, dst: &Path) {
+    if std::fs::create_dir_all(dst).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let Some(name) = from.file_name() else {
+            continue;
+        };
+        let to = dst.join(name);
+        if from.is_dir() {
+            merge_missing(&from, &to);
+            continue;
+        }
+        if !to.exists() {
+            let _ = std::fs::copy(&from, &to);
+            continue;
+        }
+        if matches!(name.to_str(), Some("plugin.json") | Some("mcp.json")) {
+            merge_json_objects(&from, &to);
+        }
+    }
+}
+
+fn merge_json_objects(src: &Path, dst: &Path) {
+    let Ok(from_text) = std::fs::read_to_string(src) else {
+        return;
+    };
+    let Ok(to_text) = std::fs::read_to_string(dst) else {
+        return;
+    };
+    let Ok(Value::Object(mut to)) = serde_json::from_str::<Value>(&to_text) else {
+        return;
+    };
+    let Ok(Value::Object(from)) = serde_json::from_str::<Value>(&from_text) else {
+        return;
+    };
+    for (key, value) in from {
+        to.entry(key).or_insert(value);
+    }
+    let _ = std::fs::write(dst, Value::Object(to).to_string());
+}
+
+/// Set a bundle manifest's display name and slug without touching anything the
+/// user changed (enabled, description, keywords, connector metadata).
+fn patch_manifest_identity(dir: &Path, name: &str, slug: &str) -> bool {
+    let path = dir.join("plugin.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(Value::Object(mut manifest)) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let mut changed = false;
+    if manifest.get("name").and_then(Value::as_str) != Some(name) {
+        manifest.insert("name".into(), json!(name));
+        changed = true;
+    }
+    if manifest.get("slug").and_then(Value::as_str) != Some(slug) {
+        manifest.insert("slug".into(), json!(slug));
+        changed = true;
+    }
+    if changed {
+        let raw = serde_json::to_string_pretty(&Value::Object(manifest)).unwrap_or_default();
+        atomic_write_text(&path, &raw);
+    }
+    changed
+}
+
+/// Rename the connector key inside the Docker bundle and its manifest metadata.
+fn patch_docker_connector_key(root: &Path) -> bool {
+    let dir = root.join("plugins").join(crate::plugins::DOCKER_BUNDLE);
+    let mut changed = false;
+    let mcp_path = dir.join("mcp.json");
+    if let Ok(text) = std::fs::read_to_string(&mcp_path) {
+        if let Ok(Value::Object(mut servers)) = serde_json::from_str::<Value>(&text) {
+            if let Some(cfg) = servers.remove("docker") {
+                servers.entry(crate::plugins::DOCKER_BUNDLE.to_string()).or_insert(cfg);
+                atomic_write_text(&mcp_path, &Value::Object(servers).to_string());
+                changed = true;
+            }
+        }
+    }
+    let manifest_path = dir.join("plugin.json");
+    if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(Value::Object(mut manifest)) = serde_json::from_str::<Value>(&text) {
+            if let Some(Value::Object(mut meta)) = manifest.get_mut("connector_meta").cloned() {
+                if let Some(entry) = meta.remove("docker") {
+                    meta.entry(crate::plugins::DOCKER_BUNDLE.to_string()).or_insert(entry);
+                    manifest.insert("connector_meta".into(), Value::Object(meta));
+                    let raw = serde_json::to_string_pretty(&Value::Object(manifest)).unwrap_or_default();
+                    atomic_write_text(&manifest_path, &raw);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Point saved schedules at the renamed bundles. Legacy `skills`/`mcp_servers`
+/// fields are rewritten too, because the scheduler still reads them.
+fn rewrite_schedule_refs(root: &Path) -> usize {
+    let dir = root.join("schedules");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut changed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(Value::Object(mut task)) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let mut touched = false;
+        for key in ["plugins", "skills", "mcp_servers"] {
+            let Some(items) = task.get_mut(key).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    continue;
+                };
+                let next = match name {
+                    "builtin-skills" => Some(crate::plugins::BUILTIN_BUNDLE_SLUG),
+                    "docker" => Some(crate::plugins::DOCKER_BUNDLE),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    *item = json!(next);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            if let Ok(raw) = serde_json::to_string_pretty(&Value::Object(task)) {
+                if atomic_write_text(&path, &raw) {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Rename the connector in the settings snapshot too. The live MCP list comes
+/// from the bundles, but `settings.json` keeps a copy that the renderer merges
+/// at startup; leaving `docker` there would show a ghost connector.
+fn rewrite_settings_refs(root: &Path) -> usize {
+    let path = root.join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let Ok(Value::Object(mut settings)) = serde_json::from_str::<Value>(&text) else {
+        return 0;
+    };
+    let mut changed = false;
+    if let Some(Value::Object(mut servers)) = settings.get("mcpServers").cloned() {
+        if let Some(cfg) = servers.remove("docker") {
+            servers.entry(crate::plugins::DOCKER_BUNDLE.to_string()).or_insert(cfg);
+            settings.insert("mcpServers".into(), Value::Object(servers));
+            changed = true;
+        }
+    }
+    if let Some(Value::Array(enabled)) = settings.get("mcpEnabled").cloned() {
+        let mut names: Vec<String> = Vec::new();
+        for item in enabled {
+            let name = match item.as_str() {
+                Some("docker") => {
+                    changed = true;
+                    crate::plugins::DOCKER_BUNDLE.to_string()
+                }
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if names.len() != settings["mcpEnabled"].as_array().map_or(0, Vec::len) {
+            changed = true;
+        }
+        settings.insert("mcpEnabled".into(), json!(names));
+    }
+    if changed {
+        if let Ok(raw) = serde_json::to_string(&Value::Object(settings)) {
+            return usize::from(atomic_write_text(&path, &raw));
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +623,136 @@ mod tests {
             "the only copy of a skill has to survive the cleanup"
         );
         assert!(!root.join("skills").join("movie-finder").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builtin_bundles_are_renamed_with_their_content_and_schedules() {
+        // An install seeded before the rename has the old folders, connector key
+        // and schedule references. Moving the folder must carry a user-added
+        // skill and the enabled switch along, and every reference must follow.
+        let root = temp_root("rename-builtins");
+
+        let builtin = root.join("plugins").join("builtin-skills");
+        std::fs::create_dir_all(builtin.join("skills").join("my-note")).unwrap();
+        std::fs::write(
+            builtin.join("plugin.json"),
+            json!({
+                "name": "Built-in Skills",
+                "slug": "builtin-skills",
+                "enabled": false,
+                "version": "1.0.0",
+                "fa_keywords": ["فیلم"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            builtin.join("skills").join("my-note").join("skill.md"),
+            "---\nname: My Note\ndescription: keep me\n---\n\n# body\n",
+        )
+        .unwrap();
+
+        let docker = root.join("plugins").join("docker");
+        std::fs::create_dir_all(&docker).unwrap();
+        std::fs::write(
+            docker.join("plugin.json"),
+            json!({
+                "name": "docker",
+                "slug": "docker",
+                "enabled": true,
+                "connector_meta": {"docker": {"description": "containers"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            docker.join("mcp.json"),
+            json!({"docker": {"command": "docker", "args": ["mcp", "gateway", "run"]}}).to_string(),
+        )
+        .unwrap();
+
+        let schedules = root.join("schedules");
+        std::fs::create_dir_all(&schedules).unwrap();
+        std::fs::write(
+            schedules.join("sch-1.json"),
+            json!({
+                "id": "sch-1",
+                "name": "nightly",
+                "plugins": ["builtin-skills", "docker"],
+                "mcp_servers": ["docker"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("settings.json"),
+            json!({
+                "mcpServers": {"docker": {"command": "docker"}},
+                "mcpEnabled": ["docker"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(rename_builtin_bundles(&root) > 0);
+        assert!(!root.join("plugins/builtin-skills").exists());
+        assert!(!root.join("plugins/docker").exists());
+
+        let builtin_new = root.join("plugins/builtin-plugin");
+        let manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(builtin_new.join("plugin.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["name"], json!("builtin plugin"));
+        assert_eq!(manifest["slug"], json!("builtin-plugin"));
+        assert_eq!(manifest["enabled"], json!(false), "the switch is preserved");
+        assert_eq!(manifest["fa_keywords"], json!(["فیلم"]));
+        assert!(builtin_new.join("skills/my-note/skill.md").is_file());
+
+        let docker_new = root.join("plugins/docker-mcp");
+        let dmanifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(docker_new.join("plugin.json")).unwrap())
+                .unwrap();
+        assert_eq!(dmanifest["name"], json!("docker-mcp"));
+        assert_eq!(dmanifest["slug"], json!("docker-mcp"));
+        assert_eq!(dmanifest["enabled"], json!(true));
+        assert_eq!(dmanifest["connector_meta"]["docker-mcp"]["description"], json!("containers"));
+        let servers: Value =
+            serde_json::from_str(&std::fs::read_to_string(docker_new.join("mcp.json")).unwrap())
+                .unwrap();
+        assert!(servers.get("docker-mcp").is_some(), "{servers}");
+        assert!(servers.get("docker").is_none(), "{servers}");
+
+        let task: Value =
+            serde_json::from_str(&std::fs::read_to_string(schedules.join("sch-1.json")).unwrap())
+                .unwrap();
+        assert_eq!(task["plugins"], json!(["builtin-plugin", "docker-mcp"]));
+        assert_eq!(task["mcp_servers"], json!(["docker-mcp"]));
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(settings["mcpServers"].get("docker-mcp").is_some(), "{settings}");
+        assert!(settings["mcpServers"].get("docker").is_none(), "{settings}");
+        assert_eq!(settings["mcpEnabled"], json!(["docker-mcp"]));
+
+        // A second boot is a no-op: no folder to move and no reference left.
+        assert_eq!(rename_builtin_bundles(&root), 0);
+
+        // A bundle the user makes LATER under an old name is theirs. The marker
+        // must stop the rename from touching it — otherwise every future boot
+        // would keep hijacking a plugin called `docker`.
+        let later = root.join("plugins").join("docker");
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(
+            later.join("plugin.json"),
+            json!({"name": "docker", "slug": "docker", "enabled": true}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(rename_builtin_bundles(&root), 0);
+        assert!(later.join("plugin.json").is_file(), "the user's bundle must stay");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

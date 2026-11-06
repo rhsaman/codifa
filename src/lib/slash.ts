@@ -11,6 +11,9 @@ export interface ParsedSlash {
 const HISTORY_KEY = 'coder:promptHistory'
 const PINS_KEY = 'coder:pinnedCommands'
 const COMMAND_USAGE_KEY = 'coder:commandUsage'
+/** Per SUB-COMMAND recency (`plugin search`, `schedule run <id>`), so the
+ *  palette's lower levels sort the same way the command level does. */
+const SUBCOMMAND_USAGE_KEY = 'coder:subcommandUsage'
 
 export const MAX_HISTORY = 10
 export const MAX_PINS = 3
@@ -37,7 +40,19 @@ export interface SubCommand {
   arg: ArgKind
   /** The token after that (an install's sub-folder, then its branch). */
   rest?: ArgKind
+  /** A nested command group (`/plugin marketplace add|remove|list`). */
+  sub?: SubCommand[]
+  /** Exact usage shown by `/help` when the generic arg suffix would mislead. */
+  usage?: string
 }
+
+/** The `/plugin marketplace` group. Kept beside the plugin table so the
+ *  palette, `/help` and the dispatcher read the same words. */
+export const MARKETPLACE_SUBCOMMANDS: SubCommand[] = [
+  { name: 'add', hint: 'Add a marketplace from a repo', arg: 'url', rest: 'free', usage: ' <repo> [label]' },
+  { name: 'remove', hint: 'Remove a marketplace (installed plugins stay)', arg: 'free', usage: ' <name|repo>' },
+  { name: 'list', hint: 'List your marketplaces', arg: 'free', usage: '' },
+]
 
 /** Sub-commands per command, in the order the menu lists them.
  *
@@ -47,29 +62,21 @@ export interface SubCommand {
 export const SUBCOMMANDS: Record<string, SubCommand[]> = {
   plugin: [
     { name: 'list', hint: 'List installed bundles', arg: 'free' },
+    // Second, not last: the popup clips below ~7 rows, and a search row at the
+    // bottom was below the fold — it read as "not in the menu".
+    { name: 'search', hint: 'Find the best plugin for a request', arg: 'free' },
     { name: 'install', hint: 'Install a bundle from a repo', arg: 'url', rest: 'free' },
     { name: 'create', hint: 'Create a bundle from a description', arg: 'free' },
     { name: 'update', hint: 'Edit a bundle (skills, commands, agents, hooks, scripts)', arg: 'name' },
     { name: 'on', hint: 'Switch a bundle on', arg: 'name' },
     { name: 'off', hint: 'Switch a bundle off', arg: 'name' },
     { name: 'remove', hint: 'Delete a bundle and its contents', arg: 'name' },
-  ],
-  skill: [
-    { name: 'list', hint: 'List every installed skill', arg: 'free' },
-    { name: 'install', hint: 'Install a skill from a repo', arg: 'url', rest: 'free' },
-    { name: 'create', hint: 'Create a skill from a description', arg: 'free' },
-    { name: 'update', hint: 'Edit an existing skill', arg: 'name' },
-    { name: 'remove', hint: 'Delete a skill', arg: 'name' },
-  ],
-  mcp: [
-    { name: 'list', hint: 'List every connector', arg: 'free' },
-    // `install` was already implemented in the dispatcher but missing from this
-    // table, so the menu could not offer it and `/help` hid it — a path only a
-    // user who already knew the word could reach.
-    { name: 'install', hint: 'Install a connector bundle from a repo', arg: 'url', rest: 'free' },
-    { name: 'create', hint: 'Create a connector from a description', arg: 'free' },
-    { name: 'update', hint: 'Edit an existing connector', arg: 'name' },
-    { name: 'remove', hint: 'Delete a connector', arg: 'name' },
+    {
+      name: 'marketplace',
+      hint: 'Add, remove or list marketplaces (marketplace add <repo>)',
+      arg: 'free',
+      sub: MARKETPLACE_SUBCOMMANDS,
+    },
   ],
   artifact: [
     { name: 'list', hint: 'List this chat\u2019s documents', arg: 'free' },
@@ -106,46 +113,43 @@ export function slashBody(command: string, rest: string): string {
 
 /** A `--flag=value` option a slash command accepts after its sub-command.
  *
- *  The palette offers the flag NAMES (`--skills`, `--mcp`, …), then the values
- *  that actually exist for it — a schedule, for instance, can name which skills,
- *  MCP connectors and plugins every run gets. `values` says which installed list
- *  the value menu reads. */
+ *  The palette offers the flag NAMES, then the values that actually exist for
+ *  it — a schedule, for instance, can name which plugins every run gets.
+ *  `values` says which installed list the value menu reads. */
 export interface CommandFlag {
   /** Flag as typed, including the leading dashes. */
   name: string
   hint: string
-  /** Key into the palette's named-value map (`skill`, `mcp`, `plugin`). */
+  /** Key into the palette's named-value map (`plugin`). */
   values: string
-  /** Comma-separated flags accumulate (`--skills=a,b`); a single one replaces. */
+  /** Comma-separated flags accumulate (`--plugins=a,b`); a single one replaces. */
   multiple?: boolean
 }
 
 /** The flags a command accepts, keyed by command name (no slash). */
 export const COMMAND_FLAGS: Record<string, CommandFlag[]> = {
   schedule: [
-    { name: '--skills', hint: 'Skills attached to every run', values: 'skill', multiple: true },
-    { name: '--mcp', hint: 'MCP connectors for every run', values: 'mcp', multiple: true },
     { name: '--plugins', hint: 'Plugins every run gets', values: 'plugin', multiple: true },
   ],
 }
 
 /** Every flag name the caret's command accepts, for the name level.
  *
- *  `sub` narrows by sub-command: the schedule flags attach skills/mcp/plugins
- *  to every run, and that only makes sense while CREATING a task — `update`
- *  keeps whatever create attached (its tail is change prose), and `run` /
- *  `remove` take no attachments, so those menus offer no flags. */
+ *  `sub` narrows by sub-command: the schedule flags attach plugins to every
+ *  run, and that only makes sense while CREATING a task — `update` keeps
+ *  whatever create attached (its tail is change prose), and `run` / `remove`
+ *  take no attachments, so those menus offer no flags. */
 export function commandFlags(command: string, sub?: string): CommandFlag[] {
   const key = command.startsWith('/') ? command.slice(1) : command
   if (sub && sub !== 'create') return []
   return COMMAND_FLAGS[key] ?? []
 }
 
-/** The flag word the caret is inside, if any: `--skills` or `--skills=a,b`.
+/** The flag word the caret is inside, if any: `--plugins` or `--plugins=a,b`.
  *
  *  Returns null for a plain argument, so a sub-command's own value menu (a repo,
  *  an id) keeps working alongside the flags. `flag` is the flag name as typed
- *  (`--skills`, lowercased), `typed` the value text already after `=`. */
+ *  (`--plugins`, lowercased), `typed` the value text already after `=`. */
 export interface CaretFlag {
   start: number
   end: number
@@ -182,7 +186,7 @@ export function isFlagToken(word: string): boolean {
 
 /** Rewrite macOS "smart dashes" back to `--` inside a command line.
  *
- *  Typing `--skills` with smart punctuation on turns the pair into one em-dash
+ *  Typing `--plugins` with smart punctuation on turns the pair into one em-dash
  *  (`—skills`), which no flag parser matched: flags inserted from the menu
  *  (real `--`) worked while every hand-typed one went dead, and even deleting
  *  the typed character did not bring the list back. Inside a command line, a
@@ -229,7 +233,7 @@ export function hasLandedValue(words: string[]): boolean {
  *  no installed name used to leave an empty popup ("No matching commands")
  *  while the list was right there, so the ranking is only a preference and the
  *  full list is the fallback. Values already picked in the same token are
- *  dropped, so `--skills=a,b` does not offer `a` twice. */
+ *  dropped, so `--plugins=a,b` does not offer `a` twice. */
 export function flagValueRows(values: string[], typed: string): string[] {
   const picked = flagValues(typed)
   const last = picked[picked.length - 1] ?? ''
@@ -243,7 +247,7 @@ export function flagValueRows(values: string[], typed: string): string[] {
   return (ranked.length > 0 ? ranked : values).filter((v) => !picked.includes(v))
 }
 
-/** The text a value pick writes over the token's typed part (`--skills=` …).
+/** The text a value pick writes over the token's typed part (`--plugins=` …).
  *
  *  An earlier COMPLETE pick is kept and the new value appended
  *  (`brainstorming` + `data-analysis` → `brainstorming,data-analysis`); a
@@ -258,31 +262,20 @@ export function flagPickInsert(typed: string, v: string, values: string[]): stri
   return picked.length > 1 ? `${picked.slice(0, -1).join(',')},${v}` : v
 }
 
-/** Resolve the command line's `--flags` into the tool's three arrays.
+/** Resolve the command line's `--flags` into the schedule tool's array.
  *
  *  The composer writes flags so the user can PICK from what exists, but the
- *  schedule tool wants `skills`/`mcp_servers`/`plugins` — so the line is read
- *  here instead of leaving the model to re-parse it. An empty result means the
- *  line carried no flags. */
+ *  schedule tool wants `plugins` — so the line is read here instead of leaving
+ *  the model to re-parse it. An empty result means the line carried no flags. */
 export interface ScheduleFlags {
-  skills: string[]
-  mcp_servers: string[]
   plugins: string[]
 }
 export function parseScheduleFlags(text: string): ScheduleFlags {
-  const out: ScheduleFlags = { skills: [], mcp_servers: [], plugins: [] }
-  const key: Record<string, keyof ScheduleFlags> = {
-    '--skills': 'skills',
-    '--mcp': 'mcp_servers',
-    '--plugins': 'plugins',
-  }
-  // `—skills=` (the smart-dash mangling of a typed `--skills=`) counts too.
-  for (const m of text.matchAll(/(?:—|–|--)(skills|mcp|plugins)=([^\s]*)/gi)) {
-    const name = `--${m[1].toLowerCase()}`
-    const target = key[name]
-    if (!target) continue
+  const out: ScheduleFlags = { plugins: [] }
+  // `—plugins=` (the smart-dash mangling of a typed `--plugins=`) counts too.
+  for (const m of text.matchAll(/(?:—|–|--)(plugins)=([^\s]*)/gi)) {
     for (const v of flagValues(m[2])) {
-      if (!out[target].includes(v)) out[target].push(v)
+      if (!out.plugins.includes(v)) out.plugins.push(v)
     }
   }
   return out
@@ -290,11 +283,11 @@ export function parseScheduleFlags(text: string): ScheduleFlags {
 
 /** Drop the `--flag=value` tokens from a line, leaving the user's prose.
  *
- *  `/schedule create هر روز --skills=x` must describe the task as "هر روز", not
- *  spell the flags out to the model — they travel as real tool arguments. */
+ *  `/schedule create هر روز --plugins=x` must describe the task as "هر روز",
+ *  not spell the flag out to the model — it travels as a real tool argument. */
 export function stripFlagTokens(text: string): string {
   return text
-    .replace(/(?:—|–|--)(?:skills|mcp|plugins)=[^\s]*/gi, '')
+    .replace(/(?:—|–|--)(?:plugins)=[^\s]*/gi, '')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -342,13 +335,19 @@ export function slashCaretAt(text: string, caret: number): SlashCaret | null {
  *
  *  Those lists live in localStorage under the OLD names, so without this the
  *  recent-command ordering silently loses its history and the history popup
- *  keeps offering `/create-skill`, a command that no longer exists. */
+ *  keeps offering `/create-skill`, a command that no longer exists. Standalone
+ *  skill/MCP creation is gone too, so both old names now point at the one
+ *  authoring command left: `/plugin create`. */
 export function migrateCommandNames(): void {
   const s = storage()
   if (!s) return
-  const renames: Record<string, string> = { 'create-skill': 'skill', 'create-mcp': 'mcp' },
-    rewrite = (raw: string): string =>
-      raw.replace(/\/(create-skill|create-mcp)\b/g, (_m, n: string) => `/${renames[n]}`)
+  const rewrite = (raw: string): string =>
+    raw.replace(/\/(?:create-skill|create-mcp)\b/g, '/plugin create')
+  // Usage stores BARE command names (no slash), so it needs its own lookup.
+  const usageRenames: Record<string, string> = {
+    'create-skill': 'plugin',
+    'create-mcp': 'plugin',
+  }
   try {
     const history = s.getItem(HISTORY_KEY)
     if (history) {
@@ -382,8 +381,8 @@ export function migrateCommandNames(): void {
       if (Array.isArray(arr)) {
         // Usage stores BARE names (no slash), so the rewrite is a lookup.
         const next = arr.map((x) =>
-          typeof x === 'string' && renames[x.trim().toLowerCase()]
-            ? renames[x.trim().toLowerCase()]
+          typeof x === 'string' && usageRenames[x.trim().toLowerCase()]
+            ? usageRenames[x.trim().toLowerCase()]
             : x,
         )
         if (JSON.stringify(next) !== JSON.stringify(arr))
@@ -441,7 +440,7 @@ export function slashTokenRange(text: string): { start: number; end: number } | 
 
 /** Pretty label for a slash command WITHOUT the leading slash.
  *  Known commands get a human label; unknown ones just lose the slash.
- *  Examples: "/compact" -> "Compact", "/skill install foo" -> "Skill: install foo". */
+ *  Examples: "/compact" -> "Compact", "/plugin install foo" -> "Plugin: install foo". */
 export function prettySlashLabel(text: string): string {
   const parsed = parseSlashInput(text)
   if (!parsed) return text
@@ -543,6 +542,46 @@ export function togglePin(text: string, prev?: string[]): string[] {
   return next
 }
 
+/** Load persisted SUB-command usage keys (newest first). Empty when none. */
+export function loadSubcommandUsage(): string[] {
+  const s = storage()
+  if (!s) return []
+  try {
+    const raw = s.getItem(SUBCOMMAND_USAGE_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    return arr
+      .filter((x) => typeof x === 'string')
+      .map((x) => x.trim().toLowerCase())
+      .filter((x) => x.length > 0)
+      .slice(0, MAX_COMMAND_USAGE)
+  } catch {
+    return []
+  }
+}
+
+/** Record a sub-level use at the front (dedupe, cap length).
+ *
+ *  `key` is the full path the row stands for — `plugin search` for a
+ *  sub-command, `plugin marketplace add` for a nested verb, and
+ *  `schedule run <id>` for a picked value — so every palette level can sort
+ *  by the same recency rule the command level already uses. Returns the new
+ *  list; empty keys leave it unchanged. */
+export function recordSubcommandUsage(key: string, prev?: string[]): string[] {
+  const k = key.trim().toLowerCase()
+  if (!k) return prev ?? loadSubcommandUsage()
+  const base = prev ?? loadSubcommandUsage()
+  const next = [k, ...base.filter((x) => x !== k)].slice(0, MAX_COMMAND_USAGE)
+  const s = storage()
+  try {
+    s?.setItem(SUBCOMMAND_USAGE_KEY, JSON.stringify(next))
+  } catch {
+    /* ignore */
+  }
+  return next
+}
+
 /** Load persisted slash-command usage (bare command names, newest first). */
 export function loadCommandUsage(): string[] {
   const s = storage()
@@ -596,7 +635,7 @@ export function recordCommandUsage(input: string, prev?: string[]): string[] {
  *  the palette, but those three kept its name forever — so `/my-plugin-skill`
  *  stayed pinned and a mistyped line kept suggesting a command that was gone.
  *
- *  Matching is on the PARSED name, so `/skill update x` is only forgotten when
+ *  Matching is on the PARSED name, so `/plugin update x` is only forgotten when
  *  `skill` itself is in `names`. Returns nothing: the stores are the state.
  */
 export function forgetCommands(names: string[]): void {

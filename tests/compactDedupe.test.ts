@@ -1,7 +1,8 @@
-// تست رگرسیون حذف رندر تکراری سامری: اتو-کامپکت وسط استریم نباید دو بلوک
-// Context summary بسازد — فقط سگمنت درون‌خطی داخل پیام استریمینگ می‌ماند و
-// نسخه مستقل ته لیست از رندر حذف می‌شود. بین‌ترن‌ها (بدون سگمنت) همان پیام
-// مستقل نمایش داده می‌شود.
+// تست رگرسیون پنجرهٔ نمایش چت:
+//  - خلاصهٔ تکراری وسط استریم فقط به‌صورت سگمنت درون‌خطی می‌ماند.
+//  - پیام‌های compacted نمایشی می‌مانند (خلاصه جایگزین تاریخچه نیست) و در
+//    شمارش «Load earlier» هم می‌آیند.
+//  - modeSwitch که ChatMessageView برایش null برمی‌گرداند از شمارش بیرون می‌ماند.
 // اجرا: npm run test:frontend (از طریق tests/run-frontend.sh)
 import './_globals.ts'
 const { useStore } = await import('../src/lib/store.ts')
@@ -62,16 +63,29 @@ function check(name: string, cond: boolean, extra?: unknown) {
     ).length === 1,
     visible.map((m) => m.segments),
   )
+  check(
+    'پیام‌های compacted در پنجرهٔ نمایش می‌مانند',
+    visible.some((m) => m.compacted),
+    visible.map((m) => ({ id: m.id, compacted: m.compacted })),
+  )
+  check(
+    'پیام قدیمی فولدشده واقعاً قابل‌رندر است',
+    visible.some((m) => m.role === 'user' && m.content === 'قدیمی'),
+    visible.map((m) => ({ id: m.id, compacted: m.compacted })),
+  )
 }
 
-// سناریو ۲: کامپکت بین‌ترن‌ها (بدون پیام استریمینگ) — سگمنتی نیست پس همان
-// پیام مستقل ته لیست نمایش داده می‌شود.
+// سناریو ۲: کامپکت بین‌ترن‌ها (بدون پیام استریمینگ) — سگمنتی نیست، پس خلاصهٔ
+// مستقل می‌ماند و پیام‌های فولدشده (compacted) هم در تاریخچه دیده می‌شوند.
 {
-  console.log('── compactDedupe: کامپکت بین‌ترن‌ها پیام مستقل را نگه می‌دارد ──')
+  console.log('── compactDedupe: کامپکت بین‌ترن‌ها خلاصه و تاریخچه را نگه می‌دارد ──')
   const s = useStore.getState()
   const chatId = s.newChat('ask')
-  s.addMessage(chatId, { role: 'user', content: 'قدیمی' })
-  s.addMessage(chatId, { role: 'assistant', content: 'پاسخ تمام‌شده' })
+  const foldedUser = s.addMessage(chatId, { role: 'user', content: 'قدیمی' })
+  const keptAssistant = s.addMessage(chatId, {
+    role: 'assistant',
+    content: 'پاسخ تمام‌شده',
+  })
   s.compactChat(chatId, '[Compacted earlier context]\nخلاصه بین‌ترن', 1)
 
   const msgs = useStore.getState().chats.find((c) => c.id === chatId)!.messages
@@ -83,9 +97,47 @@ function check(name: string, cond: boolean, extra?: unknown) {
     visible.map((m) => m.id),
   )
   check(
-    'بدون سگمنت، همه پیام‌ها نمایشی‌اند',
-    visible.length === msgs.length,
+    'پیام فولدشده (compacted) در پنجره می‌ماند',
+    visible.some((m) => m.id === foldedUser.id),
+    visible.map((m) => m.id),
+  )
+  check(
+    'پیام نگه‌داشته‌شده هنوز نمایشی است',
+    visible.some((m) => m.id === keptAssistant.id),
+    visible.map((m) => m.id),
+  )
+  check(
+    'طول پنجره همهٔ پیام‌های قابل‌رندر (از جمله compacted) را می‌شمارد',
+    visible.length === msgs.filter((m) => !m.modeSwitch).length,
     { visible: visible.length, total: msgs.length },
+  )
+}
+
+// سناریو ۳: modeSwitch فقط برای تاریخچهٔ مدل است و رندر نمی‌شود.
+{
+  console.log('── compactDedupe: پیام modeSwitch رندر نمی‌شود ──')
+  const s = useStore.getState()
+  const chatId = s.newChat('ask')
+  const user = s.addMessage(chatId, { role: 'user', content: 'سلام' })
+  const switchNote = s.addMessage(chatId, {
+    role: 'assistant',
+    content: 'mode switched',
+    modeSwitch: true,
+  })
+  const reply = s.addMessage(chatId, { role: 'assistant', content: 'پاسخ' })
+
+  const visible = visibleChatMessages(
+    useStore.getState().chats.find((c) => c.id === chatId)!.messages,
+  )
+  check(
+    'modeSwitch از پنجره حذف شده',
+    !visible.some((m) => m.id === switchNote.id),
+    visible.map((m) => m.id),
+  )
+  check(
+    'پیام‌های عادی نمایشی می‌مانند',
+    visible.some((m) => m.id === user.id) && visible.some((m) => m.id === reply.id),
+    visible.map((m) => m.id),
   )
 }
 
@@ -93,5 +145,5 @@ if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)
 }
-console.log('\nهمه تستهای compactDedupe پاس شدند ✅')
+console.log('\nهمه تست‌های compactDedupe پاس شدند ✅')
 process.exit(0)

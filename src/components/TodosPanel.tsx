@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { ensureChatHydrated, useStore } from "../lib/store";
+import { APP_DIR, ensureChatTail, useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { prepareContent } from "../lib/bidi";
+import { dirByText, isolateLtrRuns } from "../lib/ltrIslands";
 import { listAgentTerminals, stopAgentTerminal } from "../lib/api";
 import type { AgentTerminalInfo } from "../lib/api";
 import {
@@ -10,6 +11,12 @@ import {
   terminalExitLabel,
 } from "../lib/agentTerminals";
 import { TurnUsagePanel } from "./TurnUsagePanel";
+import {
+  PanelChevron,
+  PlanIcon,
+  StepCheckIcon,
+  TerminalIcon,
+} from "./PanelIcons";
 import type { ChatMessage } from "../types";
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
@@ -118,15 +125,15 @@ export function heightForChat(
 export function TodosSection() {
   const chat = useStore((s) => s.chats.find((c) => c.id === s.activeChatId) ?? null);
   const activeChatId = useStore((s) => s.activeChatId);
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
 
   // `messages` is empty while the transcript is still on disk; the todos appear
-  // as soon as the body is hydrated (the panel re-renders on that update).
-  // This panel also triggers the fetch, so opening the right panel on a chat
-  // whose body is not in memory never shows an empty todo list by accident.
+  // as soon as the newest page is hydrated (the panel re-renders on that
+  // update). Only the tail is fetched — the latest plan always lives near the
+  // end, and full-hydrating here would defeat transcript pagination.
   const needsBody = chat?.hydrated === false;
   useEffect(() => {
-    if (activeChatId && needsBody) void ensureChatHydrated(activeChatId);
+    if (activeChatId && needsBody) void ensureChatTail(activeChatId);
   }, [activeChatId, needsBody]);
   const todos = latestTodos(needsBody ? [] : chat?.messages ?? []);
 
@@ -187,7 +194,9 @@ export function TodosSection() {
           }
         }}
       >
-        <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
+        <span className="sidebar-panel-chevron">
+          <PanelChevron collapsed={collapsed} />
+        </span>
         <span className="sidebar-panel-title">Agent plan</span>
         {/* Opens the saved plan document (Plan viewer tab). stopPropagation on
             click AND keydown keeps the parent head's collapse toggle from
@@ -223,15 +232,17 @@ export function TodosSection() {
       </div>
       {!collapsed && (
         <>
-          <div
-            className="sidebar-todos-progress"
-            role="progressbar"
-            aria-valuenow={pct}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-label={`${done} of ${todos.length} steps done`}
-          >
-            <div className="sidebar-todos-progress-fill" style={{ width: `${pct}%` }} />
+          <div className="sidebar-todos-summary">
+            <div
+              className="sidebar-todos-progress"
+              role="progressbar"
+              aria-valuenow={pct}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label={`${done} of ${todos.length} steps done`}
+            >
+              <div className="sidebar-todos-progress-fill" style={{ width: `${pct}%` }} />
+            </div>
           </div>
           <ul className="sidebar-todos-list">
             {todos.map((t) => (
@@ -244,15 +255,27 @@ export function TodosSection() {
                 className={`sidebar-todo-item ${t.status === "completed" ? "done" : t.status === "in_progress" ? "running" : ""}`}
               >
                 <span className="sidebar-todo-mark">
-                  {t.status === "completed"
-                    ? "✓"
-                    : t.status === "in_progress"
-                      ? "●"
-                      : "○"}
+                  {t.status === "completed" ? (
+                    <StepCheckIcon />
+                  ) : t.status === "in_progress" ? (
+                    <span className="sidebar-todo-spin" aria-hidden="true" />
+                  ) : null}
                 </span>
-                <span className="sidebar-todo-content">
-                  {prepareContent(t.content, dir)}
+                <span className="sidebar-todo-content" dir={dirByText(t.content)}>
+                  {isolateLtrRuns(prepareContent(t.content))}
                 </span>
+                {typeof t.progress === "number" && t.status !== "completed" && (
+                  <span
+                    className="plan-item-progress"
+                    dir="ltr"
+                    aria-label={`${Math.round(t.progress)}%`}
+                  >
+                    <span
+                      className="plan-item-progress-fill"
+                      style={{ width: `${Math.max(0, Math.min(100, t.progress))}%` }}
+                    />
+                  </span>
+                )}
               </li>
             ))}
           </ul>
@@ -334,6 +357,9 @@ export function TerminalsSection() {
     // must not mirror them. The plan card below keeps the app's direction.
     <div className="sidebar-panel terminals-docked" dir="ltr">
       <div className="sidebar-panel-head">
+        <span className="sidebar-panel-icon">
+          <TerminalIcon />
+        </span>
         <span className="sidebar-panel-title">Background terminals</span>
         {hasRunning && (
           <span className="terminals-bg-count">
@@ -348,20 +374,7 @@ export function TerminalsSection() {
             key={t.id}
           >
             <span className="terminals-icon" aria-hidden="true">
-              <svg
-                width="15"
-                height="15"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <rect x="2.5" y="4" width="19" height="16" rx="3" />
-                <path d="M7 9.5l3 2.8-3 2.8" />
-                <path d="M12.5 15.5H17" />
-              </svg>
+              <TerminalIcon size={15} />
             </span>
             <div className="terminals-body">
               <div
@@ -407,9 +420,12 @@ export function TerminalsSection() {
  *  است — و همان لحظه قانون `:only-child` در global.css آن را نمایان می‌کند.
  *  با آمدن هر کارت واقعی، hint خودبه‌خود محو می‌شود (بدون state اضافه). */
 export function TodosPageEmptyHint() {
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   return (
     <div className="todos-page-empty" dir={dir}>
+      <span className="todos-page-empty-icon">
+        <PlanIcon size={22} />
+      </span>
       <p className="todos-page-empty-title">Nothing here yet</p>
       <p className="todos-page-empty-text">
         The agent&apos;s plan, tools and background terminals will appear here

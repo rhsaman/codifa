@@ -1,13 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { mdComponents } from './ChatMessage'
+import { ChatBubble } from './ChatBubble'
 import type { ChatMessage } from '../types'
 import { splitSections } from '../lib/sections'
-import { useStore } from '../lib/store'
-import { prepareContent } from '../lib/bidi'
-import { copyToClipboard } from '../lib/clipboard'
+import { APP_DIR, useStore } from '../lib/store'
+import { detectDir } from '../lib/bidi'
 import { physicalKey } from '../lib/shortcuts'
 import 'highlight.js/styles/github-dark.min.css'
 
@@ -64,10 +61,9 @@ export function ReadingMode({
   // header/footer flow right-to-left. The section content follows the app
   // direction too (dir={dir}), so in RTL mode the text reads right-to-left
   // like the main messages.
-  const dir = useStore((s) => s.dir)
+  const dir = APP_DIR;
   const sections = useMemo(() => splitSections(message.content), [message.content])
   const [active, setActive] = useState(0)
-  const [copied, setCopied] = useState(false)
   const [progress, setProgress] = useState(0)
   // Panel width — opens at half the viewport, then user-resizable by dragging
   // the left edge (VSCode-style, like the sidebar). The dragged width is
@@ -131,16 +127,6 @@ export function ReadingMode({
 
   const section = sections[active]
   if (!section) return null
-
-  const copy = async () => {
-    try {
-      await copyToClipboard(section.content)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch (err) {
-      console.warn('copy failed', err)
-    }
-  }
 
   // Track the per-drag listeners so we can clean them up if the component
   // unmounts mid-drag (e.g. user pressed Esc to close the panel while still
@@ -231,48 +217,6 @@ export function ReadingMode({
               <ChevronDownIcon />
             </button>
             <button
-              className={`reading-mode-copy${copied ? ' copied' : ''}`}
-              onClick={copy}
-              title="Copy section text"
-            >
-              {copied ? (
-                <>
-                  <svg
-                    width="13"
-                    height="13"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M20 6 9 17l-5-5" />
-                  </svg>
-                  Copied
-                </>
-              ) : (
-                <>
-                  <svg
-                    width="13"
-                    height="13"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
-                    <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-                  </svg>
-                  Copy
-                </>
-              )}
-            </button>
-            <button
               className="modal-close"
               onClick={onClose}
               title="Close (Esc)"
@@ -305,7 +249,7 @@ export function ReadingMode({
                   className="reading-mode-item-title"
                   onClick={() => setActive(i)}
                   title={s.title}
-                  dir={dir}
+                  dir={detectDir(s.title)}
                 >
                   <span
                     className="reading-mode-item-level"
@@ -322,18 +266,18 @@ export function ReadingMode({
             <div className="reading-mode-content-head">
               <div className="reading-mode-content-title">
                 <span className="reading-mode-content-num">{active + 1}</span>
-                <h3 dir={dir}>{section.title}</h3>
+                <h3 dir={detectDir(section.title)}>{section.title}</h3>
               </div>
             </div>
             <div className="reading-mode-content-inner" key={active}>
-              <div className="chat-message markdown-body" dir={dir}>
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={mdComponents}
-                >
-                  {prepareContent(section.content, dir)}
-                </ReactMarkdown>
-              </div>
+              {/* ChatBubble = the SAME component as a chat message: full chat
+                  markdown pipeline (tables, charts, mermaid, LTR islands) plus
+                  the chat actions row (copy / speak) under the section. */}
+              <ChatBubble
+                id={`${message.id}:sec:${active}`}
+                content={section.content}
+                className="reading-mode-bubble"
+              />
             </div>
           </div>
         </div>

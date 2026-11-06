@@ -375,7 +375,7 @@ fn canonical(v: &Value) -> Value {
 }
 
 pub fn discover(servers: &Value) -> Discovered {
-    let Some(map) = servers.as_object() else {
+    let Some(_map) = servers.as_object() else {
         // No connector is enabled at all: every cached session is now orphaned,
         // so release them rather than keep their child processes alive.
         retire_disabled(&serde_json::Map::new());

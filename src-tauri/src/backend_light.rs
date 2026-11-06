@@ -138,7 +138,53 @@ pub struct ModelTestBody {
     provider_id: String,
 }
 
-/// Probe one model with a tiny completion; returns the reply or the reason.
+/// A unique suffix for the probe prompt. The prompt used to be the constant
+/// "Reply with the single word: OK", which gateways cache: a probe kept
+/// returning a cached "OK" from before the account ran out of credit while
+/// every real chat was refused. A nonce forces one fresh call per test.
+fn probe_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Size of the probe prompt, in bytes of neutral context. Free tiers gate on
+/// PROMPT SIZE, not just token budget: Refuseless accepts a tiny prompt and
+/// answers HTTP 402 `insufficient_credits` ("Free slots at capacity") from
+/// roughly 2 000 chars up, so a tiny probe ticked while every real chat was
+/// refused. A real turn is far larger than this; 2 000 is the smallest size
+/// that reproduces the cap without wasting a provider's context.
+const MODEL_TEST_PROMPT_CHARS: usize = 2_000;
+
+/// A chat-representative probe prompt: ~2 000 bytes of neutral context, then
+/// the instruction. The filler is ordinary numbered prose so no provider can
+/// reject it as malformed, and the instruction stays last so the model answers
+/// it rather than the filler. The nonce keeps gateways from serving a cached
+/// reply from before the account ran out of credit.
+fn probe_prompt() -> String {
+    let mut prompt = String::with_capacity(MODEL_TEST_PROMPT_CHARS + 96);
+    prompt.push_str("Context notes:\n");
+    let mut line = 0usize;
+    while prompt.len() < MODEL_TEST_PROMPT_CHARS {
+        line += 1;
+        prompt.push_str(&format!(
+            "Note {line}: this line is neutral filler used only to size the request.\n"
+        ));
+    }
+    prompt.push_str(&format!(
+        "\nEnd of notes. Ignore them. Reply with the single word: OK. probe {}",
+        probe_nonce()
+    ));
+    prompt
+}
+
+/// Probe one model; returns the reply or the reason.
 ///
 /// Uses the same one-shot path as a real turn, so the probe exercises the
 /// exact provider+model the picker shows.
@@ -172,9 +218,10 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
         auto_think: r_auto,
     };
     let client = llm::http_client();
+    let prompt = probe_prompt();
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(MODEL_TEST_TIMEOUT_SECS),
-        llm::complete(&client, &cfg, "", "Reply with the single word: OK"),
+        llm::complete(&client, &cfg, "", &prompt),
     )
     .await
     .map_err(|_| format!("timeout — model did not answer in {MODEL_TEST_TIMEOUT_SECS}s"))?;
@@ -184,6 +231,14 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
             "empty reply — model returned no content (quota exhausted or route unavailable)"
                 .into(),
         );
+    }
+    // Some gateways answer 200 with a billing/auth refusal as ordinary
+    // CONTENT (Pollinations: "The account behind this API key doesn't have
+    // enough credits…"). A non-empty check alone turned that into a green
+    // tick while every real turn failed. `extract_completion` already rejects
+    // this when usage is reported; this catches the shape without usage.
+    if let Some(msg) = llm::content_error_message(&text) {
+        return Err(msg.to_string());
     }
     Ok(text.chars().take(200).collect())
 }
@@ -847,8 +902,28 @@ struct MarketplaceQuery {
     #[serde(default)]
     git_ref: String,
     /// Skip a still-fresh disk copy (the explicit Refresh button).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "query_bool")]
     refresh: bool,
+}
+
+/// A query-string bool that also reads `1`/`0` (and `yes`/`on`).
+///
+/// axum's default `bool` only accepts `true`/`false`, so a client sending
+/// `?refresh=1` — the shape this endpoint used to be called with — failed
+/// deserialization with a bare 400 before the read even started, and the
+/// Marketplaces tab reported an error on every chip click and Refresh.
+fn query_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(d)?;
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a bool, got `{other}`"
+        ))),
+    }
 }
 
 async fn plugins_create(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
@@ -4182,6 +4257,103 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// An OpenAI-compatible upstream that answers 200 with a billing refusal
+    /// inside `message.content` (Pollinations' drained-account shape). The
+    /// model named `broke` gets the refusal; any other model gets a real "OK".
+    async fn spawn_content_error_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = sock.read(&mut tmp).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let Ok(n) = sock.read(&mut tmp).await else { break };
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let req = String::from_utf8_lossy(&buf[head_end + 4..]).to_ascii_lowercase();
+                    let (content, usage) = if req.contains("\"model\":\"broke\"") {
+                        (
+                            "The account behind this API key doesn't have enough credits. \
+                             Please top up or complete a quest, then try again.",
+                            r#"{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}"#,
+                        )
+                    } else {
+                        ("OK", r#"{"prompt_tokens":8,"completion_tokens":1,"total_tokens":9}"#)
+                    };
+                    let body = format!(
+                        r#"{{"id":"x","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}"}},"finish_reason":"stop"}}],"usage":{usage}}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_model_probe_rejects_a_billing_refusal_returned_as_content() {
+        // The reported bug: the model test showed a green tick, then chat
+        // displayed "The account behind this API key doesn't have enough
+        // credits…" as the assistant's answer. The refusal is a normal 200
+        // completion with zero usage, so a non-empty reply check passed it.
+        let base = spawn_content_error_upstream().await;
+        let body = |model: &str| ModelTestBody {
+            provider: "custom".into(),
+            base_url: format!("{base}/v1"),
+            api_keys: vec!["k".into()],
+            model: model.into(),
+            models: Vec::new(),
+            headers: None,
+            provider_id: "p".into(),
+        };
+        let err = probe_model(&body("broke"), "broke").await.unwrap_err();
+        assert!(err.contains("enough credits"), "{err}");
+        // The healthy model on the same upstream still passes.
+        assert_eq!(probe_model(&body("ok"), "ok").await.unwrap(), "OK");
+    }
+
+    #[test]
+    fn a_probe_prompt_is_chat_sized_and_unique() {
+        // Free tiers gate on prompt size: Refuseless 402s from ~2 000 chars.
+        // A tiny probe therefore ticked while every real chat was refused, so
+        // the probe must be at least that large.
+        let a = probe_prompt();
+        let b = probe_prompt();
+        assert!(a.len() >= MODEL_TEST_PROMPT_CHARS, "len {}", a.len());
+        assert!(a.contains("Reply with the single word: OK"), "{a}");
+        // The instruction is last so the model answers it, not the filler.
+        assert!(
+            a.rfind("Reply with the single word: OK").unwrap() >= MODEL_TEST_PROMPT_CHARS,
+            "{a}"
+        );
+        // The nonce makes every probe unique: a gateway cannot serve a cached
+        // "OK" from before the account ran out of credit.
+        assert_ne!(a, b);
     }
 
     #[tokio::test]

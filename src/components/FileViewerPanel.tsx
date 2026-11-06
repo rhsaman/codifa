@@ -1,4 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { detectDir } from "../lib/bidi";
+import { rehypeLtrIslands } from "../lib/ltrIslands";
 import { onGitChange } from "../lib/liveEvents";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
@@ -9,7 +11,7 @@ import { NVIM_PROGRAM, nvimArgs } from "../lib/nvimEdit";
 import { readDocumentText } from "../lib/api";
 import { commentFileSelection } from "../lib/fileComments";
 import { selectionBarPos } from "../lib/selectionBar";
-import { useStore } from "../lib/store";
+import { APP_DIR, useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTypes";
 import { FileChip, FileIcon } from "./FileIcon";
@@ -312,7 +314,7 @@ export function FileViewerPanel({
   const docRev = useStore((s) => s.docRev[absPath] ?? 0);
   // App-wide RTL/LTR toggle (the app bar switch): the viewer chrome follows
   // it, while each content line keeps its own direction (see row dir below).
-  const appDir = useStore((s) => s.dir);
+  const appDir = APP_DIR;
   const activeChatId = useStore((s) => s.activeChatId);
   // Owning chat for live refresh + comments (file tabs are chat-scoped).
   const ownerChatId = chatId ?? activeChatId;
@@ -1330,14 +1332,18 @@ export function FileViewerPanel({
       // or every CSV shows twice (table on top, raw lines below). */}
       {state.content != null && !binary && !isImage && !(isGridDoc && sheetTables.length > 0) && (
         isMarkdownFile && mdView === "md" ? (
-          <div className="file-viewer-body text-viewer-md" dir="ltr" style={{ direction: "ltr" }}>
-            <div className="chat-message markdown-body" dir="ltr">
+          <div
+            className="file-viewer-body text-viewer-md"
+            dir={detectDir(state.content)}
+            style={{ direction: detectDir(state.content) }}
+          >
+            <div className="chat-message markdown-body" dir={detectDir(state.content)}>
               {/* Same rules as TextViewerPanel: rendered verbatim — no
                   prepareContent (bodies may legally contain ``` runs) and no
                   raw HTML (react-markdown never executes it, so a file is
                   inert). The raw view above keeps line numbers for search,
                   jumps and selection comments. */}
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeLtrIslands]} components={mdComponents}>
                 {shown}
               </ReactMarkdown>
             </div>

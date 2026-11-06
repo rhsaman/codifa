@@ -1,12 +1,10 @@
 import { useMemo, useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { useStore } from "../lib/store";
+import { APP_DIR, useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { isPlanDoc, latestPlanDoc } from "../lib/planDoc";
 import { fetchPlan } from "../lib/api";
 import { prepareContent } from "../lib/bidi";
-import { mdComponents } from "./ChatMessage";
+import { MarkdownProse } from "./ChatMessage";
 
 /** Docked Plan viewer tab (opened by the chat Plan card's "View full plan").
  *  Shows the owner chat's latest implementation plan document as markdown.
@@ -23,7 +21,7 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
   const chat = useStore((s) => s.chats.find((c) => c.id === activeChatId) ?? null);
   // The panel CHROME stays LTR (same docked layout as Git/Trace); only the
   // plan TEXT follows the app's direction + bidi handling.
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   const [copied, setCopied] = useState(false);
 
   const planDoc = useMemo(
@@ -89,13 +87,10 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
         // LTR for every plan: the document always opens with "## Plan").
         <div className="plan-panel-body" dir="ltr">
           <div className="plan-panel-content" dir={dir}>
-            <div className="chat-message markdown-body">
-              {/* Shared mdComponents: inline file paths become clickable
-                  file chips, fences get the same code-block chrome as chat. */}
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                {prepareContent(shown.body, dir)}
-              </ReactMarkdown>
-            </div>
+            {/* MarkdownProse = the shared chat pipeline (LTR islands, arrow
+                mirroring, mdComponents); direction follows the plan body's
+                own language. */}
+            <MarkdownProse text={prepareContent(shown.body)} />
           </div>
         </div>
       ) : (

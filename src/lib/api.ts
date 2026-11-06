@@ -1,6 +1,7 @@
 import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, ProviderHeader, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
+import { retryBackoffMs } from './retry'
 import { sttDecodeFields } from './stt'
 
 let sidecarUrl: string | null = null
@@ -865,7 +866,8 @@ export interface StreamParams {
   webSearchAutoFetch?: number
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
-  /** Allow the agent to create skills / MCP connectors (via /skill /mcp). */
+  /** Allow the agent to create skills / MCP connectors through its internal
+   *  `create_skill` / `create_mcp` tools (there is no standalone command). */
   allowCreate?: boolean
   /** Per-mode tool capabilities sent to the backend for tool gating. */
   cap?: ModeCapabilities
@@ -943,17 +945,16 @@ export async function streamChat(
 
   // Self-healing reconnect: if the network drops mid-stream (a fetch/reader
   // error that is NOT a manual abort and NOT an HTTP error from the backend),
-  // retry with exponential backoff instead of leaving the user stuck on a dead
+  // retry with an adaptive backoff instead of leaving the user stuck on a dead
   // "Still waiting" state. HTTP errors (5xx, etc.) are NOT retried here — the
   // backend already runs its own retry loop, and a non-2xx is a deliberate
   // response, not a dropped connection.
+  //
+  // The wait starts short (2s) so a transient blip recovers immediately, then
+  // grows to a 60s cap while the outage persists. The ATTEMPT COUNT — not a
+  // wall clock — ends the ladder, so a model that is merely slow is never
+  // treated as a drop.
   const MAX_RECONNECT_ATTEMPTS = 10
-  // Fixed 10s cadence — deliberately NOT exponential: the resend schedule is
-  // predictable, and the ATTEMPT COUNT (not a clock) is what ends the ladder.
-  // There is still no time-based failure anywhere: only the socket actually
-  // closing/erroring reaches this path, so a model that is merely slow is
-  // never a "drop" and is never retried or cut off.
-  const RECONNECT_DELAY_MS = 10_000
 
   // Abort-aware sleep: a Stop during the reconnect backoff used to leave an
   // uncancellable 10s timer behind (the loop-top abort check only ran before
@@ -1120,20 +1121,24 @@ export async function streamChat(
     } catch (err) {
       // fetch() threw (connection refused / DNS / dropped socket) — retryable.
       if (params.signal?.aborted) throw err
+      attempt++
+      // `attempt` counts RETRIES, so the ladder ends after exactly
+      // MAX_RECONNECT_ATTEMPTS of them. Check BEFORE announcing a wait: the
+      // final failure must not show a countdown that will never elapse.
+      if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
+      const delayMs = retryBackoffMs(attempt)
       // Surface the self-heal so the user isn't left wondering why the turn
-      // restarted on its own (the "interrupted itself" confusion).
+      // restarted on its own (the "interrupted itself" confusion), including
+      // the REAL delay so the footer timer matches what is actually happening.
       wrappedOnEvent({
         kind: 'retry',
-        attempt: attempt + 1,
+        attempt,
         max_attempts: MAX_RECONNECT_ATTEMPTS,
+        delay: delayMs / 1000,
         reason: 'Connection lost — reconnecting from checkpoint…',
         reconnecting: true,
       } as SidecarEvent)
-      attempt++
-      // `attempt` counts RETRIES, so the ladder ends after exactly
-      // MAX_RECONNECT_ATTEMPTS of them (an `>` test here would allow one extra).
-      if (attempt >= MAX_RECONNECT_ATTEMPTS) throw err
-      await sleepUnlessAborted(RECONNECT_DELAY_MS, params.signal)
+      await sleepUnlessAborted(delayMs, params.signal)
       continue
     }
 
@@ -1212,20 +1217,22 @@ export async function streamChat(
       // meant a single keepalive heartbeat was enough to suppress the
       // self-healing resume of a stream that really did drop.
       if (gotTerminalError) throw err
+      attempt++
+      // Same off-by-one guard as the connect path: announce only a retry that
+      // will actually be attempted, with the same adaptive delay.
+      if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
+      const delayMs = retryBackoffMs(attempt)
       // Surface the self-heal so the user isn't left wondering why the turn
       // restarted on its own (the "interrupted itself" confusion).
       wrappedOnEvent({
         kind: 'retry',
-        attempt: attempt + 1,
+        attempt,
         max_attempts: MAX_RECONNECT_ATTEMPTS,
+        delay: delayMs / 1000,
         reason: 'Connection lost — reconnecting from checkpoint…',
         reconnecting: true,
       } as SidecarEvent)
-      attempt++
-      // `attempt` counts RETRIES, so the ladder ends after exactly
-      // MAX_RECONNECT_ATTEMPTS of them (an `>` test here would allow one extra).
-      if (attempt >= MAX_RECONNECT_ATTEMPTS) throw err
-      await sleepUnlessAborted(RECONNECT_DELAY_MS, params.signal)
+      await sleepUnlessAborted(delayMs, params.signal)
       continue
     }
   }
@@ -1930,8 +1937,8 @@ export async function syncSkill(params: {
 export async function listMcp(): Promise<{
   mcpServers: Record<string, McpServerConfig>
   builtins: string[]
-  /** Connector name → owning bundle's absolute folder — what a
-   *  `/mcp update <name>` session pins the composer badge to. */
+  /** Connector name → owning bundle's absolute folder, so an edit can pin the
+   *  composer badge to the bundle that actually holds it. */
   dirs?: Record<string, string>
 }> {
   // Read directly (not through lib/plugins) so this module keeps importing

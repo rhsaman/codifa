@@ -23,8 +23,11 @@ pub const MANIFEST: &str = "plugin.json";
 /// showed 25 cards reading "1 skill" for what is really one library. A shipped
 /// skill is not a subscription the user chose — it ships with the app — so the
 /// library is a single container behind a single switch.
-pub const BUILTIN_BUNDLE_NAME: &str = "Built-in Skills";
-pub const BUILTIN_BUNDLE_SLUG: &str = "builtin-skills";
+pub const BUILTIN_BUNDLE_NAME: &str = "builtin plugin";
+pub const BUILTIN_BUNDLE_SLUG: &str = "builtin-plugin";
+/// The seeded Docker connector bundle. The bundle and the connector key share
+/// one name, so `mcp__docker-mcp__*` tool names match the Settings row.
+pub const DOCKER_BUNDLE: &str = "docker-mcp";
 /// Connector file inside one plugin folder.
 const CONNECTORS: &str = "mcp.json";
 /// Default version written for a plugin created without one.
@@ -1955,9 +1958,12 @@ pub fn retire_builtin_skills(root: &Path) -> Vec<String> {
         let Some(dir) = skill_dir_for(root, name) else {
             continue;
         };
-        // Provenance decides: an untouched seed is a stale copy of a shipped
-        // file and goes; anything the user wrote in is theirs and stays.
-        if crate::skills::skill_is_user_owned(&dir) {
+        // Provenance decides, and it must PROVE the machine wrote this copy:
+        // a `seeded` marker is a stale copy of a shipped file and goes, a
+        // `user` marker is the user's text and stays, and NO marker (migrated
+        // or pre-marker skill) is unknown provenance — deleting it could take
+        // the only copy of the user's work, so it stays.
+        if !crate::skills::skill_is_app_seeded(&dir) {
             continue;
         }
         if delete_bundle_skill(root, name).is_ok() {
@@ -2303,7 +2309,7 @@ const RETIRED_BROWSER_CONNECTOR: (&str, &str, &[&str]) =
 /// process and a startup round-trip per turn for zero usable tools.
 pub fn builtin_connectors() -> Vec<(&'static str, Value)> {
     vec![(
-        "docker",
+        DOCKER_BUNDLE,
         json!({"command": "docker", "args": ["mcp", "gateway", "run"]}),
     )]
 }
@@ -2976,7 +2982,7 @@ pub fn all_plugin_connectors(root: &Path) -> Vec<Value> {
             out.push(json!({
                 "name": name,
                 "cfg": cfg,
-                // Owning bundle's absolute folder — what a `/mcp update <name>`
+                // Owning bundle's absolute folder — what a `/plugin update`
                 // session pins the composer badge to.
                 "dir": plugin_dir(root, &slug).to_string_lossy(),
                 "description": own["description"].as_str().unwrap_or(""),

@@ -1,14 +1,14 @@
 // The auto-retry contract for a dropped connection and for a failed turn.
 //
 // Two behaviours are pinned here:
-//   1. A dropped socket is auto-resumed on a FIXED 10s cadence, at most 10
-//      times — never on an exponential ladder, and never on a wall-clock
-//      limit (a merely slow model must not be retried or cut off at all).
-//   2. The chat panel retries a turn that ERRORED on the same 10s x 10 ladder,
+//   1. A dropped socket is auto-resumed on an ADAPTIVE cadence (2s → 4s → 8s →
+//      15s → 30s → 60s cap), at most 10 times — never on a wall-clock limit
+//      (a merely slow model must not be retried or cut off at all).
+//   2. The chat panel retries a turn that ERRORED on the same adaptive ladder,
 //      so a transient provider failure recovers without a manual click.
 //
 // setTimeout is completed instantly so the suite never sleeps for the real
-// 10s delays; the ASSERTIONS are about attempt counts, not wall-clock.
+// delays; the ASSERTIONS are about attempt counts and advertised delays.
 export {}
 
 // Pass-through timer that collapses the retry waits to 0ms. Anything shorter
@@ -49,7 +49,7 @@ function check(name: string, cond: boolean, extra?: unknown) {
 // Every request fails at the transport level: this is the "connection dropped"
 // signal (the socket itself, not a model that is slow).
 let calls = 0
-const retryEvents: Array<{ attempt?: number; max_attempts?: number; reconnecting?: boolean }> = []
+const retryEvents: Array<{ attempt?: number; max_attempts?: number; delay?: number; reconnecting?: boolean }> = []
 ;(globalThis as any).fetch = async () => {
   calls++
   throw new Error('ECONNREFUSED 127.0.0.1:9999')
@@ -95,6 +95,12 @@ console.log('1) a dropped connection retries 10 times, then gives up:')
       '1,2,3,4,5,6,7,8,9,10',
     retryEvents.map((e) => e.attempt),
   )
+  check(
+    'each retry advertises the adaptive delay, capped at 60s',
+    retryEvents.map((e) => e.delay).join(',') ===
+      '2,4,8,15,30,60,60,60,60,60',
+    retryEvents.map((e) => e.delay),
+  )
   check('the retries are marked as reconnecting', retryEvents.every((e) => e.reconnecting === true))
   check('an exhausted ladder finally throws', threw === true)
 }
@@ -108,25 +114,27 @@ console.log('2) the chat panel error ladder matches the transport cadence:')
   const chatSrc = fs.readFileSync('src/components/Chat.tsx', 'utf8')
   const apiSrc = fs.readFileSync('src/lib/api.ts', 'utf8')
   check(
-    'api.ts uses a fixed 10s reconnect delay',
-    /const RECONNECT_DELAY_MS = 10_000/.test(apiSrc),
+    'api.ts computes the delay from the shared adaptive ladder',
+    /const delayMs = retryBackoffMs\(attempt\)/.test(apiSrc) &&
+      /await sleepUnlessAborted\(delayMs/.test(apiSrc),
   )
   check(
     'api.ts allows 10 reconnect attempts',
     /const MAX_RECONNECT_ATTEMPTS = 10/.test(apiSrc),
   )
   check(
-    'the exponential ladder is gone',
-    !apiSrc.includes('BASE_BACKOFF_MS * 2 **'),
+    'the fixed 10s cadence is gone',
+    !apiSrc.includes('RECONNECT_DELAY_MS') &&
+      !apiSrc.includes('BASE_BACKOFF_MS * 2 **'),
   )
   check(
-    'Chat.tsx retries a failed turn every 10s, at most 10 times',
+    'Chat.tsx retries a failed turn on the same adaptive ladder, at most 10 times',
     /const CHAT_ERROR_MAX_RETRIES = 10;/.test(chatSrc) &&
-      /const CHAT_ERROR_RETRY_DELAY_MS = 10_000;/.test(chatSrc),
+      /const delayMs = retryBackoffMs\(spent \+ 1\)/.test(chatSrc),
   )
   check(
     'the error branch actually arms that retry',
-    chatSrc.includes('autoRetryFor(originId).schedule(CHAT_ERROR_RETRY_DELAY_MS'),
+    /autoRetryFor\(originId\)\.schedule\(delayMs,/.test(chatSrc),
   )
   // The count must live in a per-chat REF, never be re-derived from the message.
   // The resend clears `retry` on the continuation bubble and the give-up banner
@@ -149,6 +157,34 @@ console.log('2) the chat panel error ladder matches the transport cadence:')
     'only a genuinely new turn (no continuation) resets that count',
     chatSrc.includes(
       'if (!continueAssistantId) autoRetryCountRef.current.set(chatId, 0)',
+    ),
+  )
+  // Recovery proof (text/tool/plan after a live retry) must reset the ladder:
+  // otherwise a later, unrelated outage starts at the last rung and gives up
+  // after one attempt. Stop must reset it too — a cancelled turn ends THIS
+  // outage, so the next failure starts at step 1.
+  check(
+    'a transient-retry row is cleared by recovery and resets the step count',
+    /autoRetryCountRef\.current\.set\(chat\.id, 0\);\n\s*store\.updateMessage\(assistantMsg\.id, \{ retry: null \}\)/.test(
+      chatSrc,
+    ),
+  )
+  check(
+    'Stop resets the step count with the pending timers',
+    /autoRetryFor\(originId\)\.stop\(\);[\s\S]{0,400}autoRetryCountRef\.current\.set\(originId, 0\)/.test(
+      chatSrc,
+    ),
+  )
+  check(
+    'cancelling a stream (undo/clear) also resets it',
+    /autoRetryFor\(id\)\.stop\(\);[\s\S]{0,300}autoRetryCountRef\.current\.set\(id, 0\)/.test(
+      chatSrc,
+    ),
+  )
+  check(
+    'manual Retry after 10/10 starts a fresh ladder',
+    /manual Retry after the ladder reached 10\/10[\s\S]{0,600}autoRetryCountRef\.current\.set\(targetId, 0\)/.test(
+      chatSrc,
     ),
   )
 }

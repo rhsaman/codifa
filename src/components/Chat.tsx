@@ -9,14 +9,15 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { RangeSlider } from "./RangeSlider";
-import { getActiveProvider, getChatProvider, ensureChatHydrated, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
+import { APP_DIR, getActiveProvider, getChatProvider, ensureChatHydrated, ensureChatTail, loadEarlierChatMessages, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, trimChatBodyWindow, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { useVimScroll } from "../lib/useVimScroll";
 import { shouldEnterInsert, shouldLeaveInsert } from "../lib/chatNormalMode";
 import { isPrefixArmed } from "../lib/prefixState";
 import { isEditableTarget, paneOwner } from "../lib/panePointer";
 import { physicalKey } from "../lib/shortcuts";
-import { AutoRetryScheduler, findRetryBannerMessage, isDeterministicTurnError, isKeepTextRetry, planRetry, resetStreamForRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
+import { AutoRetryScheduler, isDeterministicTurnError, isKeepTextRetry, planRetry, resetStreamForRetry, resolveRestartUser, retryBackoffMs, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
+import { markModelTestFailed } from "../lib/useModelTests";
 import {
   isSlashCommand,
   parseSlashInput,
@@ -31,6 +32,8 @@ import {
   historyMeta,
   loadCommandUsage,
   recordCommandUsage,
+  loadSubcommandUsage,
+  recordSubcommandUsage,
   bottomAnchoredByUsage,
   slashBody,
   SUBCOMMANDS,
@@ -49,6 +52,7 @@ import {
   migrateCommandNames,
   type SlashCaret,
   type ScheduleFlags,
+  type SubCommand,
 } from "../lib/slash";
 import { didYouMean, rankMatches } from "../lib/fuzzy";
 import {
@@ -113,18 +117,35 @@ import {
   triggerCompact,
   gitAutoCommit,
   retrySubagentNow,
-  syncSkill,
   type CompactResult,
   type CompactUsage,
   type StreamParams,
 } from "../lib/api";
-import { installPlugin, installProgress, listPlugins, deletePlugin, togglePlugin, listPluginSkills, listPluginCommands } from "../lib/plugins";
+import {
+  installPlugin,
+  installProgress,
+  listPlugins,
+  deletePlugin,
+  togglePlugin,
+  listPluginSkills,
+  listPluginCommands,
+  listMarketplace,
+  parseMarketplaceAddress,
+  marketplaceLabel,
+  findMarketplaces,
+  marketKey,
+} from "../lib/plugins";
 import type { PluginCommandRow } from "../lib/plugins";
+import {
+  rankMarketplaceHits,
+  describeMarketplaceHit,
+  type MarketplaceHit,
+} from "../lib/marketplaceSearch";
 import type { PluginInfo } from "../types";
 import { looksLikeRepoAddress } from "../lib/repoAddress";
 import { forgetPluginCommands } from "../lib/skills";
 import { listArtifacts, deleteArtifact, getArtifact, type ArtifactSummary } from "../lib/artifacts";
-import { artifactContext, connectorContext } from "../lib/cmdContext";
+import { artifactContext } from "../lib/cmdContext";
 import { playAlarm } from "../lib/alarm";
 import { isBrowserTool } from "../lib/mcpTools";
 
@@ -249,7 +270,6 @@ const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
 // gives ONE scheduler / stop flag / attempt count per chat id, so Stop from
 // any panel — even a remount — drops ladders armed by any other instance.
 const CHAT_ERROR_MAX_RETRIES = 10;
-const CHAT_ERROR_RETRY_DELAY_MS = 10_000;
 const chatStopped = new Map<string, boolean>();
 const chatAutoRetry = new Map<string, AutoRetryScheduler>();
 const autoRetryFor = (chatId: string): AutoRetryScheduler => {
@@ -260,6 +280,54 @@ const autoRetryFor = (chatId: string): AutoRetryScheduler => {
   }
   return sched;
 };
+
+// A compaction reports its percent from WALL-CLOCK budget spent, so a fast
+// summary legitimately finishes while the bar is still around 40–60%. Clearing
+// the row at that instant looked like the job was cut off midway. Hold the row
+// at 100% long enough for the fill transition to visibly land, then dismiss it.
+const COMPACT_DONE_HOLD_MS = 900;
+const compactDoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function holdCompactComplete(chatId: string): void {
+  const st = useStore.getState();
+  const chat = st.chats.find((c) => c.id === chatId);
+  if (!chat) return;
+  const prev = chat.compactProgress;
+  // Keep `compacting` true through the hold: the footer derives the row from
+  // that flag, and the per-second clock keeps it painted.
+  st.setChatCompacting(chatId, true);
+  st.setChatCompactProgress(chatId, {
+    phase: "done",
+    attempt: prev?.attempt ?? 0,
+    attempts: prev?.attempts ?? 0,
+    model: prev?.model ?? "",
+    providerId: prev?.providerId ?? "",
+    percent: 100,
+    budgetSecs: 0,
+    elapsedSecs: 0,
+    at: Date.now(),
+  });
+  const pending = compactDoneTimers.get(chatId);
+  if (pending) clearTimeout(pending);
+  compactDoneTimers.set(
+    chatId,
+    setTimeout(() => {
+      compactDoneTimers.delete(chatId);
+      // A NEW compaction may have started during the hold; its progress is no
+      // longer "done", so this stale timer must not clear its row.
+      const cur = useStore.getState().chats.find((c) => c.id === chatId);
+      if (cur?.compactProgress?.phase === "done") {
+        useStore.getState().setChatCompacting(chatId, false);
+      }
+    }, COMPACT_DONE_HOLD_MS),
+  );
+}
+function clearCompactHold(chatId: string): void {
+  const pending = compactDoneTimers.get(chatId);
+  if (pending) {
+    clearTimeout(pending);
+    compactDoneTimers.delete(chatId);
+  }
+}
 
 // THINKING_OPTIONS / THINKING_LABELS / THINKING_DESCS live in the shared
 // src/lib/thinking-options.ts module so Settings → Tools rows can render the
@@ -273,14 +341,6 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "plan", hint: "Switch this chat to Plan mode (describe the work after the command to plan it)" },
   { name: "undo", hint: "Undo the last exchange (stops a running turn first)" },
   { name: "redo", hint: "Redo the last undone exchange" },
-  {
-    name: "skill",
-    hint: "Create, edit, install or delete a skill — type a sub-command (e.g. /skill update <name>)",
-  },
-  {
-    name: "mcp",
-    hint: "Create, edit or delete an MCP connector — type a sub-command (e.g. /mcp list)",
-  },
   {
     name: "plugin",
     hint: "Create, install, edit, toggle or delete a plugin — skills + connectors as one bundle (e.g. /plugin install <repo>)",
@@ -314,17 +374,13 @@ type PermInfo = {
  *  the palette costs no request. */
 const ARG_VALUE_TTL_MS = 15_000;
 
-/** The `--skills/--mcp/--plugins` picks, spelled out for the schedule prompt.
+/** The `--plugins` picks, spelled out for the schedule prompt.
  *
  *  The composer let the user PICK the values, so handing the model a sentence it
- *  may re-interpret loses the choice; naming the three arrays verbatim makes it
- *  pass them straight to the tool. Empty when the line carried no flags. */
+ *  may re-interpret loses the choice; naming the array verbatim makes it pass
+ *  the list straight to the tool. Empty when the line carried no flags. */
 function describeScheduleFlags(flags: ScheduleFlags): string {
-  const parts: string[] = [];
-  if (flags.skills.length) parts.push(`skills=[${flags.skills.join(", ")}]`);
-  if (flags.mcp_servers.length) parts.push(`mcp_servers=[${flags.mcp_servers.join(", ")}]`);
-  if (flags.plugins.length) parts.push(`plugins=[${flags.plugins.join(", ")}]`);
-  return parts.join(", ");
+  return flags.plugins.length ? `plugins=[${flags.plugins.join(", ")}]` : "";
 }
 
 /** True when a message asks to create/edit/install/import skills or MCP connectors,
@@ -369,7 +425,7 @@ function wantsPlugin(text: string): boolean {
 }
 
 /** The only commands whose `update <name>` pick opens a pinned session. */
-const EDIT_TARGET_COMMANDS = new Set(["plugin", "skill", "mcp", "artifact"]);
+const EDIT_TARGET_COMMANDS = new Set(["plugin", "artifact"]);
 
 /** The folder holding a file path (a skill row points at its SKILL.md). */
 function folderOf(p?: string): string {
@@ -570,16 +626,6 @@ function ChatLoader() {
   );
 }
 
-/** Live progress banner for a running compaction.
- *
- *  A summary call is one long silent request, so a bare spinner told the user
- *  nothing about whether it would ever end — the exact complaint that made
- *  compaction feel broken. This shows what is happening (phase), which attempt
- *  is running, a bar filled to the share of the backend's wall-clock budget
- *  already spent, and a clock that keeps counting between ticks: the backend
- *  cannot report true completion of a model call, but "42s of 180s" is honest
- *  and enough to decide whether to keep waiting. */
-
 export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Multi-window: each stacked window mounts its own ChatPanel with an
   // explicit chatId. Single-window callers omit it and follow the focused
@@ -599,10 +645,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   });
   // Fetch this chat's transcript the moment the panel shows it. Every panel
   // (including hidden multi-window ones) runs this, so a window the user is
-  // about to look at is already loaded; `ensureChatHydrated` is single-flight
-  // and a no-op once the body is in memory.
+  // about to look at is already loaded. Only the NEWEST page is fetched:
+  // older history is paged in on scroll, so opening a multi-megabyte chat
+  // never pulls the whole transcript into RAM.
   useEffect(() => {
-    if (activeChatId) void ensureChatHydrated(activeChatId);
+    if (activeChatId) void ensureChatTail(activeChatId);
   }, [activeChatId]);
   const provider = useStore((s) => {
     // Per-chat provider override: a chat that picked its own provider/model in
@@ -699,7 +746,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     shownBal = { provider, amount: activeBal.balance };
   }
   const root = useStore((s) => s.root);
-  const dir = useStore((s) => s.dir);
   const workspaces = useStore((s) => s.workspaces);
   const settings = useStore((s) => s.settings);
   // History turn limit (Settings → General). 0 = send the full history.
@@ -741,6 +787,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       (/<link/i.test(v) && /href\s*=|src\s*=|rel\s*=/i.test(v));
     return isErrorPage ? "" : v;
   });
+  // Composer direction: dir="auto" on the input (first-strong of the typed
+  // text, like ChatGPT) — no detectDir needed. Message directions are likewise
+  // automatic (detectDir per message); the app chrome stays RTL.
   // Safety net: if a Next.js/gateway error page ever reaches the composer
   // (e.g. a stale draft saved before filters existed), strip the junk and
   // keep the clean text. Errors belong in the banner, never in the input.
@@ -798,6 +847,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setAttachments(chat?.draft?.attachments ?? []);
     setImages(chat?.draft?.images ?? []);
     setPastedBlocks(chat?.draft?.pasted ?? []);
+    // Programmatic input never fires onChange, so clear the pin here or a
+    // hand-opened menu would leak into the switched-to chat.
+    cmdPinnedRef.current = false;
     setCmdOpen(null);
     setCmdQuery("");
     setSkillMention(null);
@@ -914,34 +966,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     chat?.messages.some((m) => m.retry?.reconnecting === true) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
   const busy = busyLocal || chatHasStreaming || chatReconnecting;
-  /** The assistant message whose banner is showing right now — the NEWEST one
-   *  carrying a `retry`. Its RetryBanner is rendered once, at the END of the
-   *  message list (not inline inside the message), so it never sits "above the
-   *  agent's reply" between the user's message and the incoming content.
-   *
-   *  Newest and not first: a message can keep a stale banner (a terminal
-   *  `gaveUp` from an earlier failed turn) while a LATER message is the one
-   *  retrying right now — picking the first showed the dead old banner and its
-   *  Retry button acted on the wrong turn.
-   *
-   *  The ref is declared HERE, above its first use: a `ref` dereferenced before
-   *  its `const` declaration is a temporal-dead-zone crash at render time, not
-   *  a lint nit. Banners that are mid-fade are skipped: their `retry` field is
-   *  still set until the store update lands, so the same message would
-   *  otherwise win the scan again and re-mount right after it faded, in a loop. */
-  const retiringIdsRef = useRef(new Set<string>());
-  /**
-   * Messages whose retry banner the user closed with ✕ during the CURRENT turn.
-   * A live sub-agent ladder re-sets `message.retry` on every attempt, so without
-   * this the banner popped straight back. Cleared per message when a new turn
-   * starts (see the pre-send sweep in `send`).
-   */
-  const dismissedRetryIdsRef = useRef(new Set<string>());
-  const retryingMsg = findRetryBannerMessage(
-    chat?.messages ?? [],
-    retiringIdsRef.current,
-    dismissedRetryIdsRef.current,
-  );
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   // Separate git-action states so commit/undo/push spinners never lock the
   // composer (the shared `busy` flag disables sending).
@@ -952,6 +976,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
+  /** "Selection anchored to the BOTTOM row" — the bottom-anchored popups
+   *  (history, and every palette level below the command name) start with the
+   *  row nearest the input highlighted. `cmdSel` clamps this to the last row,
+   *  so the exact value only has to survive modulo-free until the first clamp.
+   *  The arrow handler clamps BEFORE applying its delta: a raw
+   *  `(MAX + d) % len` would land on an arbitrary row. */
+  const CMD_SEL_END = Number.MAX_SAFE_INTEGER;
   // Which LEVEL of the slash line the palette is completing (0 = the command,
   // 1 = its sub-command, 2+ = a value) plus the caret's own word. The palette
   // used to close as soon as a space arrived, so `/plugin ` could never offer
@@ -996,6 +1027,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // command popup order bottom-anchored so the last used command sits
   // just above the input.
   const [commandUsage, setCommandUsage] = useState<string[]>(() => loadCommandUsage());
+  // Sub-level recency (`plugin search`, `schedule run <id>`) — the same
+  // bottom-anchored sort for every palette level below the command name.
+  const [subUsage, setSubUsage] = useState<string[]>(() => loadSubcommandUsage());
+  // Whether the OPEN palette was summoned by hand (ArrowUp). Levels below the
+  // command name never auto-open, so sync consults this before keeping one up.
+  // A ref, not state: acceptCmd closes and re-seeds in the same tick, and a
+  // state read there would see the stale pre-close value.
+  const cmdPinnedRef = useRef(false);
   // Keep popup order fresh when usage is recorded from another panel or
   // after a command runs (storage is the source of truth).
   useEffect(() => {
@@ -1156,8 +1195,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // yet must refetch instead of showing "No matching commands".
     const cached = cmdArgValuesRef.current;
     // The guard keys on the LISTS, not on the map being non-empty: once
-    // `plugin` had landed, a map with `skill` still missing passed the old
-    // check and the value menu stayed empty for good — typing `--skills=a`
+    // `plugin` had landed, a map with another list still missing passed the old
+    // check and the value menu stayed empty for good — typing `--plugins=a`
     // then showed nothing at all.
     // The guard asks whether the map was FETCHED recently, not whether every
     // list came back non-empty: a machine with no MCP connector installed, or
@@ -1203,24 +1242,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         return next.plugin ?? [];
       }),
-      load('skill', async () => {
-        const skills = await listAvailableSkills();
-        if (Array.isArray(skills)) {
-          // Skill slug → its folder (the SKILL.md's directory), for
-          // `/skill update <name>` opening a session.
-          cmdArgDirsRef.current.skill = Object.fromEntries(
-            skills.map((s) => [s.slug || s.name, folderOf(s.path)]),
-          );
-          return Array.from(new Set(skills.map((s) => s.slug || s.name).filter(Boolean)));
-        }
-        return next.skill ?? [];
-      }),
-      load('mcp', async () => {
-        const connectors = await listMcp();
-        // Connector name → owning bundle folder, for `/mcp update <name>`.
-        cmdArgDirsRef.current.mcp = { ...(connectors.dirs ?? {}) };
-        return Object.keys(connectors?.mcpServers ?? {});
-      }),
       // Documents and tasks belong to ONE chat, so they are read from the
       // active chat id the same way their own panels do.
       load('artifact', async () => {
@@ -1264,7 +1285,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   /** The rows the palette shows: the level the caret is on, filtered by its
    *  own word. Level 3+ completes the value the chosen sub-command expects —
    *  `install` takes three tokens in a row (repo, sub-folder, branch), which is
-   *  exactly the `repo`/`repo_path`/`repo_ref` trio the backend reads. */
+   *  exactly the `repo`/`repo_path`/`repo_ref` trio the backend reads.
+   *
+   *  Every level BELOW the command name reads BOTTOM-UP like the recent-prompts
+   *  popup: the first (or best-ranked) row sits nearest the input and the rest
+   *  stack above it, so each branch reverses its rows before returning. */
   const paletteRows: PaletteRow[] = useMemo(() => {
     if (!cmdOpen) return [];
     // `cmdCaret` IS the live caret: `syncCmdPalette` re-derives it from the
@@ -1276,7 +1301,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const subName = caret.prev[1] ?? "";
       // Sub-aware: the attachment flags are a CREATE-time level; `update` keeps
       // what create set (after the pick the word is change prose), so its menu
-      // offers no `--skills/--mcp/--plugins` at all.
+      // offers no `--plugins` at all.
       const flags = commandFlags(caret.prev[0] ?? "", subName);
       const subDecl = (SUBCOMMANDS[caret.prev[0] ?? ""] ?? []).find(
         (s) => s.name === subName,
@@ -1296,19 +1321,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (afterFlagSub && (isFlagToken(caret.word) || (!caret.word && !argOwns))) {
         const caretFlag = slashFlagAt(caret, caret.prev[0] ?? "");
         if (!caret.word.includes("=")) {
-          // Rank by the straightened name: `—ski` (a smart-dash `--ski`) must
-          // still find `--skills`.
+          // Rank by the straightened name: `—plu` (a smart-dash `--plu`) must
+          // still find `--plugins`.
           const byName = rankMatches(flags, caretFlag?.flag ?? caret.word, (f) => f.name);
           // A fragment matching no flag (`—zz`) still lists the names instead of
           // an empty box — the value level follows the same never-empty rule.
-          return (byName.length > 0 ? byName : flags).map((f) => ({
-            key: `flagname:${f.name}`,
-            label: f.name,
-            hint: f.hint,
-            insert: `${f.name}=`,
-          }));
+          return (byName.length > 0 ? byName : flags)
+            .map((f) => ({
+              key: `flagname:${f.name}`,
+              label: f.name,
+              hint: f.hint,
+              insert: `${f.name}=`,
+            }))
+            .reverse();
         }
-        // `--skills=a`: a VALUE is being typed. The list loads lazily, so an
+        // `--plugins=a`: a VALUE is being typed. The list loads lazily, so an
         // empty cache renders as loading — returning [] here closed the palette
         // and looked like "writing a flag shows nothing".
         const spec = flags.find((f) => f.name === (caretFlag?.flag ?? ""));
@@ -1342,16 +1369,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         // The fragment being typed is REPLACED, not appended to: inserting
         // `typed.join(",") + "," + v` while text is present produced
-        // `--skills=an,anthropic-frontend-design` instead of completing it.
+        // `--plugins=an,anthropic-frontend-design` instead of completing it.
         // `flagPickInsert` (unit-tested) keeps earlier COMPLETE picks and only
         // replaces the partial fragment, so pick two never drops pick one.
         const typedRaw = caretFlag?.typed ?? "";
-        return remaining.map((v) => ({
-          key: `flag:${spec.name}:${v}`,
-          label: v,
-          hint: spec.name,
-          insert: flagPickInsert(typedRaw, v, values),
-        }));
+        return remaining
+          .map((v) => ({
+            key: `flag:${spec.name}:${v}`,
+            label: v,
+            hint: spec.name,
+            insert: flagPickInsert(typedRaw, v, values),
+          }))
+          .reverse();
       }
     }
     if (!caret || caret.index === 0) {
@@ -1364,14 +1393,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         !q || byName.length > 0
           ? byName
           : commands.filter((c) => c.hint.toLowerCase().includes(q));
-      // Bottom-anchored like the recent-prompt popup: oldest on top, newest
-      // just above the bottom (closest to the input).
-      return bottomAnchoredByUsage(matched, commandUsage, (c) => c.name).map((c) => ({
-        key: `cmd:${c.name}`,
-        label: `/${c.name}`,
-        hint: c.hint,
-        insert: `/${c.name}`,
-      }));
+      // Bottom-anchored like the recent-prompt popup, and like every level
+      // below: reversed table order first (the table's first command nearest
+      // the input when nothing was used yet), then used commands sink further
+      // down with the newest just above the composer.
+      return bottomAnchoredByUsage(
+        matched
+          .map((c) => ({
+            key: `cmd:${c.name}`,
+            label: `/${c.name}`,
+            hint: c.hint,
+            insert: `/${c.name}`,
+          }))
+          .reverse(),
+        commandUsage,
+        (r) => r.label.slice(1),
+      );
     }
     const verb = caret.prev[0] ?? "";
     if (caret.index === 1) {
@@ -1381,12 +1418,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const plug = pluginCmds.find((p) => p.name === verb);
       if (plug) {
         const ranked = rankMatches(plug.skills, caret.word, (s) => s.word);
-        return ranked.map((s) => ({
-          key: `plu:${plug.name}:${s.word}`,
-          label: s.word,
-          hint: s.hint,
-          insert: s.word,
-        }));
+        // Reversed table order first (first skill nearest the input), then
+        // used skills sink further down — newest just above the composer.
+        return bottomAnchoredByUsage(
+          ranked.map((s) => ({
+            key: `plu:${plug.name}:${s.word}`,
+            label: s.word,
+            hint: s.hint,
+            insert: s.word,
+          })).reverse(),
+          subUsage,
+          (r) => `${verb} ${r.label}`,
+        );
       }
       // Ranked by NAME, not filtered by name-or-hint: a hint-only hit ("List
       // installed bundles" also contains "ins") must not outrank the real
@@ -1398,12 +1441,48 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         !q || ranked.length > 0
           ? ranked
           : all.filter((x) => x.hint.toLowerCase().includes(q));
-      return subs.map((s) => ({
-        key: `sub:${verb}:${s.name}`,
-        label: s.name,
-        hint: s.hint,
-        insert: s.name,
-      }));
+      // Reversed table order first (first sub nearest the input), then used
+      // subs sink further down — newest just above the composer. The key is
+      // the same `verb sub` path acceptCmd and the dispatcher record.
+      return bottomAnchoredByUsage(
+        subs
+          .map((s) => ({
+            key: `sub:${verb}:${s.name}`,
+            label: s.name,
+            hint: s.hint,
+            insert: s.name,
+          }))
+          .reverse(),
+        subUsage,
+        (r) => `${verb} ${r.label}`,
+      );
+    }
+    // A nested command group: `/plugin marketplace ` offers its own verbs
+    // (`add`, `remove`, `list`), not the parent's free-text argument.
+    if (caret.index === 2) {
+      const parent = (SUBCOMMANDS[verb] ?? []).find((s) => s.name === (caret.prev[1] ?? ""));
+      const nested = parent?.sub ?? [];
+      if (nested.length > 0) {
+        const ranked = rankMatches(nested, caret.word, (s) => s.name);
+        const rows =
+          !q || ranked.length > 0
+            ? ranked
+            : nested.filter((x) => x.hint.toLowerCase().includes(q));
+        // Same rule as the sub level: reversed table order, then used verbs
+        // sink toward the input (key `verb parent verb`).
+        return bottomAnchoredByUsage(
+          rows
+            .map((s) => ({
+              key: `sub:${verb}:${parent!.name}:${s.name}`,
+              label: s.name,
+              hint: s.hint,
+              insert: s.name,
+            }))
+            .reverse(),
+          subUsage,
+          (r) => `${verb} ${parent!.name} ${r.label}`,
+        );
+      }
     }
     const sub = (SUBCOMMANDS[verb] ?? []).find((s) => s.name === (caret.prev[1] ?? ""));
     if (!sub) return [];
@@ -1431,12 +1510,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           },
         ];
       }
-      return rankMatches(tasks, caret.word, (t) => t.label).map((t) => ({
-        key: `val:schedule:${t.id}`,
-        label: t.label,
-        hint: "scheduled task",
-        insert: t.id,
-      }));
+      // Tasks sort by recent USE too — the key is the full `verb sub id` path
+      // a pick or a hand-typed run records — then reversed table order.
+      return bottomAnchoredByUsage(
+        rankMatches(tasks, caret.word, (t) => t.label)
+          .map((t) => ({
+            key: `val:schedule:${t.id}`,
+            label: t.label,
+            hint: "scheduled task",
+            insert: t.id,
+          }))
+          .reverse(),
+        subUsage,
+        (r) => `${verb} ${caret.prev[1] ?? ""} ${r.insert}`,
+      );
     }
     const values = (kind === "repo" ? cmdArgValues.repo : cmdArgValues[verb]) ?? [];
     // The lists load lazily and the menu opens the moment the level does, so an
@@ -1447,13 +1534,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     // `rankMatches` already drops what does not match, so a plain `includes`
     // pre-filter here would throw a typo away before the fuzzy metric saw it.
-    return rankMatches(values, caret.word, (v) => v).map((v) => ({
-      key: `val:${kind}:${v}`,
-      label: v,
-      hint: kind === "repo" ? "repo" : verb,
-      insert: v,
-    }));
-  }, [cmdOpen, cmdCaret, cmdQuery, commandUsage, commands, cmdArgValues, cmdArgLoaded, pluginCmds, input]);
+    // Recent-use sort like every other level: the key is the `verb sub value`
+    // path a pick or a hand-typed line records.
+    return bottomAnchoredByUsage(
+      rankMatches(values, caret.word, (v) => v)
+        .map((v) => ({
+          key: `val:${kind}:${v}`,
+          label: v,
+          hint: kind === "repo" ? "repo" : verb,
+          insert: v,
+        }))
+        .reverse(),
+      subUsage,
+      (r) => `${verb} ${caret.prev[1] ?? ""} ${r.insert}`,
+    );
+  }, [cmdOpen, cmdCaret, cmdQuery, commandUsage, subUsage, commands, cmdArgValues, cmdArgLoaded, pluginCmds, input]);
   const slashParsed = parseSlashInput(input);
   const slashActive =
     !!slashParsed?.name && commands.some((c) => c.name === slashParsed.name);
@@ -1777,6 +1872,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Selected row on the plan-approval card (index into its options; 0 = the
   // pre-highlighted "Approve" option). Reset whenever a new ask lands.
   const [planApprovalSel, setPlanApprovalSel] = useState(0);
+  // Selected option on the GENERIC ask card: clicking an option marks it
+  // (radio style, like ChatGPT's choice cards) and the Apply button submits
+  // it — instead of the old instant-send-per-click.
+  const [askSelected, setAskSelected] = useState<number | null>(null);
 
   /**
    * Deliver an ask/permission answer and only clear its card once the backend
@@ -2076,6 +2175,55 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  pre-append scrollHeight so a layout effect can re-anchor the scroll
    *  position (otherwise the content visibly jumps). */
   const prependAnchorRef = useRef<number | null>(null);
+  /** One earlier-page fetch at a time; scroll events fire in bursts and a
+   *  second request would fetch the same `before` cursor twice. */
+  const earlierLoadingRef = useRef(false);
+  const [earlierLoading, setEarlierLoading] = useState(false);
+
+  /** Page one screen of older history in (from DISK when the in-memory window
+   *  does not start at message 0), then grow the rendered window. Shared by
+   *  scroll-to-top, the "Load earlier" button and auto-fill. */
+  const loadOlderMessages = useCallback(async () => {
+    if (earlierLoadingRef.current) return;
+    const id = chatIdRef.current;
+    const cur = useStore.getState().chats.find((c) => c.id === id);
+    if (!cur || cur.hydrated === false) return;
+    const visibleNow = visibleChatMessages(cur.messages);
+    const renderedNow = sliceWindow(
+      visibleNow,
+      msgLimit,
+      windowBudget(msgLimit, MSG_PAGE),
+      MSG_WINDOW_MIN_KEEP,
+      (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
+    ).length;
+    const hasDiskPages = (cur.bodyStart ?? 0) > 0;
+    // Nothing to reveal: not a no-op button/scroll trigger.
+    if (!hasDiskPages && renderedNow >= visibleNow.length) return;
+    earlierLoadingRef.current = true;
+    setEarlierLoading(true);
+    const prevHeight = scrollRef.current?.scrollHeight ?? null;
+    try {
+      let added = 0;
+      if (hasDiskPages) added = await loadEarlierChatMessages(id);
+      const after = useStore.getState().chats.find((c) => c.id === id);
+      if (!after) return;
+      const visibleAfter = visibleChatMessages(after.messages);
+      const renderedAfter = sliceWindow(
+        visibleAfter,
+        msgLimit,
+        windowBudget(msgLimit, MSG_PAGE),
+        MSG_WINDOW_MIN_KEEP,
+        (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
+      ).length;
+      if (added > 0 || renderedAfter < visibleAfter.length) {
+        prependAnchorRef.current = prevHeight;
+        setMsgLimit((n) => n + MSG_PAGE);
+      }
+    } finally {
+      earlierLoadingRef.current = false;
+      setEarlierLoading(false);
+    }
+  }, [msgLimit]);
   /** Delay before the mounted window is trimmed back down once the user is at
    *  the newest message. Long enough that a burst of scroll-up/scroll-down does
    *  not trim and immediately re-page, short enough that the memory returns
@@ -2268,7 +2416,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // state would silently drop these the moment the user looks at another chat
   // and comes back. Deriving from the reactive `chat` object re-renders this
   // panel whenever the store updates the field.
-  const compactNotice = chat?.compactNotice ?? null;
   const compactError = chat?.compactError ?? null;
   const compacting = chat?.compacting ?? false;
   const compactProgress = chat?.compactProgress ?? null;
@@ -2298,6 +2445,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  authoritative controller). Used by /undo, /redo, /clear and /new so the
    *  removed/emptied history can never be repopulated by a live reply. */
   const stopChatStream = useCallback((id: string) => {
+    autoRetryFor(id).stop();
+    // A cancelled turn ends the current outage: a later failure starts the
+    // ladder over instead of inheriting the abandoned step count.
+    autoRetryCountRef.current.set(id, 0);
     try {
       abortMapRef.current.get(id)?.abort();
     } catch {
@@ -2378,8 +2529,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // was pure noise the user has to read and then watch disappear. The transcript
   // itself shows the resulting CONTEXT SUMMARY card, so the outcome is already
   // visible without a status line.
-  // `compactNotice` is still cleared below where it was set, so any value
-  // persisted from an older build cannot resurrect the row.
 
   // Same auto-dismiss for the /undo and /redo feedback: show it ~4.5s, fade out
   // over 0.5s, then drop it from the store. Kept separate from the compact
@@ -2721,23 +2870,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // uncapped (it also scales the char budget), so that comparison goes
     // permanently false on giant chats and scroll-loading silently dies.
     if (el.scrollTop < 200 && chat) {
-      const visible = visibleChatMessages(chat.messages);
-      const budget = windowBudget(msgLimit, MSG_PAGE);
-      const rendered = sliceWindow(
-        visible,
-        msgLimit,
-        budget,
-        MSG_WINDOW_MIN_KEEP,
-        (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
-      ).length;
-      if (rendered < visible.length) {
-        prependAnchorRef.current = el.scrollHeight;
-        // Not capped: scrolling up is an explicit request to read deeper into
-        // the history, and the trim effect below reclaims the memory as soon as
-        // the user returns to the newest message. A cap here would make
-        // auto-load silently stop working at the cap.
-        setMsgLimit((n) => n + MSG_PAGE);
-      }
+      // `loadOlderMessages` decides whether anything is actually left: an
+      // in-memory page that the render window still hides, or an older page
+      // that only exists on disk. It is a no-op at the true start of history.
+      void loadOlderMessages();
     }
     // Remember where the user left this chat — in-memory only. The cheap parts
     // run here; the DOM scan is deferred to the next frame (and flushed
@@ -2953,6 +3089,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // trimming under a viewport that is no longer pinned would jump. The next
       // arrival at the bottom schedules it again (see `recordAtBottom`).
       if (!el || !shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current, isActive)) return;
+      // If the window already mounts EVERY renderable message, there is
+      // nothing scrolled past to reclaim. Trimming here would only make the
+      // viewport short again and let the fill effect re-raise `msgLimit`,
+      // oscillating once per trim delay.
+      const visible = visibleChatMessages(chat?.messages ?? []);
+      const mounted = sliceWindow(
+        visible,
+        msgLimit,
+        windowBudget(msgLimit, MSG_PAGE),
+        MSG_WINDOW_MIN_KEEP,
+        (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
+      ).length;
+      if (mounted >= visible.length) return;
       prependAnchorRef.current = el.scrollHeight;
       setMsgLimit(MSG_PAGE);
     }, TRANSCRIPT_TRIM_DELAY_MS);
@@ -2964,6 +3113,53 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (stickToBottom.current) scheduleTranscriptTrim();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgLimit]);
+
+  // Release the loaded history pages themselves (not just their DOM) once the
+  // user is idle at the newest message. Without this, every scroll through the
+  // history left its messages resident for the rest of the session — the DOM
+  // shrank, but RAM did not. Older pages are one local read away and come back
+  // on scroll-up.
+  useEffect(() => {
+    if (!isActive || !stickToBottom.current || !chat?.id) return;
+    const id = chat.id;
+    const t = window.setTimeout(() => {
+      if (isActive && stickToBottom.current) trimChatBodyWindow(id);
+    }, TRANSCRIPT_TRIM_DELAY_MS);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    chat?.id,
+    chat?.messages?.length,
+    chat?.messages?.some((m) => m.streaming),
+    isActive,
+  ]);
+
+  // A window that does not overflow the viewport cannot scroll, so the
+  // scroll-to-top handler (the trigger for loading an older page) can never
+  // fire. Keep raising the page count until the transcript either overflows or
+  // every RENDERABLE message is mounted. Without this, a chat whose first page
+  // was mostly folded (`compacted`) messages showed a "Load earlier" button
+  // with no scroll gesture available to reveal the rest.
+  useLayoutEffect(() => {
+    if (!isActive || !chat) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    // Cheap bail-out first: the normal (overflowing) transcript must not pay
+    // for a full message scan on every streamed token.
+    if (el.scrollHeight > el.clientHeight + 8) return;
+    const visible = visibleChatMessages(chat.messages);
+    const rendered = sliceWindow(
+      visible,
+      msgLimit,
+      windowBudget(msgLimit, MSG_PAGE),
+      MSG_WINDOW_MIN_KEEP,
+      (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
+    ).length;
+    if (rendered < visible.length || (chat?.bodyStart ?? 0) > 0) {
+      void loadOlderMessages();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat?.id, chat?.messages, isActive, msgLimit]);
   // A pane that loses focus gives its scrolled-past pages back. Every extra open
   // chat used to keep its own warm window (markdown + highlight DOM) for the
   // whole session, so the renderer's footprint grew with the NUMBER of openness
@@ -3013,7 +3209,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         ),
       );
       const msgs = chat?.messages ?? [];
-      const idx = msgs.findIndex((m) => m.id === pos.id);
+      // Anchor resolution works on the RENDERABLE list: a compacted or
+      // mode-switch message still exists in the store but can never mount, so
+      // treating it as "paged out" expanded `msgLimit` for a message that
+      // would stay invisible. `findIndex === -1` then falls through to the
+      // nearest surviving message instead.
+      const visible = visibleChatMessages(msgs);
+      const idx = visible.findIndex((m) => m.id === pos.id);
       if (idx >= 0) {
         // The anchor still exists but is paged out (not rendered) → expand the
         // rendered window to include it (plus a buffer above for exact
@@ -3021,7 +3223,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // message or the bottom (wrong viewport after a chat switch).
         if (!rendered.has(pos.id)) {
           const start = Math.max(0, idx - SCROLL_RESTORE_BUFFER);
-          const needed = Math.max(MSG_PAGE, msgs.length - start);
+          const needed = Math.max(MSG_PAGE, visible.length - start);
           if (needed > msgLimit) {
             setMsgLimit(needed);
             return;
@@ -3029,8 +3231,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         // The anchor still exists but isn't rendered → nearest rendered message above it.
         for (let i = idx - 1; i >= 0; i--) {
-          if (rendered.has(msgs[i].id)) {
-            anchorId = msgs[i].id;
+          if (rendered.has(visible[i].id)) {
+            anchorId = visible[i].id;
             break;
           }
         }
@@ -4125,12 +4327,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const chatId = forChatId ?? chatIdRef.current;
     let chat = s.chats.find((c) => c.id === chatId) ?? null;
     if (!chat) return;
-    // The transcript may still be on disk (index-only row). Fetch it BEFORE
-    // building the request, otherwise `history` would be built from an empty
-    // message array and the turn would reach the model with no context at all —
-    // exactly the "it forgot everything" failure the lazy-body layout must
-    // never cause.
-    if (chat.hydrated === false) {
+    // The transcript may still be on disk (index-only row) OR only the newest
+    // page may be in memory. Fetch the FULL body BEFORE building the request,
+    // otherwise `history` would miss every older turn and the model would
+    // forget the conversation — exactly the failure lazy bodies must not cause.
+    if (chat.hydrated === false || (chat.bodyStart ?? 0) > 0) {
       await ensureChatHydrated(chatId);
       const fresh = useStore.getState().chats.find((c) => c.id === chatId) ?? null;
       if (!fresh || fresh.hydrated === false) return;
@@ -4424,9 +4625,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // left an assistant message with streaming:true; without this cleanup the new
     // turn would add a second streaming message and show two "Thinking" indicators.
     for (const m of chat.messages) {
-      // A new turn re-arms the ✕ dismissal for EVERY message, including the one
-      // this turn continues into, so a banner closed last turn can show again.
-      dismissedRetryIdsRef.current.delete(m.id);
       if (m.id === assistantMsg.id) continue;
       if (m.retry) s.updateMessage(m.id, { retry: null });
       // A stale streaming flag from a previous turn: close it AND stamp its
@@ -4526,6 +4724,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const prev = cur?.content ?? "";
       const clean = stripLeadingModeTag(chunk, prev);
       if (!clean) return;
+      // Real output after a live retry means the outage is over; reset the
+      // ladder so a later failure does not resume at "10/10".
+      const r = cur?.retry;
+      if (
+        r &&
+        r.gaveUp !== true &&
+        r.watchdog !== true &&
+        r.fallback !== true &&
+        !r.agent
+      ) {
+        autoRetryCountRef.current.set(chat.id, 0);
+      }
       useStore.getState().updateMessage(assistantMsg.id, {
         content: prev + clean,
         segments: appendTextSegment(cur?.segments, clean),
@@ -4884,6 +5094,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           !!r.agent
         )
           return;
+        // This event is PROOF the transient failure is over: start the next
+        // outage at step 1 again instead of continuing "9/10" across unrelated
+        // failures later in the session.
+        autoRetryCountRef.current.set(chat.id, 0);
         store.updateMessage(assistantMsg.id, { retry: null });
       };
       // Batched text must land before any tool/status/retry update, so cards
@@ -4906,6 +5120,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // thinking indicator from it (not from mere streaming).
         useStore.getState().setStreaming(true, !!event.active);
         ensureLiveBubble();
+        // Reasoning / a live status pulse is also proof of recovery.
+        const r = findMsg()?.retry;
+        if (
+          r &&
+          r.gaveUp !== true &&
+          r.watchdog !== true &&
+          r.fallback !== true &&
+          !r.agent
+        ) {
+          autoRetryCountRef.current.set(chat.id, 0);
+        }
         store.updateMessage(assistantMsg.id, {
           thinkingActive: !!event.active,
           ...(event.active ? { thinkingStartedAt: Date.now() } : {}),
@@ -4926,7 +5151,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // dropped. The `note` field is different: it warns that an attached
         // skill was NOT found (deleted/renamed) — without it the user never
         // learns why the skill silently didn't apply. Stored per-chat (like
-        // compactNotice) so it survives a chat switch mid-turn.
+        // compactProgress) so it survives a chat switch mid-turn.
         // Nothing is auto-picked for the model any more, so a `skill` event
         // never carries names — `note` is the whole payload, and it is the
         // warning that an attached skill was not found.
@@ -5240,10 +5465,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // 900s leash (not the 300s non-tool limit) — a slow mid-turn compact
         // must not be mistaken for a stalled stream and force-aborted.
         bumpToolRunning(toolRunning);
+        // A completed run's 100%-hold timer must not clear the row for THIS run.
+        clearCompactHold(chat.id);
         useStore.getState().setChatCompacting(chat.id, true);
         // Fresh run: the previous phase/elapsed pair must not leak into it.
         useStore.getState().setChatCompactProgress(chat.id, null);
-        useStore.getState().setChatCompactNotice(chat.id, null);
         useStore.getState().setChatCompactError(chat.id, null);
       } else if (event.kind === "compact_progress") {
         // Live tick from the backend's summarizer: phase, attempt and the share
@@ -5271,7 +5497,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // what caused the chat to suddenly jump away from the live reply. The
         // summary is still fully visible by scrolling up whenever the user wants.
         dropToolRunning(toolRunning);
-        useStore.getState().setChatCompacting(chat.id, false);
+        // Keep the row up at 100% across the success boundary — the backend's
+        // percent is budget-based, so without this hold a fast compaction made
+        // the bar vanish around halfway and the job looked unfinished.
+        holdCompactComplete(chat.id);
         const chatId = chat.id;
         if (chatId) {
           // Auto-compact: the backend tells us exactly how many recent turns it
@@ -5300,6 +5529,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // runs the summarizer as a read-only ask request with the parent model,
         // which succeeds even when the compact subagent model is invalid).
         dropToolRunning(toolRunning);
+        clearCompactHold(chat.id);
         useStore.getState().setChatCompacting(chat.id, false);
         useStore
           .getState()
@@ -5317,6 +5547,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // Backend emits the authoritative merged checklist (preserves completed,
         // handles steer edits/removals). Replace — never merge stale extras back.
         const incoming = event.items ?? [];
+        const liveRetry = findMsg()?.retry;
+        if (
+          liveRetry &&
+          liveRetry.gaveUp !== true &&
+          liveRetry.watchdog !== true &&
+          liveRetry.fallback !== true &&
+          !liveRetry.agent
+        ) {
+          autoRetryCountRef.current.set(chat.id, 0);
+        }
         store.updateMessage(assistantMsg.id, {
           plan: incoming,
           // A sub-agent retry banner is informational and the parent is still
@@ -5432,6 +5672,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "ask") {
         setAskFreeText("");
         setPlanApprovalSel(0);
+        setAskSelected(null);
         // Backend options may be non-strings (object/array/null). Coerce all
         // to string so prepareContent never crashes.
         const rawOpts: unknown[] = Array.isArray(event.options)
@@ -5466,6 +5707,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // own compact_failed event already does this on its normal path).
         useStore.getState().setChatCompacting(chat.id, false);
         const errorReason = event.content ?? "The backend returned an error.";
+        // A real turn just failed on this provider/model: a green test tick
+        // claims the model can serve a turn, so it must not survive the
+        // failure. Demote the live result AND drop the persisted "checked"
+        // entry — a stale ✓ from an earlier test is exactly what ticked while
+        // chat was already failing (e.g. a free tier that ran out afterwards).
+        markModelTestFailed(activeProvider.id, activeProvider.model, errorReason);
+        {
+          const live = useStore.getState();
+          const kept = live.checkedModels.filter(
+            (c) => !(c.providerId === activeProvider.id && c.model === activeProvider.model),
+          );
+          if (kept.length !== live.checkedModels.length) live.setCheckedModels(kept);
+        }
         // A DETERMINISTIC failure (4xx request/account rejection, exhausted
         // quota) cannot be fixed by re-sending the same bytes: the automatic
         // ladder below must not run, or a broken provider row costs 10 silent
@@ -5517,21 +5771,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const spent = autoRetryCountRef.current.get(chat.id) ?? 1;
         if (lastUserMsg && spent < CHAT_ERROR_MAX_RETRIES) {
           autoRetryCountRef.current.set(chat.id, spent + 1);
+          // Adaptive, capped cadence: a short first wait recovers a blip fast,
+          // while a provider outage backs off to 60s instead of hammering it.
+          const delayMs = retryBackoffMs(spent + 1);
           useStore.getState().updateMessage(assistantMsg.id, {
             retry: {
               attempt: spent + 1,
               maxAttempts: CHAT_ERROR_MAX_RETRIES,
-              delay: CHAT_ERROR_RETRY_DELAY_MS / 1000,
+              delay: delayMs / 1000,
               reason: errorReason,
               model: activeProvider.model,
               providerId: activeProvider.id,
               reconnecting: true,
+              // Anchor the countdown to the moment this wait was armed. Without
+              // it the footer rendered the raw delay forever ("in 8s" frozen):
+              // computeLeft treats a missing start as "not started yet".
+              startedAt: Date.now(),
               inline: true,
             },
           });
           const originId = chat.id;
           const continueId = assistantMsg.id;
-          autoRetryFor(originId).schedule(CHAT_ERROR_RETRY_DELAY_MS, () =>
+          autoRetryFor(originId).schedule(delayMs, () =>
             send(
               lastUserMsg.content,
               lastUserMsg.attachments ?? [],
@@ -6084,6 +6345,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // the still-streaming reply — which makes the context meter dip and jump.
     // Wait for the stream to finish, then compact.
     const chatId = ch.id;
+    // Compaction is a WHOLE-HISTORY operation: summarizing only the paged-in
+    // tail would silently drop every older turn from the new summary. Load the
+    // full body first (a no-op when it is already resident).
+    if (ch.hydrated === false || (ch.bodyStart ?? 0) > 0) {
+      await ensureChatHydrated(chatId);
+      s = useStore.getState();
+      ch = s.chats.find((c) => c.id === chatId) ?? null;
+      if (!ch) return;
+    }
     const chatStreaming = () => {
       const st = useStore.getState();
       const c = st.chats.find((x) => x.id === chatId);
@@ -6148,8 +6418,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       releaseChatBusyIfIdle(chatId);
       return;
     }
+    // The guard counts FOLDED user/assistant turns too: repairing a bad earlier
+    // summary re-summarizes the original transcript, so a chat whose turns are
+    // all marked compacted still has real content to work from.
     const msgs = ch.messages.filter(
-      (m) => !m.compacted && (m.role === "user" || m.role === "assistant"),
+      (m) => m.role === "user" || m.role === "assistant",
     );
     if (msgs.length === 0) {
       useStore.getState().setChatCompacting(chatId, false);
@@ -6160,19 +6433,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // NOTE: no busy flag is set here. Compaction is a side task, not an agent
     // turn — taking the composer's live flag used to strand the Stop button
     // (and hide Send) whenever the summarizer outlived the stream it waited on.
+    // Cancel a previous run's 100%-hold dismissal before starting a new one.
+    clearCompactHold(ch.id);
     useStore.getState().setChatCompactError(ch.id, null);
-    useStore.getState().setChatCompactNotice(ch.id, null);
     useStore.getState().setChatCompacting(ch.id, true);
 
-    // Serialize the live conversation — including any prior compact summary —
-    // so the backend can MERGE it into the new one (opencode keeps a running
-    // summary across repeated compactions instead of starting from scratch).
+    // A manual /compact is an explicit "re-summarize this chat" action, so send
+    // the FULL transcript — including messages folded by earlier compactions and
+    // the latest compact summary. Relying only on the previous summary is what
+    // made a bad summary permanent: the backend could merge a wrong checkpoint
+    // but never recover the turns it had already dropped. The backend caps the
+    // serialized head by the model window and pulls the newest summary out for
+    // merging, so old turns are only used as far as they fit.
     // Full fidelity: toolActivity/plan/mode/preservedToolSummary travel too,
     // so the summarizer sees WHAT tools ran (not just prose) and the next
     // turn does not re-issue them.
-    const history = ch.messages
-      .filter((m) => !m.compacted)
-      .map((m) => ({
+    const history = ch.messages.map((m) => ({
         role: m.role,
         content: m.content ?? "",
         thinking: m.thinking,
@@ -6309,7 +6585,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
     // Compaction finished as a side task: hand the composer back only if no
     // agent turn is running for this chat (a queued drain may already be live).
-    useStore.getState().setChatCompacting(ch.id, false);
     releaseChatBusyIfIdle(ch.id);
     // No auto-refresh of the credit chip after compact either — see the
     // credits block above. Strictly click-to-refresh.
@@ -6318,6 +6593,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // compact — do NOT collapse the real messages behind a fake summary. Leave
     // the chat untouched and let the user retry manually.
     if (!result || !result.summary || result.error) {
+      clearCompactHold(ch.id);
       useStore
         .getState()
         .setChatCompactError(ch.id, result?.error || errMsg || "empty summary");
@@ -6330,6 +6606,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       });
       return;
     }
+    // Finish the row at 100% before folding the transcript. The backend's
+    // percent is wall-clock-budget based, so a quick summary used to dismiss the
+    // bar around halfway (the "it stops in the middle" report).
+    holdCompactComplete(ch.id);
     // The backend already returns opencode's "[Compacted earlier context]"
     // summary and the token-budgeted tail (`keep`) to preserve verbatim — no
     // extra wrapper, and no hardcoded keep=1.
@@ -6370,6 +6650,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // chat "suddenly scrolling to top" after every compact.
   };
 
+  // Footer Retry on a failed compaction: clear the error row, then re-run the
+  // summarizer. Stable identity for the memoized transcript.
+  const compactRetryRef = useRef<() => void>(() => {});
+  compactRetryRef.current = () => {
+    useStore.getState().setChatCompactError(chatIdRef.current, null);
+    void compactContext();
+  };
+  const onCompactRetry = useMemo(() => () => compactRetryRef.current(), []);
+
   /** Run a sub-command whose work is already implemented locally and report the
    *  outcome. Returns true when it handled the command: list/install/remove/
    *  toggle/run are pure state changes, so spending a whole model turn (and a
@@ -6386,6 +6675,157 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const wantList = sub === "list";
     const wantRemove = sub === "remove" || sub === "delete";
     if (word === "/plugin") {
+      // `/plugin marketplace add|remove|list`: the saved sources are ordinary
+      // store state, so the command writes exactly what Settings → Marketplaces
+      // reads. No model turn is needed for a source that already exists.
+      if (sub === "marketplace") {
+        const markets = s.marketplaces ?? [];
+        const verb = arg.toLowerCase();
+        if (!verb || verb === "list") {
+          return say(
+            markets.length === 0
+              ? "No marketplaces yet. Add one with `/plugin marketplace add <repo> [label]`."
+              : markets
+                  .map(
+                    (m) =>
+                      `- **${marketplaceLabel(m)}** — \`${m.repo}\`${m.path ? ` · ${m.path}` : ""}${m.git_ref ? ` @ ${m.git_ref}` : ""}`,
+                  )
+                  .join("\n"),
+          );
+        }
+        if (verb === "add") {
+          const [address, ...labelParts] = rest.trim().split(/\s+/);
+          if (!address) {
+            return say("Usage: `/plugin marketplace add <repo> [label]`.");
+          }
+          const parsed = parseMarketplaceAddress(address);
+          if (!parsed.repo) return say("That address has no repo — use `owner/repo`.");
+          const key = marketKey(parsed.repo, parsed.path, parsed.git_ref);
+          if (markets.some((m) => marketKey(m.repo, m.path, m.git_ref) === key)) {
+            return say(`Marketplace \`${parsed.repo}\` is already saved.`);
+          }
+          const out = await listMarketplace({
+            repo: parsed.repo,
+            ...(parsed.path ? { path: parsed.path } : {}),
+            ...(parsed.git_ref ? { git_ref: parsed.git_ref } : {}),
+          });
+          if ("error" in out) {
+            return say(`Could not read marketplace \`${parsed.repo}\`: ${out.error}`);
+          }
+          const label = labelParts.join(" ").trim();
+          const source = {
+            repo: parsed.repo,
+            kind: "plugins" as const,
+            ...(label ? { label } : {}),
+            ...(parsed.path ? { path: parsed.path } : {}),
+            ...(parsed.git_ref ? { git_ref: parsed.git_ref } : {}),
+          };
+          s.setMarketplaces([...markets, source]);
+          return say(
+            `✓ Added marketplace **${marketplaceLabel(source)}** — ${out.count ?? out.plugins.length} plugin(s)` +
+              `${out.stale ? " (from its saved copy)" : ""}.`,
+          );
+        }
+        if (verb === "remove" || verb === "delete") {
+          const query = rest.trim();
+          if (!query) return say("Usage: `/plugin marketplace remove <name|repo>`.");
+          const matches = findMarketplaces(markets, query);
+          if (matches.length === 0) {
+            return say(
+              `No marketplace matches \`${query}\`. Run \`/plugin marketplace list\` to see the saved names.`,
+            );
+          }
+          if (matches.length > 1) {
+            return say(
+              `\`${query}\` matches several marketplaces: ` +
+                matches.map((m) => `**${marketplaceLabel(m)}**`).join(", ") +
+                ". Use the exact label or repo.",
+            );
+          }
+          const target = matches[0];
+          s.setMarketplaces(
+            markets.filter((m) => marketKey(m.repo, m.path, m.git_ref) !== marketKey(target.repo, target.path, target.git_ref)),
+          );
+          return say(
+            `Marketplace **${marketplaceLabel(target)}** removed. Its installed plugins stay.`,
+          );
+        }
+        return say("Usage: `/plugin marketplace add|remove|list`.");
+      }
+      // `/plugin search <prompt>`: rank every saved index locally, then let the
+      // model pick and explain from that shortlist. The model never sees the
+      // whole catalogue, so it cannot recommend a plugin the user cannot install.
+      if (sub === "search") {
+        const prompt = [arg, rest].filter(Boolean).join(" ").trim();
+        if (!prompt) return say("Usage: `/plugin search <what you need>`.");
+        const markets = s.marketplaces ?? [];
+        if (markets.length === 0) {
+          return say(
+            "No marketplaces saved yet. Add one with `/plugin marketplace add <repo>`.",
+          );
+        }
+        const loaded = await Promise.all(
+          markets.map(async (m) => ({
+            m,
+            out: await listMarketplace({
+              repo: m.repo,
+              ...(m.path ? { path: m.path } : {}),
+              ...(m.git_ref ? { git_ref: m.git_ref } : {}),
+            }),
+          })),
+        );
+        const hits: MarketplaceHit[] = [];
+        const failed: string[] = [];
+        for (const { m, out } of loaded) {
+          if ("error" in out) {
+            failed.push(`${marketplaceLabel(m)}: ${out.error}`);
+            continue;
+          }
+          for (const entry of out.plugins) {
+            hits.push({ entry, marketplace: marketplaceLabel(m) || out.name, score: 0 });
+          }
+        }
+        if (hits.length === 0) {
+          return say(
+            failed.length > 0
+              ? `No marketplace index could be read:\n${failed.map((f) => `- ${f}`).join("\n")}`
+              : "The saved marketplaces list no plugins yet.",
+          );
+        }
+        const ranked = rankMarketplaceHits(hits, prompt, 12);
+        const listing = ranked.map(describeMarketplaceHit).join("\n");
+        const failedLine =
+          failed.length > 0
+            ? `\n\nSome marketplaces could not be read (their saved copy may be stale): ${failed.join("; ")}`
+            : "";
+        if (!ch) {
+          // No chat means no model turn to explain the choice: still answer
+          // with the shortlist and the exact install commands.
+          return say(`Closest matches:\n${listing}${failedLine}`);
+        }
+        const created = s.addMessage(ch.id, {
+          role: "user",
+          content: prettySlashLabel(`/plugin search ${prompt}`),
+          ...(ch.mode ? { mode: ch.mode } : {}),
+        });
+        void send(
+          `The user wants a plugin for: "${prompt}".\n\n` +
+            `Choose the 1-3 plugins from the candidates below that best fit. For each, ` +
+            `say briefly what it does and why it fits, then give its exact install ` +
+            `command. Use ONLY this list — never invent a plugin or a repo. If none ` +
+            `fit, say so and name the kind of marketplace that would.\n\n` +
+            `Candidates:\n${listing}${failedLine}`,
+          [],
+          [],
+          true,
+          created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
+        );
+        return true;
+      }
       if (wantList) {
         const out = await listPlugins();
         if (!Array.isArray(out)) return say(`Could not list plugins: ${out.error}`);
@@ -6587,44 +7027,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
       return false;
     }
-    if (word === "/skill") {
-      if (wantList) {
-        const rows = await listAvailableSkills();
-        return say(
-          rows.length === 0
-            ? "No skills installed yet. Create one with `/skill create <description>`."
-            : rows
-                .map(
-                  (r) =>
-                    `- **${r.name}**${r.plugin ? ` (from ${r.plugin})` : ""} — ${r.description || "no description"}`,
-                )
-                .join("\n"),
-        );
-      }
-      if (wantRemove && arg) {
-        const res = await syncSkill({ name: arg, delete: true });
-        invalidateSkillsList();
-        invalidateAvailableSkills();
-        cmdArgFetchedAt.current = 0;
-        return say(
-          res.ok ? `Skill \`${arg}\` deleted.` : `Delete failed: ${res.note ?? "unknown error"}`,
-        );
-      }
-      // `install <repo>` still needs the model: only the tool can read a repo.
-      return false;
-    }
-    if (word === "/mcp") {
-      if (wantList) {
-        const rows = await listMcp();
-        const names = Object.keys(rows.mcpServers ?? {});
-        return say(
-          names.length === 0
-            ? "No MCP connectors yet. Add one with `/mcp create <description>`."
-            : names.map((n) => `- \`${n}\``).join("\n"),
-        );
-      }
-      return false;
-    }
     if (word === "/artifact") {
       if (wantList) {
         const rows = await listArtifacts(ch?.id);
@@ -6723,12 +7125,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           `Edit the existing scheduled task "${arg}": ${updChange}. Call the schedule tool ` +
             `with action=list first to find that task — it is the id or the name the ` +
             `user gave — and read its CURRENT prompt, cron, root, mode and attached ` +
-            `skills/mcp_servers/plugins. Then call action=update with the SAME id and ` +
+            `plugins. Then call action=update with the SAME id and ` +
             `send only the fields that change (an omitted field keeps its stored ` +
-            `value); its attached skills, mcp_servers and plugins stay exactly ` +
+            `value); its attached plugins stay exactly ` +
             `as creation set them — change those only when the text above ` +
             `explicitly asks.` +
-            `${updFlags ? ` Set these attached arrays exactly: ${updFlags}.` : ""} ` +
+            `${updFlags ? ` Set this attached array exactly: ${updFlags}.` : ""} ` +
             `The cron is 5 fields in the machine's LOCAL time, and an empty cron makes it run once.`,
           [],
           [],
@@ -6756,16 +7158,51 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   const handleCommand = async (v: string) => {
     const s = useStore.getState();
-    const ch = s.chats.find((c) => c.id === s.activeChatId);
+    let ch = s.chats.find((c) => c.id === s.activeChatId) ?? null;
     // Slash commands stay out of the prompt history (they have their own
     // recent-use popup); pins are managed separately.
     const parsed = parseSlashInput(v);
     const word = parsed && parsed.name ? `/${parsed.name}` : v.split(/\s+/)[0].toLowerCase();
+    // Most commands append messages or rewrite history; doing that on a paged
+    // window would either lose the append on the next full hydration or write
+    // only the suffix. Load the full transcript first. `/new` is the exception
+    // (it abandons the old chat), and the cases that already hydrate below are
+    // no-ops after this.
+    if (
+      ch &&
+      word !== "/new" &&
+      (ch.hydrated === false || (ch.bodyStart ?? 0) > 0)
+    ) {
+      const cmdChatId = ch.id;
+      await ensureChatHydrated(cmdChatId);
+      ch = useStore.getState().chats.find((c) => c.id === cmdChatId) ?? null;
+    }
     // Track usage only for known commands so typos never pollute the popup order.
     // Compute from localStorage (the source of truth) instead of inside a
     // state updater, so the write + cross-window broadcast run exactly once.
     if (commands.some((c) => `/${c.name}` === word)) {
       setCommandUsage(recordCommandUsage(v));
+      // The same for the sub-levels the line names: `plugin search`, a nested
+      // `plugin marketplace add`, or a hand-typed value (`schedule run <id>`).
+      // Only KNOWN sub-commands count, so a typo never shifts the sort.
+      const verb = word.slice(1).toLowerCase();
+      const toks = v.slice(word.length).trim().split(/\s+/).filter(Boolean);
+      const subs = SUBCOMMANDS[verb] ?? [];
+      if (toks.length >= 1 && subs.some((s) => s.name === toks[0].toLowerCase())) {
+        const sub = toks[0].toLowerCase();
+        const parent = subs.find((s) => s.name === sub)!;
+        const nested = parent.sub ?? [];
+        if (toks.length >= 2 && nested.some((n) => n.name === toks[1].toLowerCase())) {
+          setSubUsage(recordSubcommandUsage(`${verb} ${sub} ${toks[1].toLowerCase()}`));
+        } else {
+          setSubUsage(recordSubcommandUsage(`${verb} ${sub}`));
+        }
+        // A known sub with a value token: `schedule run <id>` — the id is what
+        // the value menu sorts by, so hand-typed lines count the same as picks.
+        if (toks.length >= 2 && !nested.length && (parent.arg === "name" || parent.arg === "repo")) {
+          setSubUsage(recordSubcommandUsage(`${verb} ${sub} ${toks[1].toLowerCase()}`));
+        }
+      }
     }
     switch (word) {
       case "/compact":
@@ -6785,6 +7222,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // first, then clear (the store drops the chat's undo/redo stacks too).
         if (ch) {
           stopChatStream(ch.id);
+          // Clearing writes an empty transcript: it must own the WHOLE body,
+          // never just the paged window.
+          await ensureChatHydrated(ch.id);
           s.clearChat(ch.id);
         }
         break;
@@ -6821,8 +7261,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       case "/undo":
         // Abort this chat's in-flight turn first: undoing under a live stream
         // leaves the reply appending to the truncated history. The store also
-        // refuses while a message is still streaming.
-        if (ch) stopChatStream(ch.id);
+        // refuses while a message is still streaming. Undo rewrites history, so
+        // it needs the full body, not a paged window.
+        if (ch) {
+          stopChatStream(ch.id);
+          await ensureChatHydrated(ch.id);
+        }
         if (s.undoMessage()) {
           setNotice("↩ Undid the last exchange.");
         } else {
@@ -6830,7 +7274,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         break;
       case "/redo":
-        if (ch) stopChatStream(ch.id);
+        if (ch) {
+          stopChatStream(ch.id);
+          await ensureChatHydrated(ch.id);
+        }
         if (s.redoMessage()) {
           setNotice("↪ Restored the last exchange.");
         } else {
@@ -6852,13 +7299,26 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 // Sub-commands come from the SAME table the palette offers, so
                 // the help text can never drift away from the menu.
                 const subs = SUBCOMMANDS[c.name];
+                const suffix = (x: SubCommand) =>
+                  x.usage ??
+                  (x.arg === "free"
+                    ? ""
+                    : x.arg === "repo" || x.arg === "url"
+                      ? " <repo> [path] [ref]"
+                      : " <name>");
                 const body = subs
                   ? "\n" +
                     subs
-                      .map(
-                        (x) =>
-                          `  - \`/${c.name} ${x.name}${x.arg === "free" ? "" : x.arg === "repo" || x.arg === "url" ? " <repo> [path] [ref]" : " <name>"}\` — ${x.hint}`,
-                      )
+                      .map((x) => {
+                        const line = `  - \`/${c.name} ${x.name}${suffix(x)}\` — ${x.hint}`;
+                        const nested = (x.sub ?? [])
+                          .map(
+                            (y) =>
+                              `    - \`/${c.name} ${x.name} ${y.name}${suffix(y)}\` — ${y.hint}`,
+                          )
+                          .join("\n");
+                        return nested ? `${line}\n${nested}` : line;
+                      })
                       .join("\n")
                   : "";
                 return `- \`/${c.name}\` — ${c.hint}${body}`;
@@ -6874,165 +7334,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               .join("\n"),
         });
         break;
-      case "/skill":
-      case "/mcp": {
-        if (!ch) break;
-        const target = word === "/skill" ? "skill" : "MCP connector";
-        const rest = v.slice(word.length).trim();
-        // An explicit sub-command either does its own work here (no turn spent)
-        // or names exactly WHAT the model should author.
-        if (rest) {
-          const [sub, ...tail] = rest.split(/\s+/);
-          const verb = sub.toLowerCase();
-          if (await runCmdAction(word, verb, tail[0] ?? "", tail.slice(1).join(" "))) break;
-          if (verb === "install" && tail.length > 0) {
-            const first = tail[0];
-            const path = tail[1] ?? "";
-            const ref = tail[2] ?? "";
-            // A bare word is a NAME, not a repo to read — the same distinction
-            // `/plugin install` makes. Sent as a repo it only produces "cannot
-            // read a repo from …", which reads as a bug when what the user wants
-            // is that skill/connector MADE, and it costs a whole turn to find
-            // out. So only an address-shaped argument takes the install prompt.
-            const address = looksLikeRepoAddress(first);
-            const cmd = target === "skill" ? "skill" : "mcp";
-            const what = tail.slice(1).join(" ");
-            const created = s.addMessage(ch.id, {
-              role: "user",
-              content: prettySlashLabel(address ? v : `/${cmd} create ${what || first}`),
-              ...(ch.mode ? { mode: ch.mode } : {}),
-            });
-            // Store the pretty label (no leading slash) as the visible bubble;
-            // the prompt below is what the model actually receives.
-            const prompt = address
-              ? target === "skill"
-                ? `Install a skill from this repo: "${first}"${path ? `, sub-folder "${path}"` : ""}${ref ? `, ref "${ref}"` : ""}. Call create_skill with "repo"${path ? `, "repo_path": "${path}"` : ""}${ref ? `, "repo_ref": "${ref}"` : ""} and let it read the SKILL.md itself instead of writing the instructions from memory.`
-                : `Install an MCP connector bundle from this repo: "${first}"${path ? `, sub-folder "${path}"` : ""}${ref ? `, ref "${ref}"` : ""}. Read its manifest and call create_mcp with the connector's own name plus its command/args (or url) so it is saved like any other connector.`
-              : target === "skill"
-                ? `Create a skill named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_skill with "name": "${first}", one short ENGLISH "description" saying WHEN to use it (that is what the agent matches requests against), and the instructions themselves as "content". Do not pass "repo" — there is no repository here, the skill is written from scratch.`
-                : `Create an MCP connector named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_mcp with that same "name" plus EITHER "command" (+ "args"/"env") for a stdio server OR "url" for an HTTP one, so it is saved like any other connector.`;
-            void send(
-              prompt,
-              [],
-              [],
-              true,
-              created.id,
-              undefined,
-              false,
-              undefined,
-              ch.id,
-            );
-            break;
-          }
-          if (verb === "update" && tail.length > 1) {
-            const name = tail[0];
-            const change = tail.slice(1).join(" ");
-            // The connector's CURRENT record is stated, not described:
-            // `create_mcp` REPLACES the whole config and no tool can read it
-            // back (`read` refuses any path outside the project root, and
-            // connectors live in the app's data folder), so "read its current
-            // config first" was unimplementable — env/args came back dropped.
-            // The skill branch needs no injection: `load_skill` is bound for
-            // this turn, and the prompt tells the model to use it.
-            const current =
-              target === "skill"
-                ? " Call load_skill first to read its current instructions."
-                : connectorContext(name, (await listMcp()).mcpServers ?? {});
-            const created = s.addMessage(ch.id, {
-              role: "user",
-              content: prettySlashLabel(v),
-              ...(ch.mode ? { mode: ch.mode } : {}),
-            });
-            void send(
-              target === "skill"
-                ? `Edit the existing skill "${name}": ${change}.${current} Write it back with create_skill using the SAME name so it is overwritten instead of duplicated, keeping its frontmatter ("description" in English — it is what the agent matches requests against).`
-                : `Edit the existing MCP connector "${name}": ${change}.${current} Call create_mcp with the SAME name to overwrite it in place (or previous_name when it must be renamed).`,
-              [],
-              [],
-              true,
-              created.id,
-              undefined,
-              false,
-              undefined,
-              ch.id,
-            );
-            break;
-          }
-          if (verb === "update" && tail.length === 1) {
-            // A bare `… update <name>` OPENS the session at once: the badge
-            // pins the skill/connector's folder; the change lands in the next
-            // messages (the model turn below runs only for an unknown name).
-            const name = tail[0];
-            const kind: ChatEditTarget["target"] = target === "skill" ? "skill" : "mcp";
-            const held = useStore
-              .getState()
-              .chats.find((c) => c.id === ch.id)?.editTarget;
-            if (held) {
-              s.addMessage(ch.id, {
-                role: "assistant",
-                content: `An update session for **${held.name}** is already open — close it with the badge × first.`,
-              });
-              break;
-            }
-            const dir = await editTargetDir(kind, name);
-            if (dir) {
-              useStore.getState().setChatEditTarget(ch.id, {
-                target: kind,
-                action: "update",
-                name,
-                path: dir,
-              });
-              s.addMessage(ch.id, {
-                role: "assistant",
-                content: `Update session for **${name}** is open — describe the change in your next message.`,
-              });
-              break;
-            }
-          }
-        }
-        if (!rest) {
-          s.addMessage(ch.id, {
-            role: "assistant",
-            content:
-              word === "/skill"
-                ? "Usage: `/skill list`, `/skill install <repo> [path] [ref]`, `/skill create <description>`, `/skill update <name> <change>`, `/skill remove <name>`."
-                : "Usage: `/mcp list`, `/mcp install <repo> [path] [ref]`, `/mcp create <description>`, `/mcp update <name> <change>`, `/mcp remove <name>`.",
-          });
-          return;
-        }
-        // Store the pretty label (no leading slash) as the visible bubble;
-        // send() reuses this bubble but posts the full prompt to the model.
-        const created = s.addMessage(ch.id, {
-          role: "user",
-          content: prettySlashLabel(v),
-          ...(ch.mode ? { mode: ch.mode } : {}),
-        });
-        // The description, not the raw tail: `rest` still began with the
-        // sub-command word (`/skill create ترجمه کن`), which reached the model
-        // inside a sentence that already said "Create a new skill …".
-        const body = slashBody(word, rest)
-        if (!body) {
-          s.addMessage(ch.id, {
-            role: "assistant",
-            content: `Usage: \`/${target === "skill" ? "skill" : "mcp"} create <description>\`.`,
-          });
-          break;
-        }
-        void send(
-          target === "skill"
-            ? `Create a new skill or edit an existing one from this description: "${body}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass "description" — ONE short line of English saying WHEN to use this skill; the agent picks skills by matching the request against that description, so an English description serves Persian requests too. When EDITING an existing skill, send the description again (read it from the current skill with load_skill first) — omitting it keeps the old value. If the user gives a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), pass it as "repo" (with "repo_path" for a sub-folder and "repo_ref" for a branch) and let create_skill read the SKILL.md itself instead of writing the instructions from memory. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
-            : `Create a new MCP connector or edit an existing one from this description: "${body}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
-          [],
-          [],
-          true,
-          created.id,
-          undefined,
-          false,
-          undefined,
-          ch.id,
-        );
-        break;
-      }
       case "/plugin":
       case "/artifact":
       case "/schedule": {
@@ -7040,11 +7341,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const rest = v.slice(word.length).trim();
         const usage: Record<string, string> = {
           "/plugin":
-            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]`, `\/plugin create <description>`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`. `install` reads an existing bundle from a repo; to make one, use `create`. To USE a bundle, type its `\/<slug>` command.",
+            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]`, `\/plugin create <description>`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`, `\/plugin marketplace add|remove|list`, `\/plugin search <what you need>`. `install` reads an existing bundle from a repo; to make one, use `create`. To USE a bundle, type its `\/<slug>` command.",
           "/artifact":
             "Usage: `\/artifact list`, `\/artifact create <description>`, `\/artifact update <id> <change>`, `\/artifact remove <id>`.",
           "/schedule":
-            "Usage: `\/schedule list`, `\/schedule create <description> [--skills=a,b] [--mcp=x] [--plugins=z]`, `\/schedule update <id|name> <change> [--skills=…]`, `\/schedule run <id>`, `\/schedule remove <id>`. The `--` flags attach skills, MCP connectors and plugins to every run.",
+            "Usage: `\/schedule list`, `\/schedule create <description> [--plugins=a,b]`, `\/schedule update <id|name> <change> [--plugins=…]`, `\/schedule run <id>`, `\/schedule remove <id>`. The `--plugins` flag attaches plugins to every run.",
         };
         if (!rest) {
           s.addMessage(ch.id, { role: "assistant", content: usage[word] });
@@ -7083,7 +7384,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const prompts: Record<string, string> = {
           "/plugin": `Create or edit a plugin from this description: "${desc}". A plugin is a folder bundling skills, MCP connectors AND runnable scripts so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. If instead they NAMED a plugin they want made (a bare word, not a repo address), use action=create with that name. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug, a one-line English "description" saying WHEN the bundle applies (the agent matches requests against it), the skills (name + content + a short English description each), the mcp map, and any "scripts" the description calls for. SCRIPTS ARE RUST BY DEFAULT: leave "language" out unless the user explicitly asked for python, node or bash, and write a complete, compiling program that prints its result to stdout (arguments arrive in std::env::args()). Run one later with action=run. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
           "/artifact": `Build an artifact from this description: "${desc}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
-          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field cron in the machine's LOCAL time (empty = run once), the workspace root, mode,${flagLine ? " and pass these exact arrays: " + flagLine + "." : " and the skills/mcp_servers/plugins the run needs."} To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
+          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field cron in the machine's LOCAL time (empty = run once), the workspace root, mode,${flagLine ? " and pass this exact array: " + flagLine + "." : " and the plugins the run needs."} To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
         };
         void send(
           prompts[word],
@@ -7281,7 +7582,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // same handler as typing the equivalent slash command.
   handleCommandRef.current = handleCommand;
 
-  const retryMessage = useCallback((id: string) => {
+  const retryMessage = useCallback(async (id: string) => {
     // If a previous turn is still mid-stream (auto-retry waiting on a provider
     // throttle, streaming reply, etc.), pressing Retry must cancel that run
     // FIRST — otherwise the "Retry" click is silently swallowed by the `busy`
@@ -7293,8 +7594,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       active.abort();
     }
     const s = useStore.getState();
-    const ch = s.chats.find((c) => c.id === originId);
+    let ch = s.chats.find((c) => c.id === originId);
     if (!ch) return;
+    // Resuming/restarting may truncate: a paged window must be replaced by the
+    // full transcript first or the truncation would only rewrite the window.
+    if (ch.hydrated === false || (ch.bodyStart ?? 0) > 0) {
+      await ensureChatHydrated(originId);
+      ch = useStore.getState().chats.find((c) => c.id === originId);
+      if (!ch) return;
+    }
     const msg = ch.messages.find((m) => m.id === id);
     if (!msg) return;
     // Resolve to the OWNING user message: a failed/error "retry" can be
@@ -7311,31 +7619,32 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     if (!userMsg.content.trim()) return;
 
-    // RESUME, don't restart: if this user's turn left a failed assistant
-    // message behind (partial content + preserved tool activity + plan),
-    // keep it in the transcript and re-run the SAME user message so the
-    // model continues from where it was cut off instead of redoing the
-    // completed work. Only when there is no failed turn to resume do we
-    // fall back to the old truncate-and-restart behavior.
-    const idx = ch.messages.findIndex((m) => m.id === userMsg.id);
-    const failed = ch.messages
-      .slice(idx + 1)
-      .find(
-        (m) =>
-          m.role === "assistant" &&
-          (m.retry ||
-            m.error ||
-            (typeof m.content === "string" &&
-              m.content.includes("[Interrupted before finishing"))),
-      );
-    if (failed) {
+    // RESUME, don't restart: planRetry('banner') finds the failed assistant
+    // turn (retry / error / interrupted — including a mid-turn failure) and
+    // points at the SAME bubble to continue. Only when no failed turn exists
+    // do we fall back to truncate-and-restart below.
+    const plan = planRetry(ch.messages, userMsg.id, "banner");
+    const continueId = plan?.target.continueAssistantId;
+    if (continueId) {
+      // Clear the failed-turn markers BEFORE the resume. `send` keeps the same
+      // assistant bubble, and a successful resume never rewrites `error` —
+      // leaving it true made the red "failed" row reappear the moment
+      // `streaming` flipped false again.
+      s.updateMessage(continueId, {
+        error: false,
+        errorReason: undefined,
+        interrupted: false,
+        retry: null,
+      });
       // RESUME via planRetry (banner semantics): reuse the existing user bubble
       // (no duplicate) AND continue the SAME assistant bubble so toolActivity,
       // plan and preservedToolSummary stay on one message. Backend resumes from
       // its checkpoint (restart=false) instead of redoing completed tools.
-      const plan = planRetry(ch.messages, userMsg.id, 'banner');
-      const continueId = plan?.target.continueAssistantId ?? failed.id;
       const targetId = ch.id;
+      // A manual Retry after the ladder reached 10/10 must start a FRESH
+      // ladder. Without this the next failure read `spent = 10`, skipped the
+      // `spent < 10` branch, and gave up instantly — the count never reset.
+      autoRetryCountRef.current.set(targetId, 0);
       // Epoch-guarded: dropped when Stop bumps the epoch before it fires.
       autoRetryFor(targetId).schedule(0, () =>
         send(
@@ -7356,6 +7665,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // No failed assistant turn to resume — restart from this user message.
     if (!s.truncateTo(userMsg.id)) return;
     const text = userMsg.content;
+    // Fresh turn ⇒ fresh ladder.
+    autoRetryCountRef.current.set(ch.id, 0);
     // Give the abort's finally block a tick to reset busy/streaming state
     // before re-sending (send() re-sets busy=true itself, but the abort's
     // finally would otherwise clear it mid-run).
@@ -7371,18 +7682,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   }, [send]);
 
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
-  // recreated `onRetry` per render would defeat it. Route through a ref instead.
+  // recreated callback per render would defeat it. Route through a ref instead.
   const retryMessageRef = useRef(retryMessage);
   retryMessageRef.current = retryMessage;
 
-  // Restart-from-scratch retry for the USER message's retry icon: ALWAYS delete
-  // this user message and everything below it, then re-send from scratch. This
-  // is deliberately NOT the resume path — the failed assistant turn (partial
-  // content + preserved tools + plan) is discarded so the chat continues fresh
-  // from this message onward. The error banner's Retry keeps its own resume
-  // behavior via retryMessageRef.
+  // Footer notice's Retry: resumes the failed/interrupted turn in place (no
+  // truncation, same user + assistant bubbles).
+  const onResume = useMemo(
+    () => (id: string) => retryMessageRef.current(id),
+    [],
+  );
+
+  // Regenerate: the USER message's retry icon ALWAYS deletes this user message
+  // and everything below it, then re-sends from scratch. This is deliberately
+  // NOT the resume path — the failed assistant turn (partial content +
+  // preserved tools + plan) is discarded so the turn runs fresh.
   const restartFromMessage = useCallback(
-    (id: string) => {
+    async (id: string) => {
       // Cancel any active stream first — otherwise the `busy` guard in send()
       // would swallow the re-send. Per-chat: only this panel's chat.
       const originId = chatIdRef.current;
@@ -7391,8 +7707,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         active.abort();
       }
       const s = useStore.getState();
-      const ch = s.chats.find((c) => c.id === originId);
+      let ch = s.chats.find((c) => c.id === originId);
       if (!ch) return;
+      // Regenerate truncates everything below the user turn: do it on the FULL
+      // transcript, never on a paged suffix.
+      if (ch.hydrated === false || (ch.bodyStart ?? 0) > 0) {
+        await ensureChatHydrated(originId);
+        ch = useStore.getState().chats.find((c) => c.id === originId);
+        if (!ch) return;
+      }
       // Resolve the prompt to re-send via the shared helper (same rule as
       // resolveRestartUser tests): a user id restarts its own turn, an
       // assistant id restarts the user turn above it.
@@ -7427,9 +7750,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const restartFromMessageRef = useRef(restartFromMessage);
   restartFromMessageRef.current = restartFromMessage;
 
-  // The USER message's retry icon restarts from that message (deletes everything
-  // below it and re-sends fresh). The error banner's Retry keeps its own resume
-  // path via retryMessageRef.
+  // The USER message's retry icon regenerates from that message (deletes
+  // everything below it and re-sends fresh). The footer notice's Retry keeps
+  // its own resume path via onResume.
   const onRetry = useMemo(
     () => (id: string) => restartFromMessageRef.current(id),
     [],
@@ -7440,7 +7763,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // then resends the new text with the same attachments (restart=true clears
   // the backend checkpoint so the turn runs fresh, like regenerate).
   const handleEditMessage = useCallback(
-    (id: string, newText: string) => {
+    async (id: string, newText: string) => {
       const text = newText.trim();
       if (!text) return;
       const originId = chatIdRef.current;
@@ -7449,8 +7772,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         active.abort();
       }
       const s = useStore.getState();
-      const ch = s.chats.find((c) => c.id === originId);
+      let ch = s.chats.find((c) => c.id === originId);
       if (!ch) return;
+      // Editing truncates from the edited turn down: the full body must be in
+      // memory, otherwise the truncation would only touch the paged window.
+      if (ch.hydrated === false || (ch.bodyStart ?? 0) > 0) {
+        await ensureChatHydrated(originId);
+        ch = useStore.getState().chats.find((c) => c.id === originId);
+        if (!ch) return;
+      }
       const userMsg = resolveRestartUser(ch.messages, id);
       if (!userMsg) return;
       if (!s.truncateTo(userMsg.id)) return;
@@ -7928,7 +8258,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // The language hint is what stops short clips from being auto-detected
     // as the wrong language (the main cause of mangled Persian). The user's
     // setting wins; otherwise the UI direction / typed text decides.
-    const lang = resolveSttLanguage(sttLanguage, dir, input);
+    const lang = resolveSttLanguage(sttLanguage, APP_DIR, input);
     const toTranscribeOpts = (
       cfg: (typeof settings.providers)[number],
       model: string | undefined,
@@ -8994,7 +9324,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // language is on Auto — the suffix then says "stay in the language the
       // user is speaking" instead of guessing one, while STT keeps its own
       // (existing) Persian default.
-      const liveHearLang = resolveSttLanguage(sttLanguage, dir, "");
+      const liveHearLang = resolveSttLanguage(sttLanguage, APP_DIR, "");
       const liveLang = liveHearLang || 'fa';
       const liveSendOpts = { liveSuffix: buildLiveSpeakSuffix(liveHearLang) };
       // The echo gate must follow ACTUAL playback, never the whole agent turn.
@@ -9318,6 +9648,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (prevChar && !/\s/.test(prevChar)) return;
     // Fresh usage on every open so the order is always recent-first.
     setCommandUsage(loadCommandUsage());
+    setSubUsage(loadSubcommandUsage());
     setCmdOpen({ at: pos });
     setCmdCaret({ start: pos, end: pos + 1, word: "", index: 0, prev: [] });
     setSkillMention(null);
@@ -9336,11 +9667,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (!cmdOpen) return;
     // An informational row ("Loading…", "Nothing installed", "All selected")
     // carries no insert: accepting it must be a no-op, not a wipe of the
-    // fragment the user has typed (`--skills=brain` → `--skills=`).
+    // fragment the user has typed (`--plugins=brain` → `--plugins=`).
     if (insert === "") return;
     const caret = cmdCaret;
-    // A flag token (`--skills=a,b`) appends: only the value after `=` is
-    // replaced, so picking a second skill keeps the first.
+    // A flag token (`--plugins=a,b`) appends: only the value after `=` is
+    // replaced, so picking a second plugin keeps the first.
     const caretFlag = caret ? slashFlagAt(caret, caret.prev[0] ?? "") : null;
     // Inside a flag token only the part after `=` is being edited, so a second
     // pick appends to the first instead of wiping it. Without an `=` yet the
@@ -9356,11 +9687,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Record usage on pick (like skills) so the next open sorts recent-last at
     // the bottom even before the command runs via handleCommand.
     setCommandUsage(recordCommandUsage(insert));
+    // Sub-level picks get their own recency key — `plugin search`, a nested
+    // `plugin marketplace add`, or a picked value (`schedule run <id>`) — so
+    // every level below the command sorts by use like the command level does.
+    // Flag picks (`--plugins=`) are skipped: the flag token is UI glue, not a
+    // row the user chose from a menu.
+    if (caret && caret.index >= 1 && insert && !insert.startsWith("-")) {
+      const path = [...caret.prev, insert].join(" ").toLowerCase();
+      setSubUsage(recordSubcommandUsage(path));
+    }
     // A trailing space is written into the line itself, not merely left for the
     // caret: the next level's menu opens off it, and without it the caret sat
     // one character past the text while the palette stayed on the same word.
     // A flag VALUE is the exception: no space, so a second pick appends to the
-    // same `--skills=a,b` token instead of starting a new word.
+    // same `--plugins=a,b` token instead of starting a new word.
     // A flag NAME pick (`--plugins=`) and a flag VALUE pick both keep the token
     // open: the `=` already starts the value level, and a space would split the
     // word so the value list could never appear on the same token.
@@ -9398,6 +9738,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     } catch {
       // A pick must never break the input edit.
     }
+    // The pick consumed the menu: the next level must not auto-open off the
+    // stale pin (picking a sub-command would pop its value menu at once).
+    cmdPinnedRef.current = false;
     setCmdOpen(null);
     setCmdCaret(null);
     if (cleared) {
@@ -9415,7 +9758,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // the fresh caret — leaving it closed broke the chain after one step.
     // `syncCmdPalette` closes it again for a level with nothing to offer.
     // A flag VALUE pick is the exception: the token just landed
-    // (`--skills=a,b`), and re-seeding popped the value menu straight back —
+    // (`--plugins=a,b`), and re-seeding popped the value menu straight back —
     // exactly the popup that blocked writing the prompt. ArrowUp reopens it.
     const nextCaret = slashCaretAt(next, pos);
     if (!nextCaret || !hasLandedFlag([nextCaret.word])) syncCmdPalette(next, pos);
@@ -9432,6 +9775,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const syncCmdPalette = (value: string, caretAt: number) => {
     const caret = slashCaretAt(value, caretAt);
     if (!caret) {
+      cmdPinnedRef.current = false;
       setCmdOpen(null);
       setCmdCaret(null);
       return;
@@ -9454,6 +9798,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       caret.index >= 2
         ? (SUBCOMMANDS[subVerb] ?? []).find((s) => s.name === subName)
         : undefined;
+    // A nested group (`/plugin marketplace `) has its own verb menu even
+    // though the parent sub-command takes no completable argument.
+    const nestedLevel =
+      caret.index === 2 && (subDecl?.sub ?? []).length > 0;
     const flagLevel =
       caret.index >= 2 &&
       commandFlags(subVerb, subName).length > 0 &&
@@ -9476,6 +9824,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const proseWord = caret.word !== "" && !isFlagToken(caret.word);
     const afterLanded = caret.word === "" && hasLandedFlag(caret.prev.slice(2));
     if (flagLevel && !argValueOwns && (proseWord || afterLanded)) {
+      cmdPinnedRef.current = false;
       setCmdOpen(null);
       setCmdCaret(null);
       return;
@@ -9484,6 +9833,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // create attached) is plain prose to the executor: no menu sits under it,
     // so the flag menus are not offered here at all.
     if (!flagLevel && caret.index >= 2 && !!subDecl && isFlagToken(caret.word)) {
+      cmdPinnedRef.current = false;
       setCmdOpen(null);
       setCmdCaret(null);
       return;
@@ -9498,6 +9848,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       subDecl.arg === "name" &&
       hasLandedValue(caret.prev.slice(2));
     if (valueLanded) {
+      cmdPinnedRef.current = false;
       setCmdOpen(null);
       setCmdCaret(null);
       return;
@@ -9515,8 +9866,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         (subDecl.arg === "name" || subDecl.arg === "repo")) ||
       (caret.index >= 3 && !!subDecl && !!subDecl.rest && subDecl.rest !== "free");
     const known =
-      caret.index === 0 || hasSubCommands || flagLevel || argLevel;
+      caret.index === 0 || hasSubCommands || nestedLevel || flagLevel || argLevel;
     if (!known) {
+      cmdPinnedRef.current = false;
+      setCmdOpen(null);
+      setCmdCaret(null);
+      return;
+    }
+    // The command and SUB-COMMAND levels auto-open as before (`/` and
+    // `/plugin ` both show their menu at once). Levels THIRD and beyond — a
+    // value list, a nested group's verbs, the attachment flags — open ONLY by
+    // hand: ArrowUp summons the menu for the current level, so writing the
+    // value or the change prose never has a popup jump over the words. A
+    // hand-opened menu stays up while it is being filtered (pinned), until
+    // Escape, a pick, or the line leaving a known level closes it.
+    if (caret.index <= 1) {
+      cmdPinnedRef.current = false;
+    } else if (!cmdPinnedRef.current) {
       setCmdOpen(null);
       setCmdCaret(null);
       return;
@@ -9527,11 +9893,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // place filtered the command list by a word that no longer exists and the
     // palette appeared to stay on the level that was just picked.
     setCmdQuery(caret.word.toLowerCase());
-    if (caret.index === 0) setCmdIndex(0);
+    if (caret.index === 0) setCmdIndex(CMD_SEL_END);
     // At a value level the rows are ranked by match quality, so the best one is
     // highlighted (bottom-anchoring a fuzzy-ranked list would point at the
     // worst match). The command level keeps its recent-first bottom anchor.
-    if (caret.index > 0) setCmdIndex(0);
+    // Levels below the command open BOTTOM-UP (first row nearest the input),
+    // so the anchor is the bottom row — `cmdSel` clamps the sentinel to it.
+    if (caret.index > 0) setCmdIndex(CMD_SEL_END);
     if (caret.index > 0) void ensureCmdArgValues();
   };
 
@@ -9551,7 +9919,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // (e.g. after a skill is saved in Settings) without re-importing.
   useEffect(() => {
     setSkillsFetcher(listSkills);
-    // The command names changed (`/create-skill` → `/skill`), so the stored
+    // The command names changed (`/create-skill` → `/plugin create`), so the stored
     // history/pins/usage are rewritten once: otherwise the recent-command order
     // loses its history and the popup keeps offering a command that no longer
     // exists.
@@ -9589,6 +9957,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       void ensureSkills();
       setPinnedCmds(loadPins());
       setCommandUsage(loadCommandUsage());
+      setSubUsage(loadSubcommandUsage());
     };
     window.addEventListener("coder:plugins-changed", onPluginsChanged);
     return () => window.removeEventListener("coder:plugins-changed", onPluginsChanged);
@@ -9840,9 +10209,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         e.preventDefault();
         e.stopPropagation();
         if (filteredCmds.length > 0)
-          setCmdIndex(
-            (i) => (i + d + filteredCmds.length) % filteredCmds.length,
-          );
+          setCmdIndex((i) => {
+            // Clamp FIRST: the bottom-anchor sentinel is MAX_SAFE_INTEGER, and
+            // a raw `(MAX + d) % len` would land on an arbitrary row.
+            const cur = Math.min(i, filteredCmds.length - 1);
+            return (cur + d + filteredCmds.length) % filteredCmds.length;
+          });
         return;
       }
       if (filteredCmds.length > 0 && (e.key === "Enter" || e.key === "Tab")) {
@@ -9858,6 +10230,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
+        // Escape is a hand-close: no input change follows, so without this the
+        // stale pin would auto-reopen the menu on the very next `/`.
+        cmdPinnedRef.current = false;
         setCmdOpen(null);
         return;
       }
@@ -9929,6 +10304,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           e.preventDefault();
           e.stopPropagation();
           setCommandUsage(loadCommandUsage());
+          setSubUsage(loadSubcommandUsage());
+          cmdPinnedRef.current = true;
           setCmdOpen({ at: 0 });
           // On a flag token / empty word the caret's own level opens; over prose
           // the caret word is blanked to the NAME menu, spliced at the exact
@@ -9942,10 +10319,46 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               })();
           setCmdCaret(opened);
           setCmdQuery(opened.word.toLowerCase());
-          setCmdIndex(0);
+          // Reopened by hand, so anchor to the bottom row like the auto-open.
+          setCmdIndex(CMD_SEL_END);
           void ensureCmdArgValues();
           requestAnimationFrame(() => textareaRef.current?.focus());
           return;
+        }
+        // Levels below the command no longer auto-open, so ArrowUp is THE way
+        // to summon them: the sub-command menu at level 1 (a bundle's own
+        // skills included), a nested group's verbs, and a value list. The
+        // caret's word stays the filter, so `/plugin se` + ArrowUp opens the
+        // menu already narrowed to `search`.
+        if (caret && caret.index >= 1) {
+          const verb = caret.prev[0] ?? "";
+          const subName = caret.prev[1] ?? "";
+          const decl =
+            caret.index >= 2
+              ? (SUBCOMMANDS[verb] ?? []).find((s) => s.name === subName)
+              : undefined;
+          const plug = pluginCmds.find((p) => p.name === verb);
+          const hasRows =
+            (caret.index === 1 && ((SUBCOMMANDS[verb] ?? []).length > 0 || !!plug)) ||
+            (caret.index === 2 && (decl?.sub ?? []).length > 0) ||
+            (caret.index === 2 &&
+              !!decl &&
+              (decl.arg === "name" || decl.arg === "repo")) ||
+            (caret.index >= 3 && !!decl && !!decl.rest && decl.rest !== "free");
+          if (hasRows) {
+            e.preventDefault();
+            e.stopPropagation();
+            setCommandUsage(loadCommandUsage());
+            setSubUsage(loadSubcommandUsage());
+            cmdPinnedRef.current = true;
+            setCmdOpen({ at: 0 });
+            setCmdCaret(caret);
+            setCmdQuery(caret.word.toLowerCase());
+            setCmdIndex(CMD_SEL_END);
+            void ensureCmdArgValues();
+            requestAnimationFrame(() => textareaRef.current?.focus());
+            return;
+          }
         }
       }
       const atStart = !el || ((el.selectionStart ?? 0) === 0 && (el.selectionEnd ?? 0) === 0);
@@ -10057,22 +10470,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     // Single cancellation path: drop pending auto-retry timers and bump the
     // epoch so any armed retry firing afterwards is ignored — it never
-    // restarts the turn or brings the retry banner back.
+    // restarts the turn or brings the retry row back.
     autoRetryFor(originId).stop();
+    // Stop ends THIS outage: the next failure must start at step 1, not resume
+    // at whatever rung the cancelled ladder had reached.
+    autoRetryCountRef.current.set(originId, 0);
     useStore.getState().setChatPendingAsk(originId, null);
     useStore.getState().setChatPendingPermission(originId, null);
-    // Clear any retry banner immediately. The banner's visibility
-    // (`effectiveRetry = retryingMsg?.retry ?? ...`) depends ONLY on
-    // `message.retry`, not on `busy` — so without this, a live "Provider
-    // hiccup / retry in Xs" banner keeps showing (frozen once its local
-    // countdown hits 0 → "retrying…") after Stop, even though busy already
-    // flipped false and the Stop button itself reverted to Send. The async
-    // finally in send() will eventually clear it once streamChat's promise
-    // rejects, but that's not instant — clear it eagerly here so the banner
-    // disappears the moment Stop is clicked, same as dismissRetry does.
+    // Clear the live retry row immediately. Its footer visibility depends ONLY
+    // on `message.retry`, not on `busy` — so without this, a live "Provider
+    // hiccup / retry in Xs" row keeps showing (frozen once its local countdown
+    // hits 0) after Stop, even though the Stop button itself reverted to Send.
+    // The async finally in send() will eventually clear it once streamChat's
+    // promise rejects, but that's not instant — clear the newest assistant's
+    // retry eagerly here.
     const msgs = chat?.messages ?? [];
+    const reversed = [...msgs].reverse();
     const target =
-      retryingMsg ?? [...msgs].reverse().find((m) => m.role === "assistant");
+      reversed.find((m) => m.role === "assistant" && m.retry) ??
+      reversed.find((m) => m.role === "assistant");
     if (target?.retry) {
       useStore.getState().updateMessage(target.id, { retry: null });
     }
@@ -10110,29 +10526,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
     }
   };
-
-  // Dismiss the retry banner WITHOUT touching the turn: clear the message's
-  // `retry` flag (so the banner unmounts) and remember the dismissal. This is
-  // the ✕ button on the error/stalled banner.
-  //
-  // It deliberately does NOT call `stop()`: ✕ on a live sub-agent retry used to
-  // abort the whole stream, so the chat died because the user closed a notice
-  // while explore was still working. A live ladder keeps emitting `retry`
-  // events for the same message, so the id stays in `dismissedRetryIdsRef`
-  // (read by `findRetryBannerMessage` above) until a new turn re-arms the
-  // banner — while the turn itself keeps running.
-  const dismissRetry = useCallback(() => {
-    const msgs = chat?.messages ?? [];
-    const target =
-      retryingMsg ?? [...msgs].reverse().find((m) => m.role === "assistant");
-    if (!target) return;
-    const st = useStore.getState();
-    // The banner may be a STALL banner for the newest assistant message, which
-    // carries no `retry` field yet. Stamp the id either way so the notice stays
-    // closed for the rest of this attempt.
-    dismissedRetryIdsRef.current.add(target.id);
-    if (target.retry) st.updateMessage(target.id, { retry: null });
-  }, [retryingMsg, chat?.messages]);
 
   if (!chat) {
     const noWorkspace = workspaces.length === 0;
@@ -10353,7 +10746,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           jumpScrollingRef.current = false;
         }}
       >
-        <div className="chat-messages" data-dir={dir}>
+        <div className="chat-messages" data-dir={APP_DIR}>
           {chat.hydrated === false ? (
             <ChatLoader />
           ) : (
@@ -10411,14 +10804,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
             );
             const hidden = visible.length - windowed.length;
+            // Older pages may still live only on disk (the tail was the first
+            // thing fetched). The count is honest only for messages already in
+            // memory; while a disk page remains we say "earlier messages"
+            // without a number rather than counting records we have not read.
+            const diskOlder = (chat.bodyStart ?? 0) > 0;
             // EVERY notice that used to be a banner above the composer now rides
             // the footer of the LAST visible assistant message, through the one
             // status slot in ChatMessageView. Highest-signal wins: an actual
             // failure beats a transient ack, and compaction progress beats both
             // because it blocks the turn entirely.
             const footerStatus: ChatMessage["footerStatus"] = (() => {
-              const err = cmdError ?? compactError ?? null;
-              if (err) return { kind: "error", text: err };
+              // Command/dictation errors are not retryable turns: no footer
+              // Retry button. A compaction failure IS retryable, but through
+              // its own action (re-run the summarizer), never by resending the
+              // user's last chat message.
+              if (cmdError) return { kind: "error", text: cmdError };
+              if (compactError)
+                return {
+                  kind: "error",
+                  text: compactError,
+                  action: "compact-retry",
+                };
               if (compacting) {
                 // Same information the removed CompactBanner carried, but split
                 // into structured fields instead of one long sentence: the
@@ -10432,6 +10839,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   // long "Compacting context — older messages are summarized…"
                   // sentence before the bar appears.
                   return { kind: "compact", text: "compacting" };
+                // Success hold: keep the bar visibly full for a beat instead of
+                // dismissing it at whatever wall-clock fraction the (often much
+                // faster) summary happened to reach.
+                if (compactProgress.phase === "done")
+                  return { kind: "compact", text: "compacted", percent: 100 };
                 // Waiting for the live reply to end before the summarizer may
                 // start. This is NOT compaction progress, so it gets words, not
                 // a bar: a 0% bar here read as "stuck at zero" and sat where the
@@ -10456,11 +10868,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   compactProgress.elapsedSecs +
                   Math.max(0, Math.round((Date.now() - at) / 1000));
                 const budget = compactProgress.budgetSecs > 0 ? compactProgress.budgetSecs : 0;
+                // Before the backend reports a budget (the manual "preparing"
+                // seed carries 0), there is no honest percentage. Render the
+                // phase words only: a 0% determinate bar there looked like a
+                // stalled job for the whole opening beat.
+                if (budget <= 0) return { kind: "compact", text: phase };
                 const percent = Math.min(
                   99,
                   Math.max(
                     compactProgress.percent || 0,
-                    budget > 0 ? Math.round((elapsed * 100) / budget) : compactProgress.percent || 0,
+                    Math.round((elapsed * 100) / budget),
                   ),
                 );
                 return {
@@ -10485,25 +10902,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               : null;
             return (
               <>
-                {hidden > 0 && (
+                {(hidden > 0 || diskOlder) && (
                   <div className="load-older-row">
                     <button
                       className="load-older-btn"
+                      disabled={earlierLoading}
                       onClick={() => {
-                        prependAnchorRef.current =
-                          scrollRef.current?.scrollHeight ?? null;
-                        // Deliberately NOT capped at visible.length: the char
-                        // budget scales with msgLimit, so capping would freeze
-                        // the budget on giant chats (each message over budget)
-                        // and make further clicks reveal nothing. An oversized
-                        // msgLimit is harmless — countStart floors at 0 and the
-                        // restore/auto-load comparisons still behave.
-                        setMsgLimit((n) => n + MSG_PAGE);
+                        void loadOlderMessages();
                       }}
                     >
-                      Load {Math.min(MSG_PAGE, hidden)}{" "}
-                      earlier message
-                      {hidden === 1 ? "" : "s"}…
+                      {earlierLoading
+                        ? "Loading earlier messages…"
+                        : diskOlder
+                          ? "Load earlier messages…"
+                          : `Load ${Math.min(MSG_PAGE, hidden)} earlier message${
+                              hidden === 1 ? "" : "s"
+                            }…`}
                     </button>
                   </div>
                 )}
@@ -10517,6 +10931,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                             : m
                         }
                         onRetry={onRetry}
+                        onResume={onResume}
+                        onCompactRetry={onCompactRetry}
                         onEdit={onEdit}
                       />
                       {/* Newer messages render tool cards inline via `segments`; only
@@ -10561,7 +10977,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <div
                   className={`queued-bubble${q.kind === "steer" ? " steer" : ""}`}
                   key={q.id}
-                  dir={dir}
+                  dir={detectDir(q.text)}
                   title={
                     q.kind === "steer"
                       ? "Sent to the running agent — will be addressed now or as the next turn"
@@ -10889,7 +11305,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </span>
                 </div>
                 <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
-                  {prepareContent(askReq.question, fa ? "rtl" : "ltr")}
+                  {prepareContent(askReq.question)}
                 </div>
                 {askReq.options.length > 0 && (
                   <div className="ask-options">
@@ -10897,31 +11313,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       <button
                         key={i}
                         type="button"
-                        className="ask-option"
-                        onClick={() => {
-                          // Answer through the shared helper: the card is only
-                          // cleared once the backend has accepted the answer,
-                          // so a failed delivery stays visible and re-answerable
-                          // instead of stranding the turn forever.
-                          void answerAsk(askReq.id, opt, chatIdRef.current);
-                        }}
+                        role="radio"
+                        aria-checked={askSelected === i}
+                        className={`ask-option${askSelected === i ? " selected" : ""}`}
+                        onClick={() =>
+                          // Radio select (ChatGPT choice-card style): a click
+                          // marks the option, the Apply button submits it.
+                          setAskSelected(askSelected === i ? null : i)
+                        }
                       >
-                        <span className="ask-option-mark">
-                          <svg
-                            width="11"
-                            height="11"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="2.4"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                          >
-                            <path d="M9 18l6-6-6-6" />
-                          </svg>
+                        <span className="ask-option-mark" aria-hidden>
+                          {askSelected === i ? "●" : "○"}
                         </span>
                         <span className="ask-option-text" dir={detectDir(opt)}>
-                          {prepareContent(opt, fa ? "rtl" : "ltr")}
+                          {prepareContent(opt)}
                         </span>
                       </button>
                     ))}
@@ -10932,7 +11337,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     className="ask-input"
                     rows={2}
                     autoFocus
-                    dir={fa ? "rtl" : "ltr"}
+                    dir={detectDir(askFreeText) === "rtl" || fa ? "rtl" : "ltr"}
                     value={askFreeText}
                     placeholder={
                       fa ? "پاسخ خود را بنویسید…" : "Type your answer…"
@@ -10942,12 +11347,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       if (
                         e.key === "Enter" &&
                         !e.shiftKey &&
-                        askFreeText.trim()
+                        (askFreeText.trim() ||
+                          (askSelected !== null && askReq.options[askSelected]))
                       ) {
                         e.preventDefault();
                         void answerAsk(
                           askReq.id,
-                          askFreeText.trim(),
+                          askFreeText.trim() || askReq.options[askSelected!],
                           chatIdRef.current,
                         );
                       }
@@ -10957,16 +11363,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     <button
                       type="button"
                       className="btn ask-send"
-                      disabled={!askFreeText.trim()}
+                      disabled={
+                        !askFreeText.trim() &&
+                        (askSelected === null || !askReq.options[askSelected])
+                      }
                       onClick={() => {
                         void answerAsk(
                           askReq.id,
-                          askFreeText.trim(),
+                          askFreeText.trim() || (askSelected !== null ? askReq.options[askSelected] : ""),
                           chatIdRef.current,
                         );
                       }}
                     >
-                      {fa ? "ارسال" : "Send"}
+                      {fa ? "اعمال انتخاب" : "Apply"}
                     </button>
                   </div>
                 </div>
@@ -11263,7 +11672,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 )}
                 {!skillsLoading && skillsList.length === 0 && (
                   <div className="mention-empty">
-                    No skills — create one with /skill or in Settings → Skills
+                    No skills — add one to a plugin in Settings → Plugins
                   </div>
                 )}
                 {skillsList.length > 0 && filteredSkills.length === 0 && (
@@ -11594,7 +12003,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 ref={composerMeasureRef}
                 className="composer-measure"
                 aria-hidden="true"
-                dir={dir}
+                dir="auto"
               />
               <div
                 className={`composer-input-stack${slashRange ? " slash-rich" : ""}`}
@@ -11602,11 +12011,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <div
                   className="composer-backdrop"
                   aria-hidden="true"
-                  dir={dir}
-                  style={{
-                    direction: dir,
-                    textAlign: dir === "rtl" ? "right" : "left",
-                  }}
+                  dir="auto"
                   ref={composerBackdropRef}
                 >
                   {slashRange ? (
@@ -11629,11 +12034,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <textarea
                   className={`composer-input${slashActive ? " slash-active" : ""}`}
                   rows={1}
-                  dir={dir}
-                  style={{
-                    direction: dir,
-                    textAlign: dir === "rtl" ? "right" : "left",
-                  }}
+                  dir="auto"
                   placeholder={
                     wroot ? "Write a message…" : "Open a project folder first (⌘O)…"
                   }

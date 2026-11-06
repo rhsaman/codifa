@@ -1,6 +1,6 @@
 // Cross-platform updater asset-picking tests.
 // Run: node test/updater-core.test.ts  (Node ≥23 strips TS types natively)
-import { pickAsset, isNewer, parseVersion } from '../src/lib/updater-core.ts'
+import { pickAsset, isNewer, parseVersion, assetSha256 } from '../src/lib/updater-core.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -94,12 +94,35 @@ console.log('10) Linux — فقط deb:')
   check('null برمیگردد (deb نیاز به sudo دارد)', picked === null, picked)
 }
 
-console.log('11) مقایسه نسخه:')
-check('1.5.0 > 1.4.1', isNewer('1.5.0', '1.4.1') === true)
-check('v1.4.1 با 1.4.1 برابر → false', isNewer('v1.4.1', '1.4.1') === false)
-check('1.4.1 < 1.4.2 → false', isNewer('1.4.1', '1.4.2') === false)
-check('1.4.10 > 1.4.9 (عددی، نه متنی)', isNewer('1.4.10', '1.4.9') === true)
-check('parseVersion پیشوند v را حذف میکند', JSON.stringify(parseVersion('v1.2.3')) === JSON.stringify([1, 2, 3]))
+console.log('11) مقایسه نسخه (isNewer(current, candidate) — قرینه‌ی commands.rs):')
+check('1.5.0 > 1.4.1', isNewer('1.4.1', '1.5.0') === true)
+check('v1.4.1 با 1.4.1 برابر → false', isNewer('1.4.1', 'v1.4.1') === false)
+check('1.4.1 < 1.4.2 → false', isNewer('1.4.2', '1.4.1') === false)
+check('1.4.10 > 1.4.9 (عددی، نه متنی)', isNewer('1.4.9', '1.4.10') === true)
+check('parseVersion پیشوند v را حذف میکند', JSON.stringify(parseVersion('v1.2.3').nums) === JSON.stringify([1, 2, 3]))
+
+console.log('12) prerelease — فقط به بیلدهای prerelease پیشنهاد می‌شود:')
+check('کاربر stable نباید RC ببیند (2.1.0-rc1 برای 2.0.2)', isNewer('2.0.2', '2.1.0-rc1') === false)
+check('نسخه نهایی از rc خودش جلوتر است', isNewer('2.1.0-rc1', '2.1.0') === true)
+check('rc → نسخه نهایی هم‌بیس همیشه آپدیت است', isNewer('2.1.0-rc1', '2.1.0') === true)
+check('prerelease → base بالاتر prerelease پیشنهاد می‌شود', isNewer('2.1.0-rc1', '2.2.0-rc1') === true)
+check('rc10 > rc9 (عددی، نه متنی)', isNewer('2.1.0-rc9', '2.1.0-rc10') === true)
+check('rc9 از rc10 عقب است', isNewer('2.1.0-rc10', '2.1.0-rc9') === false)
+check('تگ بدون عدد (nightly) هرگز نمی‌برد', isNewer('2.0.1', 'nightly') === false)
+
+console.log('13) assetSha256 — هر دو شکل فید، و هش خراب رد می‌شود:')
+check(
+  'digest گیت‌هاب (sha256:hex) استخراج می‌شود',
+  assetSha256({ name: 'a.dmg', browser_download_url: '', size: 0, digest: 'sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789' }) ===
+    'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+)
+check(
+  'sha256 فید سایت استخراج می‌شود',
+  assetSha256({ name: 'a.exe', browser_download_url: '', size: 0, sha256: 'aabbCCDDEEFF00112233445566778899aabbccddeeff00112233445566778899' }) ===
+    'aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899',
+)
+check('هش ناقص = بدون پین', assetSha256({ name: 'a', browser_download_url: '', size: 0, digest: 'sha256:deadbeef' }) === null)
+check('بدون hash = بدون پین', assetSha256({ name: 'a', browser_download_url: '', size: 0 }) === null)
 
 if (failed > 0) {
   console.error(`\n${failed} تست FAILED`)

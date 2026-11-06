@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
-import { useStore } from "../lib/store";
+import { detectDir } from "../lib/bidi";
+import { APP_DIR, useStore } from "../lib/store";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
 import { beforePos, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dirForPos, findNodeById, flexWeights, ghostInsertIndex, isVacatedByDrag, leafCount, normalizeTree, pickNeighborWindow, resolveLeafPos, shouldShowNestedGhost, shouldShowSiblingGhost } from "../lib/chatTree";
 import { focusChatInput } from "../lib/chatFocus";
@@ -142,7 +143,7 @@ const WindowHeader = memo(function WindowHeader({
   const unreadChats = useStore((s) => s.unreadChats);
   const workspaces = useStore((s) => s.workspaces);
   const workspaceColors = useStore((s) => s.workspaceColors);
-  const dir = useStore((s) => s.dir);
+  const dir = APP_DIR;
   const [editing, setEditing] = useState(false);
   useEffect(() => {
     setEditing(false);
@@ -222,7 +223,6 @@ const WindowHeader = memo(function WindowHeader({
       {editing ? (
         <ChatRenameInput
           initialValue={title === "New chat" ? "" : title}
-          dir={dir}
           className="chat-rename-input chat-window-title-input"
           ariaLabel={`Rename ${title}`}
           onCommit={(v) => {
@@ -234,6 +234,7 @@ const WindowHeader = memo(function WindowHeader({
       ) : (
         <span
           className="chat-window-title"
+          dir={detectDir(title)}
           draggable={multi}
           onDragStart={beginDrag}
           onDragEnd={() => onDragState(null)}

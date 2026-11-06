@@ -22,6 +22,12 @@ export interface ProviderTestSummary {
 
 const IDLE: ModelTestEntry = { status: "idle", msg: "" };
 
+/** آیا پروایدر در «تست گروهی» شرکت دارد؟ پیش‌فرض بله؛ فقط groupTest === false کنارش می‌گذارد.
+ *  تست تکیِ مدل (runModelTest) همیشه مجاز است و این فلگ روی آن اثری ندارد. */
+export function isGroupTestable(cfg: ProviderConfig): boolean {
+  return cfg.groupTest !== false;
+}
+
 /** ورودی تست مختلط (مدل + کانفیگ پروایدرش) — برای لیست‌هایی مثل Recent که
  *  مدل‌ها از چند پروایدر مختلف می‌آیند. */
 export interface MixedTestEntry {
@@ -36,6 +42,11 @@ let snapshot: ReadonlyMap<string, ModelTestEntry> = new Map();
 const EMPTY: ReadonlyMap<string, ModelTestEntry> = snapshot;
 const listeners = new Set<() => void>();
 const providerRuns = new Set<string>();
+/** Which provider/model each snapshot key belongs to. The key itself embeds
+ *  baseUrl + keys (so a config change gets a fresh result), which makes it
+ *  impossible to parse reliably — this side map lets a REAL chat failure
+ *  invalidate every result for the same provider/model. */
+const owners = new Map<string, { providerId: string; model: string }>();
 
 function key(cfg: ProviderConfig, model: string): string {
   return `${cfg.id}/${cfg.kind}/${cfg.baseUrl ?? ""}/${providerKeys(cfg).join(",")}/${model}`;
@@ -59,6 +70,17 @@ function setEntry(k: string, patch: Partial<ModelTestEntry>): void {
   for (const l of listeners) l();
 }
 
+/** Record a result and remember which provider/model it belongs to. */
+function setEntryFor(
+  cfg: ProviderConfig,
+  model: string,
+  patch: Partial<ModelTestEntry>,
+): void {
+  const k = key(cfg, model);
+  owners.set(k, { providerId: cfg.id, model });
+  setEntry(k, patch);
+}
+
 /** خواندن مستقیم وضعیت یک مدل — بدون هوک (برای تست‌ها و مصرف خارج از React). */
 export function getTestEntry(cfg: ProviderConfig, model: string): ModelTestEntry {
   return snapshot.get(key(cfg, model)) ?? IDLE;
@@ -67,6 +89,7 @@ export function getTestEntry(cfg: ProviderConfig, model: string): ModelTestEntry
 /** پاک‌کردن همهٔ نتایج ثبت‌شده. */
 export function clearModelTests(): void {
   snapshot = EMPTY;
+  owners.clear();
   for (const l of listeners) l();
 }
 
@@ -76,6 +99,32 @@ export function clearModelTests(): void {
 export function dismissModelTest(cfg: ProviderConfig, model: string): void {
   const k = key(cfg, model);
   if (snapshot.get(k)?.status === "ok") setEntry(k, { status: "idle", msg: "" });
+}
+
+/** A REAL chat turn just failed on this provider/model. A green tick claims the
+ *  model can serve a turn, so any turn error disproves it — demote every live
+ *  result for the pair to `fail`. Matching is by provider/model, not by
+ *  snapshot key: the key also embeds baseUrl/keys, which can change while a
+ *  result is still on screen. The caller also removes the persisted checked
+ *  entry (see Chat.tsx), so a stale ✓ cannot survive the failure. */
+export function markModelTestFailed(
+  providerId: string,
+  model: string,
+  msg: string,
+): void {
+  if (!providerId || !model) return;
+  let changed = false;
+  const next = new Map(snapshot);
+  for (const [k, e] of snapshot) {
+    const o = owners.get(k);
+    if (o?.providerId === providerId && o.model === model) {
+      next.set(k, { ...e, status: "fail", msg });
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  snapshot = next;
+  for (const l of listeners) l();
 }
 
 /** پاک‌کردن کلی نتایج موفق: همهٔ ✓ها به idle برمی‌گردند (تب Checked خالی
@@ -102,12 +151,15 @@ export function clearCheckedTests(): void {
 export async function runModelTest(cfg: ProviderConfig, model: string): Promise<void> {
   const k = key(cfg, model);
   if (snapshot.get(k)?.status === "testing") return;
-  setEntry(k, { status: "testing", msg: "" });
+  setEntryFor(cfg, model, { status: "testing", msg: "" });
   try {
     const r = await testModel(cfg, model);
-    setEntry(k, { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+    setEntryFor(cfg, model, { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
   } catch (err) {
-    setEntry(k, { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+    setEntryFor(cfg, model, {
+      status: "fail",
+      msg: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -119,19 +171,19 @@ export async function runProviderTests(
   models: string[],
   pool = 10,
 ): Promise<void> {
-  if (models.length === 0 || providerRuns.has(key(cfg, "__all__"))) return;
+  if (!isGroupTestable(cfg) || models.length === 0 || providerRuns.has(key(cfg, "__all__"))) return;
   providerRuns.add(key(cfg, "__all__"));
   try {
     const uniq = [...new Set(models)];
     for (const m of uniq) {
       const k = key(cfg, m);
-      if (snapshot.get(k)?.status !== "testing") setEntry(k, { status: "testing", msg: "" });
+      if (snapshot.get(k)?.status !== "testing") setEntryFor(cfg, m, { status: "testing", msg: "" });
     }
     try {
       const results = await testModelsBatch(cfg, uniq);
       const seen = new Set(results.map((r) => r.model));
       for (const r of results) {
-        setEntry(key(cfg, r.model), r.ok
+        setEntryFor(cfg, r.model, r.ok
           ? { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" }
           : { status: "fail", msg: r.error || "model test failed" });
       }
@@ -143,9 +195,12 @@ export async function runProviderTests(
             const m = missing[cursor++];
             try {
               const r = await testModel(cfg, m);
-              setEntry(key(cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+              setEntryFor(cfg, m, { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
             } catch (err) {
-              setEntry(key(cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+              setEntryFor(cfg, m, {
+                status: "fail",
+                msg: err instanceof Error ? err.message : String(err),
+              });
             }
           }
         };
@@ -159,9 +214,12 @@ export async function runProviderTests(
           const m = uniq[cursor++];
           try {
             const r = await testModel(cfg, m);
-            setEntry(key(cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+            setEntryFor(cfg, m, { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
           } catch (err) {
-            setEntry(key(cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+            setEntryFor(cfg, m, {
+              status: "fail",
+              msg: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       };
@@ -187,12 +245,14 @@ export async function runMixedTests(
   pool = 10,
   runKey = "recent",
 ): Promise<void> {
+  // پروایدرهایی که تست گروهیشان خاموش است از لیست مختلط کنار گذاشته می‌شوند.
+  entries = entries.filter((e) => isGroupTestable(e.cfg));
   if (entries.length === 0 || mixedRuns.has(runKey)) return;
   mixedRuns.add(runKey);
   try {
     for (const e of entries) {
       const k = key(e.cfg, e.model);
-      if (snapshot.get(k)?.status !== "testing") setEntry(k, { status: "testing", msg: "" });
+      if (snapshot.get(k)?.status !== "testing") setEntryFor(e.cfg, e.model, { status: "testing", msg: "" });
     }
     const groups = new Map<string, { cfg: ProviderConfig; models: string[] }>();
     for (const e of entries) {
@@ -214,16 +274,19 @@ export async function runMixedTests(
           const results = await testModelsBatch(g.cfg, g.models);
           const seen = new Set(results.map((r) => r.model));
           for (const r of results) {
-            setEntry(key(g.cfg, r.model), r.ok
+            setEntryFor(g.cfg, r.model, r.ok
               ? { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" }
               : { status: "fail", msg: r.error || "model test failed" });
           }
           for (const m of g.models.filter((x) => !seen.has(x))) {
             try {
               const r = await testModel(g.cfg, m);
-              setEntry(key(g.cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+              setEntryFor(g.cfg, m, { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
             } catch (err) {
-              setEntry(key(g.cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+              setEntryFor(g.cfg, m, {
+                status: "fail",
+                msg: err instanceof Error ? err.message : String(err),
+              });
             }
           }
         } catch {
@@ -233,9 +296,12 @@ export async function runMixedTests(
               const m = g.models[inner++];
               try {
                 const r = await testModel(g.cfg, m);
-                setEntry(key(g.cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+                setEntryFor(g.cfg, m, { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
               } catch (err) {
-                setEntry(key(g.cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+                setEntryFor(g.cfg, m, {
+                  status: "fail",
+                  msg: err instanceof Error ? err.message : String(err),
+                });
               }
             }
           };
@@ -257,6 +323,7 @@ function summarizeMixed(
   let fail = 0;
   let running = false;
   let firstFail = "";
+  entries = entries.filter((e) => isGroupTestable(e.cfg));
   for (const e of entries) {
     const s = snap.get(key(e.cfg, e.model));
     if (!s) continue;

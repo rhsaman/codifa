@@ -68,9 +68,22 @@ console.log('۱) رندر تب Providers — بدون فچ خودکار + وجو
     networkCalls++
     return new Response('', { status: 200 })
   }
-  const html = renderToString(<SettingsModal onClose={() => {}} initialTab="providers" />)
+  // لیست کارتی پروایدرها اول می‌آید و تنظیمات هر پروایدر (از جمله دکمهٔ Fetch
+  // models) فقط بعد از بازکردن کارتش دیده می‌شود.
+  // SSR از getInitialState می‌خواند نه از setState بعد از import — پس پروایدر هدف
+  // همان است که رندر سرور واقعاً می‌بیند.
+  const ssrProviders: Array<{ id: string; name: string }> =
+    ((useStore as any).getInitialState?.() ?? useStore.getState()).settings.providers
+  const listHtml = renderToString(<SettingsModal onClose={() => {}} initialTab="providers" />)
+  check(
+    'لیست کارتی: پروایدر دیده می‌شود ولی تنظیماتش هنوز بسته است',
+    listHtml.includes(ssrProviders[0].name) && !listHtml.includes('Fetch models'),
+  )
+  const html = renderToString(
+    <SettingsModal onClose={() => {}} initialTab="providers" initialProviderId={ssrProviders[0].id} />,
+  )
   check('هنگام رندر هیچ درخواست شبکه‌ای نمی‌رود', networkCalls === 0, networkCalls)
-  check('دکمه «Fetch models» در تب Providers رندر شده', html.includes('Fetch models'))
+  check('دکمه «Fetch models» در صفحهٔ تنظیمات پروایدر رندر شده', html.includes('Fetch models'))
 
   // SSR از اجرای useEffect جلوگیری می‌کند، پس حذف فچ خودکار را در همان سورس
   // قفل می‌کنیم: dependency array قدیمی effect فچ خودکار باید حذف شده باشد

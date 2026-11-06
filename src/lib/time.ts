@@ -56,3 +56,17 @@ export function fmtAgo(ts: number, now: number = Date.now()): string {
   if (mo < 12) return `${mo}mo`;
   return `${Math.floor(d / 365)}y`;
 }
+
+/** «چه مدت طول کشید» — ms → "840ms" / "12.3s" / "2m 5s". هم‌راستا با fmtTime
+ *  در ToolCallView؛ از ChatMessageView به اینجا منتقل شد تا MessageActionsBar
+ *  (فوتر مشترک چت/اینباکس/مطالعه) هم بدون import چرخه‌ای استفاده کند. */
+export function fmtElapsed(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = ms / 1000;
+  if (totalSec >= 60) {
+    const m = Math.floor(totalSec / 60);
+    const s = Math.round(totalSec % 60);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  return `${totalSec.toFixed(1)}s`;
+}

@@ -1,6 +1,8 @@
 import { useStore } from "../lib/store";
 
-/** Window-level controls: sidebar toggle, settings, direction switch. The
+/** Window-level controls: sidebar toggle, settings. Text direction is decided
+ *  automatically per message (detectDir) — the old RTL/LTR toggle pill was
+ *  removed. The
  *  workspace pill (folder + project name) does NOT live here — it renders in
  *  the chat titlebar (WorkspaceMenuButton), whose free width keeps the name
  *  fully visible; this cluster's home inside the sidebar strip is too narrow
@@ -11,7 +13,6 @@ import { useStore } from "../lib/store";
  *  the same JSX renders in both hosts. */
 export function WindowStripCluster() {
   const sidebarOpen = useStore((s) => s.sidebarOpen);
-  const dir = useStore((s) => s.dir);
   const iconProps = {
     width: 17,
     height: 17,
@@ -46,13 +47,6 @@ export function WindowStripCluster() {
           <circle cx="12" cy="12" r="3" />
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
         </svg>
-      </button>
-      <button
-        className="titlebar-icon-btn dir-text-btn"
-        onClick={() => useStore.getState().toggleDir()}
-        title={dir === "rtl" ? "Right-to-left — click for LTR" : "Left-to-right — click for RTL"}
-      >
-        {dir === "rtl" ? "RTL" : "LTR"}
       </button>
     </span>
   );

@@ -4025,8 +4025,8 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 res["slug"].as_str().unwrap_or("")
             ))
         }
-        // Create or update an MCP connector from a command (the `/create-mcp`
-        // flow). A connector is either a stdio server (command + args) or an
+        // Create or update an MCP connector from a command (`/plugin create`
+        // with a connector part). A connector is either a stdio server (command + args) or an
         // HTTP one (url), so both shapes are accepted and stored verbatim.
         // Editing an existing connector works two ways: pass the SAME name to
         // overwrite it in place, or pass previous_name to rename it (the old
@@ -4163,13 +4163,13 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                     if let Some(on) = args["allow_browser"].as_bool() {
                         obj.insert("allow_browser".into(), json!(on));
                     }
-                    // The run context: skills are names, connectors are names,
-                    // plugins are slugs whose skills + scripts + connectors are
-                    // expanded at run time (see scheduler::execute_schedule).
-                    for key in ["skills", "mcp_servers", "plugins"] {
-                        if let Some(list) = args[key].as_array() {
-                            obj.insert(key.into(), json!(list));
-                        }
+                    // The run context is a list of plugin slugs: their skills,
+                    // scripts and connectors are expanded at run time (see
+                    // scheduler::execute_schedule). Legacy `skills`/`mcp_servers`
+                    // fields are still READ by the scheduler for old tasks, but
+                    // new tool calls cannot write them.
+                    if let Some(list) = args["plugins"].as_array() {
+                        obj.insert("plugins".into(), json!(list));
                     }
                     let saved = crate::appstate::save_schedule(store, task)?;
                     Ok(format!("Schedule saved:\n{saved}"))
@@ -4946,7 +4946,7 @@ mod tests {
         let out = crate::tools::dispatch_with_data_root(
             &root,
             "load_skill",
-            &json!({"bundle": "builtin-skills"}),
+            &json!({"bundle": "builtin-plugin"}),
             None,
             Some(&root),
         )

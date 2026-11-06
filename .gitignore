@@ -41,8 +41,12 @@ src-tauri/gen/schemas/
 pytest_full_result.txt
 tests/.tmp-*
 tests/.fe-run.*
+tests/.fe-tmp/
 tests/dump-ssr.out.mjs
 .tmp-*.mjs
+.tmp-*.css
+.tmp-*.py
+fe_test.log
 # Throwaway live-probe scripts (scratch harnesses for manual verification —
 # never part of the suite).
 .probe-*.py

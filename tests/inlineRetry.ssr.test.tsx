@@ -149,7 +149,7 @@ console.log('6) آیکن پیام کاربر → Regenerate (نه Retry):')
   check('دیگر title=Retry ندارد', !html.includes('title="Retry"'), html)
 }
 
-console.log('7) ریترای ساب‌ایجنت → مدل + تول‌ها، بدون ارور:')
+console.log('7) ریترای ساب‌ایجنت → مدل + تول‌ها، ارور فقط در تول‌کارت:')
 {
   const msg = assistant({
     streaming: true,
@@ -182,9 +182,11 @@ console.log('7) ریترای ساب‌ایجنت → مدل + تول‌ها، ب
   check('اسم مدل ساب‌ایجنت رندر شد', html.includes('glm-4.6'), html)
   check('ردیف تول‌ها رندر شد', html.includes('msg-retry-inline-tools'), html)
   check('شمارش ×2 برای Read File هست', html.includes('×2'), html)
-  check('ارور نمایش داده نشد', !html.includes('error sending request'), html)
+  // خطا در خط جمع‌شده نمایش داده نمی‌شود (درخواست کاربر) اما از طریق
+  // کارت hover در دسترس است — وگرنه هیچ‌جا دیده نمی‌شد.
+  check('ردیف ارور رندر نشد', !html.includes('msg-retry-inline-reason'), html)
   check('عبارت switched model نیست', !html.includes('switched model'), html)
-  check('بدون تول‌کارت full-error', !html.includes('data-full-error'), html)
+  check('تول‌کارت full-error هست (خطا با hover دیده می‌شود)', html.includes('data-full-error'), html)
 }
 
 console.log('8) تسلیم ساب‌ایجنت (gaveUp) → ارور ترمینال می‌ماند:')
@@ -209,6 +211,35 @@ console.log('8) تسلیم ساب‌ایجنت (gaveUp) → ارور ترمین�
   )
   check('دکمهٔ Retry هست', html.includes('msg-retry-inline-btn'), html)
   check('ارور ترمینال دیده می‌شود', html.includes('error sending request'), html)
+}
+
+console.log('9) سوییچ مدل قبل از اولین تول (تالی خالی) → خطا فقط در تول‌کارت:')
+{
+  const msg = assistant({
+    streaming: true,
+    retry: {
+      attempt: 1,
+      maxAttempts: 10,
+      delay: 0,
+      reason: 'provider sent no response and no retry info — trying the next model',
+      model: 'cbai/deepseek-v4.1-flash',
+      agent: 'explore subagent',
+      tool: 'explore',
+      fallback: true,
+      reconnecting: true,
+      inline: true,
+    },
+    // The sub-agent's FIRST LLM call failed: the run exists but has called no
+    // tools yet — the exact screenshot case where the error used to leak.
+    toolActivity: [{ tool: 'explore', status: 'running', children: [] }],
+  })
+  const html = renderToString(<ChatMessageView message={msg as never} />)
+  check('اسم مدل رندر شد', html.includes('cbai/deepseek-v4.1-flash'), html)
+  check('ردیف ارور اصلاً رندر نشد', !html.includes('msg-retry-inline-reason'), html)
+  check('ردیف تول‌های خالی رندر نشد', !html.includes('msg-retry-inline-tools'), html)
+  // خطا در خط دیده نمی‌شود ولی از طریق کارت hover در دسترس است — با این حال
+  // یک لبهٔ نردبانِ بدون هیچ اطلاعاتی دیگر، کاملاً بی‌صدا نیست.
+  check('تول‌کارت full-error هست (خطا فقط با hover)', html.includes('data-full-error'), html)
 }
 
 if (failed > 0) {

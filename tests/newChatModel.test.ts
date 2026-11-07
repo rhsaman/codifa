@@ -1,6 +1,7 @@
 // Store-level test for the new-chat default model + recent-models sorting:
-//  - newChat() must start from the most-recently-used model (recentModels[0]),
-//    NOT the active provider's default model.
+//  - newChat() must start from the most-recently-USED model (highest lastUsed),
+//    NOT the active provider's default model — and NOT a stale pinned model
+//    (pins only reorder the Recent TAB, they never shadow actual usage).
 //  - addRecentModel() must keep recentModels sorted most-recent-first, so the
 //    model you just picked lands at the top of the recent list (and is the one
 //    a freshly created chat inherits).
@@ -97,30 +98,33 @@ console.log('۴) دوباره انتخاب کردن یک مدل قدیمی → �
   check('newChat حالا model-A را برمیدارد', chat.model === 'model-A', chat.model)
 }
 
-console.log('۵) پین کردن → پین‌شده بالای لیست می‌ماند و سقف ۳ رعایت می‌شود:')
+console.log('۵) پین کردن → پین‌شده بالای لیست می‌ماند و سقف ۵ (MAX_PINNED_RECENT_MODELS) رعایت می‌شود:')
 {
   useStore.setState({ recentModels: [] })
   useStore.getState().addRecentModel('model-A', activeId)
   useStore.getState().addRecentModel('model-B', activeId)
   useStore.getState().addRecentModel('model-C', activeId)
   useStore.getState().addRecentModel('model-D', activeId)
+  useStore.getState().addRecentModel('model-E', activeId)
   // قدیمی‌ترین (A) را پین کن → باید بالای لیست بیاید حتی با اینکه تازه‌ترین نیست
   check('پین A موفق است', useStore.getState().togglePinRecentModel('model-A', activeId) === true)
   let rm = useStore.getState().recentModels
   check('مدل پین‌شده بالای لیست است', rm[0]?.model === 'model-A' && rm[0]?.pinned === true, rm.map((r) => `${r.model}${r.pinned ? '*' : ''}`))
-  // دو تای دیگر را پین کن → سقف ۳ پر می‌شود
-  check('پین B موفق است', useStore.getState().togglePinRecentModel('model-B', activeId) === true)
-  check('پین C موفق است', useStore.getState().togglePinRecentModel('model-C', activeId) === true)
-  // چهارمی نباید پین شود (سقف ۳)
-  check('پین چهارم (D) رد می‌شود', useStore.getState().togglePinRecentModel('model-D', activeId) === false)
+  // B..E را هم پین کن → سقف ۵ پر می‌شود
+  for (const m of ['model-B', 'model-C', 'model-D', 'model-E']) {
+    check(`پین ${m} موفق است`, useStore.getState().togglePinRecentModel(m, activeId) === true)
+  }
+  // ششمی نباید پین شود (سقف ۵) — اول باید در لیست باشد
+  useStore.getState().addRecentModel('model-F', activeId)
+  check('پین ششم (F) رد می‌شود', useStore.getState().togglePinRecentModel('model-F', activeId) === false)
   rm = useStore.getState().recentModels
-  check('فقط ۳ مدل پین‌شده‌اند', rm.filter((r) => r.pinned).length === 3, rm.map((r) => `${r.model}${r.pinned ? '*' : ''}`))
-  check('D پین نشده است', rm.find((r) => r.model === 'model-D')?.pinned !== true)
-  // آنپین A → دوباره D قابل پین شدن است
+  check('فقط ۵ مدل پین‌شده‌اند', rm.filter((r) => r.pinned).length === 5, rm.map((r) => `${r.model}${r.pinned ? '*' : ''}`))
+  check('F پین نشده است', rm.find((r) => r.model === 'model-F')?.pinned !== true)
+  // آنپین A → دوباره F قابل پین شدن است
   check('آنپین A موفق است (false برمی‌گردد)', useStore.getState().togglePinRecentModel('model-A', activeId) === false)
   rm = useStore.getState().recentModels
   check('A دیگر پین نیست', rm.find((r) => r.model === 'model-A')?.pinned !== true)
-  check('حالا پین D موفق است', useStore.getState().togglePinRecentModel('model-D', activeId) === true)
+  check('حالا پین F موفق است', useStore.getState().togglePinRecentModel('model-F', activeId) === true)
 }
 
 console.log('۶) حذف از لیست اخیر + مصونیت پین‌شده از حذف خودکار:')
@@ -148,6 +152,28 @@ console.log('۶) حذف از لیست اخیر + مصونیت پین‌شده ا
   useStore.getState().removeRecentModel('keep-me', activeId)
   rm = useStore.getState().recentModels
   check('بعد از آنپین، حذف دستی کار می‌کند', !rm.some((r) => r.model === 'keep-me'))
+}
+
+console.log('۷) پین‌شدهٔ قدیمی نباید جلوی مدل تازه‌استفاده‌شده را در چت جدید بگیرد:')
+{
+  // پین فقط ترتیب تب Recent پیکر را عوض می‌کند — چت جدید باید آخرین مدلی را
+  // بردارد که واقعاً استفاده شده (بالاترین lastUsed)، نه پین‌شدهٔ قدیمی را.
+  useStore.setState({
+    recentModels: [
+      { providerId: activeId, model: 'pinned-stale', lastUsed: Date.now() - 60_000, pinned: true },
+      { providerId: activeId, model: 'fresh-pick', lastUsed: Date.now() },
+    ],
+  })
+  check('تب Recent پین‌شده را بالای لیست نشان می‌دهد (رفتار پیکر دست‌نخورده)', useStore.getState().recentModels[0]?.model === 'pinned-stale')
+  const id = useStore.getState().newChat('ask')
+  const chat = useStore.getState().chats.find((c) => c.id === id)!
+  check('چت جدید مدل تازه (fresh-pick) را برداشت', chat.model === 'fresh-pick', chat.model)
+  check('پرووایدر هم از مدل تازه است', chat.providerId === activeId, chat.providerId)
+  // اگر کاربر واقعاً همان مدل پین‌شده را استفاده کند، دوباره تازه‌ترین می‌شود
+  useStore.getState().addRecentModel('pinned-stale', activeId)
+  const id2 = useStore.getState().newChat('ask')
+  const chat2 = useStore.getState().chats.find((c) => c.id === id2)!
+  check('استفادهٔ دوباره از پین‌شده → چت جدید همان را برمیدارد', chat2.model === 'pinned-stale', chat2.model)
 }
 
 if (failed > 0) {

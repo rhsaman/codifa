@@ -1548,7 +1548,10 @@
 }
 
 .trace-panel-dot.kind-llm {
-  background: var(--accent);
+  /* --accent is plain #ffffff in the dark palette — an LLM dot on it was
+     indistinguishable from the TOOL/PROMPT dots around it. --link's blue is
+     the one hue no other trace kind claims. */
+  background: var(--link);
 }
 
 .trace-panel-dot.kind-prompt {
@@ -1637,8 +1640,10 @@
 }
 
 .trace-kind-badge.kind-llm {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  /* --accent is white in the dark palette; --link's blue keeps the LLM badge
+     distinct from the surrounding row text and the other kind badges. */
+  color: var(--link);
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border));
 }
 
 .trace-kind-badge.kind-prompt {

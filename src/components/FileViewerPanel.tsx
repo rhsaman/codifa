@@ -105,6 +105,10 @@ const SHEET_EXTS = new Set(["xlsx", "xlsm", "xls"]);
 const GRID_EXTS = new Set(["xlsx", "xlsm", "xls", "csv"]);
 /** Extensions read as plain text via /doc/read (no styled HTML available). */
 const DOC_TEXT_EXTS = new Set(["doc", "md"]);
+/** Viewer reads bypass the agent's 24k context cap — a repo README outgrows
+ *  it and the panel shows the text to the user, not to a model. 2M chars is
+ *  far past any real document while still sparing the markdown renderer. */
+const VIEWER_DOC_CHARS = 2_000_000;
 
 /** Strip HTML tags for search matching (row HTML -> plain text). */
 function stripSheetTags(html: string): string {
@@ -700,10 +704,18 @@ export function FileViewerPanel({
             );
             return;
           }
-          const doc = await readDocumentText(root || "", absPath, DOC_TEXT_EXTS.has(ext) ? "text" : "html", SHEET_EXTS.has(ext) && sheet.trim() ? { sheet: sheet.trim() } : undefined);
+          const doc = await readDocumentText(
+            root || "",
+            absPath,
+            DOC_TEXT_EXTS.has(ext) ? "text" : "html",
+            {
+              ...(SHEET_EXTS.has(ext) && sheet.trim() ? { sheet: sheet.trim() } : {}),
+              maxChars: VIEWER_DOC_CHARS,
+            },
+          );
           if (!alive) return;
           if (doc.error && ext === "csv") {
-            const fallback = await readDocumentText(root || "", absPath, "text");
+            const fallback = await readDocumentText(root || "", absPath, "text", { maxChars: VIEWER_DOC_CHARS });
             if (!alive) return;
             if (fallback.content != null) {
               setState({ loading: false, content: fallback.content });

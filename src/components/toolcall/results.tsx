@@ -343,6 +343,15 @@ export const FileResultLinks = memo(function FileResultLinks({  tool,
     deduped.push(it);
   }
   if (deduped.length === 0) return null;
+  // Two DIFFERENT files can share a basename (src-tauri/src/models.rs and
+  // src-tauri/src/backend_light/models.rs both read "models.rs"): with
+  // basename-only labels the list reads as the same file twice. Rows whose
+  // basename collides inside THIS list fall back to the full path instead.
+  const basenameCounts = new Map<string, number>();
+  for (const it of deduped) {
+    const base = fileBasename(String(it.file ?? it.path ?? "")).toLowerCase();
+    basenameCounts.set(base, (basenameCounts.get(base) ?? 0) + 1);
+  }
   // Every hit renders right here and the list scrolls (.file-results carries a
   // max-height): the row expands IN PLACE — results never hop to the side
   // panel (user request).
@@ -354,13 +363,17 @@ export const FileResultLinks = memo(function FileResultLinks({  tool,
         const line =
           it.line !== undefined && it.line !== null ? String(it.line) : "";
         const text = String(it.text ?? "");
+        const ambiguous =
+          (basenameCounts.get(fileBasename(file).toLowerCase()) ?? 0) > 1;
         return (
           <li key={i} className="file-result">
             <FileChip
               path={file}
               line={line ? Number(line) : undefined}
               // Basename only in the UI — the full path stays in the tooltip.
-              display={`${fileBasename(file)}${line ? `:${line}` : ""}`}
+              // Colliding basenames fall back to the full path so two different
+              // files never read as one repeated row.
+              display={`${ambiguous ? file : fileBasename(file)}${line ? `:${line}` : ""}`}
             />
             {text && <span className="file-result-text">{text}</span>}
           </li>

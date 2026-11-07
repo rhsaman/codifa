@@ -320,6 +320,7 @@ fn report(path: &Path) {
     // made the textual single-call hint look effective for eight phases.
     let mut lever_fires: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut rounds = Rounds::default();
+    let mut batch_op_tools: BTreeMap<String, usize> = BTreeMap::new();
 
     for row in &rows {
         let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
@@ -419,6 +420,36 @@ fn report(path: &Path) {
                     .unwrap_or(false);
                 if name.is_empty() {
                     unnamed_tools += 1;
+                }
+                // A `batch` row IS its inner ops on the tally: the executor's
+                // result labels every op `[k/n] tool`, so the per-tool table
+                // attributes the calls to the tools that actually ran (one
+                // batch of six reads is six reads, not one "batch").
+                if name == "batch" {
+                    // Prefer the ARGS-side count (echo truncation never touches
+                    // it); the result-label scan stays as the legacy fallback.
+                    if let Some(n) = row
+                        .get("detail")
+                        .and_then(|d| d.get("batch_ops"))
+                        .and_then(Value::as_u64)
+                    {
+                        *batch_op_tools.entry("ops".to_string()).or_default() += n as usize;
+                    }
+                    if let Some(res) = row.get("result").and_then(Value::as_str) {
+                        // The executor labels every op `=== [k/n] tool ===`.
+                        for line in res.lines() {
+                            let Some(rest) = line.strip_prefix("=== [") else { continue };
+                            let Some((idx, tail)) = rest.split_once("] ") else { continue };
+                            if !idx.contains('/') {
+                                continue;
+                            }
+                            let tool = tail.trim().trim_end_matches(" ===").trim();
+                            if tool.is_empty() || tool.contains(' ') {
+                                continue;
+                            }
+                            *batch_op_tools.entry(tool.to_string()).or_default() += 1;
+                        }
+                    }
                 }
                 if row.get("error").map(|e| !e.is_null()).unwrap_or(false) {
                     errors += 1;
@@ -601,7 +632,15 @@ fn report(path: &Path) {
         tools.values().map(|s| s.calls).sum::<usize>(),
         unnamed_tools,
         errors
-    );
+    )
+    if !batch_op_tools.is_empty() {
+        let mut parts: Vec<String> = batch_op_tools
+            .iter()
+            .map(|(t, n)| format!("{t} ×{n}"))
+            .collect();
+        parts.sort();
+        println!("      batch ops    : {} (inside the batch rows above)", parts.join(", "));
+    };
     let mut by_calls: Vec<(&String, &ToolStat)> = tools.iter().collect();
     by_calls.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
     for (name, s) in by_calls.iter().take(8) {

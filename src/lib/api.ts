@@ -1644,12 +1644,14 @@ export async function requestChatTitle(params: {
 /** Read a document for the file viewer. format: "text" (default) | "html"
  *  (styled Word/Excel view) | "pages" (PDF pages as JPEG data URLs).
  *  `sheet` selects one Excel sheet, `pages` selects PDF pages like "1-3,7".
+ *  `maxChars` overrides the backend's text cap (0/default = the 24k
+ *  agent-context cap; the viewer passes a much larger one).
  *  Results are mtime-cached backend-side, so repeated calls are cheap. */
 export async function readDocumentText(
   root: string,
   absPath: string,
   format: "text" | "html" | "pages" = "text",
-  opts?: { sheet?: string; pages?: string },
+  opts?: { sheet?: string; pages?: string; maxChars?: number },
 ): Promise<{ content?: string; html?: string; pages?: string[]; error?: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: 'the local backend is not running' }
@@ -1663,6 +1665,7 @@ export async function readDocumentText(
         format,
         sheet: opts?.sheet ?? '',
         pages: opts?.pages ?? '',
+        max_chars: opts?.maxChars ?? 0,
       }),
     })
     if (!res.ok) return { error: `document read failed (${res.status})` }
@@ -1770,8 +1773,6 @@ export interface SkillRow {
   description: string
   path: string
   content: string
-  /** Persian phrases that should trigger this skill (matches a Persian ask). */
-  fa_keywords?: string[]
   files?: string[]
   /** Owning plugin's display name, when the skill ships inside a plugin. */
   plugin?: string
@@ -1789,8 +1790,6 @@ export interface SkillSyncResult {
   removed?: boolean
   /** Extra files kept in the skill folder (slug -> name). */
   files?: string[]
-  /** Number of Persian keywords stored; 0 means no Persian request can find it. */
-  fa_keyword_count?: number
   /** Previous name when the save renamed an existing skill. */
   renamed_from?: string
 }
@@ -1892,8 +1891,6 @@ export async function syncSkill(params: {
   previousName?: string
   content?: string
   description?: string
-  /** Persian phrases that should trigger this skill (comma-separated string or list). */
-  faKeywords?: string | string[]
   delete?: boolean
   files?: Record<string, string>
   deletedFiles?: string[]
@@ -1912,9 +1909,6 @@ export async function syncSkill(params: {
         previous_name: params.previousName ?? "",
         content: params.content ?? "",
         description: params.description ?? "",
-        // Omitted = "keep what the file already has"; an explicit empty string
-        // = the user cleared the field, which must remove the keywords.
-        ...(params.faKeywords !== undefined ? { fa_keywords: params.faKeywords } : {}),
         delete: params.delete ?? false,
         ...(params.plugin ? { plugin: params.plugin } : {}),
         // Multi-file (Codex-style) skills: extra file contents to upsert.
@@ -2173,13 +2167,17 @@ export async function gitStatus(root: string): Promise<GitStatus | { error: stri
   return sidecarGet<GitStatus>(`/git/status?root=${encodeURIComponent(root)}`)
 }
 
-/** Diff تغییرات uncommitted (یا staged). */
+/** Diff تغییرات uncommitted (یا staged). `full` سقف بایتی بک‌اند را برمی‌دارد —
+ *  پنل Review دیف همه‌ی فایل‌ها را می‌خواهد؛ دیفِ بریده، فایل‌های انتهایی را
+ *  بدون دیف رها می‌کند و پنل برای‌شان +0 -0 می‌کشد. */
 export async function gitDiff(
   root: string,
   path = "",
   staged = false,
+  full = false,
 ): Promise<GitDiff | { error: string }> {
   const q = new URLSearchParams({ root, path, staged: String(staged) })
+  if (full) q.set("full", "true")
   return sidecarGet<GitDiff>(`/git/diff?${q.toString()}`)
 }
 
@@ -2194,8 +2192,10 @@ export async function gitShow(
   root: string,
   rev = "HEAD",
   path = "",
+  full = false,
 ): Promise<GitDiff | { error: string }> {
   const q = new URLSearchParams({ root, rev, path })
+  if (full) q.set("full", "true")
   return sidecarGet<GitDiff>(`/git/show?${q.toString()}`)
 }
 

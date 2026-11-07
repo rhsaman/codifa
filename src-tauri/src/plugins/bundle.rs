@@ -20,9 +20,6 @@ pub(super) fn plugin_view(root: &Path, slug: &str) -> Value {
     manifest[COMMANDS] = json!(command_names(root, slug));
     manifest[crate::subagents::AGENTS] = json!(agent_names(root, slug));
     manifest["hooks"] = crate::hooks::describe(&plugin_dir(root, slug))["hooks"].clone();
-    // Always an array, even when the file holds a hand-written string: the
-    // renderer edits it as a list and would otherwise show nothing.
-    manifest[KEYWORDS] = json!(keywords_of(&manifest[KEYWORDS].clone()));
     manifest
 }
 
@@ -129,14 +126,6 @@ pub fn create_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     if let Some(src) = body[SOURCE].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         manifest[SOURCE] = json!(src);
     }
-    // The bundle's own Persian trigger, written on CREATE too. Writing it only
-    // in `update_plugin` meant a hand-made plugin (chat or the create button)
-    // silently dropped every keyword it was given, so the bundle could never be
-    // found from a Persian request — the one thing this field is for.
-    let keywords = keywords_of(&body[KEYWORDS]);
-    if !keywords.is_empty() {
-        manifest[KEYWORDS] = json!(keywords);
-    }
     copy_source_args(&mut manifest, body);
     write_manifest(root, &slug, &manifest)?;
     apply_parts(root, &slug, body)?;
@@ -161,18 +150,6 @@ pub fn update_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     }
     if let Some(v) = body["enabled"].as_bool() {
         manifest["enabled"] = json!(v);
-    }
-    // An explicit empty list CLEARS the keywords; an absent field leaves them
-    // alone, exactly like `description` above.
-    if has_keywords(body) {
-        let keywords = keywords_of(&body[KEYWORDS]);
-        if keywords.is_empty() {
-            if let Some(map) = manifest.as_object_mut() {
-                map.remove(KEYWORDS);
-            }
-        } else {
-            manifest[KEYWORDS] = json!(keywords);
-        }
     }
     if let Some(src) = body[SOURCE].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         manifest[SOURCE] = json!(src);
@@ -226,7 +203,6 @@ pub(super) fn row_bundle_payload(
     body: &Value,
     name: &str,
     parts: Value,
-    keywords: &[String],
     stale: Vec<Value>,
 ) -> Value {
     let mut payload = json!({
@@ -241,12 +217,6 @@ pub(super) fn row_bundle_payload(
             payload[k] = v.clone();
         }
     }
-    // `keywords_of` is the one splitter/deduplicator (Persian comma included), so
-    // the same phrase cannot land twice under two spellings. An explicit empty
-    // list from the caller still clears the field.
-    if !keywords.is_empty() {
-        payload[KEYWORDS] = json!(keywords_of(&json!(keywords)));
-    }
     if !stale.is_empty() {
         payload["deleted_skills"] = json!(stale);
     }
@@ -254,10 +224,6 @@ pub(super) fn row_bundle_payload(
 }
 
 /// A Skills-tab row: the repo's skills, written into ONE plugin bundle.
-///
-/// Each skill keeps its own `fa_keywords`: an own list wins, otherwise the skill
-/// NAME seeds them (the same conservative rule the bundle mapper uses), and an
-/// empty seed leaves the key out so a reinstall cannot wipe a hand-edited list.
 pub(super) fn install_skills_as_bundle(root: &Path, body: &Value) -> Result<Value, String> {
     let spec = body["repo"].as_str().unwrap_or("").trim();
     require_repo_address(spec)?;
@@ -267,27 +233,18 @@ pub(super) fn install_skills_as_bundle(root: &Path, body: &Value) -> Result<Valu
         body["repo_ref"].as_str().unwrap_or(""),
     )?;
     let mut skills: Vec<Value> = Vec::new();
-    let mut keywords: Vec<String> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     for row in read["skills"].as_array().into_iter().flatten() {
         let name = row["name"].as_str().unwrap_or("").trim();
         if name.is_empty() {
             continue;
         }
-        let own = crate::skills::split_fa_keywords(row[KEYWORDS].as_str().unwrap_or(""));
-        let seed = if own.is_empty() {
-            category_keywords(name)
-        } else {
-            own
-        };
-        keywords.extend(seed.iter().cloned());
         names.push(name.to_string());
         skills.push(json!({
             "name": name,
             "description": row["description"].clone(),
             "content": row["content"].clone(),
             "extra_files": row["extra_files"].clone(),
-            "fa_keywords": seed,
         }));
     }
     if names.is_empty() {
@@ -318,7 +275,6 @@ pub(super) fn install_skills_as_bundle(root: &Path, body: &Value) -> Result<Valu
         body,
         &name,
         json!({ "skills": skills, "source": read["source"].clone() }),
-        &keywords,
         stale,
     );
     write_bundle_payload(root, &payload)
@@ -345,7 +301,6 @@ pub(super) fn install_connectors_as_bundle(root: &Path, body: &Value) -> Result<
         ));
     }
     let names: Vec<String> = servers.keys().cloned().collect();
-    let keywords: Vec<String> = names.iter().flat_map(|n| category_keywords(n)).collect();
     let name = body["name"]
         .as_str()
         .map(str::trim)
@@ -356,7 +311,6 @@ pub(super) fn install_connectors_as_bundle(root: &Path, body: &Value) -> Result<
         body,
         &name,
         json!({ "mcp": Value::Object(servers), "source": read["source"].clone() }),
-        &keywords,
         Vec::new(),
     );
     write_bundle_payload(root, &payload)
@@ -366,9 +320,9 @@ pub(super) fn install_connectors_as_bundle(root: &Path, body: &Value) -> Result<
 ///
 /// The single entry point every producer goes through — a boot migration, a
 /// built-in seed, the agent's `create_skill`/`create_mcp` — so exactly one place
-/// decides a slug, seeds keywords and writes a manifest. `parts` is the
-/// `plugin.json`-shaped content minus the address arguments (`skills`, `mcp`,
-/// `scripts`, `description`, `enabled`, `fa_keywords`).
+/// decides a slug and writes a manifest. `parts` is the `plugin.json`-shaped
+/// content minus the address arguments (`skills`, `mcp`, `scripts`,
+/// `description`, `enabled`).
 ///
 /// `enabled` is honoured when the caller states it (a migration has to reproduce
 /// the switch the user had) and defaults to on.
@@ -377,36 +331,10 @@ pub fn install_bundle(root: &Path, name: &str, parts: Value) -> Result<Value, St
     if name.is_empty() {
         return Err("bundle name is required".into());
     }
-    // The bundle's own trigger, so a bundle whose parts carry no keywords is
-    // still reachable from a Persian ask; a caller that already knows better
-    // passes its own list and wins.
-    let mut base = json!({ "name": name });
-    let seed = category_keywords(name);
-    if !seed.is_empty() {
-        base[KEYWORDS] = json!(seed);
-    }
-    let mut payload = base;
+    let mut payload = json!({ "name": name });
     if let Some(obj) = parts.as_object() {
         for (k, v) in obj {
             payload[k] = v.clone();
-        }
-    }
-    // A single-part bundle whose only skill carries keywords has to be findable
-    // AT BUNDLE LEVEL too: the name may identify no technology at all (a
-    // migrated skill called «Movie Finder»), and the plugin card then showed an
-    // empty trigger while the skill inside it had one.
-    if payload.get(KEYWORDS).is_none_or(|v| v.as_array().map_or(true, Vec::is_empty)) {
-        let mut lifted: Vec<String> = Vec::new();
-        for item in payload["skills"].as_array().into_iter().flatten() {
-            for kw in keywords_of(&item[KEYWORDS]) {
-                if !lifted.contains(&kw) {
-                    lifted.push(kw);
-                }
-            }
-        }
-        lifted.truncate(INHERIT_KEYWORDS_MAX);
-        if !lifted.is_empty() {
-            payload[KEYWORDS] = json!(lifted);
         }
     }
     // The description lift lives in `write_bundle_payload`, the single writer,
@@ -435,9 +363,6 @@ pub fn save_skill_into_bundle(
         json!({ "slug": plugin_slug(bundle_name, bundle_slug), "skills": [skill] }),
     )
 }
-
-/// Cap on the keywords lifted from a library's skills to its own manifest.
-pub(super) const BUNDLE_LIBRARY_KEYWORDS_MAX: usize = 8;
 
 /// Fold the per-skill bundles an older seeder made into the single builtin one.
 ///
@@ -519,86 +444,35 @@ pub fn fold_builtin_skills_into_one(root: &Path) -> usize {
     count
 }
 
-/// Lift a library's description and keywords up to its own manifest.
+/// Lift a library's first description up to its own manifest.
 ///
 /// The folders were MOVED, not re-written through the skill writer, so nothing
-/// filled the bundle-level fields the card renders.
-///
-/// Keywords are taken ROUND-ROBIN across the skills, not in folder order: the
-/// first skill of a large library (Browser Automation carries eleven) used to
-/// fill the whole cap, so the bundle advertised one topic and every other skill
-/// was unreachable from a Persian ask. One phrase per skill in turn keeps the
-/// bundle's trigger representative of what it actually holds.
-///
-/// A list the user typed by hand is left alone: when it names a phrase no skill
-/// carries, it did not come from this lift, so it is not this function's to
-/// rewrite.
+/// filled the bundle-level description the card renders. The manifest is patched
+/// only when the lift has something to say: a bundle that already shows one keeps
+/// it.
 pub(crate) fn refresh_builtin_bundle_view(root: &Path) {
     let Ok(kids) = fs::read_dir(plugin_dir(root, &builtin_bundle_slug()).join("skills")) else {
         return;
     };
     let mut description = String::new();
-    let mut per_skill: Vec<Vec<String>> = Vec::new();
     for kid in kids.flatten() {
         let Ok(raw) = fs::read_to_string(kid.path().join("skill.md")) else {
             continue;
         };
-        let (_, _, desc, fa) = crate::skills::parse_frontmatter_pub(&raw);
+        let (_, _, desc) = crate::skills::parse_frontmatter_pub(&raw);
         if description.is_empty() && !desc.trim().is_empty() {
             description = desc.trim().to_string();
         }
-        if !fa.is_empty() {
-            per_skill.push(fa);
-        }
     }
-    let lifted = interleave(&per_skill, BUNDLE_LIBRARY_KEYWORDS_MAX);
-    if let Some(stored) = read_manifest(root, &builtin_bundle_slug()) {
-        let known: Vec<String> = per_skill.iter().flatten().cloned().collect();
-        let hand_typed = keywords_of(&stored[KEYWORDS])
-            .into_iter()
-            .any(|k| !known.contains(&k));
-        if hand_typed {
-            return;
-        }
+    if description.is_empty() {
+        return;
     }
-    let mut patch = json!({ "slug": builtin_bundle_slug(), "name": BUILTIN_BUNDLE_NAME });
-    if !description.is_empty() {
-        patch["description"] = json!(description);
-    }
-    if !lifted.is_empty() {
-        patch[KEYWORDS] = json!(lifted);
-    }
+    let patch = json!({
+        "slug": builtin_bundle_slug(),
+        "name": BUILTIN_BUNDLE_NAME,
+        "description": description,
+    });
     let _ = update_plugin(root, &patch);
-}
-
-/// One phrase per list in turn, so a long list cannot starve the others.
-///
-/// Each list is deduped against the whole result, so the same phrase appearing
-/// in several skills is not paid for twice.
-pub(super) fn interleave(lists: &[Vec<String>], cap: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut round = 0;
-    while out.len() < cap {
-        let mut took = false;
-        for list in lists {
-            let Some(kw) = list.get(round).map(|k| k.trim()).filter(|k| !k.is_empty()) else {
-                continue;
-            };
-            took = true;
-            if !out.iter().any(|k| k == kw) {
-                out.push(kw.to_string());
-                if out.len() >= cap {
-                    break;
-                }
-            }
-        }
-        // Every list is exhausted, so another pass would add nothing.
-        if !took {
-            break;
-        }
-        round += 1;
-    }
-    out
 }
 
 /// Shipped skills that have been REPLACED or withdrawn, by their old name.

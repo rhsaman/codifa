@@ -42,24 +42,15 @@ const SOURCE: &str = "source";
 const SOURCE_REPO: &str = "source_repo";
 const SOURCE_PATH: &str = "source_path";
 /// The marketplace index's topic tag, stored with the same pattern as the
-/// source address: an UPDATE call carries only the address, so the stored
-/// category is what lets its seed still find Persian keywords.
+/// source address (an UPDATE call carries only the address).
 const SOURCE_CATEGORY: &str = "source_category";
 const SOURCE_REF: &str = "source_ref";
-/// Manifest key holding the Persian phrases the whole bundle answers to.
-const KEYWORDS: &str = "fa_keywords";
-/// Manifest key holding per-connector metadata: `{name: {description, fa_keywords}}`.
+/// Manifest key holding per-connector metadata: `{name: {description}}`.
 ///
 /// Deliberately NOT stored inside the connector's own config: `mcp.json` values
 /// are forwarded to the MCP server verbatim, so anything extra in there would
 /// ride into the protocol payload.
 const MCP_META: &str = "connector_meta";
-/// Most keywords a plugin hands down to a skill that carries none of its own.
-///
-/// A plugin may bundle skills on unrelated topics, so its keywords are a
-/// LAST-RESORT trigger: enough to find a bare skill from a Persian ask, few
-/// enough that a hundred skills do not refill the catalog budget.
-const INHERIT_KEYWORDS_MAX: usize = 4;
 /// Folder inside a plugin holding its runnable scripts.
 pub(crate) const SCRIPTS: &str = "scripts";
 /// Folder inside a plugin holding its slash commands (`commands/<name>.md`).
@@ -92,161 +83,6 @@ pub(crate) const MAX_SCRIPTS: usize = 20;
 ///
 /// A `rustc` BUILD is the compiler, not the script, so it keeps its own bound.
 const SCRIPT_BUILD_TIMEOUT_SECS: u64 = 180;
-
-/// The Persian trigger phrases each KNOWN capability maps to.
-///
-/// Only a CAPABILITY is listed. Broad buckets ("development", "productivity",
-/// "data", "ai") used to sit here as well, and because a category was read as
-/// fact they filed nonsense onto unrelated bundles — the reported bug, where
-/// telegram answered to «بهره‌وری، کارایی». One word of metadata can honestly
-/// claim no more than the capability it names.
-const CATEGORY_KEYWORDS: &[(&str, &str)] = &[
-    ("security", "امنیت، اسکن امنیتی، آسیب‌پذیری"),
-    ("documentation", "مستندسازی، مستندات"),
-    ("testing", "تست، تست‌نویسی"),
-    ("database", "دیتابیس، پایگاه داده"),
-    ("monitoring", "مانیتورینگ، رصد"),
-    ("deployment", "داپلوی، استقرار"),
-    ("design", "طراحی، دیزاین، رابط کاربری"),
-    ("communication", "پیام‌رسان، پیام، ارتباطات"),
-    ("automation", "اتوماسیون، خودکارسازی"),
-    ("migration", "مهاجرت داده"),
-    ("learning", "یادگیری، آموزش"),
-    ("math", "ریاضی، محاسبات"),
-    ("location", "موقعیت مکانی، نقشه"),
-    ("document", "سند، ورد، word، docx"),
-    ("spreadsheet", "اکسل، صفحه‌گسترده، excel، xlsx، csv"),
-    ("presentation", "پاورپوینت، ارائه، powerpoint، pptx"),
-    ("pdf", "پی‌دی‌اف، pdf"),
-];
-
-/// Concrete technologies an index row may NAME, and the capability each means.
-///
-/// Matched as whole words against the row's NAME — and nothing else. A product
-/// noun (`telegram`, `postgres`, `terraform`) identifies a domain on its own;
-/// the prose and the declared category do not, and both used to file nonsense
-/// onto unrelated bundles (measured: 97 of 173 seeded rows came from prose). No
-/// match → the bundle stays keyword-free for the user to edit.
-const DOMAIN_ANCHORS: &[(&str, &str)] = &[
-    ("telegram", "communication"),
-    ("slack", "communication"),
-    ("discord", "communication"),
-    ("imessage", "communication"),
-    ("whatsapp", "communication"),
-    ("twilio", "communication"),
-    ("messaging", "communication"),
-    ("mailgun", "communication"),
-    ("sendgrid", "communication"),
-    ("resend", "communication"),
-    ("postmark", "communication"),
-    ("mailchimp", "communication"),
-    ("smtp", "communication"),
-    ("email", "communication"),
-    ("inbox", "communication"),
-    ("sms", "communication"),
-    ("zulip", "communication"),
-    ("postgres", "database"),
-    ("postgresql", "database"),
-    ("mysql", "database"),
-    ("sqlite", "database"),
-    ("sqlserver", "database"),
-    ("mongodb", "database"),
-    ("redis", "database"),
-    ("clickhouse", "database"),
-    ("snowflake", "database"),
-    ("bigquery", "database"),
-    ("databricks", "database"),
-    ("cockroachdb", "database"),
-    ("supabase", "database"),
-    ("airtable", "database"),
-    ("prisma", "database"),
-    ("dynamodb", "database"),
-    ("cassandra", "database"),
-    ("sql", "database"),
-    ("database", "database"),
-    ("kubernetes", "deployment"),
-    ("docker", "deployment"),
-    ("terraform", "deployment"),
-    ("helm", "deployment"),
-    ("vercel", "deployment"),
-    ("netlify", "deployment"),
-    ("cloudflare", "deployment"),
-    ("hostinger", "deployment"),
-    ("deployment", "deployment"),
-    ("deploy", "deployment"),
-    ("hosting", "deployment"),
-    ("datadog", "monitoring"),
-    ("sentry", "monitoring"),
-    ("grafana", "monitoring"),
-    ("prometheus", "monitoring"),
-    ("honeycomb", "monitoring"),
-    ("dynatrace", "monitoring"),
-    ("newrelic", "monitoring"),
-    ("langfuse", "monitoring"),
-    ("observability", "monitoring"),
-    ("telemetry", "monitoring"),
-    ("monitoring", "monitoring"),
-    ("figma", "design"),
-    ("sketch", "design"),
-    ("photoshop", "design"),
-    ("canva", "design"),
-    ("design", "design"),
-    ("pytest", "testing"),
-    ("vitest", "testing"),
-    ("playwright", "testing"),
-    ("cypress", "testing"),
-    ("jest", "testing"),
-    ("testing", "testing"),
-    ("semgrep", "security"),
-    ("sonarqube", "security"),
-    ("snyk", "security"),
-    ("aikido", "security"),
-    ("crowdsec", "security"),
-    ("sonatype", "security"),
-    ("hawkscan", "security"),
-    ("vulnerability", "security"),
-    ("vulnerabilities", "security"),
-    ("pentest", "security"),
-    ("firewall", "security"),
-    ("malware", "security"),
-    ("security", "security"),
-    ("cron", "automation"),
-    ("zapier", "automation"),
-    ("n8n", "automation"),
-    ("webhook", "automation"),
-    ("automation", "automation"),
-    ("migration", "migration"),
-    ("migrate", "migration"),
-    ("learning", "learning"),
-    ("tutorial", "learning"),
-    ("academy", "learning"),
-    ("course", "learning"),
-    ("math", "math"),
-    ("algebra", "math"),
-    ("geometry", "math"),
-    ("documentation", "documentation"),
-    ("docs", "documentation"),
-    ("readme", "documentation"),
-    ("location", "location"),
-    ("maps", "location"),
-    ("map", "location"),
-    ("geo", "location"),
-    ("word", "document"),
-    ("docx", "document"),
-    ("document", "document"),
-    ("documents", "document"),
-    ("excel", "spreadsheet"),
-    ("xlsx", "spreadsheet"),
-    ("spreadsheet", "spreadsheet"),
-    ("spreadsheets", "spreadsheet"),
-    ("csv", "spreadsheet"),
-    ("powerpoint", "presentation"),
-    ("pptx", "presentation"),
-    ("slide", "presentation"),
-    ("slides", "presentation"),
-    ("pdf", "pdf"),
-];
-
 
 /// Enabled plugin folders, sorted by slug.
 pub fn enabled_plugins(root: &Path) -> Vec<(String, Value)> {
@@ -330,8 +166,8 @@ pub fn all_plugin_scripts(root: &Path) -> Vec<Value> {
 }
 
 /// Every connector of every plugin, enabled or not, tagged with its owning
-/// bundle — plus the description and Persian keywords kept for it in the
-/// bundle manifest (never inside `cfg`, which the MCP client forwards as-is).
+/// bundle — plus the description kept for it in the bundle manifest (never
+/// inside `cfg`, which the MCP client forwards as-is).
 pub fn all_plugin_connectors(root: &Path) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for (slug, manifest) in all_plugins(root) {
@@ -347,7 +183,6 @@ pub fn all_plugin_connectors(root: &Path) -> Vec<Value> {
                 // session pins the composer badge to.
                 "dir": plugin_dir(root, &slug).to_string_lossy(),
                 "description": own["description"].as_str().unwrap_or(""),
-                KEYWORDS: own[KEYWORDS].clone(),
                 "plugin": label,
                 "plugin_slug": slug,
                 "plugin_enabled": enabled,
@@ -397,8 +232,6 @@ fn plugin_skills(root: &Path, include_disabled: bool) -> Vec<Value> {
             .unwrap_or_default()
             .into_iter()
         {
-            // A skill's keywords are its OWN, never the bundle's, and they are
-            // data only now — selection runs off the description in the catalog.
             row["plugin"] = json!(label);
             // The bundle's own description rides along (read-only data, like
             // the label): the catalog's bundle rungs describe a group with the
@@ -412,7 +245,7 @@ fn plugin_skills(root: &Path, include_disabled: bool) -> Vec<Value> {
     out
 }
 
-/// Per-connector metadata a bundle carries: `{name: {description, fa_keywords}}`.
+/// Per-connector metadata a bundle carries: `{name: {description}}`.
 pub(crate) fn connector_meta_map(root: &Path, slug: &str) -> serde_json::Map<String, Value> {
     read_manifest(root, slug)
         .and_then(|m| m[MCP_META].as_object().cloned())
@@ -421,8 +254,8 @@ pub(crate) fn connector_meta_map(root: &Path, slug: &str) -> serde_json::Map<Str
 
 /// Store (or clear) one connector's metadata inside the bundle manifest.
 ///
-/// An entry carrying neither a description nor keywords is REMOVED rather than
-/// written empty, so clearing both fields leaves no trace behind.
+/// An entry carrying no description is REMOVED rather than written empty, so
+/// clearing the field leaves no trace behind.
 fn write_connector_meta(root: &Path, slug: &str, name: &str, entry: &Value) -> Result<(), String> {
     let Some(mut manifest) = read_manifest(root, slug) else {
         return Err(format!("plugin not found: {slug}"));
@@ -430,8 +263,7 @@ fn write_connector_meta(root: &Path, slug: &str, name: &str, entry: &Value) -> R
     let mut all = connector_meta_map(root, slug);
     let blank = entry["description"]
         .as_str()
-        .map_or(true, |d| d.trim().is_empty())
-        && keywords_of(&entry[KEYWORDS]).is_empty();
+        .map_or(true, |d| d.trim().is_empty());
     if blank {
         all.remove(name);
     } else {
@@ -844,28 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn a_librarys_own_keywords_come_from_every_skill_not_the_first_one() {
-        // The reported bug: the built-in bundle advertised ONE topic (whichever
-        // skill the folder listing happened to return first), so a Persian ask
-        // about anything else in the same library never reached it.
-        let lists = vec![
-            vec!["a1".into(), "a2".into(), "a3".into(), "a4".into()],
-            vec!["b1".into()],
-            vec!["c1".into(), "c2".into()],
-        ];
-        assert_eq!(
-            interleave(&lists, 4),
-            vec!["a1", "b1", "c1", "a2"],
-            "each skill must contribute before any skill contributes twice"
-        );
-        // The cap holds, and a phrase two skills share is paid for once.
-        let shared = vec![vec!["same".into(), "x".into()], vec!["same".into(), "y".into()]];
-        assert_eq!(interleave(&shared, 8), vec!["same", "x", "y"]);
-        assert_eq!(interleave(&shared, 1), vec!["same"]);
-        assert!(interleave(&[], 8).is_empty());
-    }
-
-    #[test]
     fn enabled_connectors_come_from_every_enabled_plugin() {
         let root = temp_root("connectors");
         create_plugin(
@@ -945,8 +755,7 @@ mod tests {
                 "skills": [{
                     "name": "Release Notes",
                     "content": "# steps\n\nread the log",
-                    "description": "when the user asks for release notes",
-                    "fa_keywords": "یادداشت انتشار"
+                    "description": "when the user asks for release notes"
                 }],
                 "mcp": {"notes": {"command": "npx"}}
             }),
@@ -1017,7 +826,6 @@ mod tests {
                 "skills": [{
                     "name": "Release Notes",
                     "content": "# steps\n\nread the log",
-                    "fa_keywords": "یادداشت انتشار",
                     "extra_files": {"checklist.md": "- tag the release"}
                 }]
             }),
@@ -1043,19 +851,18 @@ mod tests {
     }
 
     #[test]
-    fn install_seeds_persian_keywords_from_the_marketplace_name() {
-        // The reported bug: a plugin installed from a marketplace index landed
-        // with NO `fa_keywords` (neither plugin nor skills), so a Persian ask
-        // never found it. The row's NAME seeds them: a product noun names a real
-        // capability, while prose and the declared category are what used to file
-        // «تحلیل داده» onto a database tool and «بهره‌وری» onto a messaging bridge.
+    fn install_lands_without_keyword_fields() {
+        // Skills are matched on their DESCRIPTIONS (like Claude Code), so an
+        // install must not grow a `fa_keywords` field anywhere: not on the
+        // bundle, not on a skill — whatever the marketplace row or an older
+        // manifest carried.
         let src = temp_root("seed-src");
         fs::create_dir_all(src.join("skills/sec"))
             .unwrap();
         fs::write(src.join("plugin.json"), r#"{"name":"Sentry Security","version":"1.0.0"}"#).unwrap();
         fs::write(
             src.join("skills/sec/SKILL.md"),
-            "---\nname: sec\n---\n# sec\nBody.",
+            "---\nname: sec\ndescription: Automated API security auditing\nfa_keywords: مانیتورینگ\n---\n# sec\nBody.",
         )
         .unwrap();
         let root = temp_root("seed-install");
@@ -1068,113 +875,40 @@ mod tests {
             }),
         )
         .unwrap();
-        let seeded = out["plugin"][KEYWORDS].as_array().unwrap();
-        assert!(!seeded.is_empty(), "the product name must seed Persian keywords");
         assert!(
-            seeded.iter().any(|k| k.as_str() == Some("مانیتورینگ")),
-            "got {seeded:?}"
+            out["plugin"].get("fa_keywords").is_none(),
+            "the bundle view must not carry keywords, got {:?}",
+            out["plugin"].get("fa_keywords")
         );
-        // The manifest carries them too, so the seed survives a reload.
         let manifest: Value = serde_json::from_str(
             &fs::read_to_string(plugin_dir(&root, "sentry-security").join(MANIFEST)).unwrap(),
         )
         .unwrap();
-        assert!(!manifest[KEYWORDS].as_array().unwrap().is_empty());
-        // A NAME that identifies no technology guesses NOTHING: a wrong keyword
-        // fires the wrong skill, so such a bundle stays keyword-free to edit —
-        // neither the category NOR the prose is read at all.
-        let bare_root = temp_root("seed-unknown");
-        let bare = install_plugin(
-            &bare_root,
-            &json!({
-                "repo": src.to_str().unwrap(),
-                "name": "Mystery Bundle",
-                "category": "security",
-                "description": "Automate API security audits",
-            }),
-        )
-        .unwrap();
-        assert_eq!(bare["plugin"][KEYWORDS], json!([]));
-        let up_root = temp_root("seed-on-update");
-        install_plugin(
-            &up_root,
-            &json!({"repo": src.to_str().unwrap(), "category": "xyzzynotknown"}),
-        )
-        .unwrap();
-        let updated = install_plugin(
-            &up_root,
-            // Address only, like the card's "Update from source" button.
-            &json!({"repo": src.to_str().unwrap()}),
-        )
-        .unwrap();
-        // An address-only update still seeds, because the seed comes from the
-        // row's NAME (which an update carries) and not from the category (which
-        // it does not).
         assert!(
-            updated["plugin"][KEYWORDS].as_array().is_some_and(|a| !a.is_empty()),
-            "an address-only update must still seed from the name, got {:?}",
-            updated["plugin"][KEYWORDS]
+            manifest.get("fa_keywords").is_none(),
+            "the manifest must not carry keywords"
         );
-        // The reported wrong-keyword bug: the official index files telegram as
-        // "productivity" while the bundle is a MESSAGING bridge. The NAME decides
-        // — a Persian ask for پیام must find it, «بهره‌وری» must never land — and
-        // the prose is not read at all any more.
-        let tg = temp_root("seed-telegram-src");
-        fs::create_dir_all(tg.join("skills/bridge")).unwrap();
-        fs::write(
-            tg.join("plugin.json"),
-            r#"{"name":"Telegram Bridge","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        fs::write(
-            tg.join("skills/bridge/SKILL.md"),
-            "---\nname: bridge\n---\n# bridge\nBody.",
-        )
-        .unwrap();
-        let wrong_root = temp_root("seed-wrong-category");
-        let wrong = install_plugin(
-            &wrong_root,
-            &json!({
-                "repo": tg.to_str().unwrap(),
-                "category": "productivity",
-                "description": "Assorted note-taking helpers for the whole team",
-            }),
-        )
-        .unwrap();
-        let wrong_kw = wrong["plugin"][KEYWORDS].as_array().unwrap();
+        let rows = enabled_plugin_skills(&root);
+        let skill = rows
+            .iter()
+            .find(|r| r["name"] == "sec")
+            .expect("the installed skill must be listed")
+            .clone();
         assert!(
-            wrong_kw.iter().any(|k| k.as_str() == Some("پیام")),
-            "the name must decide the domain, got {wrong_kw:?}"
+            skill.get("fa_keywords").is_none(),
+            "the skill row must not carry keywords, got {:?}",
+            skill.get("fa_keywords")
         );
-        assert!(
-            !wrong_kw.iter().any(|k| k.as_str() == Some("بهره‌وری")),
-            "the declared category must not leak its keywords, got {wrong_kw:?}"
-        );
-        let _ = fs::remove_dir_all(&wrong_root);
-        let _ = fs::remove_dir_all(&tg);
-        let _ = fs::remove_dir_all(&up_root);
+        // A REINSTALL must behave the same way.
+        let again = install_plugin(&root, &json!({"repo": src.to_str().unwrap()})).unwrap();
+        assert!(again["plugin"].get("fa_keywords").is_none());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
 
     #[test]
-    fn office_skill_names_seed_their_persian_triggers() {
-        // The ZCode office packs install with skill folders named docx, xlsx,
-        // pptx and pdf and carry no Persian keywords of their own. Those nouns
-        // name a real capability, so the NAME seeds the trigger — and a name
-        // that only CONTAINS one ("password" is not "word") must stay empty.
-        for name in ["docx", "docx-viewer", "documents", "xlsx", "spreadsheets", "pptx", "pdf"] {
-            let seeded = category_keywords(name);
-            assert!(!seeded.is_empty(), "{name} must seed keywords, got none");
-        }
-        assert_eq!(category_keywords("password manager"), Vec::<String>::new());
-        assert_eq!(category_keywords("Mystery Bundle"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_marketplace_skill_row_keeps_its_description_and_keywords() {
-        // Reported: an installed skill showed a blank card line, and the Persian
-        // trigger it shipped with was nowhere to be found. The row's own
+    fn a_marketplace_skill_row_keeps_its_description() {
+        // Reported: an installed skill showed a blank card line. The row's own
         // frontmatter has to survive the trip into a bundle at BOTH levels,
         // because the card reads the manifest and the catalog reads the skill.
         let root = temp_root("row-meta");
@@ -1198,16 +932,14 @@ mod tests {
             json!("Writes copy that sells"),
             "the bundle card must not be blank"
         );
-        assert_eq!(
-            keywords_of(&manifest[KEYWORDS]),
-            vec!["نویسندگی".to_string(), "متن تبلیغاتی".to_string()],
-            "the bundle must answer the row's own Persian phrases"
+        assert!(
+            manifest.get("fa_keywords").is_none(),
+            "the legacy frontmatter key must not be copied onto the bundle"
         );
         let dir = skill_dir_for(&root, "Lex Writer").unwrap();
         let md = fs::read_to_string(dir.join("skill.md")).unwrap();
-        let (_, _, desc, fa) = crate::skills::parse_frontmatter_pub(&md);
+        let (_, _, desc) = crate::skills::parse_frontmatter_pub(&md);
         assert_eq!(desc, "Writes copy that sells", "the skill keeps its own line");
-        assert_eq!(fa.len(), 2, "the skill keeps its own phrases, got {fa:?}");
 
         // A REINSTALL must not wipe what is stored: the row is read again and
         // the same fields have to come back unchanged.
@@ -1218,7 +950,6 @@ mod tests {
         .unwrap();
         let again = read_manifest(&root, slug).unwrap();
         assert_eq!(again["description"], json!("Writes copy that sells"));
-        assert_eq!(keywords_of(&again[KEYWORDS]).len(), 2);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
@@ -1300,175 +1031,37 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_category_is_not_read_as_fact() {
-        // Reported: a bundle filed under a WRONG category answered to that
-        // category's Persian words. The row NAME identifies the domain, so a
-        // messaging bridge must answer to «پیام» and never to «بهره‌وری».
-        let prod = category_keywords("telegram");
-        assert!(prod.iter().any(|k| k == "پیام"), "got {prod:?}");
-        assert!(!prod.iter().any(|k| k == "بهره‌وری"), "got {prod:?}");
-
-        // A name with no technology noun stays KEYWORD-FREE: prose and category
-        // are no longer read at all, so nothing can be misfiled from them.
-        assert!(category_keywords("altimate-code").is_empty());
-        assert!(category_keywords("mystery-bundle").is_empty());
-
-        // A name that IS a product noun maps on its own.
-        let db = category_keywords("clickhouse");
-        assert!(db.iter().any(|k| k == "دیتابیس"), "got {db:?}");
-        let loc = category_keywords("amazon-location-service");
-        assert!(loc.iter().any(|k| k == "نقشه"), "got {loc:?}");
-    }
-
-    #[test]
-    fn boot_sweep_also_fixes_the_seed_inside_each_skill() {
-        // The per-skill seed read the category and the row's prose too, so the
-        // same wrong list sits in each shipped skill's frontmatter — and a
-        // skill's OWN list outranks the bundle's when the skill is matched. A
-        // sweep that only rewrote the manifest left the wrong trigger in force.
-        let root = temp_root("boot-remap-skill");
-        let dir = plugins_dir(&root).join("skills");
-        // The REAL layout `sync_skill` writes: the skills live one level below
-        // the bundle (`<plugin>/skills/<slug>/skill.md`). The fixture used to
-        // write `<plugin>/<slug>/skill.md`, which the sweep read and no writer
-        // produces — so it passed while the sweep was blind to real skills.
-        fs::create_dir_all(dir.join("skills").join("docx")).unwrap();
+    fn a_legacy_fa_line_is_tolerated_but_not_carried() {
+        // A skill.md written by an older build still carries `fa_keywords:` in
+        // its frontmatter. The parser ignores the key (no error, no crash) and
+        // nothing reads or rewrites it: the line stays inert until the next
+        // save regenerates the frontmatter without it.
+        let root = temp_root("legacy-fa-line");
+        let src = temp_root("legacy-fa-src");
+        fs::create_dir_all(src.join("writer")).unwrap();
         fs::write(
-            dir.join(MANIFEST),
-            serde_json::to_string(&json!({ "name": "skills" })).unwrap(),
+            src.join("writer/SKILL.md"),
+            "---\nname: Lex Writer\ndescription: Writes copy that sells\n\
+             fa_keywords: نویسندگی\n---\n# writer\nBody.",
         )
         .unwrap();
-        fs::write(
-            dir.join("skills").join("docx").join("skill.md"),
-            "---\nname: docx\ndescription: Word documents\nfa_keywords: داده، تحلیل داده، پردازش داده\n---\n\n# docx\n\nBody text.\n",
-        )
-        .unwrap();
-
-        remap_legacy_keywords(&root);
-
-        let raw = fs::read_to_string(dir.join("skills").join("docx").join("skill.md")).unwrap();
-        assert!(!raw.contains("تحلیل داده"), "wrong seed survived: {raw}");
-        assert!(raw.contains("Body text."), "body must survive: {raw}");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn boot_sweep_remaps_a_wrong_seed_already_on_disk() {
-        // Reported: the wrong keywords were ALREADY written into the installed
-        // folder by the earlier mapper, so fixing the mapper alone left telegram
-        // answering to «بهره‌وری، کارایی». The boot sweep corrects such a bundle
-        // without the user re-installing it — and still leaves a hand-typed list
-        // alone, because only a verbatim machine seed counts as stale.
-        let root = temp_root("boot-remap");
-        let dir = plugins_dir(&root).join("telegram");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(MANIFEST),
-            serde_json::to_string(&json!({
-                "name": "telegram",
-                "description": "Telegram channel — messaging bridge with access control",
-                SOURCE_CATEGORY: "productivity",
-                KEYWORDS: ["بهره‌وری", "کارایی", "مدیریت کار"],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // A hand-typed list that is NOT a full machine seed stays untouched:
-        // that is the only way a stored list can be told apart from a seed.
-        let partial = plugins_dir(&root).join("partial");
-        fs::create_dir_all(&partial).unwrap();
-        fs::write(
-            partial.join(MANIFEST),
-            serde_json::to_string(&json!({
-                "name": "partial",
-                KEYWORDS: ["بهره‌وری", "کارایی"],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(remap_legacy_keywords(&root), 1, "only the machine seed");
-        let fixed = read_manifest(&root, "telegram").unwrap();
-        let kw = keywords_of(&fixed[KEYWORDS]);
-        assert!(kw.iter().any(|k| k == "پیام"), "got {kw:?}");
-        assert!(!kw.iter().any(|k| k == "بهره‌وری"), "got {kw:?}");
-        // The short hand-typed list is the user's and survives verbatim.
-        let kept = read_manifest(&root, "partial").unwrap();
-        assert_eq!(
-            keywords_of(&kept[KEYWORDS]),
-            vec!["بهره‌وری".to_string(), "کارایی".to_string()]
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn paragraph_keyword_seed_is_recognised_by_verbatim_comparison() {
-        // The re-map gate: only a list an EARLIER mapper wrote is replaceable, so
-        // a list the user retyped (or reordered) is never touched.
-        assert!(is_legacy_seed(&["بهره‌وری".into(), "کارایی".into(), "مدیریت کار".into()]));
-        assert!(is_legacy_seed(&["داده".into(), "تحلیل داده".into(), "پردازش داده".into()]));
-        // A reorder is still the same machine list.
-        assert!(is_legacy_seed(&["کارایی".into(), "بهره‌وری".into(), "مدیریت کار".into()]));
-        // A hand-typed phrase is the user's own and must survive.
-        assert!(!is_legacy_seed(&["بهره‌وری".into(), "کارایی".into()]));
-        assert!(!is_legacy_seed(&["دموی من".into()]));
-        assert!(!is_legacy_seed(&[]));
-    }
-
-    #[test]
-    fn a_stale_seed_is_remapped_and_a_hand_typed_list_is_kept() {
-        // Reported: the wrong keywords were already written into the installed
-        // folder, so fixing the mapper alone left the bad list in place forever.
-        // An install always carries the bundle's own name/description, so it can
-        // re-map a machine seed — while a list the USER typed is never touched.
-        let src = temp_root("stale-src");
-        fs::create_dir_all(src.join("skills/msg")).unwrap();
-        fs::write(src.join("plugin.json"), r#"{"name":"telegram"}"#).unwrap();
-        fs::write(
-            src.join("skills/msg/SKILL.md"),
-            "---\nname: msg\n---\n# msg\nBody.",
-        )
-        .unwrap();
-        let root = temp_root("stale-root");
-        let spec = src.to_str().unwrap();
-        install_plugin(&root, &json!({"repo": spec})).unwrap();
-        // Simulate the install an older mapper produced.
-        update_plugin(
+        install_from_marketplace(
             &root,
-            &json!({
-                "slug": "telegram",
-                "fa_keywords": ["بهره‌وری", "کارایی", "مدیریت کار"],
-            }),
+            &json!({"kind": "skills", "repo": src.to_str().unwrap()}),
         )
         .unwrap();
-        // Reinstalling re-maps that stale seed: the row's own name is enough.
-        let fixed = install_plugin(&root, &json!({"repo": spec})).unwrap();
-        let kw = fixed["plugin"][KEYWORDS].as_array().unwrap();
-        assert!(
-            kw.iter().any(|k| k.as_str() == Some("پیام")),
-            "the stale seed must be re-mapped, got {kw:?}"
-        );
-        assert!(!kw.iter().any(|k| k.as_str() == Some("بهره‌وری")), "got {kw:?}");
-        // A hand-typed list is the user's own, so a reinstall leaves it alone.
-        update_plugin(
-            &root,
-            &json!({"slug": "telegram", "fa_keywords": ["تلگرام", "پیام‌رسان من"]}),
-        )
-        .unwrap();
-        let kept = install_plugin(&root, &json!({"repo": spec})).unwrap();
-        let kept_kw = kept["plugin"][KEYWORDS].as_array().unwrap();
-        assert!(
-            kept_kw.iter().any(|k| k.as_str() == Some("پیام‌رسان من")),
-            "a hand-typed list must survive a reinstall, got {kept_kw:?}"
-        );
+        let dir = skill_dir_for(&root, "Lex Writer").unwrap();
+        let md = fs::read_to_string(dir.join("skill.md")).unwrap();
+        let (name, _, desc) = crate::skills::parse_frontmatter_pub(&md);
+        assert_eq!(name, "Lex Writer");
+        assert_eq!(desc, "Writes copy that sells");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
 
     #[test]
-    fn install_records_the_address_and_keeps_edited_keywords() {
-        // "Update from source" needs the ARGUMENTS, not a display string, and a
-        // reinstall must not discard keywords the user typed by hand.
+    fn install_records_the_address() {
+        // "Update from source" needs the ARGUMENTS, not a display string.
         // The install source is a plain folder, which `repo.rs` reads through
         // the SAME path a GitHub repo takes — so this needs no network.
         let src = temp_root("install-src");
@@ -1490,52 +1083,41 @@ mod tests {
         .unwrap();
         assert_eq!(manifest["source_repo"], spec);
 
-        // The user adds keywords by hand; the repo carries none.
-        update_plugin(
-            &root,
-            &json!({"slug": slug, "fa_keywords": ["دموی من"]}),
-        )
-        .unwrap();
+        // A reinstall is an UPDATE of the same bundle.
         let again = install_plugin(&root, &json!({"repo": spec})).unwrap();
         assert_eq!(again["installed"], "updated");
-        assert_eq!(again["plugin"][KEYWORDS], json!(["دموی من"]));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
 
     #[test]
-    fn creating_a_plugin_by_hand_keeps_its_keywords() {
-        // The reported bug: `create_plugin` wrote no plugin-level
-        // `fa_keywords`, so a bundle created by hand (from the chat or the
-        // agent's tool) was saved WITHOUT them and could never be found from a
-        // Persian request — while `update_plugin` saved them fine.
+    fn creating_a_plugin_by_hand_writes_no_keywords() {
+        // A bundle created by hand (from the chat or the agent's tool) must land
+        // without a `fa_keywords` field: matching runs off descriptions, so the
+        // manifest carries no trigger list at all.
         let root = temp_root("create-keywords");
         let created = create_plugin(
             &root,
             &json!({
                 "name": "Demo",
-                "fa_keywords": "دموی من, نمونه",
                 "skills": [{"name": "Demo", "content": "x"}]
             }),
         )
         .unwrap();
-        assert_eq!(created[KEYWORDS], json!(["دموی من", "نمونه"]));
+        assert!(created.get("fa_keywords").is_none());
         let manifest: Value = serde_json::from_str(
             &fs::read_to_string(plugin_dir(&root, "demo").join(MANIFEST)).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest[KEYWORDS], json!(["دموی من", "نمونه"]));
+        assert!(manifest.get("fa_keywords").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn install_seeds_keywords_on_skills_that_carry_none() {
-        // The reported bug, second half: a bundle installed from a marketplace
-        // whose rows carry no per-skill keywords landed with a keyworded PLUGIN
-        // but BARE skills — and a Persian request found the plugin, not its
-        // skills. The skill's row now carries the bundle's list as
-        // `bundle_keywords`, so the router reaches it WITHOUT the bundle's
-        // phrases being written on every skill as if they were its own.
+    fn install_writes_no_keywords_on_skills_that_carry_none() {
+        // A bundle installed from a marketplace must land with no `fa_keywords`
+        // anywhere — on the bundle or on its skills — and a legacy key a repo's
+        // skill.md still carries must not be copied into the store either.
         let src = temp_root("skill-seed-src");
         fs::create_dir_all(src.join("skills/guard")).unwrap();
         fs::write(
@@ -1549,7 +1131,7 @@ mod tests {
         )
         .unwrap();
         let root = temp_root("skill-seed");
-        let out = install_plugin(
+        install_plugin(
             &root,
             &json!({
                 "repo": src.to_str().unwrap(),
@@ -1558,10 +1140,6 @@ mod tests {
             }),
         )
         .unwrap();
-        // The PLUGIN was seeded by the earlier fix; the SKILL stays bare — the
-        // bundle's phrases are its own manifest data, never copied onto skills,
-        // and selection runs off descriptions in the catalog anyway.
-        assert!(!out["plugin"][KEYWORDS].as_array().unwrap().is_empty());
         let rows = enabled_plugin_skills(&root);
         let skill = rows
             .iter()
@@ -1569,71 +1147,12 @@ mod tests {
             .expect("the installed skill must be listed")
             .clone();
         assert!(
-            skill["bundle_keywords"].is_null(),
-            "the bundle's phrases must not ride on the skill's row"
+            skill.get("fa_keywords").is_none(),
+            "the skill row must not carry keywords, got {:?}",
+            skill.get("fa_keywords")
         );
-        assert!(
-            keywords_of(&skill[KEYWORDS]).is_empty(),
-            "the bundle's phrases must not be written as if they were the skill's OWN"
-        );
-        // A skill that DOES ship its own keywords is never overwritten.
-        let src2 = temp_root("skill-own-src");
-        fs::create_dir_all(src2.join("skills/own")).unwrap();
-        fs::write(src2.join("plugin.json"), r#"{"name":"Own","version":"1.0.0"}"#).unwrap();
-        fs::write(
-            src2.join("skills/own/SKILL.md"),
-            "---\nname: own\ndescription: x\nfa_keywords: کلیدواژهٔ خودم\n---\n# own\nBody.",
-        )
-        .unwrap();
-        let root2 = temp_root("skill-own");
-        install_plugin(
-            &root2,
-            &json!({
-                "repo": src2.to_str().unwrap(),
-                "category": "security",
-                "description": "security security",
-            }),
-        )
-        .unwrap();
-        let rows2 = enabled_plugin_skills(&root2);
-        let own = rows2
-            .iter()
-            .find(|r| r["name"] == "own")
-            .expect("the skill must be listed")
-            .clone();
-        assert_eq!(keywords_of(&own[KEYWORDS]), vec!["کلیدواژهٔ خودم".to_string()]);
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&root2);
         let _ = fs::remove_dir_all(&src);
-        let _ = fs::remove_dir_all(&src2);
-    }
-
-    #[test]
-    fn a_skill_with_no_keywords_keeps_the_ones_the_user_added() {
-        // `sync_skill` now treats an explicit empty value as "remove them", so
-        // a bundle edit that names no keywords must send NULL (keep) rather
-        // than "" (clear) or every save would silently drop the user's own
-        // Persian trigger.
-        let root = temp_root("keep-skill-keywords");
-        create_plugin(
-            &root,
-            &json!({
-                "name": "Demo",
-                "skills": [{"name": "Demo", "content": "x", "fa_keywords": "دموی من"}]
-            }),
-        )
-        .unwrap();
-        update_plugin(
-            &root,
-            &json!({
-                "slug": "demo",
-                "skills": [{"name": "Demo", "content": "x"}]
-            }),
-        )
-        .unwrap();
-        let rows = enabled_plugin_skills(&root);
-        assert_eq!(rows[0][KEYWORDS], json!(["دموی من"]));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1761,7 +1280,6 @@ mod tests {
                 "name": "fs",
                 "cfg": { "command": "npx", "args": ["-y", "server-fs"] },
                 "description": "Filesystem access",
-                "fa_keywords": ["فایل"],
             }),
         )
         .unwrap();
@@ -1778,7 +1296,7 @@ mod tests {
             .find(|r| r["name"] == "fs")
             .expect("the connector row");
         assert_eq!(row["description"], "Filesystem access");
-        assert_eq!(row["fa_keywords"][0], "فایل");
+        assert!(row.get("fa_keywords").is_none(), "{row}");
         assert!(row["cfg"].get("description").is_none(), "{row}");
 
         // Deleting from the page targets the same bundle.
@@ -1808,7 +1326,6 @@ mod tests {
 
 mod bundle;
 mod install;
-mod legacy;
 mod parts;
 mod scripts;
 mod skills_connectors;
@@ -1821,7 +1338,6 @@ use parts::*;
 // the single-file module. The pub use globs below re-export the public surface.
 use bundle::*;
 use install::*;
-use legacy::*;
 use scripts::*;
 use skills_connectors::*;
 use store::*;
@@ -1831,7 +1347,6 @@ use store::*;
 pub use bundle::*;
 #[allow(unused_imports)] // some items are only referenced under cfg(test)
 pub use install::*;
-pub use legacy::remap_legacy_keywords;
 pub use scripts::run_plugin_script;
 #[allow(unused_imports)] // some items are only referenced under cfg(test)
 pub use skills_connectors::*;

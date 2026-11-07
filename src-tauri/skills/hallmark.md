@@ -1,7 +1,6 @@
 ---
 name: Hallmark
 description: Anti-AI-slop design skill for greenfield pages, audits, redesigns, and design extraction from URLs or screenshots. Use when the user asks to build a new app or landing page, wants to redesign something, invokes Hallmark by name, or uses audit/redesign/study.
-fa_keywords: هال مارک, طراحی سایت, طراحی لندینگ, بازطراحی سایت, hallmark, audit design, redesign page, study design, anti-ai-slop design, distinctive visual identity
 ---
 
 # Hallmark

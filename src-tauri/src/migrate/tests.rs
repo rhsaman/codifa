@@ -6,7 +6,7 @@
         // beside the bundles that already held the same content — and because the
         // marker stopped the migration from re-running, nothing ever cleaned them.
         let root = temp_root("prune");
-        write_skill(&root, "movie-finder", "Movie Finder", "فیلم، سریال");
+        write_skill(&root, "movie-finder", "Movie Finder");
         write_connector(&root, "docker", "docker");
         standalone_stores_to_bundles(&root);
 
@@ -24,9 +24,9 @@
         // The cleanup must not eat data: a folder dropped into the old store
         // AFTER the marker was written has no bundle behind it.
         let root = temp_root("prune-late");
-        write_skill(&root, "movie-finder", "Movie Finder", "فیلم، سریال");
+        write_skill(&root, "movie-finder", "Movie Finder");
         standalone_stores_to_bundles(&root);
-        write_skill(&root, "late-arrival", "Late Arrival", "دیر رسیده");
+        write_skill(&root, "late-arrival", "Late Arrival");
 
         assert_eq!(prune_migrated_stores(&root), 1);
         assert!(
@@ -52,8 +52,7 @@
                 "name": "Built-in Skills",
                 "slug": "builtin-skills",
                 "enabled": false,
-                "version": "1.0.0",
-                "fa_keywords": ["فیلم"]
+                "version": "1.0.0"
             })
             .to_string(),
         )
@@ -118,7 +117,6 @@
         assert_eq!(manifest["name"], json!("builtin plugin"));
         assert_eq!(manifest["slug"], json!("builtin-plugin"));
         assert_eq!(manifest["enabled"], json!(false), "the switch is preserved");
-        assert_eq!(manifest["fa_keywords"], json!(["فیلم"]));
         assert!(builtin_new.join("skills/my-note/skill.md").is_file());
 
         let docker_new = root.join("plugins/docker-mcp");
@@ -174,14 +172,10 @@
         dir
     }
 
-    fn write_skill(root: &Path, slug: &str, name: &str, keywords: &str) {
+    fn write_skill(root: &Path, slug: &str, name: &str) {
         let dir = root.join("skills").join(slug);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut md = format!("---\nname: {name}\ndescription: does {name}\n");
-        if !keywords.is_empty() {
-            md.push_str(&format!("fa_keywords: {keywords}\n"));
-        }
-        md.push_str("---\n\n# body\n\nthe steps\n");
+        let md = format!("---\nname: {name}\ndescription: does {name}\n---\n\n# body\n\nthe steps\n");
         std::fs::write(dir.join("skill.md"), md).unwrap();
         std::fs::write(dir.join("notes.md"), "extra").unwrap();
     }
@@ -251,7 +245,7 @@
     #[test]
     fn a_stored_skill_becomes_its_own_bundle() {
         let root = temp_root("skill");
-        write_skill(&root, "movie-finder", "Movie Finder", "فیلم، سریال");
+        write_skill(&root, "movie-finder", "Movie Finder");
         assert_eq!(standalone_stores_to_bundles(&root), 1);
 
         let listed = crate::plugins::list_plugins(&root);
@@ -260,7 +254,7 @@
         let view = &rows[0];
         assert_eq!(view["name"], "Movie Finder");
         assert_eq!(view["skills"], json!(["Movie Finder"]));
-        assert_eq!(view["fa_keywords"], json!(["فیلم", "سریال"]));
+        assert!(view.get("fa_keywords").is_none());
         // The body and the extra file survive, so nothing the user wrote is lost.
         let row = &crate::plugins::all_plugin_skills(&root)[0];
         assert!(row["content"].as_str().unwrap().contains("the steps"));
@@ -309,7 +303,7 @@
     #[test]
     fn the_migration_runs_once_and_never_resurrects_a_deleted_bundle() {
         let root = temp_root("once");
-        write_skill(&root, "keeper", "Keeper", "");
+        write_skill(&root, "keeper", "Keeper");
         assert_eq!(standalone_stores_to_bundles(&root), 1);
         // A second boot must not rewrite anything…
         assert_eq!(standalone_stores_to_bundles(&root), 0);

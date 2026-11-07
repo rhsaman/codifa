@@ -135,20 +135,21 @@ fn cell_to_string(cell: &calamine::Data) -> String {
 // Text-family readers
 // ---------------------------------------------------------------------------
 
-fn read_text_file(path: &Path) -> Result<String, String> {
+/// `max_chars` bounds one read: the 24k default protects the agent's context,
+/// while the viewer passes a much larger cap (a repo README outgrows 24k).
+fn read_text_file(path: &Path, max_chars: usize) -> Result<String, String> {
     check_size(path)?;
-    let mut file = fs::File::open(path).map_err(|e| format!("cannot read file: {e}"))?;
-    let mut buf = vec![0u8; MAX_DOC_READ_CHARS * 4 + 4];
-    let n = file
-        .read(&mut buf)
+    let file = fs::File::open(path).map_err(|e| format!("cannot read file: {e}"))?;
+    // UTF-8 worst case is 4 bytes/char — `take` bounds the read without
+    // pre-allocating, and a single `read` can legally return short.
+    let mut buf = Vec::new();
+    file.take(max_chars.saturating_mul(4) as u64 + 4)
+        .read_to_end(&mut buf)
         .map_err(|e| format!("cannot read file: {e}"))?;
-    buf.truncate(n);
     let text = String::from_utf8_lossy(&buf).into_owned();
-    if text.chars().count() > MAX_DOC_READ_CHARS {
-        let cut: String = text.chars().take(MAX_DOC_READ_CHARS).collect();
-        return Ok(format!(
-            "{cut}\n[truncated at {MAX_DOC_READ_CHARS} chars]"
-        ));
+    if text.chars().count() > max_chars {
+        let cut: String = text.chars().take(max_chars).collect();
+        return Ok(format!("{cut}\n[truncated at {max_chars} chars]"));
     }
     Ok(text)
 }
@@ -271,7 +272,7 @@ fn read_spreadsheet(path: &Path, sheet: &str) -> Result<String, String> {
 // PDF (text)
 // ---------------------------------------------------------------------------
 
-fn read_pdf(path: &Path, pages: &str) -> Result<String, String> {
+fn read_pdf(path: &Path, pages: &str, max_chars: usize) -> Result<String, String> {
     check_size(path)?;
     let text = pdf_extract::extract_text(path)
         .map_err(|e| format!("cannot open PDF: {e}"))?;
@@ -297,9 +298,9 @@ fn read_pdf(path: &Path, pages: &str) -> Result<String, String> {
         }
         out.push(format!("=== page {} ===\n{body}", i + 1));
         shown += body.chars().count();
-        if shown >= MAX_DOC_READ_CHARS {
+        if shown >= max_chars {
             out.push(format!(
-                "[truncated at {MAX_DOC_READ_CHARS} chars — re-read with `pages`]"
+                "[truncated at {max_chars} chars — re-read with `pages`]"
             ));
             break;
         }
@@ -404,7 +405,7 @@ fn docx_table_rows(tbl: &roxmltree::Node) -> Vec<Vec<String>> {
 }
 
 /// Walk `body` in document order, emitting markdown-ish lines.
-fn docx_body_lines(body: &roxmltree::Node) -> Vec<String> {
+fn docx_body_lines(body: &roxmltree::Node, max_chars: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut chars = 0usize;
     for child in body.children().filter(|c| c.is_element()) {
@@ -433,15 +434,15 @@ fn docx_body_lines(body: &roxmltree::Node) -> Vec<String> {
             }
             _ => continue,
         }
-        if chars > MAX_DOC_READ_CHARS {
-            lines.push(format!("[truncated at {MAX_DOC_READ_CHARS} chars]"));
+        if chars > max_chars {
+            lines.push(format!("[truncated at {max_chars} chars]"));
             break;
         }
     }
     lines
 }
 
-fn read_docx(path: &Path) -> Result<String, String> {
+fn read_docx(path: &Path, max_chars: usize) -> Result<String, String> {
     check_size(path)?;
     let xml = read_zip_entry(path, "word/document.xml")?;
     let doc = roxmltree::Document::parse(&xml)
@@ -452,7 +453,7 @@ fn read_docx(path: &Path) -> Result<String, String> {
     else {
         return Err("cannot open Word file: no document body".into());
     };
-    let lines = docx_body_lines(&body);
+    let lines = docx_body_lines(&body, max_chars);
     if lines.is_empty() {
         return Ok("[empty document]".into());
     }
@@ -612,15 +613,17 @@ fn render_docx_html(path: &Path) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// Read a document's text (dispatches by extension). Mirrors read_document.
-pub fn read_document(path: &str, sheet: &str, pages: &str) -> Result<String, String> {
+/// `max_chars` caps the returned text — 0 means the 24k agent default.
+pub fn read_document(path: &str, sheet: &str, pages: &str, max_chars: usize) -> Result<String, String> {
+    let max_chars = if max_chars == 0 { MAX_DOC_READ_CHARS } else { max_chars };
     let p = Path::new(path);
     match ext_of(path).as_str() {
-        ".pdf" => read_pdf(p, pages),
-        ".docx" => read_docx(p),
+        ".pdf" => read_pdf(p, pages, max_chars),
+        ".docx" => read_docx(p, max_chars),
         ".xlsx" | ".xlsm" | ".xls" => read_spreadsheet(p, sheet),
         ".csv" => read_csv(p, pages),
         ".doc" => Err(".doc is the legacy Word format — re-save as .docx first".into()),
-        _ => read_text_file(p),
+        _ => read_text_file(p, max_chars),
     }
 }
 
@@ -651,6 +654,11 @@ pub struct DocReadBody {
     pub sheet: String,
     #[serde(default)]
     pub pages: String,
+    /// Text cap for this read; 0 keeps the 24k agent default. The viewer
+    /// passes a much larger value — its output goes to the screen, not a
+    /// model context window.
+    #[serde(default)]
+    pub max_chars: usize,
 }
 
 /// Handle one `/doc/read` call: resolve the path inside the workspace sandbox,
@@ -687,7 +695,7 @@ pub fn handle_doc_read(body: DocReadBody) -> Value {
         "pages" => json!({
             "error": "PDF preview is rendered natively by the viewer (asset protocol)"
         }),
-        _ => match read_document(&target_str, &sheet, &pages) {
+        _ => match read_document(&target_str, &sheet, &pages, body.max_chars) {
             Ok(content) => json!({ "content": content }),
             Err(e) => json!({ "error": e }),
         },

@@ -1,0 +1,496 @@
+/* ── "This turn's tools" card: one calm list of rows ─────────────────────────
+   Kind icon tile · name + origin · state pill. No boxed groups, no chips. */
+.sidebar-panel.usage-docked .tu-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+}
+
+.tu-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tu-sum {
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.tu-sum.used {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.tu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tu-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.tu-row:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.tu-row.used {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--hairline));
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.tu-row.idle .tu-name {
+  color: var(--text-dim);
+}
+
+.tu-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.tu-row.used .tu-icon {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.tu-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tu-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.tu-sub {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.tu-state {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.tu-state.used {
+  color: var(--success, #34d399);
+  background: color-mix(in srgb, var(--success, #34d399) 15%, transparent);
+}
+
+@container (max-width: 220px) {
+  .tu-state {
+    display: none;
+  }
+}
+
+/* ── Explore card: responsive at any chat width ── */
+/* The panel-only `padding: 0` on the chips leaked onto the chat card, so the
+   chips sat flush against (and over) the card border. Restore the card inset. */
+.tool-card.explore .explore-tool-chips {
+  padding: 4px 12px 10px;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tool-card.explore .explore-tool-chip {
+  padding: 2px 9px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.tool-card.explore .explore-tool-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-card.explore {
+  container-type: inline-size;
+  container-name: explore-card;
+  overflow: hidden;
+}
+
+.tool-card.explore .explore-card-open {
+  min-width: 0;
+}
+
+.tool-card.explore .trace-head-right {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@container explore-card (max-width: 340px) {
+  .explore-card-arrow {
+    display: none;
+  }
+  .explore-card-open {
+    padding-inline: 10px;
+    gap: 7px;
+  }
+  .explore-card-count {
+    font-size: 10px;
+    padding-inline: 5px;
+  }
+}
+
+@container explore-card (max-width: 260px) {
+  .explore-card-open .trace-pill-sub,
+  .explore-card-open .trace-time {
+    display: none;
+  }
+}
+
+/* ── Message footer: the status line never spills over the token counter ──
+   Any inline status row (model name, retry, sub-agent) lets the footer wrap, so
+   on narrow panes the model name takes its own row and ellipsizes if still too
+   long, instead of overprinting the "in / out" numbers. */
+.msg-actions:has(.msg-retry-inline) {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+.msg-actions:has(.msg-retry-inline) .msg-actions-status {
+  flex: 1 1 12rem;
+  min-width: min(12rem, 100%);
+}
+
+.msg-actions:has(.msg-retry-inline) .msg-actions-tools {
+  margin-inline-start: auto;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.msg-actions-status > .msg-retry-inline {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.msg-retry-inline-head {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.msg-retry-inline-who,
+.msg-retry-inline-model {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Agent question card (AskUserCard) ──
+   Real padding all round (the answer line used to sit on the card's bottom
+   edge and the card on the text below it), a drawn checkbox instead of the
+   tiny ☐ glyph, and an answer pill. */
+.ask-card.ask-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: min(640px, 100%);
+  margin: 10px auto 20px;
+  padding: 16px 18px 18px;
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  background: var(--bg-panel);
+}
+
+.ask-card .ask-header {
+  display: flex;
+  margin: 0;
+}
+
+.ask-card .ask-badge {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.ask-card .ask-card-question {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.65;
+  color: var(--text);
+}
+
+.ask-card .ask-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ask-card .ask-section-title {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.ask-card .ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ask-card .ask-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 44px;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 1.5;
+  text-align: start;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.ask-card .ask-option:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.ask-card .ask-option.selected {
+  border-color: color-mix(in srgb, var(--accent) 65%, transparent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+}
+
+.ask-card .ask-option:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.ask-card .ask-option:disabled:not(.selected) {
+  color: var(--text-dim);
+}
+
+/* drawn checkbox: the glyph text inside is hidden */
+.ask-card .ask-option-mark {
+  position: relative;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  box-sizing: border-box;
+  border: 1.5px solid color-mix(in srgb, var(--text) 35%, transparent);
+  border-radius: 6px;
+  font-size: 0;
+  line-height: 0;
+  color: transparent;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ask-card .ask-option.selected .ask-option-mark {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.ask-card .ask-option.selected .ask-option-mark::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 1.5px;
+  width: 4px;
+  height: 9px;
+  border: solid var(--on-accent, #111);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.ask-card .ask-option-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ask-card .ask-freetext {
+  margin: 0;
+}
+
+.ask-card .ask-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  resize: vertical;
+}
+
+.ask-card .ask-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0;
+}
+
+.ask-card .ask-answer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 2px 2px 0;
+  background: none;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.ask-card .ask-answer-check {
+  flex: 0 0 auto;
+  color: var(--success, #34d399);
+}
+
+/* Lighter, flatter card: no white selection ring, no heavy fills. */
+.ask-card.ask-card {
+  gap: 10px;
+  padding: 14px 16px 16px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--text) 3%, var(--bg, transparent));
+}
+
+.ask-card .ask-badge {
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.ask-card .ask-card-question {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.ask-card .ask-options {
+  gap: 6px;
+}
+
+.ask-card .ask-option,
+.ask-card .ask-option.selected,
+.ask-card .ask-option:focus,
+.ask-card .ask-option:focus-visible,
+.ask-card .ask-option:active {
+  outline: none;
+  box-shadow: none;
+}
+
+.ask-card .ask-option {
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border-color: transparent;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.ask-card .ask-option.selected {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.ask-card .ask-option:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
+.ask-card .ask-option:disabled:not(.selected) {
+  opacity: 0.55;
+}
+
+/* No borders: card and options are told apart by fill alone. */
+.ask-card.ask-card,
+.ask-card .ask-option,
+.ask-card .ask-option.selected,
+.ask-card .ask-option:hover:not(:disabled),
+.ask-card .ask-option:focus-visible,
+.ask-card .ask-input {
+  border: 0;
+}
+
+.ask-card .ask-option.selected {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.ask-card .ask-option:focus-visible {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.ask-card .ask-answer-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.ask-card .ask-answer-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}

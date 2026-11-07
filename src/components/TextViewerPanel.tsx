@@ -39,6 +39,16 @@ export function TextViewerPanel({
     [body, capped],
   );
 
+  // A compaction summary arrives wrapped in `<summary>…</summary>` (sometimes
+  // with an `<analysis>` block). In markdown an unknown tag opens a raw-HTML
+  // block, so the tag showed up as literal text AND the headings/lists after it
+  // were not parsed. The wrapper is dropped for the rendered view only — the Raw
+  // view and Copy keep the text verbatim.
+  const mdShown = useMemo(
+    () => shown.replace(/^\s*<\/?(?:summary|analysis)>[ \t]*\r?\n?/gim, "").replace(/<\/?(?:summary|analysis)>/gi, ""),
+    [shown],
+  );
+
   const copy = async () => {
     try {
       await copyToClipboard(body);
@@ -104,7 +114,7 @@ export function TextViewerPanel({
                 3-backtick fence splitting would corrupt. react-markdown never
                 executes raw HTML, so untrusted payloads stay inert. */}
             <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeLtrIslands]} components={mdComponents}>
-              {shown}
+              {mdShown}
             </ReactMarkdown>
           </div>
         </div>

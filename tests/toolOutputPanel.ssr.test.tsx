@@ -110,6 +110,27 @@ console.log('3) باز شدن دستی خروجی در پنل حفظ شده اس
   check('openText دستی پنل را باز می‌کند', useViewerTabs.getState().paneOpen === true)
 }
 
+console.log('3b) فایل‌های هم‌نام (basename یکسان) با مسیر کامل از هم جدا می‌شوند:')
+{
+  // دو models.rs واقعی در ریپو: بدون مسیر کامل، هر دو ردیف فقط «models.rs»
+  // نشان می‌دادند و مثل یک نتیجهٔ تکراری به نظر می‌رسیدند.
+  const { FileResultLinks } = await import('../src/components/ToolCallView')
+  const listHtml = renderToString(
+    <FileResultLinks
+      tool="grep"
+      items={[
+        { file: 'src-tauri/src/models.rs' },
+        { file: 'src-tauri/src/backend_light/models.rs' },
+        { file: 'unique.rs' },
+      ] as never}
+    />,
+  )
+  check('سه ردیف رندر شد', (listHtml.match(/class="file-result"/g) || []).length === 3)
+  check('مسیر کامل برای models.rs اول', listHtml.includes('src-tauri/src/models.rs'), listHtml)
+  check('مسیر کامل برای models.rs دوم', listHtml.includes('src-tauri/src/backend_light/models.rs'), listHtml)
+  check('فایل یکتا همان نام کوتاه را دارد', listHtml.includes('>unique.rs<'), listHtml)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`)
   process.exit(1)

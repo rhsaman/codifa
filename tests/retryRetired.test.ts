@@ -61,7 +61,33 @@ console.log('3) بنر ترمینال باید بماند (دکمه Retry از �
   const ev = { kind: 'tool_result', tool: 'explore' }
   check('gaveUp → پاک نشود', retryRetiredByEvent(live({ gaveUp: true }), ev) === false)
   check('watchdog → پاک نشود', retryRetiredByEvent(live({ watchdog: true }), ev) === false)
-  check('fallback → پاک نشود', retryRetiredByEvent(live({ fallback: true }), ev) === false)
+}
+
+console.log('3ب) خط fallback زنده است → مثل هر خط زنده‌ای بازنشسته شود:')
+{
+  // باگ اسکرین‌شات: اکسپلور تمام شده بود ولی «batch ×3» زیرش مانده بود —
+  // معافیتِ قدیمیِ fallback خط را بازنشسته‌نشدنی کرده بود.
+  const ev = { kind: 'tool_result', tool: 'explore' }
+  check(
+    'fallback + result خود explore → پاک شود',
+    retryRetiredByEvent(live({ fallback: true }), ev) === true,
+  )
+  check(
+    'fallback + تول نستد همان برنچ → پاک شود (مدل جدید جواب داد)',
+    retryRetiredByEvent(live({ fallback: true, branch: 0 }), {
+      kind: 'tool',
+      tool: 'read',
+      sub: true,
+      branch: 0,
+    }) === true,
+  )
+  check(
+    'fallback + result ابزار دیگر → بماند',
+    retryRetiredByEvent(live({ fallback: true }), {
+      kind: 'tool_result',
+      tool: 'write_file',
+    }) === false,
+  )
 }
 
 console.log('4) بنر ایجنت اصلی (بدون agent) و نبودِ بنر → هیچ کاری:')

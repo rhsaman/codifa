@@ -308,12 +308,6 @@ fn main() {
             // until the disk fills. Owns its thread, so boot is never blocked.
             {
                 let root = state::get_data_root(app.handle());
-                // Correct any Persian keyword an EARLIER mapper wrote into an
-                // installed bundle: those words came from a category read as
-                // fact, so a bundle filed under the wrong category answered a
-                // Persian ask it has nothing to do with. Only a verbatim
-                // machine seed is remapped — a hand-typed list is left alone.
-                plugins::remap_legacy_keywords(&root);
                 // Fold the two standalone stores into bundles BEFORE any reader
                 // runs: every stored skill and connector becomes a bundle of its
                 // own, so from here on "plugin" is the only concept the rest of
@@ -356,11 +350,10 @@ fn main() {
                 if moved > 0 {
                     println!("[plugins] folded {moved} builtin skill(s) into one bundle");
                 }
-                // Recompute the library's own description and trigger phrases
-                // even when nothing moved: an earlier version filled them from
-                // whichever skill came first in the folder, so the bundle
-                // answered one topic and every other skill in it was
-                // unreachable. Idempotent, and a hand-typed list is kept.
+                // Recompute the library's own description even when nothing
+                // moved: an earlier version filled it from whichever skill came
+                // first in the folder, so the bundle described one topic while
+                // other skills lived in it. Idempotent.
                 plugins::refresh_builtin_bundle_view(&root);
                 // A shipped skill that was RENAMED would otherwise sit beside its
                 // replacement forever (the seeder only ever adds or updates), so

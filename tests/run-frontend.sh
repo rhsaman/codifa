@@ -170,6 +170,7 @@ providerModelSelect|tests/providerModelSelect.ssr.test.tsx|--jsx=automatic --pac
 toolFallbackAdd|tests/toolFallbackAdd.test.ts|--packages=external --external:electron
 settingsNoFetch|tests/settingsNoFetch.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 modelTest|tests/modelTest.test.tsx|--jsx=automatic --packages=external --external:electron
+modelTestOrder|tests/modelTestOrder.test.ts|--packages=external --external:electron
 manualContext|tests/manualContext.test.ts|--packages=external --external:electron
 gitApiError|tests/gitApiError.test.ts|--packages=external --external:electron
 reviewDiff|tests/reviewDiff.test.ts|--packages=external --external:electron

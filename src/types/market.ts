@@ -54,9 +54,6 @@ export interface PluginInfo {
   /** Shell guards declared in `hooks/hooks.json`, as `Event: command` rows.
    *  They run while the bundle itself is enabled — the switch on its card. */
   hooks?: Array<{ event: string; matcher?: string; command: string; dispatched?: boolean }>
-  /** Persian phrases the WHOLE bundle answers to (data left from earlier
-   *  installs; selection runs off descriptions, not these). */
-  fa_keywords?: string[]
   /** Repo (or folder) the bundle was installed from, when it was. */
   source?: string
   /** The install ARGUMENTS of `source`, re-runnable as-is. `source` alone is a

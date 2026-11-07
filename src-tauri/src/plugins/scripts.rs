@@ -68,11 +68,11 @@ pub(super) fn apply_scripts(root: &Path, slug: &str, body: &Value) -> Result<(),
                 }
             }
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            // PATCH, not replace: a call that only rewrites the description or
-            // the Persian keywords keeps the language and the body the script
-            // already has. Naming neither used to fall back to Rust plus the
-            // boilerplate template, so editing a Python script's description
-            // silently replaced its source with Rust code nothing could run.
+            // PATCH, not replace: a call that only rewrites the description
+            // keeps the language and the body the script already has. Naming
+            // neither used to fall back to Rust plus the boilerplate template,
+            // so editing a Python script's description silently replaced its
+            // source with Rust code nothing could run.
             let stored = read_script(root, slug, &name);
             let language = match item["language"].as_str().map(str::trim).filter(|l| !l.is_empty()) {
                 Some(raw) => script_language(raw)?,
@@ -104,31 +104,18 @@ pub(super) fn apply_scripts(root: &Path, slug: &str, body: &Value) -> Result<(),
                     .unwrap_or("")
                     .to_string(),
             };
-            // An absent field keeps the stored keywords; an explicit empty one
-            // clears them, exactly like `update_plugin` treats the bundle's own.
-            let keywords = if has_keywords(item) {
-                keywords_of(&item[KEYWORDS])
-            } else {
-                stored
-                    .as_ref()
-                    .map(|m| keywords_of(&m[KEYWORDS]))
-                    .unwrap_or_default()
-            };
             let now = now_secs();
             let created = stored
                 .as_ref()
                 .and_then(|m| m["created_at"].as_u64())
                 .unwrap_or(now);
-            let mut meta = json!({
+            let meta = json!({
                 "name": name,
                 "language": language,
                 "description": description,
                 "created_at": created,
                 "updated_at": now,
             });
-            if !keywords.is_empty() {
-                meta[KEYWORDS] = json!(keywords);
-            }
             fs::write(
                 dir.join(script_file(&language)),
                 content.trim_end().to_string() + "\n",

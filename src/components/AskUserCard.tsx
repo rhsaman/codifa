@@ -123,7 +123,14 @@ export function AskUserCard({
   }, [req?.freeText]);
 
   const answered = activity?.status === "done" || activity?.status === "error";
-  const replyText = answered ? (activity?.resultText ?? activity?.summary ?? "") : "";
+  // The backend wraps the reply as "The user answered: <text>" — an English
+  // prefix that scrambles a Persian line (bidi) and says nothing the card does
+  // not already say. Show only the reply itself.
+  const replyText = answered
+    ? (activity?.resultText ?? activity?.summary ?? "")
+        .replace(/^\s*the user answered\s*:?\s*/i, "")
+        .trim()
+    : "";
 
   const persist = (patch: Partial<AskCardReq>) => {
     if (live && chatId && req) {
@@ -278,12 +285,20 @@ export function AskUserCard({
         )
       )}
       {answered ? (
-        <div className="ask-answer">
-          <span className="ask-answer-label">{fa ? "پاسخ:" : "Answer:"}</span>{" "}
-          <span className="ask-answer-text" dir={detectDir(replyText)}>
-            {prepareContent(replyText || "—")}
-          </span>
-        </div>
+        // The answer row appears only when a reply was actually recorded. A card
+        // that closed without one (the user typed in the chat instead, or the
+        // turn moved on) used to show "پاسخ: —" — an answer slot that is
+        // empty and cannot be typed into.
+        replyText ? (
+          <div className="ask-answer" dir={detectDir(replyText)}>
+            <svg className="ask-answer-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-label={fa ? "پاسخ داده شد" : "Answered"}>
+              <path d="M20 6 9 17l-5-5" />
+            </svg>
+            <span className="ask-answer-text" dir={detectDir(replyText)}>
+              {prepareContent(replyText)}
+            </span>
+          </div>
+        ) : null
       ) : (
         <>
           <div className="ask-freetext">

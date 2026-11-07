@@ -50,7 +50,20 @@ console.log("۲) فایل untracked از status اضافه می‌شود:")
 {
   const files = buildUncommittedFiles(["new.ts"], "", "")
   check("یک فایل", files.length === 1, files.length)
-  check("دیف خالی + آمار صفر", files[0]?.diff === "" && files[0]?.adds === 0 && files[0]?.dels === 0, files[0])
+  check("بدون دیف: خالی + آمار صفر", files[0]?.diff === "" && files[0]?.adds === 0 && files[0]?.dels === 0, files[0])
+  // بک‌اند حالا untracked را در دیف unstaged به‌صورت new-file می‌فرستد.
+  const newFileDiff = [
+    "diff --git a/new.ts b/new.ts",
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/new.ts",
+    "@@ -0,0 +1,2 @@",
+    "+line1",
+    "+line2",
+  ].join("\n")
+  const files2 = buildUncommittedFiles(["new.ts"], newFileDiff, "")
+  check("با دیف new-file: آمار +2 -0", files2.length === 1 && files2[0]?.adds === 2 && files2[0]?.dels === 0, files2[0])
+  check("محتوای دیف رسیده", files2[0]?.diff.includes("+line1") === true, files2[0]?.diff)
 }
 
 console.log("۳) sumDiffStats: جمع +N -M:")

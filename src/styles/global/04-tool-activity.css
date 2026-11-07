@@ -1474,24 +1474,6 @@
   background: var(--bg);
 }
 
-/* Skill frontmatter inputs (English description + Persian fa_keywords) in the
-   New-skill and existing-skill editor panes. The inputs themselves inherit the
-   generic `.field input` well; these rules only lay the caption above each
-   input and stack the two rows. */
-.skill-meta-row {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.skill-meta-label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 11.5px;
-  color: var(--text-dim);
-}
-
 /* Settings → Auth: Google Cloud setup guide. */
 .guided-steps {
   margin: 8px 0 12px;

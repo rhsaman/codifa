@@ -1917,3 +1917,19 @@ token mid 3
     thread_local! {
         static TAILS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+
+    #[test]
+    fn tmp_read_missing_file_lists_siblings() {
+        let dir = std::env::temp_dir().join(format!("codifa-sib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stats.py"), "x=1").unwrap();
+        std::fs::write(dir.join("test_stats.py"), "t").unwrap();
+        std::fs::write(dir.join("README.md"), "r").unwrap();
+        let root = dir.to_str().unwrap().to_string();
+        let err = dispatch(&root, "read", &json!({"filePath": "stat.py"}), None).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("stats.py"), "{err}");
+        assert!(err.contains("test_stats.py"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }

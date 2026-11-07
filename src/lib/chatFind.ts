@@ -122,6 +122,15 @@ export function isBlockTag(tag: string): boolean {
 
 const SKIP_TAGS = new Set(["script", "style", "noscript", "template"]);
 
+/** Tool-call cards are chrome, not conversation: their args, output dumps and
+ *  result lists must not answer a find query (user: Ctrl+F searches the user's
+ *  and the agent's TEXT only). REJECTing a card's ROOT element skips its whole
+ *  subtree, so one selector per card kind covers every nested detail block;
+ *  the prose around them (user bubbles, assistant markdown, thinking) still
+ *  flows through. */
+const FIND_SKIP_SELECTOR =
+  ".tool-card, .tool-group, .tool-edit-group, .trace-row";
+
 /** Flatten the DOM under `root` into per-block runs of text segments. A run
  *  continues while consecutive text nodes share the same nearest block
  *  ancestor (inline wrappers — strong/em/a/code — stay inside the run); a
@@ -163,8 +172,14 @@ export function collectRuns(root: Node): FindRun[] {
     {
       acceptNode(node: Node): number {
         if (node.nodeType === 3 /* TEXT_NODE */) return 1 /* ACCEPT */;
-        const tag = ((node as Element).tagName || "").toLowerCase();
+        const el = node as Element;
+        const tag = (el.tagName || "").toLowerCase();
         if (SKIP_TAGS.has(tag)) return 2 /* REJECT — skips the subtree */;
+        // A tool-call card's root: skip the card AND everything inside it.
+        // Guarded — test stubs may carry a tagName without `matches`.
+        if (typeof el.matches === "function" && el.matches(FIND_SKIP_SELECTOR)) {
+          return 2 /* REJECT — skips the subtree */;
+        }
         if (tag === "br") return 1 /* ACCEPT — line boundary */;
         return 3 /* SKIP — visit children */;
       },

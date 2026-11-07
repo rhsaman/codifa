@@ -53,10 +53,15 @@ fn run_git(root: &str, args: &[&str]) -> Result<String, GitError> {
 }
 
 fn truncate(diff: String) -> Value {
-    if diff.len() > MAX_DIFF {
-        // Cut on a char boundary: a raw byte slice panics when MAX_DIFF lands
+    truncate_to(diff, MAX_DIFF)
+}
+
+/// Cap-aware core of `truncate` — `max = usize::MAX` never cuts.
+fn truncate_to(diff: String, max: usize) -> Value {
+    if diff.len() > max {
+        // Cut on a char boundary: a raw byte slice panics when the cap lands
         // inside a multi-byte character (e.g. '—' or Persian text).
-        let mut end = MAX_DIFF;
+        let mut end = max;
         while !diff.is_char_boundary(end) {
             end -= 1;
         }
@@ -69,16 +74,30 @@ fn truncate(diff: String) -> Value {
 /// GET /git/status?root=...
 pub fn status(root: &str) -> GitResult {
     valid_root(root)?;
-    let out = run_git(root, &["status", "--porcelain=v1", "--branch"])?;
+    // `--untracked-files=all` matches the /ws/events fingerprint: without it a
+    // fully-new directory collapses to one `?? dir/` row with no diff behind
+    // it, while its files go out individually elsewhere.
+    let out = run_git(
+        root,
+        &["status", "--porcelain=v1", "--branch", "--untracked-files=all"],
+    )?;
     let mut branch = String::new();
     let mut entries: Vec<Value> = Vec::new();
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("## ") {
             branch = rest.split("...").next().unwrap_or(rest).trim().to_string();
         } else if line.len() >= 3 {
+            // Renames report "XY old -> new"; the panel keys files by this
+            // path (the diff's b/ side), so keep only the new name instead of
+            // a ghost "old -> new" row with zero stats.
+            let raw = &line[3..];
+            let path = match raw.rsplit_once(" -> ") {
+                Some((_, new)) => new,
+                None => raw,
+            };
             entries.push(json!({
                 "xy": &line[..2],
-                "path": &line[3..],
+                "path": path,
                 "st": &line[..1],
                 "wt": &line[1..2],
             }));
@@ -89,6 +108,17 @@ pub fn status(root: &str) -> GitResult {
 
 /// GET /git/diff?root=...&path=...&staged=true|false
 pub fn diff(root: &str, path: &str, staged: bool) -> GitResult {
+    diff_capped(root, path, staged, MAX_DIFF)
+}
+
+/// Same fetch with the byte cap lifted — the Review panel renders EVERY
+/// changed file, and a capped aggregate strands the alphabetically-late tail
+/// files as +0 -0 ghosts with "no diff available yet".
+pub fn diff_full(root: &str, path: &str, staged: bool) -> GitResult {
+    diff_capped(root, path, staged, usize::MAX)
+}
+
+fn diff_capped(root: &str, path: &str, staged: bool, max: usize) -> GitResult {
     valid_root(root)?;
     let mut args: Vec<&str> = vec!["diff", "--no-color"];
     if staged {
@@ -98,7 +128,63 @@ pub fn diff(root: &str, path: &str, staged: bool) -> GitResult {
         args.push("--");
         args.push(path);
     }
-    Ok(truncate(run_git(root, &args)?))
+    let mut diff = run_git(root, &args)?;
+    // Untracked files live only in `git status` — no `git diff` variant shows
+    // them, so the Review panel used to list them as +0 -0 ghosts. Append each
+    // one as a new-file diff vs /dev/null (the staged view keeps excluding
+    // them: nothing about an untracked file is in the index).
+    if !staged {
+        let mut untracked = untracked_paths(root);
+        if !path.is_empty() {
+            let dir = format!("{path}/");
+            untracked.retain(|p| p == path || p.starts_with(&dir));
+        }
+        for p in untracked.into_iter().take(MAX_UNTRACKED_DIFFS) {
+            let d = untracked_file_diff(root, &p);
+            if d.is_empty() {
+                continue;
+            }
+            if !diff.is_empty() && !diff.ends_with('\n') {
+                diff.push('\n');
+            }
+            diff.push_str(&d);
+        }
+    }
+    Ok(truncate_to(diff, max))
+}
+
+/// Cap the per-file `git diff --no-index` spawns for untracked files —
+/// thousands of dropped files must not turn a panel refresh into minutes.
+const MAX_UNTRACKED_DIFFS: usize = 100;
+
+/// Untracked + unignored paths relative to `root`. These never appear in any
+/// `git diff`, so they have to be listed separately.
+fn untracked_paths(root: &str) -> Vec<String> {
+    run_git(root, &["ls-files", "--others", "--exclude-standard", "-z"])
+        .map(|out| {
+            out.split('\0')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// New-file unified diff of one untracked path vs /dev/null. `git diff
+/// --no-index` exits 1 on differences — that is the success case here; any
+/// other outcome (spawn failure, file deleted between the listing and the
+/// diff) folds into an empty string instead of failing the whole response.
+fn untracked_file_diff(root: &str, path: &str) -> String {
+    match Command::new("git")
+        .args(["diff", "--no-index", "--no-color", "--", "/dev/null", path])
+        .current_dir(root)
+        .output()
+    {
+        Ok(out) if out.status.code() == Some(1) => {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// GET /git/log?root=...&limit=20
@@ -130,6 +216,17 @@ pub fn log(root: &str, limit: u32) -> GitResult {
 
 /// GET /git/show?root=...&rev=HEAD&path=...
 pub fn show(root: &str, rev: &str, path: &str) -> GitResult {
+    show_capped(root, rev, path, MAX_DIFF)
+}
+
+/// Same fetch with the byte cap lifted — the committed view of the Review
+/// panel renders every file of the commit, and a capped one strands the tail
+/// files as +0 -0 ghosts.
+pub fn show_full(root: &str, rev: &str, path: &str) -> GitResult {
+    show_capped(root, rev, path, usize::MAX)
+}
+
+fn show_capped(root: &str, rev: &str, path: &str, max: usize) -> GitResult {
     valid_root(root)?;
     if rev.starts_with('-') {
         return Err(err("invalid revision"));
@@ -139,7 +236,7 @@ pub fn show(root: &str, rev: &str, path: &str) -> GitResult {
         args.push("--");
         args.push(path);
     }
-    Ok(truncate(run_git(root, &args)?))
+    Ok(truncate_to(run_git(root, &args)?, max))
 }
 
 /// Stage every change (`git add -A`). Used by /git/autocommit, which needs the

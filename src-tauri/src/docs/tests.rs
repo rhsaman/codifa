@@ -51,6 +51,21 @@
             format: "text".into(),
             sheet: String::new(),
             pages: String::new(),
+            max_chars: 0,
         });
         assert!(out["error"].is_string());
+    }
+
+    #[test]
+    fn text_read_truncates_at_the_cap_and_honors_a_bigger_one() {
+        let path = std::env::temp_dir().join(format!("codifa-doc-cap-{}.md", std::process::id()));
+        std::fs::write(&path, "x".repeat(50)).unwrap();
+        // Small cap: cut with the marker, like the agent's 24k default.
+        let capped = read_text_file(&path, 10).unwrap();
+        assert!(capped.ends_with("[truncated at 10 chars]"));
+        // Cap >= the char count: the whole file comes back, marker-free —
+        // what the viewer relies on for long READMEs.
+        let full = read_text_file(&path, 50).unwrap();
+        assert_eq!(full, "x".repeat(50));
+        std::fs::remove_file(&path).ok();
     }

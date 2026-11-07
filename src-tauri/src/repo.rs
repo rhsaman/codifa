@@ -932,23 +932,10 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
         .filter(|n| !n.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| repo.repo_name());
-    // The bundle's own Persian trigger travels with the install: it is what
-    // makes a plugin whose skills carry no keywords findable from a Persian
-    // request. Accepts the array form and a hand-written comma-separated string.
-    let keywords = match &manifest["fa_keywords"] {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::String(s) => s.clone(),
-        _ => String::new(),
-    };
     Ok(json!({
         "name": name,
         "description": manifest["description"].as_str().unwrap_or(""),
         "version": manifest["version"].as_str().unwrap_or(""),
-        "fa_keywords": crate::skills::split_fa_keywords(&keywords),
         "source": repo.describe(),
         "manifest": manifest_path,
         "skills": skills,
@@ -1273,7 +1260,7 @@ fn read_command_at(repo: &Repo, path: &str) -> Result<Value, String> {
     } else {
         declared
     };
-    let (_, _, description, _) = crate::skills::parse_frontmatter_pub(&raw);
+    let (_, _, description) = crate::skills::parse_frontmatter_pub(&raw);
     Ok(json!({
         // `kind` is what turns a stored skill row into a SLASH COMMAND: the
         // command palette and the router read the same store, and this field is
@@ -1292,7 +1279,7 @@ fn read_command_at(repo: &Repo, path: &str) -> Result<Value, String> {
 
 fn read_skill_at(repo: &Repo, path: &str) -> Result<Value, String> {
     let raw = repo.read(path)?;
-    let (mut name, _slug, description, fa_keywords) =
+    let (mut name, _slug, description) =
         crate::skills::parse_frontmatter_pub(&raw);
     let dir = parent(path);
     if name.trim().is_empty() {
@@ -1336,7 +1323,6 @@ fn read_skill_at(repo: &Repo, path: &str) -> Result<Value, String> {
     Ok(json!({
         "name": name,
         "description": description,
-        "fa_keywords": fa_keywords.join(", "),
         "content": crate::skills::strip_frontmatter_pub(&raw).trim().to_string(),
         "extra_files": Value::Object(extra),
         "path": path,

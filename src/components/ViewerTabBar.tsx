@@ -20,9 +20,9 @@ import { FileIcon } from "./FileIcon";
 import { fmtAgo } from "../lib/time";
 import { unseenRunCount } from "../lib/schedule-notify";
 import { useScheduleRunsLive } from "../lib/scheduleRunsLive";
-import { gitDiff, gitStatus } from "../lib/api";
-import { buildUncommittedFiles } from "../lib/uncommitted";
+import { gitStatus } from "../lib/api";
 import { splitWorkspaceFiles } from "../lib/fileTree";
+import { onGitChange } from "../lib/liveEvents";
 
 /** Width (px) of the tab-list dropdown, mirrored from `.tab-list-menu`. */
 const TAB_LIST_MENU_WIDTH = 410;
@@ -593,9 +593,13 @@ export function ViewerAddButton() {
   );
 }
 
-/** Changed-files count for the ACTIVE chat's workspace, polled lightly
- *  (5s + window focus) with the same counting rule as the review panel —
- *  feeds the badge on the dock's git icon. Returns 0 outside a repo. */
+/** Changed-files count for the ACTIVE chat's workspace: the `git status`
+ *  paths inside the workspace (every diff path also sits in status, so this
+ *  matches the review panel's list), updated LIVE from the /ws/events change
+ *  push — its `files` come from the very same status command, so the event
+ *  payload alone recounts with zero extra git round-trips — with a 5s poll +
+ *  window focus as the dead-socket fallback. Feeds the badge on the dock's
+ *  git icon. Returns 0 outside a repo. */
 function useUncommittedCount(root: string | null): number {
   const [count, setCount] = useState(0);
   useEffect(() => {
@@ -606,17 +610,14 @@ function useUncommittedCount(root: string | null): number {
     let cancelled = false;
     const load = async () => {
       try {
-        const [st, unstaged, staged] = await Promise.all([
-          gitStatus(root),
-          gitDiff(root),
-          gitDiff(root, "", true),
-        ]);
+        const st = await gitStatus(root);
         if (cancelled) return;
+        // The badge only counts files — and every diff path also shows up in
+        // status, so the status paths alone count exactly the same set.
+        // Skipping the diff keeps each poll to one light fetch instead of
+        // three, and can never be skewed by the diff byte cap.
         const paths = "error" in st ? [] : st.entries.map((e) => e.path);
-        const unstagedDiff = "error" in unstaged ? "" : unstaged.diff;
-        const stagedDiff = "error" in staged ? "" : staged.diff;
-        const list = buildUncommittedFiles(paths, unstagedDiff, stagedDiff);
-        setCount(splitWorkspaceFiles(list, root).inside.length);
+        setCount(splitWorkspaceFiles(paths.map((path) => ({ path })), root).inside.length);
       } catch {
         /* Git errors keep the badge empty — non-critical. */
       }
@@ -625,10 +626,17 @@ function useUncommittedCount(root: string | null): number {
     const timer = setInterval(() => void load(), 5000);
     const onFocus = () => void load();
     window.addEventListener("focus", onFocus);
+    // Live: the backend pushes the status paths the moment they move (1.5s
+    // beat, shared with the review panel) — recount from the payload directly.
+    const offChange = onGitChange(root, (evRoot, files) => {
+      if (cancelled || evRoot !== root) return;
+      setCount(splitWorkspaceFiles(files.map((path) => ({ path })), root).inside.length);
+    });
     return () => {
       cancelled = true;
       clearInterval(timer);
       window.removeEventListener("focus", onFocus);
+      offChange();
     };
   }, [root]);
   return count;

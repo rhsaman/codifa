@@ -126,7 +126,7 @@ fn strip_frontmatter(raw: &str) -> String {
 /// Public wrappers for the repo reader (`repo.rs`): a skill fetched from a git
 /// repo must follow the SAME frontmatter rules as a stored one, so the parser
 /// and the stripper live only here.
-pub fn parse_frontmatter_pub(raw: &str) -> (String, String, String, Vec<String>) {
+pub fn parse_frontmatter_pub(raw: &str) -> (String, String, String) {
     parse_frontmatter(raw)
 }
 
@@ -202,58 +202,12 @@ pub fn expand_command_args(body: &str, args: &str) -> String {
     out
 }
 
-/// Fold a Persian/Arabic phrase for COMPARISON only.
-///
-/// Matching raw bytes failed on the spelling differences that are invisible to
-/// the user: the Arabic yeh/kaf (`ي`, `ك`) against the Persian ones (`ی`, `ک`),
-/// the zero-width non-joiner inside compound words, the Arabic diacritics and
-/// the Arabic-Indic digits. Folding BOTH sides through this before comparing is
-/// what makes a Persian keyword find the skill the user typed it into.
-/// The stored text is never rewritten — only the key used for matching.
-pub fn fold_fa(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        let c = match c {
-            'ي' | 'ی' | 'ى' => 'ی',
-            'ك' | 'ک' => 'ک',
-            'أ' | 'إ' | 'آ' | 'ٱ' | 'ا' => 'ا',
-            'ؤ' => 'و',
-            'ئ' => 'ی',
-            'ة' => 'ه',
-            // Zero-width and directional marks carry no sound: a keyword typed
-            // with a ZWNJ and the same one typed with a space must match.
-            '\u{200c}' | '\u{200d}' | '\u{200e}' | '\u{200f}' | '\u{0640}' => continue,
-            '\u{064b}'..='\u{0652}' | '\u{0670}' => continue,
-            '۰'..='۹' => char::from_u32(c as u32 - '۰' as u32 + '0' as u32).unwrap_or(c),
-            _ => c,
-        };
-        for lc in c.to_lowercase() {
-            out.push(lc);
-        }
-    }
-    out
-}
-
-/// Split a `fa_keywords` field into its phrases.
-///
-/// Shared by the skill frontmatter parser and the plugin manifest reader so both
-/// stores accept the same syntax: the ASCII comma, the Persian comma (U+060C)
-/// and a YAML-style `- item` entry. Deduped on the folded form, first wins.
-pub fn split_fa_keywords(raw: &str) -> Vec<String> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    raw.split([',', '،'])
-        .map(|k| k.trim().trim_start_matches('-').trim().to_string())
-        .filter(|k| !k.is_empty() && seen.insert(fold_fa(k)))
-        .collect()
-}
-
 /// Fold YAML block scalars onto their key's own line.
 ///
 /// The reader below is a line-oriented `key: value` splitter, so a `skill.md`
-/// written in the usual style — `description: >` followed by indented text, or
-/// `fa_keywords:` followed by `- item` lines — used to store the literal `>` as
-/// its description and throw the text away. Folding first keeps the splitter
-/// simple and makes those files readable.
+/// written in the usual style — `description: >` followed by indented text —
+/// used to store the literal `>` as its description and throw the text away.
+/// Folding first keeps the splitter simple and makes those files readable.
 fn fold_block_scalars(block: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     // The key line being built, plus what separates the next folded line.
@@ -280,10 +234,6 @@ fn fold_block_scalars(block: &str) -> String {
                         open = Some((format!("{key}:"), " "));
                         continue;
                     }
-                    "" if key.eq_ignore_ascii_case("fa_keywords") => {
-                        open = Some((format!("{key}:"), ","));
-                        continue;
-                    }
                     _ => {}
                 }
             }
@@ -296,12 +246,13 @@ fn fold_block_scalars(block: &str) -> String {
     out.join("\n")
 }
 
-/// Parse `name`, `slug`, `description`, `fa_keywords` from skill.md frontmatter.
-fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {
+/// Parse `name`, `slug`, `description` from skill.md frontmatter. Any other
+/// key — including a `fa_keywords:` line left over in files written by older
+/// builds — is silently ignored.
+fn parse_frontmatter(raw: &str) -> (String, String, String) {
     let mut name = String::new();
     let mut slug = String::new();
     let mut description = String::new();
-    let mut fa_keywords: Vec<String> = Vec::new();
     if let Some(rest) = raw.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
             for line in fold_block_scalars(&rest[..end]).lines() {
@@ -313,11 +264,6 @@ fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {
                     "name" => name = val,
                     "slug" => slug = val,
                     "description" => description = val,
-                    // Split on the ASCII comma AND the Persian one (U+060C):
-                    // a list typed as `فیلم، سریال` used to collapse into a
-                    // single garbled keyword that could never match a real
-                    // request. A YAML-style `- item` entry is tolerated too.
-                    "fa_keywords" => fa_keywords = split_fa_keywords(&val),
                     _ => {}
                 }
             }
@@ -340,7 +286,7 @@ fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {
     if slug.is_empty() && !name.is_empty() {
         slug = raw_slug(&name);
     }
-    (name, slug, description, fa_keywords)
+    (name, slug, description)
 }
 
 /// Locate a skill folder by name or slug (mirror of _find_skill_dir).
@@ -372,7 +318,7 @@ fn find_skill_dir(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
             continue;
         }
         if let Ok(raw) = fs::read_to_string(&md) {
-            let (name, _, _, _) = parse_frontmatter(&raw);
+            let (name, _, _) = parse_frontmatter(&raw);
             if name.trim() == q {
                 return Some(p);
             }
@@ -439,7 +385,7 @@ pub fn list_skills(root: &Path) -> Value {
         let Ok(raw) = fs::read_to_string(&md) else {
             continue;
         };
-        let (name, slug, description, fa_keywords) = parse_frontmatter(&raw);
+        let (name, slug, description) = parse_frontmatter(&raw);
         if name.is_empty() {
             continue;
         }
@@ -475,7 +421,6 @@ pub fn list_skills(root: &Path) -> Value {
             "description": description,
             "path": md.to_string_lossy(),
             "content": content,
-            "fa_keywords": fa_keywords,
             "files": files,
         }));
     }
@@ -544,28 +489,6 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     // known once the folder is resolved. Validating here is what made
     // `create_skill` reject a delete or an extra-file-only save.
     let mut description = body["description"].as_str().unwrap_or("").trim().to_string();
-    let mut fa_keywords: Vec<String> = match &body["fa_keywords"] {
-        // Split on the ASCII comma AND the Persian one (U+060C), exactly like
-        // `parse_frontmatter` reads them. Splitting only on the ASCII comma
-        // meant a caller that wrote `فیلم، سریال` (the natural way to type a
-        // Persian list, and what the `create_skill` schema asks for) produced
-        // ONE keyword containing a comma instead of two — the file happened to
-        // round-trip because the reader is more permissive, but the in-memory
-        // value was wrong for the empty-check and the dedupe below.
-        Value::String(s) => s
-            .split([',', '،'])
-            .map(|k| k.trim().trim_start_matches('-').trim().to_string())
-            .filter(|k| !k.is_empty())
-            .collect(),
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|v| v.as_str())
-            .flat_map(|k| k.split([',', '،']))
-            .map(|k| k.trim().trim_start_matches('-').trim().to_string())
-            .filter(|k| !k.is_empty())
-            .collect(),
-        _ => Vec::new(),
-    };
     let slug = skill_slug(&name);
 
     // Renaming: move the previous folder so extra files survive.
@@ -593,21 +516,14 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
 
     // PRESERVE an omitted field instead of erasing it. The editor's draft body
     // carries no frontmatter, so a save used to arrive with an empty
-    // `description` and no `fa_keywords` at all — `sync_skill` then rewrote the
-    // file with `description:` blank and DROPPED the `fa_keywords:` line, so the
-    // skill lost its catalog description and became unfindable from Persian
-    // (the reported "fa_keywords/description get wiped on save" bug).
-    // An ABSENT value means "keep what the file already has"; an explicitly
-    // empty one means the caller wants the keywords gone — that is the only way
-    // the Settings editor can remove a keyword, since it always sends the field
-    // it shows. A call that carries no `fa_keywords` at all still preserves it.
+    // `description` and `sync_skill` rewrote the file with `description:` blank
+    // — the skill lost its catalog description and the model could no longer
+    // match a request to it (the reported "description gets wiped on save" bug).
+    // An ABSENT value means "keep what the file already has".
     let existing_raw = fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
-    let (existing_name, _, existing_desc, existing_fa) = parse_frontmatter(&existing_raw);
+    let (existing_name, _, existing_desc) = parse_frontmatter(&existing_raw);
     if description.is_empty() {
         description = existing_desc;
-    }
-    if !body.get("fa_keywords").is_some_and(|v| !v.is_null()) {
-        fa_keywords = existing_fa;
     }
     // The heading stack an OLDER save left behind: this writer used to prepend
     // `# {name}` on every write while the Settings editor sends the whole stored
@@ -637,20 +553,9 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     }
     // A body that strips down to NOTHING but was not empty to begin with was
     // only its own (stacked) name heading; the write below keeps exactly one.
-    // Dedupe case-insensitively, keeping the author's order: a repeated phrase
-    // only bloats the catalog line the model has to read.
-    {
-        let mut seen_kw: std::collections::HashSet<String> = std::collections::HashSet::new();
-        fa_keywords.retain(|k| seen_kw.insert(k.to_lowercase()));
-    }
-
     let mut markdown = format!(
-        "---\nname: {name}\ndescription: {description}\n"
+        "---\nname: {name}\ndescription: {description}\n---\n\n"
     );
-    if !fa_keywords.is_empty() {
-        markdown.push_str(&format!("fa_keywords: {}\n", fa_keywords.join(", ")));
-    }
-    markdown.push_str("---\n\n");
     if starts_with_h1(&content) {
         // The body opens with its own title — the standard SKILL.md shape a
         // marketplace ships and a model writes. That heading IS the file's one
@@ -707,10 +612,6 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
         "note": "saved",
         "files": files,
         "renamed_from": renamed_from,
-        // An empty keyword list leaves the catalog line English-only, so a
-        // Persian request has no trigger to find the skill by: the callers
-        // surface this instead of pretending everything is fine.
-        "fa_keyword_count": fa_keywords.len(),
     }))
 }
 
@@ -877,11 +778,8 @@ fn rewrite_skill_file(md: &Path, next: &str, current: &str) -> bool {
 }
 
 /// Stable 16-hex fingerprint of a skill's shipped form.
-fn fingerprint(description: &str, body: &str, fa_keywords: &[String]) -> String {
-    let mut sorted: Vec<String> = fa_keywords.iter().map(|k| k.trim().to_string()).collect();
-    sorted.retain(|k| !k.is_empty());
-    sorted.sort();
-    let joined = format!("{}\u{1}{}\u{1}{}", norm_ws(description), norm_ws(body), sorted.join("\u{1}"));
+fn fingerprint(description: &str, body: &str) -> String {
+    let joined = format!("{}\u{1}{}", norm_ws(description), norm_ws(body));
     sha1_hex(joined.as_bytes())[..16].to_string()
 }
 
@@ -1008,9 +906,9 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
     };
     let existing = json!({ "skills": crate::plugins::all_plugin_skills(root) });
     let rows = existing["skills"].as_array().cloned().unwrap_or_default();
-    // Map name/slug -> (description, body, fa_keywords) so a shipped change to
-    // any of the three triggers a re-sync below.
-    let mut meta: std::collections::HashMap<String, (String, String, Vec<String>)> =
+    // Map name/slug -> (description, body) so a shipped change to either
+    // triggers a re-sync below.
+    let mut meta: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     for s in &rows {
         let entry = (
@@ -1019,19 +917,6 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
                 s["content"].as_str().unwrap_or(""),
                 s["name"].as_str().unwrap_or(""),
             )),
-            s["fa_keywords"]
-                .as_array()
-                .map(|a| {
-                    let mut v: Vec<String> = a
-                        .iter()
-                        .filter_map(|k| k.as_str())
-                        .map(|k| k.trim().to_string())
-                        .filter(|k| !k.is_empty())
-                        .collect();
-                    v.sort();
-                    v
-                })
-                .unwrap_or_default(),
         );
         for key in [s["name"].as_str(), s["slug"].as_str()].into_iter().flatten() {
             if !key.is_empty() {
@@ -1051,7 +936,7 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let (name, slug, description, fa_keywords) = parse_frontmatter(&raw);
+        let (name, slug, description) = parse_frontmatter(&raw);
         if name.is_empty() {
             continue;
         }
@@ -1067,14 +952,8 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
         // stored body never matches the shipped one (which made every startup
         // re-seed every built-in).
         let body = strip_heading(&body, &name);
-        let mut sorted_fa = fa_keywords.clone();
-        sorted_fa.sort();
-        let shipped = (
-            norm_ws(&description),
-            norm_ws(&body),
-            sorted_fa,
-        );
-        let shipped_fp = fingerprint(&description, &body, &fa_keywords);
+        let shipped = (norm_ws(&description), norm_ws(&body));
+        let shipped_fp = fingerprint(&description, &body);
 
         // Three cases, in order:
         // 1. no stored copy            -> seed it
@@ -1135,7 +1014,6 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
             "name": name,
             "description": description,
             "content": body,
-            "fa_keywords": fa_keywords,
         });
         if crate::plugins::save_skill_into_bundle(
             root,
@@ -1186,15 +1064,20 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_parses_like_python() {
+    fn frontmatter_parses_like_python_and_ignores_legacy_fa() {
         let raw = "---\nname: Test\nslug: test\ndescription: d\nfa_keywords: a, b\n---\n\n# Test\nbody";
-        let (name, slug, desc, fa) = parse_frontmatter(raw);
+        let (name, slug, desc) = parse_frontmatter(raw);
         assert_eq!(name, "Test");
         assert_eq!(slug, "test");
         assert_eq!(desc, "d");
-        assert_eq!(fa, vec!["a", "b"]);
+        // A `fa_keywords:` line left over from an older build is an unknown key:
+        // silently ignored, never an error.
+        assert!(
+            parse_frontmatter(raw).0 == "Test",
+            "the legacy key must not break parsing"
+        );
         // Heading fallback when frontmatter is absent.
-        let (name2, _, _, _) = parse_frontmatter("# Only heading\nbody");
+        let (name2, _, _) = parse_frontmatter("# Only heading\nbody");
         assert_eq!(name2, "Only heading");
     }
 
@@ -1432,7 +1315,7 @@ mod tests {
         for (file, name) in [("movie-finder", "Movie Finder"), ("brainstorming", "Brainstorming")] {
             fs::write(
                 shipped.join(format!("{file}.md")),
-                format!("---\nname: {name}\ndescription: does {name}\nfa_keywords: کلمه\n---\n\n# {name}\nbody\n"),
+                format!("---\nname: {name}\ndescription: does {name}\n---\n\n# {name}\nbody\n"),
             )
             .unwrap();
         }
@@ -1445,10 +1328,10 @@ mod tests {
         let bundle = &bundles[0];
         assert_eq!(bundle["slug"], crate::plugins::builtin_bundle_slug());
         assert_eq!(bundle["skills"].as_array().unwrap().len(), 2);
-        // The card renders the bundle's own description and trigger, so the fold
-        // has to lift them up from the skills it holds.
+        // The card renders the bundle's own description, so the fold
+        // has to lift it up from the skills it holds.
         assert!(!bundle["description"].as_str().unwrap_or("").is_empty());
-        assert!(!bundle["fa_keywords"].as_array().unwrap().is_empty());
+        assert!(bundle.get("fa_keywords").is_none());
 
         // Both are still reachable: the catalog reads the bundle's skills.
         let listed = catalog(&store);
@@ -1513,7 +1396,7 @@ mod tests {
         fs::create_dir_all(&shipped).unwrap();
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم\n---\n\n# Movie Finder\nbody\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n",
         )
         .unwrap();
         seed_builtin_skills(&store, &shipped);
@@ -1553,7 +1436,7 @@ mod tests {
         fs::create_dir_all(&shipped).unwrap();
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nbody\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n",
         )
         .unwrap();
 
@@ -1562,7 +1445,7 @@ mod tests {
         assert_eq!(first, vec!["Movie Finder".to_string()]);
         let listed = catalog(&store);
         assert_eq!(listed["skills"][0]["name"], "Movie Finder");
-        assert_eq!(listed["skills"][0]["fa_keywords"][0], "film");
+        assert!(listed["skills"][0].get("fa_keywords").is_none());
 
         // Second run is a no-op: the stored copy already matches the shipped one.
         assert!(seed_builtin_skills(&store, &shipped).is_empty());
@@ -1570,7 +1453,7 @@ mod tests {
         // A shipped body change re-syncs the built-in.
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nUPDATED\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nUPDATED\n",
         )
         .unwrap();
         assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
@@ -1594,7 +1477,7 @@ mod tests {
         fs::create_dir_all(&shipped).unwrap();
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nbody\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n",
         )
         .unwrap();
 
@@ -1607,7 +1490,6 @@ mod tests {
                 "name": "Movie Finder",
                 "description": "my own movies helper",
                 "content": "MY OWN BODY",
-                "fa_keywords": "فیلم, سینما",
             }),
         )
         .expect("user edit saves");
@@ -1623,7 +1505,7 @@ mod tests {
         // their edit wins over an upstream rewrite.
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nUPDATED SHIPPED\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nUPDATED SHIPPED\n",
         )
         .unwrap();
         assert!(
@@ -1648,7 +1530,7 @@ mod tests {
         fs::create_dir_all(&shipped).unwrap();
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nbody\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n",
         )
         .unwrap();
         assert_eq!(seed_builtin_skills(&store, &shipped).len(), 1);
@@ -1656,7 +1538,7 @@ mod tests {
 
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nv2\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nv2\n",
         )
         .unwrap();
         assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
@@ -1676,7 +1558,7 @@ mod tests {
         fs::create_dir_all(&shipped).unwrap();
         fs::write(
             shipped.join("movie-finder.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film\n---\n\n# Movie Finder\nbody\n",
+            "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n",
         )
         .unwrap();
         let store = tmp.join("store");
@@ -1700,7 +1582,6 @@ mod tests {
                 "name": "Has Folder",
                 "description": "d",
                 "content": "c",
-                "fa_keywords": "folder",
             }),
         )
         .expect("write");
@@ -1727,7 +1608,6 @@ mod tests {
                 "name": "Old Name",
                 "description": "d",
                 "content": "c",
-                "fa_keywords": "old",
                 "extra_files": { "keep.txt": "kept", "drop.txt": "gone" },
             }),
         )
@@ -1740,7 +1620,6 @@ mod tests {
                 "previous_name": "Old Name",
                 "description": "d",
                 "content": "c2",
-                "fa_keywords": "new",
                 "files": { "added.txt": "added" },
                 "deletedFiles": ["drop.txt"],
             }),
@@ -1770,38 +1649,23 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// `sync_skill` reports the keyword count so callers can warn about a skill
-    /// that holds no Persian trigger for a request to be found by.
+    /// The sync reply no longer reports a keyword count: skills are matched on
+    /// their description, so there is nothing to count.
     #[test]
-    fn sync_skill_reports_the_keyword_count() {
+    fn sync_skill_reply_has_no_keyword_count() {
         let tmp = std::env::temp_dir().join(format!("codifa-kwcount-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let store = tmp.join("store");
-        let with = sync_skill(
+        let reply = sync_skill(
             &store,
             &json!({
                 "name": "With Kws",
                 "description": "d",
                 "content": "c",
-                "fa_keywords": "فیلم، سریال",
             }),
         )
         .expect("write");
-        // The Persian comma must split into TWO keywords, not one.
-        assert_eq!(with["fa_keyword_count"], 2);
-
-        // An empty list on a NEW skill really is zero.
-        let without = sync_skill(
-            &store,
-            &json!({
-                "name": "No Kws",
-                "description": "d",
-                "content": "c",
-                "fa_keywords": "",
-            }),
-        )
-        .expect("write");
-        assert_eq!(without["fa_keyword_count"], 0);
+        assert!(reply.get("fa_keyword_count").is_none(), "{reply}");
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1814,7 +1678,7 @@ mod tests {
         let store = tmp.join("store");
         let shipped = tmp.join("shipped");
         fs::create_dir_all(&shipped).unwrap();
-        let shipped_md = "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film\n---\n\n# Movie Finder\nbody\n";
+        let shipped_md = "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n";
         fs::write(shipped.join("movie-finder.md"), shipped_md).unwrap();
 
         // Seed once, then pretend the marker was lost (old build wrote the file).
@@ -1849,7 +1713,7 @@ mod tests {
         let store = tmp.join("store");
         let shipped = tmp.join("shipped");
         fs::create_dir_all(&shipped).unwrap();
-        let shipped_md = "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film\n---\n\n# Movie Finder\nbody\n";
+        let shipped_md = "---\nname: Movie Finder\ndescription: find movies\n---\n\n# Movie Finder\nbody\n";
         fs::write(shipped.join("movie-finder.md"), shipped_md).unwrap();
         seed_builtin_skills(&store, &shipped);
 

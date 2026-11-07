@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ProviderConfig } from "../types";
+import type { CheckedModel, ProviderConfig } from "../types";
 import { providerDisplayName } from "../lib/provider-meta";
 import { MAX_PINNED_RECENT_MODELS, sortRecentModels, useStore } from "../lib/store";
 import { resolveSlotEntry } from "../lib/toolSlots";
 import { ModelTestButton, PinIcon, RemoveIcon, TestBoltIcon } from "./ModelTestButton";
 import { ProviderTestButton } from "./ProviderTestButton";
 import { RecentTestButton } from "./RecentTestButton";
+import type { ModelTestEntry } from "../lib/useModelTests";
 import { useModelTests } from "../lib/useModelTests";
 
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
@@ -124,6 +125,43 @@ interface GroupedEntry {
   models: string[];
 }
 
+/** مرتب‌سازی تب «Checked»: جدیدترین تست‌ها بالا — هم مدل‌های درون هر گروه و
+ *  هم خود گروه‌های پروایدر. زمان مرجع هر مدل آخرین زمانِ پاس‌شدنِ واقعی‌اش
+ *  است: برای ✓ زنده، مُهر okAt که استور تست در لحظهٔ نتیجه ثبت کرده (نه
+ *  Date.nowِ رندر، که همهٔ تست‌شده‌های همزمان را گره می‌زند و مرتب‌سازی را
+ *  بی‌اثر می‌کند) و برای بقیه lastOkAt ماندگار. ورودی fail زنده و مدلی که
+ *  نه ✓ زنده دارد نه در لیست ماندگار است، نمایش داده نمی‌شود.
+ *  تابع خالص است تا خارج از React هم قابل تست باشد. */
+export function orderCheckedModels(
+  providers: ProviderConfig[],
+  checkedModels: CheckedModel[],
+  getStatus: (cfg: ProviderConfig, model: string) => ModelTestEntry,
+): GroupedEntry[] {
+  const checkedKeys = new Set(checkedModels.map((c) => `${c.providerId}/${c.model}`));
+  const at = new Map(checkedModels.map((c) => [`${c.providerId}/${c.model}`, c.lastOkAt]));
+  const out: Array<{ p: ProviderConfig; models: string[]; newest: number }> = [];
+  for (const p of providers) {
+    const picked: Array<{ m: string; at: number }> = [];
+    for (const m of allModels(p)) {
+      const live = getStatus(p, m);
+      if (live.status === "fail") continue;
+      if (live.status !== "ok" && !checkedKeys.has(`${p.id}/${m}`)) continue;
+      picked.push({
+        m,
+        at:
+          live.status === "ok"
+            ? live.okAt ?? at.get(`${p.id}/${m}`) ?? Date.now()
+            : at.get(`${p.id}/${m}`) ?? 0,
+      });
+    }
+    if (picked.length === 0) continue;
+    picked.sort((a, b) => b.at - a.at);
+    out.push({ p, models: picked.map((x) => x.m), newest: picked[0].at });
+  }
+  out.sort((a, b) => b.newest - a.newest);
+  return out.map(({ p, models }) => ({ p, models }));
+}
+
 /** Centered model-picker MODAL shown in the composer AND in Settings → Tools
  *  (the same component, controlled or not). Clicking the trigger opens a
  *  dialog in the middle of the screen: a left-hand tab rail lists "Recent",
@@ -226,43 +264,21 @@ export function ProviderModelSelect(props?: {
   // پر می‌کند). نتیجهٔ
   // fail زنده همیشه بیرون می‌ماند حتی اگر در لیست ذخیره باشد تا در همان
   // تیک، افکت سینک آن را از لیست هم حذف کند.
-  const checkedKeys = useMemo(
-    () => new Set(checkedModels.map((c) => `${c.providerId}/${c.model}`)),
-    [checkedModels],
-  );
   // تب «Checked»: مدل‌های تیک‌دار = نتیجهٔ ✓ زندهٔ این نشست + لیست ماندگار
   // checkedModels (بعد از ری‌استارت وضعیت زنده idle است و همین لیست تب را
   // پر می‌کند). نتیجهٔ fail زنده همیشه بیرون می‌ماند حتی اگر در لیست ذخیره
-  // باشد تا در همان تیک، افکت سینک آن را از لیست هم حذف کند.
-  // مرتب‌سازی: جدیدترین تست‌ها بالا — زمان مرجع هر مدل lastOkAt ماندگار است
-  // و مدل با ✓ زندهٔ همین لحظه newest حساب می‌شود تا ترتیب بلافاصله جابه‌جا
-  // شود (merge effect هم همان لحظه را در استور می‌نویسد). خود گروه‌های
-  // پروایدر هم بر اساس تازه‌ترین ✓شان از بالا به پایین می‌روند.
-  const checkedGroups = useMemo<GroupedEntry[]>(() => {
-    const at = new Map(checkedModels.map((c) => [`${c.providerId}/${c.model}`, c.lastOkAt]));
-    const out: Array<{ p: ProviderConfig; models: string[]; newest: number }> = [];
-    for (const p of providers) {
-      const picked: Array<{ m: string; at: number }> = [];
-      for (const m of allModels(p)) {
-        const st = getStatus(p, m).status;
-        if (st === "fail") continue;
-        if (st !== "ok" && !checkedKeys.has(`${p.id}/${m}`)) continue;
-        picked.push({
-          m,
-          at: st === "ok" ? Date.now() : at.get(`${p.id}/${m}`) ?? 0,
-        });
-      }
-      if (picked.length === 0) continue;
-      picked.sort((a, b) => b.at - a.at);
-      out.push({ p, models: picked.map((x) => x.m), newest: picked[0].at });
-    }
-    out.sort((a, b) => b.newest - a.newest);
-    return out.map(({ p, models }) => ({ p, models }));
-  }, [providers, getStatus, checkedKeys, checkedModels]);
+  // باشد تا در همان تیک، افکت سینک آن را از لیست هم حذف کند. فیلتر و
+  // مرتب‌سازی (جدیدترین تست بالا) در orderCheckedModels است.
+  const checkedGroups = useMemo<GroupedEntry[]>(
+    () => orderCheckedModels(providers, checkedModels, getStatus),
+    [providers, getStatus, checkedModels],
+  );
 
   // نتایج ✓ زنده را در استور ماندگار می‌کند و failها (و ورودی‌های خارج از
   // کاتالوگ پروایدرها) را از لیست ذخیره حذف می‌کند — تب Checked بعد از
-  // ری‌استارت هم سر جایش می‌ماند. ادغام یک‌طرفه است: فقط ok جدید اضافه،
+  // ری‌استارت هم سر جایش می‌ماند. ورودی موجود هم lastOkAt تازه می‌گیرد:
+  // تست دوبارهٔ یک مدل باید جایگاهش را در تب Checked برای همیشه جابه‌جا کند،
+  // نه فقط تا وقتی ✓ زنده است. ادغام یک‌طرفه است: فقط ok اضافه/به‌روز،
   // fail حذف، بقیهٔ لیست دست‌نخورده. نوشتن با تأخیر کوتاه trailing است تا
   // یک تست گروهی بزرگ، چند صد encrypt پشت‌سرهم نسازد.
   useEffect(() => {
@@ -273,13 +289,15 @@ export function ProviderModelSelect(props?: {
       for (const m of allModels(p)) {
         const k = `${p.id}/${m}`;
         catalog.add(k);
-        const st = getStatus(p, m).status;
-        if (st === "ok") {
-          if (!next.has(k)) {
-            next.set(k, { providerId: p.id, model: m, lastOkAt: Date.now() });
+        const live = getStatus(p, m);
+        if (live.status === "ok") {
+          const liveAt = live.okAt ?? Date.now();
+          const prev = next.get(k);
+          if (!prev || prev.lastOkAt !== liveAt) {
+            next.set(k, { providerId: p.id, model: m, lastOkAt: liveAt });
             changed = true;
           }
-        } else if (st === "fail") {
+        } else if (live.status === "fail") {
           if (next.delete(k)) changed = true;
         }
       }

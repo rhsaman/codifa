@@ -50,12 +50,6 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
             payload["hook_files"] = read["hook_files"].clone();
         }
     }
-    // A repo that ships no keywords leaves the key OUT, so reinstalling never
-    // discards keywords the user edited by hand — `update_plugin` only touches
-    // fields that are present.
-    if read[KEYWORDS].as_array().is_some_and(|a| !a.is_empty()) {
-        payload[KEYWORDS] = read[KEYWORDS].clone();
-    }
     // An empty version must not overwrite the default with "".
     if read["version"].as_str().is_some_and(|v| !v.trim().is_empty()) {
         payload["version"] = read["version"].clone();
@@ -65,37 +59,6 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     }
     let slug = plugin_ref(&payload);
     let existed = plugin_dir(root, &slug).join(MANIFEST).is_file();
-    // SEED the bundle's keywords from the index row when it would otherwise
-    // land with none: an English-only marketplace plugin is unreachable from a
-    // Persian ask — the reported bug. A hand-typed list always wins; the one
-    // exception is a list an EARLIER mapper wrote (`is_legacy_seed`), which is
-    // re-mapped because those words were never the user's own.
-    if payload.get(KEYWORDS).and_then(|v| v.as_array()).map_or(true, Vec::is_empty) {
-        let manifest = read_manifest(root, &slug);
-        let stored = if existed {
-            manifest
-                .as_ref()
-                .map(|m| keywords_of(&m[KEYWORDS]))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let stale = is_legacy_seed(&stored);
-        // A stored list is replaced only when it is EMPTY or was written by an
-        // earlier mapper: an install always carries the bundle's own name, so it
-        // has the one piece of evidence the mapper trusts, while a list the user
-        // typed is theirs and is never rewritten.
-        if stored.is_empty() || stale {
-            let seed = category_keywords(&seed_name(body, &payload, manifest.as_ref()));
-            if !seed.is_empty() {
-                payload[KEYWORDS] = json!(seed);
-            } else if stale {
-                // A stale seed the new mapper cannot replace is still a wrong
-                // trigger: drop it rather than keep the old nonsense.
-                payload[KEYWORDS] = json!([]);
-            }
-        }
-    }
     // Writing is the install's LAST leg; the progress bubble shows it so a slow
     // disk write does not read as a hang either. Cleared on success, so a done
     // install does not leave a stale bar behind (an error path leaves the last

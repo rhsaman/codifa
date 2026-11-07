@@ -962,8 +962,15 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text);
-  overflow-wrap: anywhere;
+  /* Collapsed-header detail is ONE line: a multi-line terminal command (or a
+     long search pattern) used to wrap and balloon the collapsed card. The
+     full value stays reachable — title tooltip here, expanded Args section
+     in the body. */
+  flex: 0 1 auto;
   min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tool-card-head .tool-path {
@@ -971,8 +978,13 @@
   font-size: 11px;
   color: var(--text-dim);
   opacity: 0.85;
-  overflow-wrap: anywhere;
+  /* Same one-line contract as .tool-cmd above: a long path or range list
+     ellipsizes instead of wrapping the collapsed header taller. */
+  flex: 0 1 auto;
   min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tool-card-head .tool-path+.tool-path {

@@ -156,7 +156,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         ),
         (
             "update_plan",
-            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Call it ONCE after writing the plan, then again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one. While a long step runs you may report its percent done via the optional \"progress\" field (0-100); the UI draws a small bar.",
+            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Call it ONCE after writing the plan, then again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one. While a long step runs you may report its percent done via the optional \"progress\" field (0-100); the UI draws a small bar. Issue it IN THE SAME STEP as your other tool calls (or inside `batch` ops), never as a solo round.",
             json!({
                 "items": {
                     "type": "array",
@@ -175,7 +175,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         ),
         (
             "ask_user",
-            "Ask the user and WAIT for the answer. Use on ambiguity or a genuine fork with no clearly-correct default. ONE decision: `question` + `options` (2-5 short choices; the app shows a pick-one card; free text allowed too). Related sub-questions feeding the SAME decision: `sections` instead — one card, answered and submitted together. Fill either form, never both.",
+            "Ask the user and WAIT for the answer. Use on ambiguity or a genuine fork with no clearly-correct default. ONE decision: `question` + `options` (2-5 short choices; the app shows a pick-one card; free text allowed too). Related sub-questions feeding the SAME decision: `sections` instead — one card, answered and submitted together. Fill either form, never both. Issue it IN THE SAME STEP as your other tool calls (the independent lookups run first, then the question waits) — never as a solo round.",
             json!({
                 "question": {"type": "string"},
                 "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 short choices"},
@@ -195,7 +195,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         ),
         (
             "confirm_action",
-            "Ask the user to APPROVE a destructive or out-of-workspace action and WAIT for the decision (returns allowed/denied). Use it before deleting outside the workspace, installing packages, or running an irreversible command.",
+            "Ask the user to APPROVE a destructive or out-of-workspace action and WAIT for the decision (returns allowed/denied). Use it before deleting outside the workspace, installing packages, or running an irreversible command. Issue it IN THE SAME STEP as your other tool calls (the independent calls run first, then the approval waits) — never as a solo round.",
             json!({
                 "action": {"type": "string", "description": "What you want to do — short and concrete"},
                 "path": {"type": "string", "description": "The file/folder it touches, if any"},
@@ -234,7 +234,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         ),
         (
             "load_skill",
-            "Load a skill's FULL body BEFORE work it covers. ONE call can load SEVERAL skills: names=[\"A\",\"B\"] returns every body together — ask for all the skills the task needs here, a second load call costs a round-trip. `query` searches every installed skill, `bundle` lists one plugin bundle's skills.",
+            "Load a skill's FULL body BEFORE work it covers. ONE call can load SEVERAL skills: names=[\"A\",\"B\"] returns every body together — ask for all the skills the task needs here, a second load call costs a round-trip. Issue it IN THE SAME STEP as your other tool calls, never as a solo round. `query` searches every installed skill, `bundle` lists one plugin bundle's skills.",
             json!({
                 "name": {"type": "string", "description": "Name or slug"},
                 "names": {"type": "array", "items": {"type": "string"}, "description": "SEVERAL skills in THIS one call — every body comes back together"},

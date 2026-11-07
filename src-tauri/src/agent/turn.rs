@@ -240,6 +240,14 @@ pub(super) fn finish_tool(
             // token cost from it was measuring the wrong thing. This is the
             // number any future read/grep budget decision must be based on.
             "model_chars": model_chars,
+            // For a `batch` call: how many ops it carried (from the ARGS, not
+            // the echo — a long batch result is echo-truncated and its labels
+            // disappear, which under-counted the round-elimination metric).
+            "batch_ops": if name == "batch" {
+                args["ops"].as_array().map(|a| a.len()).unwrap_or(0)
+            } else {
+                0
+            },
             // Which DETERMINISTIC levers fired on this call. Both are decided in
             // the backend (never a model choice) and both attach their payload
             // to this result, so that payload is IN `model_chars` above. Without
@@ -1702,24 +1710,31 @@ the Vision model's description instead.\n"
                 // baseline counts successes only and every retry is invisible
                 // (a stream that dies before any usage never reached the llm
                 // row). `kind:"retry"` keeps one kind for all non-productive
-                // attempts; the summary names the side.
-                trace.record(crate::trace::TraceEntry {
-                    kind: "retry".into(),
-                    summary: format!(
-                        "main stream failed at step {} — {}",
-                        step + 1,
-                        &named.chars().take(160).collect::<String>()
-                    ),
-                    model: Some(req.model.clone()),
-                    error: Some(named.clone()),
-                    detail: Some(json!({
-                        "step": step + 1,
-                        "side": "main",
-                        "status": status,
-                        "duration_ms": stream_started.elapsed().as_millis() as u64,
-                    })),
-                    ..Default::default()
-                });
+                // attempts; the summary names the side. A sub-agent attempt
+                // skips this row: its ladder records the SAME failure as its
+                // own "attempt n/m" row, and two rows for one failure just
+                // duplicated the noise in the trace panel.
+                if req.mode != "subagent" {
+                    trace.record(crate::trace::TraceEntry {
+                        kind: "retry".into(),
+                        summary: format!(
+                            "main stream failed at step {} — {}",
+                            step + 1,
+                            &named.chars().take(160).collect::<String>()
+                        ),
+                        model: Some(req.model.clone()),
+                        error: Some(named.clone()),
+                        detail: Some(json!({
+                            "step": step + 1,
+                            "side": "main",
+                            "status": status,
+                            "duration_ms": stream_started.elapsed().as_millis() as u64,
+                            "model": req.model.clone(),
+                            "provider_id": req.provider_id.clone(),
+                        })),
+                        ..Default::default()
+                    });
+                }
                 if req.headless {
                     // A headless caller (the scheduler) has no SSE client to
                     // receive the Error/Done protocol: it records the run and
@@ -2706,10 +2721,30 @@ Valid names: {}",
                 // be unusable the moment the model used a tool the index named.
                 && crate::mcp_index::owner_of(&connectors, name).is_none()
             {
+                // The listing names the NATIVE tools plus the batch/delegation
+                // families by count, not every delegation agent's full id: a
+                // hallucinated call paid ~1.3K chars for a 20-row agent list it
+                // did not need (traced: `check_cwd_and_cargo`).
+                let delegates = advertised
+                    .iter()
+                    .filter(|n| n.starts_with("agent__"))
+                    .count();
+                let listed: Vec<&str> = advertised
+                    .iter()
+                    .filter(|n| !n.starts_with("agent__"))
+                    .map(String::as_str)
+                    .collect();
                 (
                     format!(
-                        "unknown tool {name:?}: no such tool exists. Call one of exactly these names: {}",
-                        advertised.join(", ")
+                        "unknown tool {name:?}: no such tool exists. Call one of exactly these names: {}{}",
+                        listed.join(", "),
+                        if delegates > 0 {
+                            format!(
+                                " — plus {delegates} installed agent__* delegation tools (explore-style, listed in your system prompt)"
+                            )
+                        } else {
+                            String::new()
+                        }
                     ),
                     false,
                 )

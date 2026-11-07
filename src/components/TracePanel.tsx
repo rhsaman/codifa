@@ -449,6 +449,9 @@ export function TraceRow({
         </span>
         {tokenTotal > 0 ? <span className="trace-meta-chip trace-panel-chip">{tokenTotal} tok</span> : null}
         {step !== null ? <span className="trace-meta-chip trace-panel-chip">step {step}</span> : null}
+        {(entry.kind as string) === "retry" && entry.model ? (
+          <span className="trace-meta-chip trace-panel-chip" title={entry.model}>{entry.model}</span>
+        ) : null}
         {status ? <span className={`trace-status-chip status-${status}`}>{status}</span> : null}
         <span className="trace-panel-time">{timeLabel(entry.at)}</span>
         <span className="trace-panel-chev" aria-hidden="true">{open ? "▾" : "▸"}</span>
@@ -508,6 +511,18 @@ export function TraceRow({
               ) : null}
               {typeof detail.result_chars === "number" ? (
                 <span className="trace-meta-chip">{Number(detail.result_chars)} chars out</span>
+              ) : null}
+              {entry.error ? <span className="trace-meta-error">{entry.error}</span> : null}
+            </div>
+          )}
+          {(entry.kind as string) === "retry" && (
+            <div className="trace-llm-meta">
+              {entry.model ? <span className="trace-meta-chip">{entry.model}</span> : null}
+              {detail.provider_id ? (
+                <span className="trace-meta-chip">{String(detail.provider_id)}</span>
+              ) : null}
+              {typeof detail.duration_ms === "number" && Number(detail.duration_ms) > 0 ? (
+                <span className="trace-meta-chip">{(Number(detail.duration_ms) / 1000).toFixed(1)}s</span>
               ) : null}
               {entry.error ? <span className="trace-meta-error">{entry.error}</span> : null}
             </div>

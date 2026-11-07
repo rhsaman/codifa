@@ -62,8 +62,9 @@ export function ComposerDiffBar({
       try {
         const [st, unstaged, staged] = await Promise.all([
           gitStatus(root),
-          gitDiff(root),
-          gitDiff(root, "", true),
+          // full: totals over a capped diff miss the tail files' stats.
+          gitDiff(root, "", false, true),
+          gitDiff(root, "", true, true),
         ]);
         if (cancelled) return;
         const statusPaths =

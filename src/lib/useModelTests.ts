@@ -8,6 +8,10 @@ export type ModelTestStatus = "idle" | "testing" | "ok" | "fail";
 export interface ModelTestEntry {
   status: ModelTestStatus;
   msg: string;
+  /** Exact moment a passing test finished (stamped once at result time, not at
+   *  render time — a render-time Date.now() would tie every just-tested model
+   *  and defeat the Checked tab's most-recent-first ordering). */
+  okAt?: number;
 }
 
 /** جمع‌بندی تست‌های یک پروایدر — برای دکمهٔ «تست همهٔ مدل‌ها». */
@@ -78,7 +82,9 @@ function setEntryFor(
 ): void {
   const k = key(cfg, model);
   owners.set(k, { providerId: cfg.id, model });
-  setEntry(k, patch);
+  // Stamp the pass moment here, at result time — the Checked tab sort and the
+  // persisted lastOkAt both read this exact timestamp.
+  setEntry(k, patch.status === "ok" ? { okAt: Date.now(), ...patch } : patch);
 }
 
 /** خواندن مستقیم وضعیت یک مدل — بدون هوک (برای تست‌ها و مصرف خارج از React). */

@@ -300,6 +300,18 @@ export const ToolCallView = memo(function ToolCallView({
             toolLabel(activity.tool)
           )}
         </span>
+        {/* A batch card names its ops right in the header: "Batch" alone says
+            nothing about what ran (user request). The ops ride the args. */}
+        {activity.tool === "batch" &&
+          Array.isArray(activity.args?.ops) &&
+          (activity.args!.ops as Array<{ tool?: string }>).length > 0 && (
+            <span className="tool-skill" dir="ltr">
+              {(activity.args!.ops as Array<{ tool?: string }>)
+                .map((o) => toolLabel(String(o.tool ?? "")))
+                .filter(Boolean)
+                .join(", ")}
+            </span>
+          )}
         {/* The head must say WHICH skill was loaded: the label is only
             "Load Skill" and the raw `name` arg is filtered out of the chips. */}
         {skillName && (
@@ -313,7 +325,9 @@ export const ToolCallView = memo(function ToolCallView({
           </span>
         )}
         {activity.args && activity.args.command !== undefined && (
-          <span className="tool-cmd">{String(activity.args.command)}</span>
+          <span className="tool-cmd" title={String(activity.args.command)}>
+            {String(activity.args.command)}
+          </span>
         )}
         {activity.args && activity.args.path !== undefined && !isWrite && (
           <ToolPathSpan path={String(activity.args.path)} />
@@ -338,12 +352,18 @@ export const ToolCallView = memo(function ToolCallView({
           </span>
         )}
         {activity.args && activity.args.query !== undefined && (
-          <span className="tool-cmd">
+          <span
+            className="tool-cmd"
+            title={fixZwsp(String(activity.args.query))}
+          >
             {fixZwsp(String(activity.args.query))}
           </span>
         )}
         {activity.args && activity.args.pattern !== undefined && (
-          <span className="tool-cmd">
+          <span
+            className="tool-cmd"
+            title={fixZwsp(String(activity.args.pattern))}
+          >
             {fixZwsp(String(activity.args.pattern))}
           </span>
         )}

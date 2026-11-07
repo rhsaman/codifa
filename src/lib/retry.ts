@@ -295,8 +295,12 @@ export function shouldIgnoreLateRetryEvent(stopped: boolean): boolean {
  * left "Provider rate limit (2/10) — retrying…" frozen on screen for the rest
  * of the turn while the answer streamed underneath it.
  *
- * Terminal banners (gaveUp / watchdog / model fallback) deliberately survive:
- * they carry the Retry button and the "which model to fix" hint.
+ * Terminal banners (gaveUp / watchdog) deliberately survive: they carry the
+ * Retry button and the "which model to fix" hint. A `fallback` row is NOT
+ * terminal any more — since it became a live status line (model + tool tally,
+ * user request) it must retire like every other live row: the user screenshot
+ * had "batch ×3" lingering under a FINISHED explore, because the old
+ * "informational fallback notice" exemption made the row un-retirable.
  *
  * Matching on the tool NAME rather than a call id is deliberate: a fan-out
  * wraps the call in a `branch`, and a batch can retry several explore calls
@@ -319,9 +323,9 @@ export function retryRetiredByEvent(
 ): boolean {
   if (!retry || !retry.agent) return false
   if (retry.gaveUp === true || retry.watchdog === true) return false
-  if (retry.fallback === true) return false
   // PROOF OF RECOVERY: the sub-agent's own tool call (read/grep/glob) in the
-  // SAME branch means its model answered again, so the retry is over. Waiting
+  // SAME branch means its model answered again, so the retry is over — a
+  // fallback row included (its "next model" is demonstrably working). Waiting
   // for the owning tool's final result left a recovered explore showing its
   // error banner for the whole rest of its run. Branch-exact on purpose: a
   // parallel sibling working fine proves nothing about this one.

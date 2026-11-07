@@ -13,8 +13,9 @@ export interface UncommittedFile {
 }
 
 /** از مسیرهای status و دیف‌های خام، لیست نهایی فایل‌ها را می‌سازد:
- *  دیف‌های یک مسیر (staged/unstaged) الحاق می‌شوند تا آمار کامل شود و
- *  مسیرهایی که دیف ندارند (untracked) با آمار صفر اضافه می‌شوند. */
+ *  دیف‌های یک مسیر (staged/unstaged) الحاق می‌شوند تا آمار کامل شود. دیف
+ *  unstaged بک‌اند فایل‌های untracked را هم به‌صورت new-file می‌فرستد؛
+ *  مسیرهایی که با این همه هنوز دیفی ندارند با آمار صفر اضافه می‌شوند. */
 export function buildUncommittedFiles(
   statusPaths: string[],
   unstagedDiff: string,

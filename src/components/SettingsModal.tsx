@@ -457,18 +457,17 @@ export function SettingsModal({
   const builtinMcp = useStore((s) => s.builtinMcp)
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
-  const [skills, setSkills] = useState<Array<{ name: string; key: string; plugin: string; pluginName: string; pluginEnabled: boolean; path: string; raw: string; files: string[]; description: string; faKeywords: string[] }>>([])
+  const [skills, setSkills] = useState<Array<{ name: string; key: string; plugin: string; pluginName: string; pluginEnabled: boolean; path: string; raw: string; files: string[]; description: string }>>([])
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set())
   const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
   // Frontmatter fields of the skill being edited, keyed like skillDrafts.
   //
   // These are kept SEPARATE from the draft body on purpose. The draft is the
   // body WITHOUT frontmatter (`listSkills` strips it), so a save that only sent
-  // the body used to wipe `description` and `fa_keywords` on every edit from
-  // settings — the agent's catalog then showed a skill with no description and
-  // no Persian keywords, i.e. it silently became unreachable for Persian asks.
+  // the body used to wipe `description` on every edit from settings — the
+  // agent's catalog then showed a skill with no description, i.e. it silently
+  // became unmatchable.
   const [skillDescriptions, setSkillDescriptions] = useState<Record<string, string>>({})
-  const [skillKeywords, setSkillKeywords] = useState<Record<string, string>>({})
   // Extra (Codex-style) files per skill key: filename -> content to upsert.
   const [skillExtraFiles, setSkillExtraFiles] = useState<Record<string, Record<string, string>>>({})
   // Extra files marked for deletion per skill key.
@@ -491,13 +490,13 @@ export function SettingsModal({
   })
   const mcpGrid = useInfiniteGrid(matchedMcp.length, `mcp:${mcpFilter}`)
 
-  /** Skills, filtered then paged: one query covers the name, the English
-   *  description, the Persian keywords and the owning plugin. */
+  /** Skills, filtered then paged: one query covers the name, the description
+   *  and the owning plugin. */
   const matchedSkills = skills.filter((s) => {
     const q = skillFilter.trim().toLowerCase()
     if (!q) return true
     const meta = skillMeta(s.raw)
-    return `${s.name} ${meta.name} ${meta.description} ${s.pluginName} ${(s.faKeywords ?? []).join(' ')}`
+    return `${s.name} ${meta.name} ${meta.description} ${s.pluginName}`
       .toLowerCase()
       .includes(q)
   })
@@ -533,11 +532,10 @@ export function SettingsModal({
         path: r.path,
         raw: r.content,
         files: r.files ?? [],
-        // Carried through so a save can send them back: `content` is the
-        // frontmatter-stripped body, so without these the backend would rewrite
-        // `description:`/`fa_keywords:` as empty (see sync_skill).
+        // Carried through so a save can send it back: `content` is the
+        // frontmatter-stripped body, so without this the backend would rewrite
+        // `description:` as empty (see sync_skill).
         description: r.description ?? '',
-        faKeywords: (r.fa_keywords ?? []).filter((k) => k.trim().length > 0),
       })),
       ...fromPlugin.map((r) => {
         const slug = r.plugin_slug ?? ''
@@ -551,7 +549,6 @@ export function SettingsModal({
           raw: r.content,
           files: r.files ?? [],
           description: r.description ?? '',
-          faKeywords: (r.fa_keywords ?? []).filter((k) => k.trim().length > 0),
         }
       }),
     ]
@@ -576,9 +573,6 @@ export function SettingsModal({
         )
         setSkillDescriptions((prev) =>
           prev[key] !== undefined ? prev : { ...prev, [key]: hit.description },
-        )
-        setSkillKeywords((prev) =>
-          prev[key] !== undefined ? prev : { ...prev, [key]: hit.faKeywords.join(', ') },
         )
       }
     }
@@ -618,15 +612,12 @@ export function SettingsModal({
       if (prev[key] !== undefined) return prev
       return { ...prev, [key]: skills.find((x) => x.key === key)?.raw ?? '' }
     })
-    // Seed the frontmatter inputs from the list row, once per open. The draft
-    // body has no frontmatter, so these values are the ONLY copy of the skill's
-    // description/fa_keywords the editor holds.
+    // Seed the frontmatter input from the list row, once per open. The draft
+    // body has no frontmatter, so this value is the ONLY copy of the skill's
+    // description the editor holds.
     const row = skills.find((x) => x.key === key)
     setSkillDescriptions((prev) =>
       prev[key] !== undefined ? prev : { ...prev, [key]: row?.description ?? '' },
-    )
-    setSkillKeywords((prev) =>
-      prev[key] !== undefined ? prev : { ...prev, [key]: (row?.faKeywords ?? []).join(', ') },
     )
     setSkillsMsg('')
   }
@@ -666,12 +657,11 @@ export function SettingsModal({
     const extra = skillExtraFiles[name] ?? {}
     const extraNames = Object.keys(extra)
     const deleted = (skillDeletedFiles[name] ?? []).filter((f) => !extraNames.includes(f))
-    // Description and Persian keywords live in the frontmatter, which the draft
-    // body does NOT carry — send them explicitly, or the backend rewrites the
-    // file with an empty `description:` and no `fa_keywords:` at all.
+    // The description lives in the frontmatter, which the draft body does NOT
+    // carry — send it explicitly, or the backend rewrites the file with an
+    // empty `description:`.
     const row = skills.find((s) => s.key === name)
     const description = (skillDescriptions[name] ?? row?.description ?? '').trim()
-    const keywords = (skillKeywords[name] ?? (row?.faKeywords ?? []).join(', ')).trim()
     // A plugin's skill belongs to its bundle: without `plugin` the backend wrote
     // the edit into the user's own store, so the bundle kept advertising the old
     // body and the catalog and the file disagreed.
@@ -681,19 +671,11 @@ export function SettingsModal({
       previousName: name !== NEW_SKILL_KEY && name !== newName ? name : '',
       content: normalized,
       description,
-      faKeywords: keywords,
       ...(owner ? { plugin: owner } : {}),
       ...(extraNames.length > 0 ? { files: extra } : {}),
       ...(deleted.length > 0 ? { deletedFiles: deleted } : {}),
     })
     setSkillsMsg(res.ok ? 'Saved ✓' : `Save failed: ${res.note ?? 'unknown error'}`)
-    if (res.ok && (res.fa_keyword_count ?? 0) === 0) {
-      // Without keywords the catalog line is English-only, so a Persian request
-      // carries no trigger to find this skill by.
-      setSkillsMsg(
-        'Saved ✓ but no Persian keywords: a Persian request has nothing to find this skill by. Add keywords above.',
-      )
-    }
     if (res.ok) {
       const savedName = res.name || newName
       // The row key follows the plugin scope, not the bare name: a plugin skill
@@ -706,17 +688,11 @@ export function SettingsModal({
         next[savedKey] = normalized
         return next
       })
-      // Carry the frontmatter inputs over to the saved (possibly renamed) key.
+      // Carry the frontmatter input over to the saved (possibly renamed) key.
       setSkillDescriptions((prev) => {
         const next = { ...prev }
         if (renamed) delete next[name]
         next[savedKey] = description
-        return next
-      })
-      setSkillKeywords((prev) => {
-        const next = { ...prev }
-        if (renamed) delete next[name]
-        next[savedKey] = keywords
         return next
       })
       setExpandedSkills((prev) => {
@@ -893,13 +869,12 @@ export function SettingsModal({
     setSkillDrafts((prev) => ({
       ...prev,
       [NEW_SKILL_KEY]:
-        '---\nname: new-skill\ndescription: One-line English summary of when to use this skill\nfa_keywords: \n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
+        '---\nname: new-skill\ndescription: One-line English summary of when to use this skill\n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
     }))
-    // Seed the two frontmatter inputs (the draft body above has no frontmatter,
-    // so these are the values that actually get saved).
+    // Seed the frontmatter input (the draft body above has no frontmatter,
+    // so this is the value that actually gets saved).
     setSkillDescriptions((prev) => ({ ...prev, [NEW_SKILL_KEY]: '' }))
-    setSkillKeywords((prev) => ({ ...prev, [NEW_SKILL_KEY]: '' }))
-    setSkillsMsg('Editing a new skill — fill in the details, then press Save skill. Add a one-line English `description:` and fill `fa_keywords:` (comma-separated phrases you would say, e.g. ترجمه کن, translate this) so it is matched automatically.')
+    setSkillsMsg('Editing a new skill — fill in the details, then press Save skill. Add a one-line English `description:` naming when to use it so the agent matches it automatically.')
     // The "New skill" editor renders at the TOP of the list; if the user had
     // scrolled down, scroll the list back to the top so it's immediately visible.
     requestAnimationFrame(() => skillListRef.current?.scrollTo({ top: 0, behavior: 'smooth' }))

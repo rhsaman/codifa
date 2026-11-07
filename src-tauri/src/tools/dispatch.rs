@@ -202,6 +202,53 @@ into one union — those lines are all above; do NOT re-read them]"
             // must be explicit (offset/limit).
             let limit = args["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
             let abs = resolve_safe(root, &path, true, permit)?;
+            // A read of a file that is not there is the classic detour into a
+            // terminal `ls`: "No such file or directory" gives the model nothing
+            // to self-correct from, so it spent a WHOLE round listing the folder
+            // it could have been told about here. Name the closest existing
+            // siblings instead — the next round reads the right file directly.
+            if !abs.exists() {
+                let parent = abs.parent().unwrap_or(abs.as_path()).to_path_buf();
+                let wanted = abs
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let mut siblings: Vec<String> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&parent) {
+                    for e in rd.flatten() {
+                        if let Some(n) = e.file_name().to_str() {
+                            siblings.push(n.to_string());
+                        }
+                    }
+                }
+                siblings.sort_by_key(|n| {
+                    let l = n.to_lowercase();
+                    std::cmp::Reverse(
+                        (l.contains(&wanted) as u8) * 2
+                            + (wanted
+                                .split(['.', '-', '_'])
+                                .filter(|p| !p.is_empty())
+                                .any(|p| l.contains(p))
+                                as u8),
+                    )
+                });
+                let listed: Vec<String> = siblings.iter().take(8).cloned().collect();
+                return Err(format!(
+                    "read: {path} does not exist. Files in {}: {}{}",
+                    parent.display(),
+                    if listed.is_empty() {
+                        "(empty folder)".to_string()
+                    } else {
+                        listed.join(", ")
+                    },
+                    if siblings.len() > listed.len() {
+                        format!(" (+{} more)", siblings.len() - listed.len())
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
             // Same as the batch path above: an image file is described, never
             // windowed.
             if let Some(note) = crate::commands::image_read_note(&abs.to_string_lossy()) {
@@ -706,9 +753,7 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             }
         }
         // Create or update a skill from a command (the Codex/Claude
-        // `create_skill` flow). `fa_keywords` is what makes the skill findable
-        // from a Persian request: the catalog line carries them, so the model
-        // can match the user's own wording without any embedding or classifier.
+        // `create_skill` flow).
         "create_skill" => {
             // A repo is an alternative SOURCE for the whole skill: read it first,
             // then hand it to `sync_skill` exactly like a model-written body, so
@@ -752,19 +797,12 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 "name": name,
                 "previous_name": s("previous_name"),
                 "content": content,
-                // Pass the raw JSON through (not `s(...)`, which turns a
-                // missing field into ""): `sync_skill` treats null/absent as
-                // "keep whatever the file already has", so a model that omits
-                // fa_keywords on an EDIT no longer wipes the existing ones.
                 "description": args["description"].clone(),
-                "fa_keywords": args["fa_keywords"].clone(),
             });
             if let Some(r) = &from_repo {
                 // The repo fills only what the call left out.
-                for key in ["description", "fa_keywords"] {
-                    if body[key].is_null() {
-                        body[key] = r[key].clone();
-                    }
+                if body["description"].is_null() {
+                    body["description"] = r["description"].clone();
                 }
                 if let Some(files) = r["extra_files"].as_object() {
                     if !files.is_empty() {
@@ -1144,6 +1182,11 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
 pub(super) const BATCH_TOOLS: &[&str] = &[
     "read",
     "grep",
+    // The skill load and the plan update ride the batch too: the model should
+    // issue them IN THE SAME ROUND as the lookups (user request — a solo
+    // load_skill/update_plan round is a wasted round-trip).
+    "load_skill",
+    "update_plan",
     "glob",
     "find_symbol",
     "lsp_symbols",

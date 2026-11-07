@@ -51,53 +51,6 @@ pub fn plugin_ref(body: &Value) -> String {
     )
 }
 
-/// Persian phrases read out of a manifest field that may be an array or a
-/// single comma-separated string.
-///
-/// Splits on the ASCII comma AND the Persian one (U+060C), trims, drops empties
-/// and dedupes on the folded form so `فیلم` and `فيلم` count once.
-pub(super) fn keywords_of(value: &Value) -> Vec<String> {
-    let chunks: Vec<String> = match value {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect(),
-        Value::String(s) => vec![s.clone()],
-        _ => Vec::new(),
-    };
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for chunk in chunks {
-        for k in crate::skills::split_fa_keywords(&chunk) {
-            if seen.insert(crate::skills::fold_fa(&k)) {
-                out.push(k);
-            }
-        }
-    }
-    out
-}
-
-/// Whether a request body carries the keyword field at all (an explicit empty
-/// list clears it; an absent field leaves it alone).
-pub(super) fn has_keywords(body: &Value) -> bool {
-    body.get(KEYWORDS).is_some_and(|v| !v.is_null())
-}
-
-/// The name a marketplace row's keywords should be mapped from.
-///
-/// The index row's own name wins (it is the short identifier), the bundle's
-/// manifest name is the fallback, so an install with neither still maps.
-pub(super) fn seed_name(body: &Value, payload: &Value, stored: Option<&Value>) -> String {
-    body["name"]
-        .as_str()
-        .or_else(|| payload["name"].as_str())
-        .or_else(|| stored.and_then(|m| m["name"].as_str()))
-        .unwrap_or("")
-        .trim()
-        .to_string()
-}
-
 pub(super) fn read_manifest(root: &Path, slug: &str) -> Option<Value> {
     let raw = fs::read_to_string(plugin_dir(root, slug).join(MANIFEST)).ok()?;
     serde_json::from_str(&raw).ok()
@@ -259,7 +212,7 @@ pub fn list_commands(root: &Path, slug: &str) -> Vec<Value> {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let (_, _, description, _) = crate::skills::parse_frontmatter_pub(&raw);
+        let (_, _, description) = crate::skills::parse_frontmatter_pub(&raw);
         rows.push(json!({
             "name": stem,
             "description": if description.trim().is_empty() {
@@ -405,8 +358,8 @@ pub fn all_plugin_agents(root: &Path) -> Vec<Value> {
 /// Every script of a plugin WITH its own metadata, sorted by name.
 ///
 /// Read out of each script's manifest — the folder stays the only source of
-/// truth — so Settings can show (and edit) a script's description and Persian
-/// keywords without opening its source.
+/// truth — so Settings can show (and edit) a script's description without
+/// opening its source.
 pub fn list_scripts(root: &Path, slug: &str) -> Vec<Value> {
     let Ok(entries) = fs::read_dir(scripts_dir(root, slug)) else {
         return Vec::new();
@@ -434,7 +387,6 @@ pub fn list_scripts(root: &Path, slug: &str) -> Vec<Value> {
             "name": name,
             "language": language,
             "description": meta["description"].as_str().unwrap_or(""),
-            KEYWORDS: keywords_of(&meta[KEYWORDS]),
             // The file the script's code lives in, so the page can name it.
             "file": source,
         }));
@@ -450,7 +402,7 @@ pub(super) fn read_script(root: &Path, slug: &str, name: &str) -> Option<Value> 
 }
 
 /// The source text a script already has on disk, so an edit that only changes
-/// its description or keywords leaves the body alone.
+/// its description leaves the body alone.
 pub(super) fn read_script_source(root: &Path, slug: &str, name: &str, meta: &Value) -> Option<String> {
     let language = meta["language"].as_str().unwrap_or(DEFAULT_SCRIPT_LANGUAGE);
     fs::read_to_string(script_dir(root, slug, name).join(script_source_file(language))).ok()

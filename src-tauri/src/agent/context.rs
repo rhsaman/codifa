@@ -178,7 +178,12 @@ pub(super) fn subagent_idle_secs() -> u64 {
             .unwrap_or(SUBAGENT_ATTEMPT_IDLE_SECS)
     })
 }
-pub(super) const SUBAGENT_ATTEMPT_IDLE_SECS: u64 = 300;
+/// Lowered from 300: an explore attempt that goes completely silent for two
+/// minutes is wedged, not thinking (reasoning-heavy models are not used for
+/// explore), and every extra silent minute is a minute before the ladder moves
+/// to the next fallback model. The LSP heartbeat still extends a cold start up
+/// to the hard ceiling (idle + 120s).
+pub(super) const SUBAGENT_ATTEMPT_IDLE_SECS: u64 = 120;
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 pub(super) const TOOL_RESULT_CAP: usize = 4000;
 

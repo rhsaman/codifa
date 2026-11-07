@@ -63,7 +63,7 @@ createServer((req, res) => {
         source: 'stub',
         skills: ['Stub Skill'],
         mcp: [],
-        plugin: { name: 'Stub Row', slug: 'stub', fa_keywords: ['تست'] },
+        plugin: { name: 'Stub Row', slug: 'stub' },
       })
     })
     return

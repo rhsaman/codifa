@@ -539,8 +539,10 @@ export function ReviewPanel(props?: {
       try {
         const [st, unstaged, staged] = await Promise.all([
           gitStatus(root),
-          gitDiff(root),
-          gitDiff(root, "", true),
+          // full: the cap would strand the alphabetically-late tail files
+          // with no diff — the panel renders every row's diff.
+          gitDiff(root, "", false, true),
+          gitDiff(root, "", true, true),
         ]);
         if (cancelled) return;
         if ("error" in unstaged) {
@@ -551,8 +553,9 @@ export function ReviewPanel(props?: {
           }
           return;
         }
-        // فایل‌های untracked در diff نیستند — `buildUncommittedFiles` آن‌ها را
-        // از status اضافه می‌کند و staged/unstaged را per-file ادغام می‌کند.
+        // بک‌اند فایل‌های untracked را در دیف unstaged به‌صورت new-file
+        // می‌فرستد؛ `buildUncommittedFiles` فقط مسیرهای بی‌دیف باقی‌مانده را از
+        // status اضافه می‌کند و staged/unstaged را per-file ادغام می‌کند.
         const statusPaths = "error" in st ? [] : st.entries.map((e) => e.path);
         const stagedDiff = "error" in staged ? "" : staged.diff;
         const next = buildUncommittedFiles(statusPaths, unstaged.diff, stagedDiff);
@@ -606,7 +609,7 @@ export function ReviewPanel(props?: {
       setGitLoading(true);
       setGitError(null);
       try {
-        const d = await gitShow(root, rev);
+        const d = await gitShow(root, rev, "", true);
         if (cancelled) return;
         if ("error" in d) {
           setGitFiles([]);

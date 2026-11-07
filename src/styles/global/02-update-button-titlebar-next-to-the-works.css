@@ -2048,7 +2048,12 @@ body.coder-dragging .chat-split-child {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  flex-shrink: 0;
+  /* Shrinkable + min-width 0: the head can carry the sub-agent's MODEL NAME —
+     one long unbreakable token. With shrink-0 the head kept its max-content
+     width, escaped the chip and painted over the usage readout (user
+     screenshot); the shrink lives on the model span inside (below). */
+  flex-shrink: 1;
+  min-width: 0;
 }
 
 .msg-retry-inline {
@@ -2250,6 +2255,15 @@ body.coder-dragging .chat-split-child {
 .msg-retry-inline-model {
   color: var(--tone);
   font-weight: 600;
+  /* The model id is ONE long unbreakable token ("nvidia/nemotron-3-ultra-
+     550b-a55b:free"): it must be the part that yields — ellipsized — when the
+     footer is narrow, instead of overlapping the usage readout. Overrides
+     `.msg-retry-inline-count`'s shrink-0 above (same specificity, later wins);
+     the ordinary "retry 3/10" counter keeps shrink-0. */
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .msg-retry-inline-tools {
@@ -2321,7 +2335,14 @@ body.coder-dragging .chat-split-child {
   pointer-events: none;
 }
 
-.msg-retry-inline:hover::after,
+/* The hover card only exists when the row actually carries an error
+   (`data-full-error`): without the attribute gate `content: attr()` resolved
+   to an empty string and hovering showed an empty box. Sub-agent status rows
+   (model + tool tally) carry the attribute too now — their compact line stays
+   status-only (user request) and the hover card is the only place their
+   provider error shows. The second selector is safe ungated: a
+   `.msg-retry-inline-reason` span always carries `data-full-error`. */
+.msg-retry-inline[data-full-error]:hover::after,
 .msg-retry-inline:has(.msg-retry-inline-reason:hover)::after {
   display: block;
   animation: msg-retry-card-in 0.12s ease-out;

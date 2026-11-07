@@ -29,6 +29,27 @@ export function exploreToolCounts(activity: ToolActivity): ExploreToolCount[] {
   const counts = new Map<string, ExploreToolCount>();
   const walk = (list?: ToolActivity[]) => {
     for (const a of list ?? []) {
+      // A `batch` call IS its inner ops on the UI: a bare "Batch ×3" chip says
+      // nothing about what ran (user request). The ops ride the call's args —
+      // tally each op's tool as its own chip; when the args are missing
+      // (older transcripts), the plain Batch chip stays.
+      if (a.tool === "batch") {
+        const ops = Array.isArray(a.args?.ops)
+          ? (a.args!.ops as Array<{ tool?: string }>)
+          : [];
+        if (ops.length > 0) {
+          for (const op of ops) {
+            const label = toolLabel(String(op.tool ?? ""));
+            const cur = counts.get(label);
+            if (cur) {
+              cur.count += 1;
+            } else {
+              counts.set(label, { tool: String(op.tool ?? ""), label, count: 1 });
+            }
+          }
+          continue;
+        }
+      }
       const label = toolLabel(a.tool);
       const cur = counts.get(label);
       if (cur) {

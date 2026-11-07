@@ -21,6 +21,10 @@ pub(super) struct DiffQuery {
     path: String,
     #[serde(default)]
     staged: bool,
+    /// Lift the diff byte cap — the Review panel needs every file's diff; a
+    /// capped aggregate strands the tail files as +0 -0 ghosts.
+    #[serde(default)]
+    full: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -41,6 +45,10 @@ pub(super) struct ShowQuery {
     rev: String,
     #[serde(default)]
     path: String,
+    /// Lift the byte cap for the Review panel's committed view (same reason
+    /// as DiffQuery::full).
+    #[serde(default)]
+    full: bool,
 }
 
 pub(super) fn default_rev() -> String {
@@ -63,7 +71,11 @@ pub(super) async fn git_diff(Query(q): Query<DiffQuery>) -> Response<Body> {
     // Same early trigger as `/git/status`: the renderer calls this on every chat
     // switch, so the language servers start loading before the turn does.
     crate::lsp::prewarm(&q.root);
-    git_response(git::diff(&q.root, &q.path, q.staged))
+    git_response(if q.full {
+        git::diff_full(&q.root, &q.path, q.staged)
+    } else {
+        git::diff(&q.root, &q.path, q.staged)
+    })
 }
 
 pub(super) async fn git_log(Query(q): Query<LogQuery>) -> Response<Body> {
@@ -73,7 +85,11 @@ pub(super) async fn git_log(Query(q): Query<LogQuery>) -> Response<Body> {
 }
 
 pub(super) async fn git_show(Query(q): Query<ShowQuery>) -> Response<Body> {
-    git_response(git::show(&q.root, &q.rev, &q.path))
+    git_response(if q.full {
+        git::show_full(&q.root, &q.rev, &q.path)
+    } else {
+        git::show(&q.root, &q.rev, &q.path)
+    })
 }
 
 pub(super) async fn git_commit(Json(body): Json<git::CommitBody>) -> Response<Body> {

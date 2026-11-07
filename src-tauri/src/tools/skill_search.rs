@@ -50,26 +50,6 @@ pub(super) fn available_hint(all: &[Value]) -> String {
     )
 }
 
-/// Everything about one skill a search query is matched against: name, slug,
-/// description and the user's own `fa_keywords` — a Persian word has to find
-/// its skill exactly as it does in the prompt catalog.
-pub(super) fn skill_haystack(sk: &Value) -> String {
-    let mut hay = String::new();
-    for key in ["name", "slug", "description", "plugin"] {
-        if let Some(v) = sk[key].as_str() {
-            hay.push_str(v);
-            hay.push(' ');
-        }
-    }
-    if let Some(kw) = sk["fa_keywords"].as_array() {
-        for k in kw.iter().filter_map(Value::as_str) {
-            hay.push_str(k);
-            hay.push(' ');
-        }
-    }
-    hay.to_lowercase()
-}
-
 /// Warn when a bundle's scripts hard-code a `$HOME` path outside their own
 /// folder.
 ///
@@ -150,24 +130,16 @@ pub(super) fn term_in_field(field: &str, term: &str) -> f64 {
 
 /// The string of one skill field as the matcher sees it.
 pub(super) fn skill_field<'a>(sk: &'a Value, key: &str) -> String {
-    match key {
-        "fa_keywords" => sk[key]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
-            .unwrap_or_default(),
-        _ => sk[key].as_str().unwrap_or_default().to_string(),
-    }
+    sk[key].as_str().unwrap_or_default().to_string()
 }
 
 /// Field weights, strongest first: the name is the sharpest signal of WHAT a
-/// skill is, the slug says the same thing in URL form, `fa_keywords` is the
-/// user's own Persian trigger list, the description is prose that may mention
-/// many things, and the owning bundle is the weakest (a bundle name says
-/// little about one skill inside it).
-pub(super) const SKILL_FIELD_WEIGHTS: [(&str, f64); 5] = [
+/// skill is, the slug says the same thing in URL form, the description is prose
+/// that may mention many things, and the owning bundle is the weakest (a bundle
+/// name says little about one skill inside it).
+pub(super) const SKILL_FIELD_WEIGHTS: [(&str, f64); 4] = [
     ("name", 4.0),
     ("slug", 3.0),
-    ("fa_keywords", 2.5),
     ("description", 2.0),
     ("plugin", 1.0),
 ];
@@ -187,7 +159,7 @@ pub(super) const SKILL_DOMINANT_RATIO: f64 = 1.6;
 /// The catalog is byte-capped, so a store with hundreds of skills cannot list
 /// them all — this is the way in for everything it had to leave out. Scoring:
 /// stopwords out, IDF over the installed store (a word every skill carries
-/// cannot discriminate), field weights (name > slug > fa_keywords >
+/// cannot discriminate), field weights (name > slug >
 /// description > bundle), whole-word above substring. A confident top hit
 /// returns its body on the FIRST call — the second call naming it was a wasted
 /// round (traced `mvyy1qf7`: one query listed Test UI beside three skills that
@@ -214,13 +186,13 @@ pub(super) fn search_skills(store_base: &str, query: &str) -> Result<String, Str
     // IDF over THIS store: a term in every skill cannot help pick one, so its
     // weight collapses toward ~1.0; a term only one skill carries weighs ln(N).
     // The document frequency reads the skill's OWN fields (name, slug,
-    // description, fa_keywords) — the owning bundle's label is context for the
+    // description) — the owning bundle's label is context for the
     // score but not the skill's identity, and counting it once made every
     // skill of a bundle named "Skills" dilute the very word "skills".
     // Smoothed so a term in every row still counts a little.
     let n = all.len() as f64;
     let own_fields = |sk: &Value| -> Vec<String> {
-        ["name", "slug", "description", "fa_keywords"]
+        ["name", "slug", "description"]
             .iter()
             .map(|k| skill_field(sk, k))
             .collect()

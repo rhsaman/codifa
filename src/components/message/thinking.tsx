@@ -174,9 +174,12 @@ export function InlineRetryLine({
   }, [retry.delay, retry.startedAt, retry.attempt, retry.gaveUp]);
   const gaveUp = retry.gaveUp === true;
   // A sub-agent line that is still cycling (user request): the error never
-  // shows — the line carries its live model + tool tally instead, so it reads
-  // as status, not failure. Only a terminal give-up keeps the error: the
-  // Retry button beside it needs a reason to make sense.
+  // shows INLINE — the line carries its live model + tool tally instead, so it
+  // reads as status, not failure. The error itself stays reachable through the
+  // hover card (`data-full-error` below): with the tally replacing the reason
+  // span, that card is the only place a cycling ladder's provider error shows.
+  // Only a terminal give-up keeps the error in the line itself: the Retry
+  // button beside it needs a reason to make sense.
   const subLive = sub && !gaveUp ? sub : null;
   // A footer STATUS line (no ladder) rides through the same component: compact
   // progress, an interrupted reply, and plain (non-retried) failures all use
@@ -284,7 +287,7 @@ export function InlineRetryLine({
          the pointer jitters, and cannot wrap a multi-sentence provider body —
          which is why hovering "did not show the full error". The card below is
          CSS-only (no portal, no JS), appears instantly, and wraps to 46ch. */
-      data-full-error={subLive ? undefined : fullDetail || retry.reason || undefined}
+      data-full-error={fullDetail || retry.reason || undefined}
     >
       {/* Mirrors the Working pill's proven structure (`.msg-thinking` →
           `.msg-thinking-inner`): the OUTER span only parks the line — it inherits
@@ -304,6 +307,9 @@ export function InlineRetryLine({
         {who && <span className="msg-retry-inline-who">{who}</span>}
         <span
           className={`msg-retry-inline-count${subLive ? " msg-retry-inline-model" : ""}`}
+          /* The model id is the one part that ellipsizes on a narrow footer —
+             the full name stays reachable on hover. */
+          title={subLive?.model || undefined}
         >
           {shownLabel}
         </span>
@@ -331,12 +337,16 @@ export function InlineRetryLine({
       {/* A status row already puts the whole sentence in `label`, so echoing
           `detail` printed it twice ("Undo applied — … Undo applied — …").
           Only ladder/fallback rows carry a separate reason. A live sub-agent
-          row swaps the reason for the run's tool tally (user request) — the
-          error itself is never shown while the ladder still cycles. */}
-      {subLive && subLive.tools.length > 0 ? (
-        <span className="msg-retry-inline-tools" dir="ltr">
-          {subLive.tools.join(" · ")}
-        </span>
+          row NEVER shows the reason (user request) — not even when the run has
+          called no tools yet, which is exactly when a model switch fires (the
+          sub-agent's first LLM call failed, so there is nothing to tally). The
+          tools fill in as the run works; until then the line is agent+model. */}
+      {subLive ? (
+        subLive.tools.length > 0 && (
+          <span className="msg-retry-inline-tools" dir="ltr">
+            {subLive.tools.join(" · ")}
+          </span>
+        )
       ) : (
         detail &&
         !isStatus && (

@@ -35,7 +35,6 @@
             &json!({
                 "name": "Probe Skill",
                 "description": "probe",
-                "fa_keywords": "پروب",
                 "content": "step 1",
             }),
             None,
@@ -1989,8 +1988,10 @@
             // whole-step tool is the round-elimination lever itself — ~1.1K
             // chars of schema buys back 3-7 round-trips on a search-heavy
             // step, the exact trade this ceiling prices deliberately.
-            ("main", tool_schemas(false, false), 19_200usize),
-            ("main+browser", tool_schemas(false, true), 26_050),
+            // +87: the ask_user/confirm_action same-step clause (the anti-solo
+            // teaching for the interactive tools).
+            ("main", tool_schemas(false, false), 19_350usize),
+            ("main+browser", tool_schemas(false, true), 26_200),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -2002,8 +2003,8 @@
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
             // Raised for `ask_user` `sections` (see the `main` note above).
-            ("main+authoring", tool_schemas(true, false), 26_250),
-            ("main+authoring+browser", tool_schemas(true, true), 33_100),
+            ("main+authoring", tool_schemas(true, false), 26_400),
+            ("main+authoring+browser", tool_schemas(true, true), 33_250),
             // Re-based when `batch` joined the RESEARCH set: the explore
             // sub-agent is the heaviest search caller, so the whole-step
             // executor rides there too (that is where the round-trips are).
@@ -3193,7 +3194,7 @@
     }
 
     #[test]
-    fn create_skill_persists_persian_keywords_into_the_catalog() {
+    fn create_skill_persists_the_description_into_the_catalog() {
         use crate::tools::dispatch;
         let dir = std::env::temp_dir().join(format!("codifa-create-skill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3207,16 +3208,14 @@
                 "name": "Movie Finder",
                 "description": "find movies",
                 "content": "Step 1: ask for the genre.",
-                "fa_keywords": "فیلم, سینما",
             }),
             None,
         )
         .unwrap();
         assert!(out.contains("Movie Finder"), "{out}");
-        assert!(!out.contains("WARNING"), "keywords are inert data now: {out}");
 
         // The description is the trigger: the catalog lists the skill with it,
-        // and any frontmatter keywords stay data — never a catalog line.
+        // and a legacy keyword line never becomes a catalog line.
         let section = crate::skill_router::build_section(root, &[]);
         assert!(section.text.contains("- Movie Finder"), "{}", section.text);
         assert!(section.text.contains("find movies"), "{}", section.text);
@@ -3234,8 +3233,7 @@
             "create_skill must claim the file so the seeder leaves it alone"
         );
 
-        // A skill saved with NO keywords at all is ordinary now: selection runs
-        // off the description, so the reply is a plain success.
+        // A plain create is ordinary: selection runs off the description.
         let out = dispatch(
             root,
             "create_skill",
@@ -3243,7 +3241,7 @@
             None,
         )
         .unwrap();
-        assert!(!out.contains("WARNING"), "{out}");
+        assert!(out.contains("No Keywords"), "{out}");
 
         // deleted_files from the model actually removes the extra file.
         dispatch(
@@ -3272,7 +3270,7 @@
         dispatch(
             root,
             "create_skill",
-            &json!({"name": "Movie Finder", "fa_keywords": "فیلم, سینما, فیلم"}),
+            &json!({"name": "Movie Finder"}),
             None,
         )
         .unwrap();
@@ -3288,7 +3286,7 @@
         assert!(dispatch(
             root,
             "create_skill",
-            &json!({"name": "Bodyless", "description": "d", "fa_keywords": "x y"}),
+            &json!({"name": "Bodyless", "description": "d"}),
             None,
         )
         .is_err());
@@ -3362,17 +3360,17 @@
                 format!(r#"{{"name":"{name}","slug":"{slug}","enabled":true}}"#),
             )
             .unwrap();
-            // One distinctive English description, one Persian keyword set, the
-            // rest filler — the two things a real query has to find.
-            let (description, keywords) = match i {
-                39 => ("bewildering xylophone maintenance", ""),
-                38 => ("earthquake drill", "fa_keywords: زلزله\n"),
-                _ => ("a filler skill", ""),
+            // One distinctive description per findable skill, the rest filler —
+            // the description is the one thing a real query has to find.
+            let description = match i {
+                39 => "bewildering xylophone maintenance",
+                38 => "earthquake drill — زلزله",
+                _ => "a filler skill",
             };
             std::fs::write(
                 sdir.join("skill.md"),
                 format!(
-                    "---\nname: {name}\ndescription: {description}\n{keywords}---\nBODY OF {i}\n"
+                    "---\nname: {name}\ndescription: {description}\n---\nBODY OF {i}\n"
                 ),
             )
             .unwrap();
@@ -3382,7 +3380,8 @@
         // Exactly one match returns its body: the model never guesses a name.
         let hit = dispatch(root, "load_skill", &json!({"query": "xylophone"}), None).unwrap();
         assert!(hit.contains("BODY OF 39"), "{hit}");
-        // The user's own Persian word finds its skill, exactly as in the catalog.
+        // A Persian query term finds its skill through the description — the
+        // matcher is Unicode-aware, so a Persian word works like any other.
         let fa = dispatch(root, "load_skill", &json!({"query": "زلزله"}), None).unwrap();
         assert!(fa.contains("BODY OF 38"), "{fa}");
         // Several matches list the candidates instead of inlining a wrong body.
@@ -3446,7 +3445,6 @@
                 "skills": [{
                     "name": "Release Notes",
                     "content": "READ THE GIT LOG",
-                    "fa_keywords": "یادداشت انتشار",
                     "extra_files": {"checklist.md": "- tag it"}
                 }]
             }),

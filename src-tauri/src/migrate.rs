@@ -115,7 +115,7 @@ fn prune_skill_store(root: &Path) -> usize {
         let Ok(raw) = std::fs::read_to_string(&md) else {
             continue;
         };
-        let (name, _, _, _) = crate::skills::parse_frontmatter_pub(&raw);
+        let (name, _, _) = crate::skills::parse_frontmatter_pub(&raw);
         let key = name.trim().to_lowercase();
         if key.is_empty() || !in_bundles.contains(&key) {
             continue;
@@ -206,7 +206,7 @@ fn skills_to_bundles(root: &Path) -> usize {
         let Ok(raw) = std::fs::read_to_string(&md) else {
             continue;
         };
-        let (name, _slug, description, fa_keywords) = crate::skills::parse_frontmatter_pub(&raw);
+        let (name, _slug, description) = crate::skills::parse_frontmatter_pub(&raw);
         if name.trim().is_empty() {
             continue;
         }
@@ -235,7 +235,6 @@ fn skills_to_bundles(root: &Path) -> usize {
             "name": name,
             "description": description,
             "content": content,
-            "fa_keywords": fa_keywords,
         });
         if !extra.is_empty() {
             skill["extra_files"] = Value::Object(extra);

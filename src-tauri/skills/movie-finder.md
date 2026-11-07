@@ -2,7 +2,6 @@
 name: Movie Finder
 slug: movie-finder
 description: Search the web for movies and present rich results with posters, trailers, ratings, and recommendations.
-fa_keywords: فیلم, سریال, فیلم معرفی کن, movie finder, film recommendation
 ---
 
 # Movie-Finder

@@ -445,8 +445,6 @@ export interface PluginConnectorRow {
   /** What this connector is for — stored in the bundle manifest, NOT in `cfg`
    *  (that object is forwarded to the MCP server verbatim). */
   description?: string
-  /** Persian phrases this connector answers to; same store as `description`. */
-  fa_keywords?: string[]
   /** Owning plugin's display name. */
   plugin?: string
   plugin_slug?: string
@@ -458,7 +456,6 @@ export interface PluginScriptRow {
   name: string
   language: string
   description: string
-  fa_keywords?: string[]
   /** Source file the code lives in (`main.rs`, `main.py`, …). */
   file?: string
   plugin?: string
@@ -559,10 +556,10 @@ export async function savePluginConnector(
   name: string,
   cfg: McpServerConfig,
   previousName?: string,
-  /** The row's own description and Persian keywords. They travel in the same
-   *  call but are filed in the bundle manifest — never inside `cfg`, which the
-   *  MCP client forwards verbatim. */
-  meta?: { description?: string; faKeywords?: string | string[] },
+  /** The row's own description. It travels in the same call but is filed in
+   *  the bundle manifest — never inside `cfg`, which the MCP client forwards
+   *  verbatim. */
+  meta?: { description?: string },
 ): Promise<{ ok: true } | { error: string }> {
   const out = await postPlugin('/plugins/mcp/save', {
     slug,
@@ -570,7 +567,6 @@ export async function savePluginConnector(
     cfg,
     ...(previousName && previousName !== name ? { previous_name: previousName } : {}),
     ...(meta?.description !== undefined ? { description: meta.description } : {}),
-    ...(meta?.faKeywords !== undefined ? { fa_keywords: meta.faKeywords } : {}),
   })
   return 'error' in out ? out : { ok: true }
 }
@@ -587,11 +583,11 @@ export async function deletePluginConnector(
 /** Patch one script's own metadata inside a bundle.
  *
  *  Sends NO `content`, so the backend keeps the body and the language already
- *  on disk — only the description and the Persian keywords change. */
+ *  on disk — only the description changes. */
 export async function savePluginScript(
   slug: string,
   name: string,
-  meta: { description?: string; faKeywords?: string | string[] },
+  meta: { description?: string },
 ): Promise<{ ok: true } | { error: string }> {
   const out = await postPlugin('/plugins/update', {
     slug,
@@ -599,7 +595,6 @@ export async function savePluginScript(
       {
         name,
         ...(meta.description !== undefined ? { description: meta.description } : {}),
-        ...(meta.faKeywords !== undefined ? { fa_keywords: meta.faKeywords } : {}),
       },
     ],
   })

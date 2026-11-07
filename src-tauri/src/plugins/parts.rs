@@ -9,32 +9,6 @@ pub(super) fn apply_parts(root: &Path, slug: &str, body: &Value) -> Result<(), S
             if name.is_empty() {
                 return Err("every entry in `skills` needs a name".into());
             }
-            // An entry that names no keywords at all inherits the bundle's;
-            // an explicit (even empty) list is respected as written, so a
-            // skill can opt out of keywords.
-            let empty = item.get("fa_keywords").is_none_or(|v| match v {
-                Value::Null => true,
-                Value::String(s) => s.trim().is_empty(),
-                Value::Array(a) => a.is_empty(),
-                _ => false,
-            });
-            // A skill that names no keywords is seeded from its own NAME — the
-            // only fact about it that is known to be relevant. The bundle's list
-            // is deliberately NOT used here: it belongs to the bundle, and
-            // copying it onto every skill of a mixed library gave all of them
-            // one identical, half-irrelevant trigger.
-            let keywords = if empty {
-                let seed = category_keywords(name);
-                // Empty seed → Null ("keep what is stored"), never "": a bare
-                // reinstall would otherwise wipe a list the user typed in.
-                if seed.is_empty() {
-                    Value::Null
-                } else {
-                    json!(seed)
-                }
-            } else {
-                item["fa_keywords"].clone()
-            };
             // A rename and an extra-file deletion were dropped here, so a rename
             // built a second folder and a "deleted" extra file stayed on disk.
             // `sync_skill` accepts both spellings, so pass whichever came in.
@@ -55,7 +29,6 @@ pub(super) fn apply_parts(root: &Path, slug: &str, body: &Value) -> Result<(), S
                     "previous_name": item["previous_name"].clone(),
                     "content": item["content"].clone(),
                     "description": item["description"].clone(),
-                    "fa_keywords": keywords,
                     "extra_files": if item.get("extra_files").is_some() {
                         item["extra_files"].clone()
                     } else {

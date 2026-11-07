@@ -36,7 +36,35 @@ pub(super) fn classify_subagent_attempt(res: &Result<(), String>, report: &str, 
                 .to_string(),
         );
     }
+    if report_is_garbled(report) {
+        // A model that breaks mid tool-call can end the turn with a few tokens
+        // of leaked call markup (`analysis激光 </rfl:parameter>`). That is not a
+        // report: treat it as a failed attempt so the ladder moves on at once.
+        return Err(
+            "explore returned malformed output (broken tool-call markup)".to_string(),
+        );
+    }
     Ok(())
+}
+
+/// Whether a SHORT report is just leaked tool-call markup. Deliberately narrow:
+/// only a tiny reply that carries a call-markup marker counts, so a real report
+/// that merely quotes such a tag in its body is never rejected.
+pub(super) fn report_is_garbled(report: &str) -> bool {
+    let t = report.trim();
+    if t.chars().count() > 160 {
+        return false;
+    }
+    const MARKERS: [&str; 7] = [
+        "</parameter>",
+        ":parameter>",
+        "</tool_call>",
+        "<tool_call>",
+        "<function_calls>",
+        "<|",
+        "antml:",
+    ];
+    MARKERS.iter().any(|m| t.contains(m))
 }
 
 pub(super) fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEvent) {
@@ -901,7 +929,8 @@ pub(super) fn skills_context_message() -> Value {
              The `=== AVAILABLE SKILLS ===` catalog is in your system prompt. Before \
              your first tool call of this turn, check it: if the request falls under \
              one of those skills — a request in any language matches on the \
-             description — call `load_skill` with that skill's name FIRST and follow its \
+             description — call `load_skill` for those skills IN THE SAME STEP as \
+             your other tool calls (never as a solo round) and follow their \
              instructions for the rest of the turn. If the catalog has no entry for \
              the task, do not read that as `no skill exists`: a large store cannot \
              all fit there, so call `load_skill` with a `query` of the task's words \
@@ -1280,22 +1309,36 @@ pub(super) async fn run_subagent(
     // only written after a successful stream), so without this the baseline
     // could not count the attempts a run actually burned — the mission's
     // instrumentation asks for exactly that. `kind:"retry"`; the reason and
-    // model name the rung.
+    // model name the rung. This is the ONE row per retry — run_turn's own
+    // stream-failure row is skipped for sub-agent mode (see turn.rs), so the
+    // panel shows a single line carrying the model, the reason and the
+    // counters instead of two half-empty rows for the same failure.
     let trace = crate::trace::TraceStore::new(parent.chat_id.clone())
         .with_run(TURN_SEQ.fetch_add(1, Ordering::Relaxed));
+    // Wall-clock (epoch ms) of the RUNNING attempt, refreshed at the top of
+    // the loop and stamped onto every retry row: a 60s provider timeout reads
+    // as `duration_ms: 60002` without opening the row. An atomic (not a Cell)
+    // because the emit closure is cast to a Send sink inside run_turn.
+    let attempt_started_ms = AtomicU64::new(0);
     let mut emit = |ev: &AgentEvent| match ev {
         ev @ (AgentEvent::Retry { attempt, max_attempts, reason, model, tool, provider_id, fallback, .. }
         | AgentEvent::RetryGiveup { attempt, max_attempts, reason, model, tool, provider_id, fallback, .. }) => {
             let giveup = matches!(ev, AgentEvent::RetryGiveup { .. });
             let reconnecting = matches!(ev, AgentEvent::Retry { reconnecting: true, .. });
+            // The reason IS the failure (provider 429, hang, empty report …) —
+            // it belongs in the row title, not buried behind the expander. A
+            // manual "retrying now (requested)" is not a failure: leaving the
+            // `error` unset keeps the red ERROR chip off that row.
+            let informational = reason == "retrying now (requested)";
             trace.record(crate::trace::TraceEntry {
                 kind: "retry".into(),
                 summary: format!(
-                    "attempt {attempt}/{max_attempts}{}",
-                    if giveup { " — gave up" } else { "" }
+                    "attempt {attempt}/{max_attempts}{} — {}",
+                    if giveup { " — gave up" } else { "" },
+                    &reason.chars().take(160).collect::<String>()
                 ),
                 model: Some(model.clone()),
-                error: Some(reason.clone()),
+                error: (!informational).then(|| reason.clone()),
                 detail: Some(json!({
                     "attempt": attempt,
                     "max_attempts": max_attempts,
@@ -1304,6 +1347,8 @@ pub(super) async fn run_subagent(
                     "reconnecting": reconnecting,
                     "fallback": fallback,
                     "giveup": giveup,
+                    "duration_ms": (crate::state::now_ms() as u64)
+                        .saturating_sub(attempt_started_ms.load(Ordering::Relaxed)),
                 })),
                 ..Default::default()
             });
@@ -1541,6 +1586,7 @@ pub(super) async fn run_subagent(
     // the rung changes. The budget belongs to ONE model, not to the ladder.
     let mut rung_attempts = 0usize;
     for attempt in 1..=max_attempts {
+        attempt_started_ms.store(crate::state::now_ms() as u64, Ordering::Relaxed);
         let mut report = String::new();
         let mut sub_error = String::new();
         // Re-resolve the slot BEFORE every attempt. The user fixing the

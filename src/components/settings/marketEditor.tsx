@@ -453,8 +453,8 @@ export function MarketplaceEditor() {
       <div className="field">
         <div className="hint">
           A bundle installed from here lands in <b>Plugins</b> like any other: edit its
-          description and Persian keywords there, switch it off, or press{' '}
-          <b>Update from source</b> to pull it again.
+          description there, switch it off, or press <b>Update from source</b> to pull
+          it again.
         </div>
       </div>
     </>
@@ -479,12 +479,12 @@ export function PluginBundleEditor() {
   const setSkillCatalogMaxChars = useStore((s) => s.setSkillCatalogMaxChars)
 
   /** Filter before paging: one query covers the name, its skills and its
-   *  Persian keywords, so `/ترجمه` finds a bundle whose skills translate. */
+   *  description, so a word of what a bundle does finds it. */
   const filteredPlugins = (plugins ?? []).filter((p) => {
     const q = pluginFilter.trim().toLowerCase()
     if (!q) return true
     return (
-      `${p.name} ${p.slug} ${p.description ?? ''} ${(p.skills ?? []).join(' ')} ${(p.fa_keywords ?? []).join(' ')}`
+      `${p.name} ${p.slug} ${p.description ?? ''} ${(p.skills ?? []).join(' ')}`
         .toLowerCase()
         .includes(q)
     )

@@ -1,7 +1,6 @@
 ---
 name: Code-Mentor
 description: Senior software engineering mentor for project-aware coding, debugging, architecture, refactoring, performance engineering, code review, and programming education.
-fa_keywords: آموزش کد, یادگیری کد, از کد پیدا کن
 ---
 
 # Code-Mentor

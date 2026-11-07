@@ -95,8 +95,6 @@ pub fn save_bundle_skill(root: &Path, skill: Value) -> Result<Value, String> {
     // and the Settings toast both read these keys, so a bundle write has to
     // report the same way a store write used to.
     let dir = skill_dir_for(root, &name).unwrap_or_else(|| plugin_dir(root, &slug));
-    let md = std::fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
-    let (_, _, _, written_fa) = crate::skills::parse_frontmatter_pub(&md);
     // The same listing `sync_skill` reports: the editor refreshes its file list
     // from this reply, so a hard-coded empty array hid the extra files the call
     // had just written or kept.
@@ -120,7 +118,6 @@ pub fn save_bundle_skill(root: &Path, skill: Value) -> Result<Value, String> {
         "note": "saved",
         "files": files,
         "renamed_from": if previous.is_empty() { Value::Null } else { json!(previous) },
-        "fa_keyword_count": written_fa.len(),
     }))
 }
 
@@ -161,14 +158,13 @@ pub fn save_bundle_connector(root: &Path, body: &Value) -> Result<Value, String>
     if !cfg.is_object() {
         return Err("connector config must be an object".into());
     }
-    // The row's own description and keywords travel in the SAME call but are
-    // stored in the bundle manifest — never inside the connector's config, which
-    // is forwarded to the MCP server verbatim.
+    // The row's own description travels in the SAME call but is stored in the
+    // bundle manifest — never inside the connector's config, which is forwarded
+    // to the MCP server verbatim.
     let entry = json!({
         "description": body["description"].as_str().unwrap_or(""),
-        KEYWORDS: keywords_of(&body[KEYWORDS]),
     });
-    let has_meta = body.get("description").is_some() || has_keywords(body);
+    let has_meta = body.get("description").is_some();
     match connector_target(root, body, name, previous) {
         Some(slug) => {
             if has_meta {

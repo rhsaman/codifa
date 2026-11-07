@@ -22,6 +22,43 @@ function bareTool(tool: string): string {
   return i > 0 ? rest.slice(i + 2) : tool;
 }
 
+/** Kind glyph of a row in the card (skill spark / connector plug / plugin box). */
+function TuKindIcon({ kind }: { kind: "skill" | "connector" | "plugin" }) {
+  const p = {
+    width: 14,
+    height: 14,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.9,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+  };
+  if (kind === "skill") {
+    return (
+      <svg {...p}>
+        <path d="M12 3l1.8 4.6L18.5 9l-4.7 1.4L12 15l-1.8-4.6L5.5 9l4.7-1.4z" />
+        <path d="M18 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z" />
+      </svg>
+    );
+  }
+  if (kind === "connector") {
+    return (
+      <svg {...p}>
+        <path d="M9 3v5M15 3v5" />
+        <path d="M6 8h12v3a6 6 0 0 1-12 0z" />
+        <path d="M12 17v4" />
+      </svg>
+    );
+  }
+  return (
+    <svg {...p}>
+      <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" />
+      <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
+    </svg>
+  );
+}
+
 /** Skills/MCP/plugins of the CURRENT turn — the same per-chat window the Todos
  *  card uses (newest user message → end of the transcript). Attached skills and
  *  enabled connectors come from that message; a `load_skill` call anywhere
@@ -94,49 +131,51 @@ export function TurnUsageSection({
     used: c.used,
     tools: connectorTools.get(c.name) ?? [],
   }));
-  // Split ONCE: the Used row states what ran, so the groups below carry only
-  // what was attached/enabled and left untouched. Listing a used skill in both
-  // places was the panel's real noise (the same chip appeared twice).
-  const unusedSkills = skills.filter((s) => !s.used);
-  const unusedConnectors = connectors.filter((c) => !c.used && c.tools.length === 0);
-
   const total = usage.skills.length + usage.mcp.length + owners.length;
-
-  // The Used row: exactly what the turn ran, listed here ONCE and never again
-  // in the groups below (those keep the untouched inventory). A skill's owning
-  // plugin rides along as its meta suffix ("Ponytail · Dev Kit").
-  const usedChips: Array<{
-    key: string;
-    name: string;
-    meta?: string;
-    title: string;
-  }> = [];
-  for (const s of skills) {
-    if (!s.used) continue;
-    usedChips.push({
-      key: `used-skill-${s.name}`,
-      name: s.name,
-      meta: skillOwner(s.name, catalog) || undefined,
-      title: "Loaded by the agent this turn",
-    });
-  }
-  for (const c of connectors) {
-    if (!c.used && c.tools.length === 0) continue;
-    usedChips.push({
-      key: `used-mcp-${c.name}`,
-      name: c.name,
-      meta: c.tools.length > 0 ? `· ${c.tools.length}` : undefined,
-      title:
-        c.tools.length > 0
-          ? c.tools.join(", ")
-          : "Loaded by the agent this turn",
-    });
-  }
 
   // Nothing attached and nothing used → NO card. The old "runs without
   // skills…" paragraph was a whole empty card for a fact nobody asked for; the
   // page-level hint speaks only when every card on the page is empty.
   if (total === 0) return null;
+
+  // The card's rows: used first, then attached/enabled-but-untouched, then the
+  // owning plugins (no state — they are context, not something that ran).
+  type TuRow = {
+    key: string;
+    kind: "skill" | "connector" | "plugin";
+    name: string;
+    sub: string;
+    state: "used" | "idle" | "plain";
+    title: string;
+  };
+  const rows: TuRow[] = [];
+  for (const s of skills) {
+    rows.push({
+      key: `skill-${s.name}`,
+      kind: "skill",
+      name: s.name,
+      sub: skillOwner(s.name, catalog) || "Skill",
+      state: s.used ? "used" : "idle",
+      title: s.used ? "Loaded by the agent this turn" : "Attached to this turn, not loaded",
+    });
+  }
+  for (const c of connectors) {
+    const used = c.used || c.tools.length > 0;
+    rows.push({
+      key: `mcp-${c.name}`,
+      kind: "connector",
+      name: c.name,
+      sub: c.tools.length > 0 ? `${c.tools.length} tool${c.tools.length === 1 ? "" : "s"}` : "Connector",
+      state: used ? "used" : "idle",
+      title: c.tools.length > 0 ? c.tools.join(", ") : used ? "Loaded by the agent this turn" : "Enabled for this turn, never called",
+    });
+  }
+  rows.sort((a, b) => Number(b.state === "used") - Number(a.state === "used"));
+  for (const name of owners) {
+    rows.push({ key: `plugin-${name}`, kind: "plugin", name, sub: "Plugin", state: "plain", title: "Plugin that provides this turn's tools" });
+  }
+  const usedCount = rows.filter((r) => r.state === "used").length;
+  const idleCount = rows.filter((r) => r.state === "idle").length;
 
   return (
     <div
@@ -166,100 +205,41 @@ export function TurnUsageSection({
         <span className="sidebar-panel-count">{total}</span>
       </div>
       {!collapsed && (
-        <div className="turn-usage-body">
-          {/* What the turn ACTUALLY ran with, first and as one row of chips:
-              the card's job is answering that before listing the inventory
-              below. An entry repeats its own group on purpose — the same skill
-              is both "attached" and "used", and only this row says so at a
-              glance. */}
-          {usedChips.length > 0 && (
-            <section className="turn-usage-group turn-usage-group-used">
-              <h4 className="turn-usage-label">
-                Used
-                <span className="turn-usage-count">{usedChips.length}</span>
-              </h4>
-              <ul className="turn-usage-list">
-                {usedChips.map((c) => (
-                  <li
-                    className="turn-usage-chip used"
-                    key={c.key}
-                    title={c.title}
-                  >
-                    <span className="turn-usage-dot" aria-hidden="true" />
-                    <span className="turn-usage-name">{c.name}</span>
-                    {c.meta && <span className="turn-usage-meta">{c.meta}</span>}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-          {unusedSkills.length > 0 && (
-            <section className="turn-usage-group">
-              <h4
-                className="turn-usage-label"
-                title="Attached to this turn but never loaded"
+        <div className="tu-body">
+          {/* One calm list instead of boxed groups: every entry is a row with a
+              kind icon, its name, where it comes from and a state pill. What the
+              turn RAN comes first; attached-but-untouched entries follow dimmed. */}
+          <div className="tu-summary">
+            <span className="tu-sum used">{`${usedCount} used`}</span>
+            {idleCount > 0 && (
+              <span className="tu-sum idle">{`${idleCount} not used`}</span>
+            )}
+            {owners.length > 0 && (
+              <span className="tu-sum idle">{`${owners.length} plugin${owners.length === 1 ? "" : "s"}`}</span>
+            )}
+          </div>
+          <ul className="tu-list">
+            {rows.map((r) => (
+              <li
+                key={r.key}
+                className={`tu-row ${r.state}`}
+                title={r.title}
               >
-                Skills
-                <span className="turn-usage-count">{unusedSkills.length}</span>
-              </h4>
-              <ul className="turn-usage-list">
-                {unusedSkills.map((s) => {
-                  // The owning plugin tells a store skill from a bundled one
-                  // without opening Settings ("Ponytail · Dev Kit").
-                  const owner = skillOwner(s.name, catalog);
-                  return (
-                    <li
-                      className="turn-usage-chip"
-                      key={`skill-${s.name}`}
-                      title="Attached to this turn, not loaded"
-                    >
-                      <span className="turn-usage-dot" aria-hidden="true" />
-                      <span className="turn-usage-name">{s.name}</span>
-                      {owner && <span className="turn-usage-meta">{owner}</span>}
-                    </li>
-                  );
-                })}
-              </ul>
-            </section>
-          )}
-          {unusedConnectors.length > 0 && (
-            <section className="turn-usage-group">
-              <h4
-                className="turn-usage-label"
-                title="Enabled for this turn but never called"
-              >
-                Connectors
-                <span className="turn-usage-count">
-                  {unusedConnectors.length}
+                <span className={`tu-icon ${r.kind}`} aria-hidden="true">
+                  <TuKindIcon kind={r.kind} />
                 </span>
-              </h4>
-              <ul className="turn-usage-list">
-                {unusedConnectors.map(({ name }) => (
-                  <li
-                    className="turn-usage-chip"
-                    key={`mcp-${name}`}
-                    title="Enabled for this turn, never called"
-                  >
-                    <span className="turn-usage-dot" aria-hidden="true" />
-                    <span className="turn-usage-name">{name}</span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-          {owners.length > 0 && (
-            <section className="turn-usage-group">
-              <h4 className="turn-usage-label">Plugins</h4>
-              <ul className="turn-usage-list">
-                {owners.map((name) => (
-                  <li className="turn-usage-chip" key={`plugin-${name}`}>
-                    <span className="turn-usage-dot" aria-hidden="true" />
-                    <span className="turn-usage-name">{name}</span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
+                <span className="tu-main">
+                  <span className="tu-name">{r.name}</span>
+                  <span className="tu-sub">{r.sub}</span>
+                </span>
+                {r.state !== "plain" && (
+                  <span className={`tu-state ${r.state}`}>
+                    {r.state === "used" ? "Used" : "Not used"}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>

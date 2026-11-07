@@ -632,7 +632,7 @@ fn report(path: &Path) {
         tools.values().map(|s| s.calls).sum::<usize>(),
         unnamed_tools,
         errors
-    )
+    );
     if !batch_op_tools.is_empty() {
         let mut parts: Vec<String> = batch_op_tools
             .iter()
@@ -640,7 +640,7 @@ fn report(path: &Path) {
             .collect();
         parts.sort();
         println!("      batch ops    : {} (inside the batch rows above)", parts.join(", "));
-    };
+    }
     let mut by_calls: Vec<(&String, &ToolStat)> = tools.iter().collect();
     by_calls.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
     for (name, s) in by_calls.iter().take(8) {

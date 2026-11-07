@@ -276,6 +276,11 @@ pub struct TtsBody {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// The renderer sends the whole key ring as a JSON-encoded array string
+    /// (same shape STT receives); it was silently ignored here, so TTS went out
+    /// unauthenticated unless an env var happened to be set.
+    #[serde(default)]
+    pub api_keys: String,
     #[serde(default)]
     pub env_var: String,
     #[serde(default)]
@@ -304,6 +309,14 @@ pub async fn tts(Json(b): Json<TtsBody>) -> Response<Body> {
         return error_response(StatusCode::BAD_REQUEST, "remote TTS needs 'base_url'");
     }
     let mut key = b.api_key.trim().to_string();
+    if key.is_empty() {
+        if let Some(first) = serde_json::from_str::<Vec<String>>(&b.api_keys)
+            .ok()
+            .and_then(|keys| keys.into_iter().find(|k| !k.trim().is_empty()))
+        {
+            key = first.trim().to_string();
+        }
+    }
     if key.is_empty() {
         key = crate::providers::env_key(&provider_kind, b.env_var.trim());
     }

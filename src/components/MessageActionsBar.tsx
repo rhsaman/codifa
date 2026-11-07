@@ -88,6 +88,7 @@ export function MessageActionsBar({
   usage,
   ttsStatus,
   onSpeak,
+  onStopTts,
   fork,
   onFork,
   read,
@@ -100,6 +101,8 @@ export function MessageActionsBar({
   /** Speak button shows only when BOTH are given (parent owns the logic). */
   ttsStatus?: TtsStatus;
   onSpeak?: () => void;
+  /** Hard-stop for TTS playback (pause keeps the queue, this clears it). */
+  onStopTts?: () => void;
   fork?: boolean;
   onFork?: () => void;
   read?: boolean;
@@ -258,6 +261,21 @@ export function MessageActionsBar({
                   <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
                 </svg>
               )}
+            </button>
+          )}
+          {/* Hard stop BESIDE pause (user request): pause keeps the queue and
+              resumes; this button kills playback AND the pending sentence
+              queue outright. Only meaningful while playback is active. */}
+          {onStopTts && (ttsStatus === "speaking" || ttsStatus === "paused") && (
+            <button
+              className="msg-copy msg-speak msg-tts-stop"
+              onClick={onStopTts}
+              title="توقف پخش"
+              aria-label="Stop TTS"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
             </button>
           )}
           {read && onRead && (

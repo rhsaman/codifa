@@ -1131,7 +1131,14 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 .as_array()
                 .ok_or("batch needs ops: [{tool, args}]")?;
             if ops.is_empty() {
-                return Err("batch: ops is empty".into());
+                // The failing model retries IMMEDIATELY after this error, so
+                // the message carries a copy-pasteable example: traced 7 Nov
+                // on a weak model, 8 of 29 batch calls arrived with empty ops
+                // and each bare error cost a whole extra round.
+                return Err(
+                    "batch: ops is empty — pass a NON-empty array of {tool, args} pairs, e.g. {\"ops\":[{\"tool\":\"grep\",\"args\":{\"pattern\":\"todo\",\"path\":\".\"}},{\"tool\":\"read\",\"args\":{\"filePath\":\"a.txt\"}}]}; tool one of: read, grep, glob, find_symbol, lsp_*, run_terminal, edit_file, write_file"
+                        .into(),
+                );
             }
             if ops.len() > BATCH_MAX_OPS {
                 return Err(format!(
@@ -1176,9 +1183,10 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
 }
 
 /// Batchable tools for the `batch` executor — the read-only search family plus
-/// the writers and the terminal, so a WHOLE step (lookups → edits → verify)
-/// rides one round-trip. `load_skill` and the delegation tools stay out: their
-/// results are turn-shaping decisions the model should make on its own round.
+/// the writers, the terminal and the planning controls (skill load, plan
+/// update), so a WHOLE step (lookups → edits → verify) rides one round-trip.
+/// The DELEGATION tools stay out: their results are turn-shaping decisions the
+/// model should make on its own round.
 pub(super) const BATCH_TOOLS: &[&str] = &[
     "read",
     "grep",

@@ -454,7 +454,11 @@ console.log('۱۵) وقتی هیچ جمله‌ای موفق نیست، خطا ب
 console.log('۱۶) markdown برای گفتار تمیز می‌شود:')
 {
   const md = stripMarkdownForTts('## Title\n\nSee [docs](https://x.test/page) and `code`.\n\n```ts\nconst a = 1\n```\n\n- item one\n> quote here\n\nVisit https://x.test/raw now')
-  check('هدر/لینک/کدفنس/نقل‌قول خوانا شد', md.includes('Title') && md.includes('docs') && md.includes('const a = 1') && md.includes('item one') && md.includes('quote here'), md)
+  check('هدر/لینک/نقل‌قول خوانا شد', md.includes('Title') && md.includes('docs') && md.includes('item one') && md.includes('quote here'), md)
+  check('بلوک کد خوانده نمی‌شود', !md.includes('const a = 1'), md)
+  check('بلوک کدِ نیمه‌باز (استریم) خوانده نمی‌شود', !stripMarkdownForTts('Intro.\n```ts\nconst b = 2').includes('const b'))
+  check('جدول بدون پایپ بیرونی خوانده نمی‌شود', !stripMarkdownForTts('Before.\n\nName | Age\n--- | ---\nAli | 3\n\nAfter.').includes('Ali'))
+  check('بلوک tool call خوانده نمی‌شود', !stripMarkdownForTts('Hi. <tool_call>{"name":"x"}</tool_call> Bye.').includes('name'))
   check('نشانه‌گذاری و URL خام خوانده نمی‌شود', !md.includes('https://') && !md.includes('```') && !md.includes('##'), md)
 }
 

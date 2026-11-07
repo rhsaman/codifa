@@ -52,11 +52,8 @@ fn run_git(root: &str, args: &[&str]) -> Result<String, GitError> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn truncate(diff: String) -> Value {
-    truncate_to(diff, MAX_DIFF)
-}
-
-/// Cap-aware core of `truncate` — `max = usize::MAX` never cuts.
+/// Cap-aware core of the capped fetchers (`diff_capped` / `show_capped`) —
+/// `max = usize::MAX` never cuts.
 fn truncate_to(diff: String, max: usize) -> Value {
     if diff.len() > max {
         // Cut on a char boundary: a raw byte slice panics when the cap lands

@@ -352,6 +352,16 @@ pub(super) fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Opt
             if !google {
                 body["stream_options"] = json!({ "include_usage": true });
             }
+            // OpenRouter's OWN usage-accounting switch: without this top-level
+            // field its streams may omit `usage` (and with it the cache-hit
+            // numbers the meter and the pricing math read) even though the
+            // OpenAI-standard `stream_options.include_usage` above is set. The
+            // payload shape itself is the SUBSET convention
+            // (`prompt_tokens_details.cached_tokens` inside `prompt_tokens`),
+            // which `llm::NormalizedUsage` already handles.
+            if cfg.provider == "openrouter" {
+                body["usage"] = json!({ "include": true });
+            }
             // Ask the model to emit INDEPENDENT tool calls in ONE assistant
             // message instead of serialising one call per round trip.
             //

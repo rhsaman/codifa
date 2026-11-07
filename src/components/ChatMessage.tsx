@@ -76,6 +76,12 @@ import { MessageActionsBar, MsgClocks } from "./MessageActionsBar";
 /** Basename for attachment chips: message bubbles must show "report.pdf",
  *  never the full absolute path (imported uploads live in the app data root
  *  and rendering it verbatim is noise). The full path stays in the tooltip. */
+/** Show a TTS error in the chat footer. It does not fade on a timer: the next
+ *  status (new turn, compaction, notice — see Chat.tsx) replaces it. */
+function postTtsError(chatId: string, msg: string): void {
+  useStore.getState().setChatTtsError(chatId, msg);
+}
+
 export function forkChatWithConfirm(messageId: string): void {
   const s = useStore.getState();
   const src = s.chats.find((c) => c.messages.some((m) => m.id === messageId));
@@ -538,7 +544,12 @@ export const ChatMessageView = memo(
     const st = useStore.getState();
     // A live voice session owns the audio output: never start separate message playback over it.
     const liveVoice = (st as unknown as { liveVoiceState?: string }).liveVoiceState;
-    if (liveVoice === "live" || liveVoice === "speaking" || liveVoice === "connecting") return;
+    if (liveVoice === "live" || liveVoice === "speaking" || liveVoice === "connecting") {
+      // Never a silent no-op: tell the user why the speaker button does nothing.
+      const liveChatId = st.chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
+      if (liveChatId) postTtsError(liveChatId, "ویس لایو فعال است — ابتدا آن را متوقف کنید");
+      return;
+    }
     const providers = st.settings.providers ?? [];
     // Build the provider chain: primary first, then ordered fallbacks.
     const toSpeakOpts = (
@@ -563,7 +574,7 @@ export const ChatMessageView = memo(
     if (chain.length === 0) {
       const msg = "برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید";
       const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
-      if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, msg);
+      if (bannerChatId) postTtsError(bannerChatId, msg);
       return;
     }
     // Only the final answer is spoken — the working trace (tool narrations,
@@ -572,7 +583,7 @@ export const ChatMessageView = memo(
     if (!speakable.trim()) {
       const msg = "متن قابل خواندنی برای پخش نیست";
       const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
-      if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, msg);
+      if (bannerChatId) postTtsError(bannerChatId, msg);
       return;
     }
     try {
@@ -582,7 +593,7 @@ export const ChatMessageView = memo(
       if (!friendly) return;
       console.warn("speak failed", err);
       const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
-      if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, friendly);
+      if (bannerChatId) postTtsError(bannerChatId, friendly);
     }
   };
 
@@ -922,6 +933,7 @@ export const ChatMessageView = memo(
                 }
               : undefined
           }
+          onStopTts={ttsStop}
           fork={Boolean(message.content)}
           onFork={() => forkChatWithConfirm(message.id)}
           read={!isSummary && !message.streaming && sections.length >= 2}

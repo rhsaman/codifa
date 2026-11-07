@@ -1990,8 +1990,11 @@
             // step, the exact trade this ceiling prices deliberately.
             // +87: the ask_user/confirm_action same-step clause (the anti-solo
             // teaching for the interactive tools).
-            ("main", tool_schemas(false, false), 19_350usize),
-            ("main+browser", tool_schemas(false, true), 26_200),
+            // +111: the glob/grep/terminal ownership lines (file discovery =
+            // glob, content = grep — the traced batch used grep+ls for what
+            // one glob answers).
+            ("main", tool_schemas(false, false), 19_500usize),
+            ("main+browser", tool_schemas(false, true), 26_350),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -2003,8 +2006,8 @@
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
             // Raised for `ask_user` `sections` (see the `main` note above).
-            ("main+authoring", tool_schemas(true, false), 26_400),
-            ("main+authoring+browser", tool_schemas(true, true), 33_250),
+            ("main+authoring", tool_schemas(true, false), 26_450),
+            ("main+authoring+browser", tool_schemas(true, true), 33_300),
             // Re-based when `batch` joined the RESEARCH set: the explore
             // sub-agent is the heaviest search caller, so the whole-step
             // executor rides there too (that is where the round-trips are).
@@ -5635,6 +5638,45 @@
             !dir.join("nope.txt").exists(),
             "a refused op must not touch the disk"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_plan_execute_protocol_rides_the_first_request() {
+        // The model-INDEPENDENT round lever: the first request carries the
+        // protocol head, and when the model obeys it (one batch, whole step),
+        // 3 tool calls complete in ONE tool round + the answer.
+        let dir = std::env::temp_dir().join(format!("codifa-scen-protocol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello protocol").unwrap();
+        let batch_args = json!({"ops": [
+            {"tool": "read", "args": {"filePath": "a.txt"}},
+            {"tool": "grep", "args": {"pattern": "hello", "path": ".", "include": "*.txt"}},
+            {"tool": "run_terminal", "args": {"command": "echo protocol-ok"}},
+        ]});
+        let (base, mut rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "batch", &batch_args.to_string()),
+                finish_frame("tool_calls", 150, 10),
+            ],
+            vec![text_frame("step done"), finish_frame("stop", 200, 8)],
+        ])
+        .await;
+        let events = scenario_events();
+        let res = scenario_turn(&base, "scen-protocol", dir.to_str().unwrap(), events.clone()).await;
+        assert!(res.is_ok(), "{res:?}");
+        // The FIRST request on the wire carries the protocol head.
+        let first = rx.recv().await.expect("first request body");
+        let body = first.to_string();
+        assert!(
+            body.contains("PROTOCOL: your first tool reply is ONE batch"),
+            "the protocol must ride the first request: {}",
+            &body[..body.len().min(300)]
+        );
+        // ONE tool round for the 3 calls, then the answer round.
+        let ev = events.lock().unwrap();
+        assert_eq!(count_kind(&ev, "usage"), 2, "3 tool calls in 1 round + answer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

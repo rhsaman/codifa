@@ -17,13 +17,13 @@
         let mut diff = "a".repeat(MAX_DIFF - 2);
         diff.push('—');
         diff.push_str("tail");
-        let out = truncate(diff);
+        let out = truncate_to(diff, MAX_DIFF);
         assert_eq!(out["truncated"], true);
         let kept = out["diff"].as_str().unwrap();
         assert_eq!(kept.len(), MAX_DIFF - 2);
         assert!(kept.chars().all(|c| c == 'a'));
         // Under the cap: untouched.
-        let small = truncate("short — diff".to_string());
+        let small = truncate_to("short — diff".to_string(), MAX_DIFF);
         assert_eq!(small["truncated"], false);
     }
 

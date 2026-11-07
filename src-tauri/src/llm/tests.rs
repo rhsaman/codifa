@@ -203,6 +203,9 @@
         let msgs = vec![json!({"role": "user", "content": "hi"})];
         let body = build_request_body(&c, &msgs, Some(&tools));
         assert_eq!(body["parallel_tool_calls"], json!(true));
+        // OpenRouter's own usage-accounting switch: without it the stream may
+        // omit `usage` — and with it the cache-hit numbers the meter reads.
+        assert_eq!(body["usage"], json!({"include": true}));
 
         // Only when tools are actually offered: the flag is meaningless — and an
         // unknown field to a strict gateway — on a call that carries none.

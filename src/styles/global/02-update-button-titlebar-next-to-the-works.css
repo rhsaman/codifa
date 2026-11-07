@@ -2788,6 +2788,20 @@ body.coder-dragging .chat-split-child {
   animation: tts-spin 0.9s linear infinite;
 }
 
+/* Hard-stop TTS button (sits beside the pause icon): it has no speaking/
+   paused state class of its own, so give it the accent visibility directly —
+   always shown while playback is active, danger-tinted on hover. */
+.msg-speak.msg-tts-stop {
+  opacity: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.msg-speak.msg-tts-stop:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
 @keyframes tts-spin {
   to {
     transform: rotate(360deg);

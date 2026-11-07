@@ -882,14 +882,22 @@ pub(super) const SKILLS_CONTEXT_HEAD: &str =
 pub(super) const PLUGIN_CONTEXT_HEAD: &str =
     "=== CONTEXT: from an installed plugin (NOT a new request) ===";
 
+/// Opening line of the trailing Plan-Execute protocol message: the model's
+/// FIRST tool-carrying reply of the turn must be ONE `batch` with the whole
+/// step. This is the model-INDEPENDENT round-trip lever — the reply SHAPE is
+/// dictated by the loop, not requested from the model.
+pub(super) const BATCH_PROTOCOL_HEAD: &str =
+    "=== PROTOCOL: your first tool reply is ONE batch with the whole step (NOT a new request) ===";
+
 /// True for a message that exists ONLY on the wire (the renderer never stores
-/// it): the trailing plan/checklist context and the skills reminder. Both are
-/// pushed after the user prompt to stay off the cached prefix, so the fold count
-/// must ignore both.
+/// it): the trailing plan/checklist context, the skills reminder, the plugin
+/// context and the step protocol. All are pushed after the user prompt to stay
+/// off the cached prefix, so the fold count must ignore all of them.
 pub(super) fn is_wire_only_context(content: &str) -> bool {
     content.starts_with(PLAN_CONTEXT_HEAD)
         || content.starts_with(SKILLS_CONTEXT_HEAD)
         || content.starts_with(PLUGIN_CONTEXT_HEAD)
+        || content.starts_with(BATCH_PROTOCOL_HEAD)
 }
 
 /// Number of messages in a compaction tail that the RENDERER can actually fold.
@@ -941,6 +949,31 @@ pub(super) fn skills_context_message() -> Value {
     })
 }
 
+
+/// The Plan-Execute protocol, pushed at the tail of the FIRST request.
+///
+/// The model-INDEPENDENT round-trip lever: a weak model answers with exactly
+/// one tool call per reply (traced: nemotron 38/43 rounds solo) no matter how
+/// many batching tools exist. Dictating the REPLY SHAPE closes that gap — the
+/// first tool-carrying reply must be one `batch` carrying the whole step, the
+/// loop executes all of it in one round-trip, and a dependent second wave goes
+/// in the next reply. Replanning stays free (mission rule 6): an unexpected
+/// result simply shapes the second wave.
+pub(super) fn batch_protocol_message() -> Value {
+    json!({
+        "role": "user",
+        "content": format!(
+            "{BATCH_PROTOCOL_HEAD}\n\
+             For this task, your FIRST reply that makes tool calls must be ONE `batch` \
+             call carrying EVERY call you expect to need — the lookups (grep/glob/read/\
+             find_symbol/lsp_*), the files to open, the commands to check — as \
+             ops:[{{\"tool\":\"grep\",\"args\":{{...}}}},…] (max 10). Every result comes back \
+             together in one round-trip; a dependent second wave (calls that needed a \
+             result you just got) goes in your NEXT reply. A reply with a single \
+             independent tool call wastes a whole round-trip — never send one."
+        ),
+    })
+}
 
 /// Wrap a PER-TURN section as a trailing context message, or `None` when there
 /// is nothing to send.

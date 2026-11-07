@@ -67,7 +67,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
             // The schema is where the model learns the DIVISION OF LABOUR: the
             // backend refuses a shell read/search (MEASURED: the model reached
             // for `cat`/`sed -n` whenever the tool list did not say so).
-            "Run shell command(s) in the workspace with a timeout. For terminal-only work: listing/measuring (du, df, ps, lsof), builds, tests, git, and paths outside the workspace (shell grep/find is fine there). It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`. For a long-running process (dev server, watcher) set background=true: detached, output to a log, returns at once — never mute curl/wget (-s/-q hides progress). SEVERAL commands: pass `commands` — they run IN ORDER in this ONE call (one result block each); never spend one round-trip per inspection.",
+            "Run shell command(s) in the workspace with a timeout. For terminal-only work: system-level measures (du, df, ps, lsof, env), builds, tests, git, and paths outside the workspace (a shell find/ls there is fine when a glob/grant does not cover it — inside the workspace file discovery is `glob`). It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`. For a long-running process (dev server, watcher) set background=true: detached, output to a log, returns at once — never mute curl/wget (-s/-q hides progress). SEVERAL commands: pass `commands` — they run IN ORDER in this ONE call (one result block each); never spend one round-trip per inspection.",
             json!({
                 "command": {"type": "string"},
                 "commands": {"type": "array", "items": {"type": "string"}, "description": "Several commands run IN ORDER in this ONE call — one result block per command. Batch every independent inspection here instead of one call each."},
@@ -96,7 +96,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         ),
         (
             "grep",
-            "Regex search for a token whose FILE is unknown: pass path+include to scope it, then read the hits. Search HERE, not via `run_terminal` (a shell search is refused).",
+            "Regex CONTENT search for a token whose FILE is unknown: pass path+include to scope it, then read the hits. Search HERE, not via `run_terminal` (a shell search is refused). File-NAME discovery ('which files exist') is `glob`, not grep-for-names.",
             json!({
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},
@@ -777,7 +777,7 @@ pub(super) fn research_schemas() -> Vec<Value> {
         ),
         (
             "glob",
-            "Find FILES (never directories) by glob. The pattern is matched against the path relative to `path`; `**/` matches zero or more directories and `*` never crosses `/`. ALWAYS pass path scoped to a real directory from the project layout. A 'no matches' answer is final — do not retry variations; use grep, or read a directory path to list it.",
+            "Find FILES (never directories) by glob. The pattern is matched against the path relative to `path`; `**/` matches zero or more directories and `*` never crosses `/`. ALWAYS pass path scoped to a real directory from the project layout — absolute paths outside the workspace work too (one permission prompt, then granted). This is THE file-discovery tool: 'which files match X' is ONE glob, never terminal ls/find and never grep-for-names. A 'no matches' answer is final — do not retry variations; use grep for CONTENT, or read a directory path to list it.",
             json!({
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},

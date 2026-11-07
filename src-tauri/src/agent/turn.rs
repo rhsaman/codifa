@@ -775,6 +775,10 @@ already approved with \"Always allow\".",
     if req.mode != "subagent" {
         messages.push(skills_context_message());
     }
+    // The Plan-Execute protocol (always-on, main AND sub): the first tool reply
+    // must be one `batch` with the whole step — the model-INDEPENDENT
+    // round-trip lever. Wire-only (see is_wire_only_context).
+    messages.push(batch_protocol_message());
     // Separate context/autocompact for the explore sub-agent (user request):
     // its message list is compacted against its OWN budget — never the main
     // agent's history or window. An unresolved window follows the same capacity

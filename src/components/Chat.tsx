@@ -2068,6 +2068,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const skillNotice = chat?.skillNotice ?? null;
   const undoNotice = chat?.undoNotice ?? null;
   const stalled = chat?.stalled ?? false;
+  // ONE rule for every footer error (command, compaction, live voice, speaker):
+  // it stays until something NEW takes the status row — a turn starting to
+  // stream, a compaction starting, a skill/undo notice — and is then replaced
+  // by that status instead of lingering on top of it. Errors never fade on a
+  // timer; they are only superseded.
+  const turnStreaming = chat?.messages.some((m) => m.streaming) ?? false;
+  useEffect(() => {
+    if (!chat?.id) return;
+    if (!turnStreaming && !compacting && !skillNotice && !undoNotice) return;
+    const s = useStore.getState();
+    const cur = s.chats.find((c) => c.id === chat.id);
+    if (!cur) return;
+    if (cur.cmdError) s.setChatCmdError(cur.id, null);
+    if (cur.liveError) s.setChatLiveError(cur.id, null);
+    if (cur.ttsError) s.setChatTtsError(cur.id, null);
+    if (cur.compactError) s.setChatCompactError(cur.id, null);
+    setLiveError(null);
+  }, [chat?.id, turnStreaming, compacting, skillNotice, undoNotice]);
   /** The Ctrl+X prefix is app-wide (managed in App.tsx) with NO in-chat
    *  banner: the user asked for it removed (the chord is feedback enough). */
   const thinkingLevel = chat?.thinkingLevel ?? "xhigh";
@@ -4035,6 +4053,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // A genuine new turn — not a continuation of a failed one — starts the
     // automatic error-retry ladder over from its first attempt.
     if (!continueAssistantId) autoRetryCountRef.current.set(chatId, 0);
+    // A turn start is a NEW moment: the footer must show what is happening
+    // now (the Working/Thinking pill on the streaming reply), not a command
+    // or dictation error from an earlier beat. cmdError has no other clear
+    // path, so once set it outlived every later turn — the stale "Dictation
+    // error" that stayed pinned under finished replies.
+    if (chat.cmdError) s.setChatCmdError(chatId, null);
     // Per-turn local state (was shared refs — now locals so concurrent chats
     // don't race). stop() coordinates via chatStopped + chatAborts store.
     let mcpChanged = false;
@@ -8078,26 +8102,73 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // direction (Persian for RTL): without a language hint short Persian
     // chunks come back transliterated or in Arabic orthography.
     const effectiveLang = lang || chainLang || 'fa';
-    let lastError: unknown = null;
-    for (const opts of chains) {
-      try {
-        const text = await transcribeAudio(
-          blob,
-          undefined,
-          effectiveLang,
-          opts,
+    if (chains.length === 0) throw new Error('Transcription failed');
+    // Hedged chain: the primary provider always goes first and a failure still
+    // falls through to the next one immediately. The only addition is for a
+    // provider that is SLOW rather than failing — instead of waiting out its
+    // full timeout, the next provider is started in parallel once the primary
+    // has taken far longer than a normal decode of this clip, and the first
+    // transcript wins. Nothing is trimmed or skipped, so a healthy primary
+    // returns exactly the same text as before; only a stalled one is cut short.
+    // The WAV is 16 kHz mono 16-bit = 32000 B/s, which gives the clip length.
+    const clipSecs =
+      blob.type === 'audio/wav' ? Math.max(0, (blob.size - 44) / 32000) : 0;
+    const hedgeMs = Math.round((5 + clipSecs * 1.5) * 1000);
+    return new Promise<string>((resolve, reject) => {
+      let next = 0;
+      let running = 0;
+      let settled = false;
+      let lastError: unknown = null;
+      let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
+      const settle = () => {
+        settled = true;
+        if (hedgeTimer !== undefined) clearTimeout(hedgeTimer);
+      };
+      const launch = (): boolean => {
+        if (settled || next >= chains.length) return false;
+        const opts = chains[next++];
+        running++;
+        if (hedgeTimer !== undefined) clearTimeout(hedgeTimer);
+        // A fired timer must not count as pending any more — otherwise the
+        // failure branch below (running === 0) can never conclude the promise.
+        hedgeTimer = undefined;
+        if (next < chains.length) hedgeTimer = setTimeout(launch, hedgeMs);
+        transcribeAudio(blob, undefined, effectiveLang, opts).then(
+          (text) => {
+            if (settled) return;
+            settle();
+            resolve(text);
+          },
+          (e) => {
+            lastError = e;
+            running--;
+            if (settled) return;
+            // `running === 0` alone is not "nothing in flight": a hedge timer
+            // that has not fired yet can still launch the next provider. Settle
+            // only when the chain is exhausted AND no timer is pending, or a
+            // healthy provider's answer could be thrown away.
+            const started = launch();
+            if (!started && running === 0 && hedgeTimer === undefined) {
+              settle();
+              reject(lastError ?? new Error('Transcription failed'));
+            }
+          },
         );
-        lastError = null;
-        return text;
-      } catch (e) {
-        lastError = e;
-      }
-    }
-    throw lastError ?? new Error('Transcription failed');
+        return true;
+      };
+      launch();
+    });
   };
 
   const startRecording = async () => {
     if (recording || transcribing) return;
+    // Retrying dictation is a new moment too: drop the previous attempt's
+    // cmd error so the footer reflects this attempt, not the last failure.
+    const prevChat = useStore
+      .getState()
+      .chats.find((c) => c.id === chatIdRef.current);
+    if (prevChat?.cmdError)
+      useStore.getState().setChatCmdError(prevChat.id, null);
     // Streaming dictate first: same engine as live voice (VAD, 1.4s chunks,
     // pipelined requests), configured so a pause never auto-sends — while the
     // user talks, partials type into the composer; only the mic button/Space
@@ -8950,6 +9021,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // speech starts on the first completed sentence instead of waiting
       // for the full answer. Never replays an older answer: before the new
       // bubble exists the snapshot is empty and not done.
+      // Spoken text of a live answer: prose only (speakableMessageText), never
+      // the raw content — that also holds tool-call narration, code blocks and
+      // tables, which must not be read aloud.
+      const liveSpeakable = (m: ChatMessage, fallback: string): string => {
+        try {
+          return speakableMessageText(m);
+        } catch {
+          return m.content ?? fallback;
+        }
+      };
       const makeLiveStreamSource = (chatId: string) => {
         let trackedId: string | null = null;
         let finalText = '';
@@ -8975,12 +9056,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               );
               if (streaming) {
                 trackedId = streaming.id;
-                finalText = streaming.content ?? '';
+                finalText = liveSpeakable(streaming, finalText);
                 return { text: finalText, done: false };
               }
               if (trackedId) {
                 const msg = chat.messages.find((m) => m.id === trackedId);
-                if (msg) finalText = msg.content ?? finalText;
+                if (msg) finalText = liveSpeakable(msg, finalText);
                 return { text: finalText, done: true };
               }
               return { text: '', done: false };
@@ -11776,13 +11857,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       className="live-stop-pill"
                       onClick={toggleLive}
                       title="Stop live voice"
+                      aria-label="Stop live voice"
                     >
-                      <span className="live-dots" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                      </span>
-                      <span>Stop</span>
+                      <svg
+                        className="live-stop-icon"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                        aria-hidden="true"
+                      >
+                        <rect x="6" y="6" width="12" height="12" rx="2.5" />
+                      </svg>
                     </button>
                   )}
                   {(showVoiceButtons || showLiveActive) && (

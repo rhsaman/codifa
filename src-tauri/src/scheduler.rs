@@ -1118,6 +1118,22 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
                     }
                     _ => {}
                 };
+                // A `:free` rung is the visibility trap that ate today's runs:
+                // the free gateway models answer with exactly ONE tool call per
+                // reply (traced 7 Nov: 187/187 rounds solo on nemotron-:free
+                // across two runs, while the same mechanics batched on
+                // deepseek/mistral), so a run that lands here costs 2-3× the
+                // round-trips of the funded model it replaced. Warn through the
+                // same emit the turn's own events use — once per rung attempt.
+                if rung_model.contains(":free") {
+                    emit(&crate::agent::AgentEvent::Warn {
+                        content: format!(
+                            "[schedule] this run fell back to the FREE model {rung_model} — it \
+answers with one tool call per reply, so every step costs 2-3× the round-trips. A funded \
+model earlier in the fallback chain avoids this."
+                        ),
+                    });
+                }
                 tokio::select! {
                     r = crate::agent::run_turn(&rung, &mut emit, &cancel) => r,
                     // Stop pressed: the turn gets a short grace to end by itself,

@@ -166,6 +166,40 @@ export function subArgSummary(activity: ToolActivity): string {
   if (!args) return "";
   const parts: string[] = [];
 
+  // A `batch` call's args ARE its inner ops: the raw JSON dump (`ops:{"args":…`)
+  // said nothing about what ran (user request). Show the op tool names tallied —
+  // "Glob, Run Command ×2" — the per-op detail lives in the expanded body.
+  if (activity.tool === "batch") {
+    const counts = new Map<string, number>();
+    const tally = (label: string) => {
+      if (!label) return;
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    };
+    // Preferred source: the call's own args.
+    if (Array.isArray(args.ops)) {
+      for (const op of args.ops as Array<{ tool?: string }>) {
+        tally(toolLabel(String(op.tool ?? "")));
+      }
+    }
+    // Fallback: activities rebuilt from stored history can lose `args` — but
+    // the executor labels every op in its RESULT (`=== [1/2] read ===`), so the
+    // names are recoverable from there instead of showing a bare "batch".
+    if (counts.size === 0) {
+      for (const m of (activity.resultText ?? "").matchAll(
+        /=== \[\d+\/\d+\] (\S+) ===/g,
+      )) {
+        tally(toolLabel(m[1]));
+      }
+    }
+    if (counts.size > 0) {
+      return [...counts.entries()]
+        .map(([label, n]) => (n > 1 ? `${label} ×${n}` : label))
+        .join(", ");
+    }
+    // Truly nothing ran (e.g. the empty-ops refusal) — the bare label is honest.
+    return "";
+  }
+
   // load_skill: the skill's own name is the whole story — printing `name:x`
   // as a `key:value` arg (the generic fallback below) reads like machine output.
   if (canonicalTool(activity.tool) === "load_skill") {

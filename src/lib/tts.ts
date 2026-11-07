@@ -47,7 +47,11 @@ export function friendlyTtsError(err: unknown): string {
   const msg = raw.trim()
   if (!msg) return 'پخش صدا ناموفق بود — دوباره تلاش کنید'
   const lower = msg.toLowerCase()
-  if (lower.includes('aborted') || lower.includes('aborterror')) return ''
+  // A TIMEOUT also says "aborted" ("The operation was aborted due to timeout"):
+  // that is a real failure the user must see, not a silent user cancel — it was
+  // swallowed here, so a stalled request ended with no error at all.
+  const timedOut = lower.includes('timeout') || lower.includes('timed out')
+  if (!timedOut && (lower.includes('aborted') || lower.includes('aborterror'))) return ''
   if (msg.includes('the local backend is not ready')) return 'سرویس صوتی آماده نیست — برنامه را دوباره راه‌اندازی کنید'
   if (lower.includes('failed to fetch') || lower.includes('networkerror') || lower.includes('load failed'))
     return 'ارتباط با سرویس صوتی قطع شد — اتصال اینترنت/سرور محلی را بررسی کنید'
@@ -115,12 +119,13 @@ export function stopTts(owner?: number) {
 // یک جمله کند/خراب نباید کل پاسخ را وسط پخش گیر بیندازد: هر جمله سقف زمانی
 // خودش را دارد با یک تلاش مجدد، و جمله‌ای که باز هم نیامد رد می‌شود تا بقیه
 // پاسخ پخش شود. نگهبان پخش هم Audioی گیرکرده (بدون end/error) را رد می‌کند.
-const SENTENCE_FETCH_TIMEOUT_MS = 20_000
+const SENTENCE_FETCH_TIMEOUT_MS = 90_000
 // Number of full rounds over the provider chain before giving up on a sentence.
 // Delay between rounds (abort-aware). Exported as mutable `let` plus
 // `setTtsRetryConfig` so tests can shrink the delay.
-// Tuned for fast first audio: a slow sentence fails fast (20s) and retries
-// once after 1s instead of stalling the speaker icon for minutes.
+// Tuned for fast first audio: a slow sentence fails at the per-sentence cap
+// (see SENTENCE_FETCH_TIMEOUT_MS) and retries once after 1s instead of stalling
+// the speaker icon forever. Keep the two in sync when either is retuned.
 export let TTS_RETRY_ATTEMPTS = 2
 export let TTS_RETRY_DELAY_MS = 1_000
 
@@ -134,6 +139,48 @@ export function setTtsRetryConfig(cfg: Record<string, unknown>): void {
   const delay =
     num(cfg.delayMs) ?? num(cfg.delay) ?? num(cfg.baseDelayMs) ?? num(cfg.retryDelayMs) ?? num(cfg.retryDelay)
   if (delay !== undefined) TTS_RETRY_DELAY_MS = Math.max(0, delay)
+}
+
+/** A chunk needs at least this many letters to be worth a synthesis request. */
+const MIN_SPEECH_LETTERS = 5
+
+/**
+ * Clean the sentence queue before it reaches the synthesizer.
+ *
+ * A diffusion TTS asked to say almost nothing does not stay silent — it invents
+ * ~1–4 s of babble/noise (a log showed "۱." -> 1.24 s of audio, "---" -> a 6 s
+ * clip, "rs:105" -> 1.7 s): that was the noise that kept cutting into the middle
+ * of the spoken answer. So:
+ *  - a chunk with NO letters at all ("---", "۱.", "•", "...") is dropped;
+ *  - a chunk with fewer than MIN_SPEECH_LETTERS letters ("نه.", "rs:105") is
+ *    merged into the NEXT chunk (or the previous one when it is the last), so
+ *    the words are still spoken, inside a sentence the model can pace.
+ */
+export function normalizeSpeechChunks(chunks: string[]): string[] {
+  const letters = (s: string) => (s.match(/\p{L}/gu) ?? []).length
+  const out: string[] = []
+  let carry = ''
+  for (const c of chunks) {
+    if (letters(c) === 0) continue
+    const merged = carry ? `${carry} ${c}` : c
+    if (letters(merged) < MIN_SPEECH_LETTERS) {
+      carry = merged
+      continue
+    }
+    out.push(merged)
+    carry = ''
+  }
+  if (carry) {
+    if (out.length > 0) out[out.length - 1] = `${out[out.length - 1]} ${carry}`
+    else out.push(carry)
+  }
+  return out
+}
+
+/** True for a throttling answer (HTTP 429 / "rate limit" / "too many requests"). */
+function isRateLimitedError(err: unknown): boolean {
+  const m = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase()
+  return m.includes('429') || m.includes('rate limit') || m.includes('too many requests')
 }
 
 /** Normalize a single provider opts or a primary+fallback chain into a chain. */
@@ -202,7 +249,12 @@ export function fetchSentenceRobust(
     })
   const run = async (): Promise<Blob> => {
     let lastErr: unknown = new Error('TTS failed: empty provider chain')
-    const rounds = Math.max(1, TTS_RETRY_ATTEMPTS)
+    let rounds = Math.max(1, TTS_RETRY_ATTEMPTS)
+    // A rate-limited (429) provider is not broken, just busy: a long answer fires
+    // many sentence requests and the quota window needs seconds, not the 1 s a
+    // plain failure waits. Give such a sentence up to two extra, slower rounds
+    // instead of dropping it (a dropped sentence = a hole in the spoken answer).
+    let extraRateRounds = 0
     for (let round = 0; round < rounds; round++) {
       for (const providerOpts of providers) {
         if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
@@ -214,9 +266,16 @@ export function fetchSentenceRobust(
           // Try the next fallback provider in this round.
         }
       }
+      if (round === rounds - 1 && extraRateRounds < 2 && isRateLimitedError(lastErr)) {
+        extraRateRounds++
+        rounds++
+      }
       if (round < rounds - 1) {
         // Wait before the next round; abort throws immediately.
-        await sleepAbortAware(TTS_RETRY_DELAY_MS, signal)
+        const delay = isRateLimitedError(lastErr)
+          ? TTS_RETRY_DELAY_MS * 3 * (round + 1)
+          : TTS_RETRY_DELAY_MS
+        await sleepAbortAware(delay, signal)
       }
     }
     throw lastErr
@@ -261,9 +320,9 @@ export async function playTts(
   // remote chain on any error. Remote selection uses the chain directly.
   const fetchOne = (sentence: string, signal: AbortSignal): Promise<Blob> =>
     fetchSentenceRobust(sentence, chain, signal)
-  const sentences = splitTtsSentences(text)
+  const sentences = normalizeSpeechChunks(splitTtsSentences(text))
   // متن خیلی کوتاه: همان مسیر تک‌فایل قبلی (بدون صف).
-  const queue = sentences.length > 1 ? sentences : [text]
+  const queue = sentences.length > 1 ? sentences : sentences.length === 1 ? sentences : [text]
   // NOTE: local sentences are NOT merged into batches anymore. The Persian
   // G2P strips punctuation, so the backend cannot see sentence boundaries
   // inside a merged batch and its natural pacing (~120 ms gap) landed
@@ -288,7 +347,10 @@ export async function playTts(
   try {
     for (let i = 0; i < queue.length; i++) {
       if (activeSeq !== seq || controller.signal.aborted) return
-      ensureFetch(i + 2)
+      // Only ONE sentence ahead of the one being played: three requests in
+      // flight at once tripped provider rate limits on long answers (the
+      // speaker button then failed with a "quota" error).
+      ensureFetch(i + 1)
       const job = pending.get(i)
       pending.delete(i)
       let blob: Blob
@@ -303,7 +365,7 @@ export async function playTts(
       if (activeSeq !== seq || controller.signal.aborted) return
       // جمله خالی (پروایدر هیچ بایتی نداد): رد شو تا صف گیر نکند.
       if (blob.size === 0) continue
-      await playBlobChunk(blob, seq, controller)
+      await playBlobChunk(blob, seq, controller, !playedAny)
       playedAny = true
       // Breathe between sentences so long answers do not sound rushed.
       // Skipped after the final chunk so playback idles promptly.
@@ -453,14 +515,14 @@ export async function playTtsStream(
         if (speaksTail) readyEnd = full.length
       }
       if (readyEnd > committed.length) {
-        queue.push(...splitTtsSentences(full.slice(committed.length, readyEnd)))
+        queue.push(...normalizeSpeechChunks(splitTtsSentences(full.slice(committed.length, readyEnd))))
         committed = full.slice(0, readyEnd)
         tailText = ''
         tailSince = Date.now()
       }
       // Keep the prefetch window full: chunks already completed but not
       // yet played download in the background during playback.
-      for (let i = played; i < Math.min(queue.length, played + 3); i++) {
+      for (let i = played; i < Math.min(queue.length, played + 2); i++) {
         ensureFetch(i, queue[i])
       }
       if (queue.length > played) {
@@ -484,7 +546,7 @@ export async function playTtsStream(
         failStreak = 0
         played++
         if (blob.size === 0) continue
-        await playBlobChunk(blob, seq, controller)
+        await playBlobChunk(blob, seq, controller, !playedAny)
         if (stale()) return
         playedAny = true
         try {
@@ -521,8 +583,76 @@ export async function playTtsStream(
   if (mute) throw lastErr ?? new Error("progressive speech produced no audio")
 }
 
+/** Silence put in front of the FIRST chunk of a playback (ms). */
+const LEAD_IN_MS = 280
+
+/**
+ * Prepend silence to a WAV blob.
+ *
+ * The audio output device (built-in speakers, and above all Bluetooth) needs a
+ * moment to wake when playback starts: the first ~200–300 ms of the first
+ * sentence is swallowed, so the opening word ("سلام") was never heard even
+ * though the server synthesized it. A short run of zeros in front gives the
+ * device time to open before the speech begins. Only plain PCM WAV can be
+ * padded safely; any other container (mp3 from a remote provider) is returned
+ * untouched.
+ */
+export async function padWavLeadIn(blob: Blob, ms: number = LEAD_IN_MS): Promise<Blob> {
+  try {
+    if (!(blob.type || '').toLowerCase().includes('wav')) return blob
+    const buf = await blob.arrayBuffer()
+    const view = new DataView(buf)
+    if (buf.byteLength < 44) return blob
+    const tag = (o: number) => String.fromCharCode(view.getUint8(o), view.getUint8(o + 1), view.getUint8(o + 2), view.getUint8(o + 3))
+    if (tag(0) !== 'RIFF' || tag(8) !== 'WAVE') return blob
+    let sampleRate = 0
+    let channels = 0
+    let bits = 0
+    let dataStart = -1
+    let dataSizeOffset = -1
+    let pos = 12
+    while (pos + 8 <= buf.byteLength) {
+      const id = tag(pos)
+      const size = view.getUint32(pos + 4, true)
+      if (id === 'fmt ') {
+        channels = view.getUint16(pos + 10, true)
+        sampleRate = view.getUint32(pos + 12, true)
+        bits = view.getUint16(pos + 22, true)
+      } else if (id === 'data') {
+        dataStart = pos + 8
+        dataSizeOffset = pos + 4
+        break
+      }
+      pos += 8 + size + (size % 2)
+    }
+    if (dataStart < 0 || !sampleRate || !channels || bits !== 16) return blob
+    const pad = Math.floor((sampleRate * ms) / 1000) * channels * 2
+    const declared = view.getUint32(dataSizeOffset, true)
+    const dataLen = Math.min(declared, buf.byteLength - dataStart)
+    const out = new Uint8Array(dataStart + pad + dataLen)
+    out.set(new Uint8Array(buf, 0, dataStart), 0)
+    out.set(new Uint8Array(buf, dataStart, dataLen), dataStart + pad)
+    const ov = new DataView(out.buffer)
+    ov.setUint32(dataSizeOffset, pad + dataLen, true)
+    ov.setUint32(4, out.length - 8, true)
+    return new Blob([out], { type: blob.type })
+  } catch {
+    return blob
+  }
+}
+
 /** پخش یک تکه صوتی (یک جمله) و انتظار تا پایان آن. */
-function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Promise<void> {
+async function playBlobChunk(
+  blob: Blob,
+  seq: number,
+  controller: AbortController,
+  leadIn = false,
+): Promise<void> {
+  if (leadIn) blob = await padWavLeadIn(blob)
+  return playBlobChunkNow(blob, seq, controller)
+}
+
+function playBlobChunkNow(blob: Blob, seq: number, controller: AbortController): Promise<void> {
   return new Promise((resolve, reject) => {
     if (activeSeq !== seq || controller.signal.aborted) {
       resolve()
@@ -815,23 +945,59 @@ export function speakableMessageText(message: ChatMessage): string {
   return stripMarkdownForTts(display.content ?? '')
 }
 
+/** Drop GFM tables identified by their `---|---` separator row (with or without outer pipes). */
+function dropPipelessTables(text: string): string {
+  const lines = text.split('\n')
+  const sep = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/
+  const drop = new Array<boolean>(lines.length).fill(false)
+  for (let i = 0; i < lines.length; i++) {
+    if (!sep.test(lines[i])) continue
+    drop[i] = true
+    if (i > 0 && lines[i - 1].includes('|')) drop[i - 1] = true
+    for (let j = i + 1; j < lines.length && lines[j].includes('|'); j++) drop[j] = true
+  }
+  return lines.map((l, i) => (drop[i] ? ' ' : l)).join('\n')
+}
+
 /**
  * Strip markdown syntax for speech synthesis so the voice reads words, not
  * markup (headers, links, code fences, tables, HTML tags, bare URLs).
+ *
+ * Fenced code blocks and GFM tables are dropped ENTIRELY (user decision):
+ * reading code or table cells aloud is noise — the voice skips them the way
+ * a human skims past them. Inline code stays (it is ordinary words).
  */
 export function stripMarkdownForTts(text: string): string {
   let out = text ?? ''
-  // Fenced code blocks: keep the code, drop the fences + language tag.
-  out = out.replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, _lang, code: string) => ` ${code} `)
+  // Tool-call markup (XML-style blocks a model may print): never spoken. An
+  // unclosed one (still streaming) is dropped to the end of the text.
+  out = out.replace(
+    /<(tool_call|tool_use|tool_result|function_calls|function_call|invoke|antml:[a-z_]+)\b[^>]*>[\s\S]*?(?:<\/\1>|$)/gi,
+    ' ',
+  )
+  // Fenced code blocks: drop whole, fences + language tag + code alike.
+  out = out.replace(/```[\s\S]*?```/g, ' ')
+  // A fence that is still open (live streaming): drop it to the end, so a half
+  // received code block is never read aloud before its closing fence arrives.
+  out = out.replace(/```[\s\S]*$/, ' ')
+  // Tables written without outer pipes (`a | b` + `--- | ---`).
+  out = dropPipelessTables(out)
+  // GFM tables: header/separator/data rows are all pipe-delimited lines —
+  // remove them whole before the generic pipe cleanup.
+  out = out.replace(/^[^\S\n]*\|[^\n]*\|[^\S\n]*$/gm, ' ')
   // Inline code, images, links → readable words.
-  out = out.replace(/`([^`]*)`/g, '$1')
+  out = out.replace(/`([^`]*)`/g, '$1');
   out = out.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
   out = out.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
   // Headings, quotes, list markers, rules, tables, HTML tags.
   out = out.replace(/^\s{0,3}#{1,6}\s+/gm, '')
   out = out.replace(/^\s{0,3}>\s?/gm, '')
-  out = out.replace(/^\s{0,3}(?:[-*+]|\d+[.)])\s+/gm, '')
-  out = out.replace(/^\s{0,3}(?:-[-*]|\*[*-]|_[*_])\s*$/gm, '')
+  // A line that is ONLY a list number ("۱." / "2)") carries nothing to say.
+  out = out.replace(/^[ \t]*[\d۰-۹٠-٩]+[.)][ \t]*$/gm, '')
+  out = out.replace(/^\s{0,3}(?:[-*+]|[\d۰-۹٠-٩]+[.)])\s+/gm, '')
+  // Horizontal rules (---, ***, ___, with or without spaces). The old pattern
+  // only matched TWO characters, so a real "---" reached the synthesizer.
+  out = out.replace(/^\s{0,3}(?:[-*_][ \t]*){3,}$/gm, '')
   out = out.replace(/\|/g, ' ')
   out = out.replace(/<[^>]+>/g, ' ')
   // Bold/italic/strike markers.
@@ -839,6 +1005,9 @@ export function stripMarkdownForTts(text: string): string {
   out = out.replace(/~~/g, '')
   // Bare URLs are unreadable aloud — name them instead of spelling them out.
   out = out.replace(/https?:\/\/\S+/g, 'link')
+  // Emoji / pictographs are not speech: a sentence that STARTS with one ("😊 چطور ...")
+  // makes the synthesizer stumble on the opening, and the word after it is lost.
+  out = out.replace(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}‍️]/gu, ' ')
   out = out.replace(/[ \t]+/g, ' ')
   out = out.replace(/\n{3,}/g, '\n\n')
   return out.trim()

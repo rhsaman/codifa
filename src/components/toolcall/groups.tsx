@@ -13,7 +13,7 @@ import { ToolArgs, argsTextFor, fmtArgValue, rowDetail } from './args'
 import { DiffPreview, useDiffPreview } from './diff'
 import { IconSparkle, fmtTime } from './editGroup'
 import { IconChevron, StatusIcon, TerminalRowIcon } from './icons'
-import { canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel, useRunningClock } from './naming'
+import { activityLabel, batchOpTools, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel, useRunningClock } from './naming'
 import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
 
 export const ToolGroupView = memo(function ToolGroupView({
@@ -61,8 +61,13 @@ export const ToolGroupView = memo(function ToolGroupView({
     }));
   const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
     if (isSubagentCard(a.activity)) return acc;
-    const label = toolLabel(a.activity.tool);
-    acc[label] = (acc[label] || 0) + 1;
+    // A batch is only a wrapper: its pills are the tools it ran, merged with the
+    // same-label pills of ordinary calls — "batch" is never a pill.
+    const names = a.activity.tool === "batch" ? batchOpTools(a.activity) : [];
+    for (const tool of names.length > 0 ? names : [a.activity.tool]) {
+      const label = toolLabel(tool);
+      acc[label] = (acc[label] || 0) + 1;
+    }
     return acc;
   }, {});
   const searchEngines = [
@@ -169,38 +174,10 @@ export function subArgSummary(activity: ToolActivity): string {
   const parts: string[] = [];
 
   // A `batch` call's args ARE its inner ops: the raw JSON dump (`ops:{"args":…`)
-  // said nothing about what ran (user request). Show the op tool names tallied —
-  // "Glob, Run Command ×2" — the per-op detail lives in the expanded body.
-  if (activity.tool === "batch") {
-    const counts = new Map<string, number>();
-    const tally = (label: string) => {
-      if (!label) return;
-      counts.set(label, (counts.get(label) ?? 0) + 1);
-    };
-    // Preferred source: the call's own args.
-    if (Array.isArray(args.ops)) {
-      for (const op of args.ops as Array<{ tool?: string }>) {
-        tally(toolLabel(String(op.tool ?? "")));
-      }
-    }
-    // Fallback: activities rebuilt from stored history can lose `args` — but
-    // the executor labels every op in its RESULT (`=== [1/2] read ===`), so the
-    // names are recoverable from there instead of showing a bare "batch".
-    if (counts.size === 0) {
-      for (const m of (activity.resultText ?? "").matchAll(
-        /=== \[\d+\/\d+\] (\S+) ===/g,
-      )) {
-        tally(toolLabel(m[1]));
-      }
-    }
-    if (counts.size > 0) {
-      return [...counts.entries()]
-        .map(([label, n]) => (n > 1 ? `${label} ×${n}` : label))
-        .join(", ");
-    }
-    // Truly nothing ran (e.g. the empty-ops refusal) — the bare label is honest.
-    return "";
-  }
+  // said nothing about what ran (user request). The row label already names the
+  // tools it ran (`activityLabel`), so the detail stays empty rather than
+  // repeating them; the per-op detail lives in the expanded body.
+  if (activity.tool === "batch") return "";
 
   // load_plugin/load_skill: the plugin or skill's own name is the whole story —
   // printing `slug:x` as a `key:value` arg (the generic fallback below) reads
@@ -388,7 +365,7 @@ export const ToolSubRow = memo(function ToolSubRow({
         <span className="tool-sub-name">
           {isSubagentCard(activity)
             ? subagentDisplayName(activity.tool, subagentRows)
-            : toolLabel(activity.tool)}
+            : activityLabel(activity)}
         </span>
         <span className="tool-sub-args" title={subSummary}>
           {subSummary}
@@ -444,7 +421,7 @@ export const TraceRow = memo(function TraceRow({
   const subagentRows = useStore((s) => s.customSubagents);
   const label = isSubagentCard(activity)
     ? subagentDisplayName(activity.tool, subagentRows)
-    : toolLabel(activity.tool);
+    : activityLabel(activity);
   const detail = rowDetail(activity);
 
   const argsText = argsTextFor(activity);
@@ -594,7 +571,7 @@ export const ToolTimelineRow = memo(function ToolTimelineRow({
         {running ? <span className="spinner" /> : toolIcon(activity.tool)}
       </span>
       <span className="tool-timeline-label">
-        {toolLabel(activity.tool)}
+        {activityLabel(activity)}
       </span>
       {detail && (
         <span className="tool-timeline-detail" title={detail}>
@@ -744,7 +721,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   const subagentRows = useStore((s) => s.customSubagents);
   const label = isSubagentCard(activity)
     ? subagentDisplayName(activity.tool, subagentRows)
-    : toolLabel(activity.tool);
+    : activityLabel(activity);
   const detail = rowDetail(activity);
 
   const argsText = argsTextFor(activity);

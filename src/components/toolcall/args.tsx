@@ -2,7 +2,7 @@ import { fixZwsp } from '../../lib/bidi'
 import type { ToolActivity } from '../../types'
 import { DiffView } from './diff'
 import { shortArg, subArgSummary } from './groups'
-import { canonicalTool, toolLabel } from './naming'
+import { canonicalTool } from './naming'
 
 export const HEADER_SHOWN_KEYS = new Set([
   "command",
@@ -54,25 +54,10 @@ export function ToolArgs({
 }) {
   const skip = REDUNDANT_ARG_KEYS[canonicalTool(tool ?? "")];
   // A `batch` call's args ARE its inner ops: the raw JSON dump said nothing
-  // about what ran (user request). Show the op tool names tallied instead —
-  // "read ×2, grep ×1" — the per-op detail lives in the expanded body.
-  if (tool === "batch" && Array.isArray(args.ops) && args.ops.length > 0) {
-    const counts = new Map<string, number>();
-    for (const op of args.ops as Array<{ tool?: string }>) {
-      const label = toolLabel(String(op.tool ?? ""));
-      counts.set(label, (counts.get(label) ?? 0) + 1);
-    }
-    const summary = [...counts.entries()]
-      .map(([label, n]) => (n > 1 ? `${label} ×${n}` : label))
-      .join(", ");
-    return (
-      <span className="tool-args" dir="ltr">
-        <span className="tool-arg">
-          <span className="tool-arg-val">{summary}</span>
-        </span>
-      </span>
-    );
-  }
+  // about what ran (user request), and the card label already names the tools
+  // it ran (`activityLabel`) — so no chips here; the per-op detail lives in the
+  // expanded body.
+  if (tool === "batch") return null;
   const entries = Object.entries(args).filter(
     ([k]) =>
       !HEADER_SHOWN_KEYS.has(k) && !HIDDEN_KEYS.has(k) && !skip?.has(k),
@@ -107,6 +92,9 @@ export function argsTextFor(activity: ToolActivity): string {
  *  summary, else whatever the args say. */
 export function rowDetail(activity: ToolActivity): string {
   const tool = canonicalTool(activity.tool);
+  // The row's label already names the tools a batch ran; repeating them (or
+  // the wrapper's own name) in the detail would only add noise.
+  if (tool === "batch") return "";
   if (tool === "load_plugin") {
     const what = [activity.args?.slug, activity.args?.skill]
       .filter((v): v is string => typeof v === "string" && v.trim().length > 0)

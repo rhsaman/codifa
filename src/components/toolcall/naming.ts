@@ -74,6 +74,9 @@ export const TOOL_LABEL: Record<string, string> = {
   system_stats: "System Stats",
   computer: "Computer",
   search_console: "Search Console",
+  // Safety net only: a batch card is labelled with the tools it ran
+  // (`activityLabel`), so this shows just when no op is known yet.
+  batch: "Tools",
 };
 
 /** Foreign names for a tool we DO have, mapped to the canonical name.
@@ -179,6 +182,49 @@ export function toolLabel(tool: string): string {
   return TOOL_LABEL[canonical] ?? canonical;
 }
 
+/** Canonical names of the tools a `batch` call ran, one per op, in order.
+ *
+ *  A batch is only a wrapper: the card must say WHAT ran, never the word
+ *  "batch". Preferred source is the call's own `args.ops`. Activities rebuilt
+ *  from stored history can lose `args`, but the executor labels every op in its
+ *  RESULT (`=== [1/2] read ===`), so the names are recoverable from there. */
+export function batchOpTools(activity: ToolActivity): string[] {
+  const out: string[] = [];
+  const ops = activity.args?.ops;
+  if (Array.isArray(ops)) {
+    for (const op of ops as Array<{ tool?: unknown } | null>) {
+      const name = typeof op?.tool === "string" ? op.tool.trim() : "";
+      if (name) out.push(canonicalTool(name));
+    }
+  }
+  if (out.length === 0) {
+    for (const m of (activity.resultText ?? "").matchAll(
+      /=== \[\d+\/\d+\] (\S+) ===/g,
+    )) {
+      out.push(canonicalTool(m[1]));
+    }
+  }
+  return out;
+}
+
+/** The label a card/row shows for one activity. Same as `toolLabel`, except a
+ *  `batch` is named after the tools it ran, tallied: "Search Files, Read File ×2". */
+export function activityLabel(activity: ToolActivity): string {
+  if (activity.tool === "batch") {
+    const counts = new Map<string, number>();
+    for (const tool of batchOpTools(activity)) {
+      const label = toolLabel(tool);
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    if (counts.size > 0) {
+      return [...counts.entries()]
+        .map(([label, n]) => (n > 1 ? `${label} ×${n}` : label))
+        .join(", ");
+    }
+  }
+  return toolLabel(activity.tool);
+}
+
 /** Prefix the backend advertises every sub-agent profile under: the tool the
  *  model calls is `agent__<id>` (a custom row's stable id, or a bundle agent's
  *  frontmatter name). The builtin research agent keeps the bare `explore`.
@@ -244,7 +290,13 @@ export const TOOL_NOUN: Record<string, [string, string]> = {
 };
 export function groupSummary(activities: ToolActivity[]): string {
   const counts: Record<string, number> = {};
-  for (const a of activities) counts[a.tool] = (counts[a.tool] || 0) + 1;
+  for (const a of activities) {
+    // A batch is only a wrapper: count the tools it ran, never "batch" itself.
+    const names = a.tool === "batch" ? batchOpTools(a) : [];
+    for (const tool of names.length > 0 ? names : [a.tool]) {
+      counts[tool] = (counts[tool] || 0) + 1;
+    }
+  }
   return Object.entries(counts)
     .map(([tool, n]) => {
       const name = toolLabel(tool);

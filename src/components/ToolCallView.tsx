@@ -135,7 +135,7 @@ import { DiffPreview, DiffView, applyReverseDiff, useDiffPreview } from './toolc
 import { fmtTime } from './toolcall/editGroup'
 import { DownloadProgressBar, LiveTerminalTail, ToolCascade, ToolPathSpan, ToolSubRow } from './toolcall/groups'
 import { StatusIcon } from './toolcall/icons'
-import { canonicalTool, isSubagentCard, subagentDisplayName, toolLabel, useRunningClock } from './toolcall/naming'
+import { activityLabel, canonicalTool, isSubagentCard, subagentDisplayName, useRunningClock } from './toolcall/naming'
 import { MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, resultRows } from './toolcall/results'
 
 export const ToolCallView = memo(function ToolCallView({
@@ -306,21 +306,10 @@ export const ToolCallView = memo(function ToolCallView({
           ) : isSubagentCard(activity) ? (
             subagentDisplayName(activity.tool, subagentRows)
           ) : (
-            toolLabel(activity.tool)
+            // A batch is named after the tools it ran, never "batch" itself.
+            activityLabel(activity)
           )}
         </span>
-        {/* A batch card names its ops right in the header: "Batch" alone says
-            nothing about what ran (user request). The ops ride the args. */}
-        {activity.tool === "batch" &&
-          Array.isArray(activity.args?.ops) &&
-          (activity.args!.ops as Array<{ tool?: string }>).length > 0 && (
-            <span className="tool-skill" dir="ltr">
-              {(activity.args!.ops as Array<{ tool?: string }>)
-                .map((o) => toolLabel(String(o.tool ?? "")))
-                .filter(Boolean)
-                .join(", ")}
-            </span>
-          )}
         {/* The head must say WHICH skill was loaded: the label is only
             "Load Skill" and the raw `name` arg is filtered out of the chips. */}
         {skillName && (
@@ -484,6 +473,7 @@ export const ToolCallView = memo(function ToolCallView({
               load that only repeats the head label, so the body stays empty. */}
           {activity.summary &&
             !isWrite &&
+            activity.tool !== "batch" &&
             !isSkillTool(activity.tool) && (
               <div className="tool-summary">{fixZwsp(activity.summary)}</div>
             )}

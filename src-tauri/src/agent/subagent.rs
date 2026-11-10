@@ -869,9 +869,20 @@ pub(super) fn round_hint(
     lone_rounds: usize,
     root: &str,
 ) -> Option<Cow<'static, str>> {
+    round_hint_with(&BatchCapability::FULL, mode, calls, streak, lone_rounds, root)
+}
+
+pub(super) fn round_hint_with(
+    caps: &BatchCapability,
+    mode: &str,
+    calls: &[(String, String, String)],
+    streak: usize,
+    lone_rounds: usize,
+    root: &str,
+) -> Option<Cow<'static, str>> {
     discovery_streak_hint(mode, streak)
         .map(Cow::Borrowed)
-        .or_else(|| single_call_hint(mode, calls, lone_rounds, root))
+        .or_else(|| single_call_hint_with(caps, mode, calls, lone_rounds, root))
 }
 
 /// True when a lone `run_terminal` command is a pure READ, i.e. one the backend
@@ -925,7 +936,73 @@ fn expand_batch(calls: &[(String, String, String)]) -> Option<Vec<(String, Strin
     )
 }
 
+/// What a turn ACTUALLY has bound.
+///
+/// Both batching levers are only obeyable when the tool they NAME exists: the
+/// `batch` wrapper for "one call carries the whole step", and a lookup family
+/// for "issue the lookups together". A `browser`/`computer` child has no file
+/// search, and a custom profile is narrowed by its own declaration
+/// (`retain_subagent_tools` drops `batch` when the list does not name it), so a
+/// hard-coded hint names a tool the child cannot call — the traced model then
+/// answers by calling the missing name and loses the round to the refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BatchCapability {
+    /// `batch` is advertised this turn.
+    pub has_batch: bool,
+    /// At least one read/search lookup is advertised this turn.
+    pub has_lookup: bool,
+}
+
+impl BatchCapability {
+    /// The full set (the main agent, and what the plain entry points assume).
+    pub(super) const FULL: Self = Self {
+        has_batch: true,
+        has_lookup: true,
+    };
+
+    /// Derive the capability from the exact tool names this run advertised — the
+    /// same list the error path uses, so the hint can never drift from the
+    /// schema table the model was actually given.
+    pub(super) fn from_advertised(advertised: &[String]) -> Self {
+        // `run_terminal` is deliberately NOT a lookup here: a computer child is
+        // granted it (it needs the CLI for the work the desktop is bad at), and
+        // counting it would hand that child the "issue your greps and finds
+        // together" wording it cannot obey. A read-only shell round keeps its
+        // own branch in `single_call_hint`.
+        let has_lookup = advertised.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "read"
+                    | "grep"
+                    | "glob"
+                    | "find_symbol"
+                    | "lsp_symbols"
+                    | "lsp_definition"
+                    | "lsp_references"
+                    | "lsp_hover"
+                    | "lsp_diagnostics"
+                    | "fetch_url"
+            )
+        });
+        Self {
+            has_batch: advertised.iter().any(|a| a == "batch"),
+            has_lookup,
+        }
+    }
+}
+
 pub(super) fn single_call_hint(
+    mode: &str,
+    calls: &[(String, String, String)],
+    lone_rounds: usize,
+    root: &str,
+) -> Option<Cow<'static, str>> {
+    single_call_hint_with(&BatchCapability::FULL, mode, calls, lone_rounds, root)
+}
+
+/// [`single_call_hint`], but only advising what this turn can actually do.
+pub(super) fn single_call_hint_with(
+    caps: &BatchCapability,
     mode: &str,
     calls: &[(String, String, String)],
     lone_rounds: usize,
@@ -966,9 +1043,29 @@ pub(super) fn single_call_hint(
                 "[hint] Desktop actions are serial: act on the screen you already have, and do not screenshot again immediately after an action that returned the new screen. Finish the smallest sequence, then report.",
             ));
         }
-        return Some(Cow::Borrowed(
-            "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
-        ));
+        // A child binds whatever its kind and its own declaration allow, so the
+        // wording names only what it really has. Naming `grep`/`find_symbol` to
+        // a browser child (or to a profile narrowed to `read`) is an instruction
+        // it cannot obey.
+        if caps.has_batch && caps.has_lookup {
+            return Some(Cow::Borrowed(
+                "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
+            ));
+        }
+        if caps.has_batch {
+            return Some(Cow::Borrowed(
+                "[hint] That step had ONE call. Every step costs a model round trip, so put the whole step in ONE `batch` call as ops:[{tool, args},…] — every call you can already foresee, in order — and keep the report for the step after.",
+            ));
+        }
+        if caps.has_lookup {
+            return Some(Cow::Borrowed(
+                "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together, then write the report.",
+            ));
+        }
+        // Neither a batch wrapper nor a combinable lookup: this child's calls are
+        // a serial driver chain, so there is nothing to merge and silence is the
+        // only honest answer.
+        return None;
     }
     let name = calls[0].1.as_str();
     if is_delegation(name) {
@@ -1042,7 +1139,10 @@ pub(super) fn single_call_hint(
         )));
     }
     if matches!(name, "edit_file" | "write_file" | "artifact") {
-        return Some(Cow::Owned(single_call_hint_text(lone_rounds)));
+        // The teaching text names `batch`, so it is only honest when this turn
+        // carries it; a narrowed profile without `batch` keeps its files in ONE
+        // write_file / edit_file instead (the per-family shape still works).
+        return Some(Cow::Owned(single_call_hint_text(lone_rounds, caps.has_batch)));
     }
     None
 }
@@ -1064,7 +1164,25 @@ pub(super) fn single_call_hint(
 /// is nothing to batch, so counting it would grow the streak while the hint
 /// stays silent and the field would report waste that was never addressable.
 pub(super) fn single_call_is_serial(mode: &str, calls: &[(String, String, String)], root: &str) -> bool {
-    if mode == "subagent" {
+    let _ = mode;
+    single_call_is_serial_with(&BatchCapability::FULL, calls, root)
+}
+
+/// [`single_call_is_serial`], capability-gated.
+///
+/// The blanket `mode == "subagent" => false` guard is GONE: it meant a custom
+/// profile granted `batch` + lookups never grew the streak, so the escalating
+/// lever could not fire on the one child shape it was written for. Nothing
+/// unsafe rides on that: the whitelist below names only MERGEABLE shapes, and a
+/// driver call (`browser_*`, `computer`) is not in it, so a serial child still
+/// never grows the counter — and a turn with neither `batch` nor a lookup has
+/// nothing to merge at all.
+pub(super) fn single_call_is_serial_with(
+    caps: &BatchCapability,
+    calls: &[(String, String, String)],
+    root: &str,
+) -> bool {
+    if !caps.has_batch && !caps.has_lookup {
         return false;
     }
     // Same look-through as `single_call_hint`: a one-op `batch` is a lone call.
@@ -1168,9 +1286,18 @@ pub(super) const LONE_CALL_HINT_MAX_PER_TURN: usize = 3;
 /// and it stayed in the re-sent history. The hint speaks only where batching is
 /// actually possible — file edits and the read-only lookups — and leaves the
 /// shell loop alone.
-pub(super) fn single_call_hint_text(rounds: usize) -> String {
+pub(super) fn single_call_hint_text(rounds: usize, has_batch: bool) -> String {
     if rounds <= 1 {
-        return SINGLE_CALL_HINT.to_string();
+        return if has_batch {
+            SINGLE_CALL_HINT.to_string()
+        } else {
+            SINGLE_CALL_HINT_ONLY_FAMILIES.to_string()
+        };
+    }
+    if !has_batch {
+        return format!(
+            "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation. Merge them per family: several files fit ONE write_file as files:[{{path, content}}], several independent replacements ONE edit_file as edits:[{{path, old_string, new_string, replace_all}}]."
+        );
     }
     format!(
         "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch NOW: the `batch` tool runs your whole step (lookups + edits + the verify command) IN ORDER in ONE call as ops:[{{tool, args}},…] — or per-family: files:[{{path, content}}] on write_file, edits:[…] on edit_file, commands:[\"…\"] on run_terminal."
@@ -1179,6 +1306,10 @@ pub(super) fn single_call_hint_text(rounds: usize) -> String {
 
 /// The teaching form, delivered once at the start of a streak.
 pub(super) const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so a whole step belongs in ONE call: the `batch` tool runs up to 10 tool calls (lookups, edits, the verify command) IN ORDER in one round-trip as ops:[{tool, args},…]; several files also fit ONE write_file as files:[{path, content}]; several replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}]; several shell commands ONE run_terminal as commands:[\"…\"].";
+
+/// The same teaching for a turn that has NO `batch` bound: only the per-family
+/// shapes remain, because naming a wrapper the model cannot call costs a round.
+pub(super) const SINGLE_CALL_HINT_ONLY_FAMILIES: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so merge what you can into ONE call: several files fit ONE write_file as files:[{path, content}], and several independent replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}].";
 
 /// Cap on the saved-plan body injected into the system prompt. A plan is
 /// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
@@ -1334,10 +1465,17 @@ pub(super) fn skills_context_message(attached: &[String], plugins: &[String]) ->
 /// loop executes all of it in one round-trip, and a dependent second wave goes
 /// in the next reply. Replanning stays free (mission rule 6): an unexpected
 /// result simply shapes the second wave.
-pub(super) fn batch_protocol_message() -> Value {
-    json!({
-        "role": "user",
-        "content": format!(
+///
+/// Returns `None` when this turn has no `batch` bound: the directive would name
+/// a tool the model cannot call, and the traced cost of that is a whole round
+/// spent on the refusal. A child with `batch` but no lookup gets a shorter
+/// directive that names only the families it really has.
+pub(super) fn batch_protocol_message(caps: &BatchCapability) -> Option<Value> {
+    if !caps.has_batch {
+        return None;
+    }
+    let content = if caps.has_lookup {
+        format!(
             "{BATCH_PROTOCOL_HEAD}\n\
              For this task, your FIRST reply that makes tool calls must be ONE `batch` \
              call carrying EVERY call you expect to need — the lookups (grep/glob/read/\
@@ -1349,8 +1487,18 @@ pub(super) fn batch_protocol_message() -> Value {
              `load_plugin`, the `browser_*` tools and MCP connector tools are NOT \
              batchable: they change the tool set or act on one shared page in order, so \
              call them directly in your next reply."
-        ),
-    })
+        )
+    } else {
+        format!(
+            "{BATCH_PROTOCOL_HEAD}\n\
+             For this task, your FIRST reply that makes tool calls must be ONE `batch` \
+             call carrying EVERY call you expect to need, as ops:[{{\"tool\":\"run_terminal\",\"args\":{{...}}}},…] \
+             (max 10). Every result comes back together in one round-trip; a dependent \
+             second wave goes in your NEXT reply. A reply with a single independent tool \
+             call wastes a whole round-trip — never send one."
+        )
+    };
+    Some(json!({ "role": "user", "content": content }))
 }
 
 /// Wrap a PER-TURN section as a trailing context message, or `None` when there

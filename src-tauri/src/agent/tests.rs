@@ -3383,8 +3383,77 @@
                 "a lone {name} must deliver the batching hint"
             );
         }
-        // The sub-agent's rounds are governed by its own report, not this lever.
-        assert!(!single_call_is_serial("subagent", &write, root));
+        // A sub-agent's lone write is batchable TOO when it carries `batch`:
+        // the blanket `mode == "subagent"` guard used to leave every child
+        // streak at 0, so the escalating lever never fired on a custom profile
+        // that DOES have the wrapper. A child without it is gated below.
+        assert!(single_call_is_serial("subagent", &write, root));
+    }
+
+    /// A turn is only told to use what it actually BOUND.
+    ///
+    /// The batching levers were hard-coded to `batch` + `grep`/`find_symbol`: a
+    /// browser/desktop child has neither, and a custom profile is narrowed by
+    /// its own declaration (`retain_subagent_tools` drops `batch` unless the list
+    /// names it). Traced cost of the mismatch: the model answers the directive
+    /// with the missing name and the round dies on "not a batch tool" — 14 such
+    /// ops in trace `mwab8nku`, and 11 fully-refused rounds.
+    #[test]
+    fn a_turn_is_only_told_to_batch_what_it_actually_bound() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let one = |name: &str| vec![(format!("c-{name}"), name.to_string(), "{}".to_string())];
+        let caps = |names: &[&str]| {
+            let owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            super::BatchCapability::from_advertised(&owned)
+        };
+
+        // The main agent / an explore child: both levers are available.
+        let full = caps(&["batch", "read", "grep", "run_terminal"]);
+        assert!(full.has_batch && full.has_lookup, "{full:?}");
+        assert!(super::batch_protocol_message(&full).is_some());
+        let hint = super::single_call_hint_with(&full, "subagent", &one("grep"), 1, root)
+            .expect("a lookup child with `batch` must be told to batch");
+        assert!(hint.contains("grep"), "{hint}");
+
+        // A child that carries `batch` but NO file lookup: the wrapper wording
+        // stands on its own, and the lookup names must not appear. (A `browser_*`
+        // call is answered by the serial driver branch BEFORE this one — that is
+        // the correct shape for it, so the family is probed through a write.)
+        let no_lookup = caps(&["batch", "edit_file", "run_terminal"]);
+        assert!(no_lookup.has_batch && !no_lookup.has_lookup, "{no_lookup:?}");
+        let hint = super::single_call_hint_with(&no_lookup, "subagent", &one("edit_file"), 1, root)
+            .expect("a batchable child still gets the wrapper wording");
+        assert!(hint.contains("batch"), "{hint}");
+        assert!(!hint.contains("grep"), "a lookup-less child has no grep: {hint}");
+        assert!(!hint.contains("find_symbol"), "{hint}");
+
+        // A COMPUTER child with no `batch` at all: silence is the only honest
+        // answer, and the protocol message must not be pushed at all.
+        let desktop = caps(&["computer", "read"]);
+        assert!(!desktop.has_batch, "{desktop:?}");
+        assert!(super::batch_protocol_message(&desktop).is_none());
+
+        // A custom profile narrowed to `read` only: no `batch`, but a lookup.
+        let narrowed = caps(&["read", "load_plugin"]);
+        assert!(!narrowed.has_batch && narrowed.has_lookup, "{narrowed:?}");
+        assert!(super::batch_protocol_message(&narrowed).is_none());
+        let hint = super::single_call_hint_with(&narrowed, "subagent", &one("read"), 1, root)
+            .expect("a lookup-only child can still merge lookups");
+        assert!(!hint.contains("`batch`"), "no batch is bound: {hint}");
+
+        // A child with NEITHER has nothing to merge: no hint, no streak growth.
+        let nothing = caps(&["computer"]);
+        assert!(!nothing.has_batch && !nothing.has_lookup, "{nothing:?}");
+        assert!(super::single_call_hint_with(&nothing, "subagent", &one("edit_file"), 1, root).is_none());
+        // ...but a desktop action still gets its OWN serial wording: it is a
+        // driver chain, not a missing batch.
+        assert!(super::single_call_hint_with(&nothing, "subagent", &one("computer"), 1, root)
+            .unwrap()
+            .contains("Desktop"));
+        assert!(!super::single_call_is_serial_with(&nothing, &one("edit_file"), root));
+        // ...while the same lone write DOES count once `batch` is bound, which is
+        // exactly the custom-profile case the old blanket guard hid.
+        assert!(super::single_call_is_serial_with(&full, &one("edit_file"), root));
     }
 
     /// A lone READ-ONLY shell round is batchable and must be named as such.

@@ -978,8 +978,9 @@ it. Put update_plan in the SAME step as your other tool calls, never alone.",
     }
     // The Plan-Execute protocol (always-on, main AND sub): the first tool reply
     // must be one `batch` with the whole step — the model-INDEPENDENT
-    // round-trip lever. Wire-only (see is_wire_only_context).
-    messages.push(batch_protocol_message());
+    // round-trip lever. Wire-only (see is_wire_only_context), and pushed BELOW
+    // once the tool table is final: a turn without `batch` must not be told to
+    // call it.
     // Separate context/autocompact for the explore sub-agent (user request):
     // its message list is compacted against its OWN budget — never the main
     // agent's history or window. An unresolved window follows the same capacity
@@ -1323,6 +1324,18 @@ it. Put update_plan in the SAME step as your other tool calls, never alone.",
         .collect();
     advertised.sort();
     advertised.dedup();
+
+    // What this turn really has bound. Every batching lever is gated on it, so a
+    // `browser`/`computer` child or a profile narrowed by its own declaration
+    // (`retain_subagent_tools`) is never told to call a tool it does not carry —
+    // that instruction used to cost the whole round to the refusal.
+    let batch_caps = super::subagent::BatchCapability::from_advertised(&advertised);
+    // The Plan-Execute protocol rides the TAIL, once the tool table is final: the
+    // directive must name only tools that exist here, and a turn without `batch`
+    // gets none at all. Wire-only (see is_wire_only_context).
+    if let Some(protocol) = super::subagent::batch_protocol_message(&batch_caps) {
+        messages.push(protocol);
+    }
 
     // Trace: the full system prompt of this turn, plus the serialized size of
     // the tool array that rides along on EVERY model call of the turn. The tool
@@ -4747,7 +4760,7 @@ call fetch_url again with offset={next} for the rest]",
         // of them (wallpaper, exactly as the 423-of-863 corpus measurement
         // predicted). Sub-agent and explore shapes are unchanged — they are
         // already rare and correctly worded.
-        if single_call_is_serial(&req.mode, &tool_calls, &root) {
+        if single_call_is_serial_with(&batch_caps, &tool_calls, &root) {
             lone_mutating_rounds += 1;
         } else {
             lone_mutating_rounds = 0;
@@ -4775,14 +4788,29 @@ call fetch_url again with offset={next} for the rest]",
         let hint: Option<Cow<'_, str>> = if hints_are_quiet {
             discovery_streak_hint(&req.mode, discovery_streak)
                 .map(Cow::Borrowed)
-                .or_else(|| single_call_hint(&req.mode, &tool_calls, lone_mutating_rounds, &root))
+                .or_else(|| {
+                    single_call_hint_with(
+                        &batch_caps,
+                        &req.mode,
+                        &tool_calls,
+                        lone_mutating_rounds,
+                        &root,
+                    )
+                })
         } else {
             // The escalating form keeps this slot for the WHOLE turn. It used to
             // yield to `discovery_streak_hint` once its cap was spent — and that
             // hint returns `None` unless the streak sits exactly on 3 or 7, so
             // the round went silent in the one state the counter proves is
             // wasteful: a long run of lone shell rounds.
-            round_hint(&req.mode, &tool_calls, discovery_streak, lone_mutating_rounds, &root)
+            round_hint_with(
+                &batch_caps,
+                &req.mode,
+                &tool_calls,
+                discovery_streak,
+                lone_mutating_rounds,
+                &root,
+            )
         };
         // Which lever spoke, counted apart: `hints_delivered` sums both, so it
         // rose on rounds where the model had in fact batched (traced:

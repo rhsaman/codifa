@@ -1,7 +1,12 @@
 // Nesting of sub-agent tool events under their branch task card.
 // Run: npx esbuild test/toolNesting.test.ts --bundle --platform=node --format=esm --packages=external --external:electron --outfile=test/.tmp-tn.mjs && node test/.tmp-tn.mjs
 import type { SidecarEvent, ToolActivity } from '../src/types.ts'
-import { applyToolEvent, resolveToolResult } from '../src/lib/toolActivity.ts'
+import {
+  appendBranchNarration,
+  applyToolEvent,
+  latestNarrationLine,
+  resolveToolResult,
+} from '../src/lib/toolActivity.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -131,6 +136,51 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
   )
   check('explore keeps its report text', acts[0]?.resultText === report, acts[0]?.resultText)
   check('explore result makes no file chips', !acts[0]?.items, acts[0]?.items)
+}
+
+// 10) Custom sub-agents (Settings → Sub-agents) are advertised as
+//    `agent__<id>` and must behave EXACTLY like `explore`: their child events
+//    nest under the branch card and their report text survives resolution.
+//    Anything keyed on the bare name "explore" silently dropped this.
+{
+  const report = 'Opened example.com and read the pricing table'
+  let acts: ToolActivity[] = []
+  acts = applyToolEvent(
+    acts,
+    toolEvent({ tool: 'agent__browser', branch: 0, call_id: 20, args: { description: 'scan pricing' } }),
+  )
+  acts = applyToolEvent(acts, toolEvent({ tool: 'read', branch: 0, sub: true, call_id: 21 }))
+  check('child nests under a custom sub-agent card',
+    acts[0]?.children?.length === 1 && acts[0].children![0].tool === 'read',
+    acts[0]?.children)
+  acts = resolveToolResult(
+    acts,
+    resultEvent({ tool: 'agent__browser', branch: 0, call_id: 20, status: 'done', result: report }),
+  )
+  check('custom sub-agent keeps its report text', acts[0]?.resultText === report, acts[0]?.resultText)
+  check('custom sub-agent report makes no file chips', !acts[0]?.items, acts[0]?.items)
+}
+
+// 11) A sub-agent's narration belongs to ITS card only. It must append to the
+//     branch card (latest line shown in chat, full log in the panel) and never
+//     to the parent's message text — that is what caused extra parent context
+//     and round-trips.
+{
+  let acts: ToolActivity[] = []
+  acts = applyToolEvent(acts, toolEvent({ tool: 'agent__browser', branch: 3, call_id: 30 }))
+  acts = applyToolEvent(acts, toolEvent({ tool: 'agent__browser', branch: 4, call_id: 31 }))
+  const before = acts[1].narration
+  acts = appendBranchNarration(acts, 3, 'Opening the profile…')
+  acts = appendBranchNarration(acts, 3, ' checking the follower count')
+  check('narration lands on the matching branch', acts[0].narration === 'Opening the profile… checking the follower count', acts[0].narration)
+  check('other branch narration is untouched', acts[1].narration === before, acts[1].narration)
+  check('latest line is what the chat card shows', latestNarrationLine(acts[0]) === 'Opening the profile… checking the follower count', latestNarrationLine(acts[0]))
+  // An unmatched branch is a no-op, not an orphan top-level text segment.
+  const same = appendBranchNarration(acts, 99, 'stray')
+  check('unmatched narration is ignored', same === acts, same.length)
+  // A re-emit must not wipe the log.
+  acts = applyToolEvent(acts, toolEvent({ tool: 'agent__browser', branch: 3, call_id: 30 }))
+  check('re-emit preserves narration', acts[0].narration?.startsWith('Opening the profile…') === true, acts[0].narration)
 }
 
 if (failed > 0) {

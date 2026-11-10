@@ -56,6 +56,7 @@ import {
 } from "../lib/slash";
 import { didYouMean, rankMatches } from "../lib/fuzzy";
 import {
+  appendBranchNarration,
   applyToolEvent,
   applyToolOutputEvent,
   diffStatsFromUnified,
@@ -134,6 +135,12 @@ import {
   marketplaceLabel,
   findMarketplaces,
   marketKey,
+  sameMarketplace,
+  installedForRow,
+  installedFromAddress,
+  parsePluginInstallSpec,
+  resolvePluginInstall,
+  readMarketplaceIndex,
 } from "../lib/plugins";
 import type { PluginCommandRow } from "../lib/plugins";
 import {
@@ -141,7 +148,7 @@ import {
   describeMarketplaceHit,
   type MarketplaceHit,
 } from "../lib/marketplaceSearch";
-import type { PluginInfo } from "../types";
+import type { PluginInfo, PluginInstallResult } from "../types";
 import { looksLikeRepoAddress } from "../lib/repoAddress";
 import { forgetPluginCommands } from "../lib/skills";
 import { listArtifacts, deleteArtifact, getArtifact, type ArtifactSummary } from "../lib/artifacts";
@@ -238,6 +245,7 @@ import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
+import { isDelegationTool, subagentDisplayName } from "./toolcall/naming";
 import { BalanceChip } from "./BalanceChip";
 import { ChatFindBar } from "./ChatFindBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
@@ -459,6 +467,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       origPath?: string;
     }>
   >(chat?.draft?.images ?? []);
+  // Live mirror of `images`: the async image pipeline and send() must see the
+  // CURRENT list even before React commits the state update (see addImage).
+  const imagesRef = useRef(images);
+  /** setImages + keep the ref current synchronously. */
+  const updateImages = (
+    updater: (
+      prev: Array<{ path: string; name: string; dataUrl?: string; origPath?: string }>,
+    ) => Array<{ path: string; name: string; dataUrl?: string; origPath?: string }>,
+  ) => {
+    const next = updater(imagesRef.current);
+    imagesRef.current = next;
+    setImages(next);
+  };
+  // Image paths whose normalize/read round-trip is still running. submit()
+  // awaits these so Enter can never race the async loader.
+  const pendingImageLoadsRef = useRef(new Map<string, Promise<void>>());
   // Long pastes captured as collapsed cards above the input (joined back into
   // the prompt on send). Scoped to the chat like input/attachments/images.
   const [pastedBlocks, setPastedBlocks] = useState<PastedText[]>(
@@ -480,7 +504,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Never restore a polluted draft: HTML error pages belong in the banner, never in the input.
     setInput(isHtmlTranscriptJunk(incomingInput) || /<\/?[a-z]/i.test(incomingInput) || incomingInput.includes('/_next/') || incomingInput.includes('&lt;') ? "" : incomingInput);
     setAttachments(chat?.draft?.attachments ?? []);
-    setImages(chat?.draft?.images ?? []);
+    updateImages(() => chat?.draft?.images ?? []);
     setPastedBlocks(chat?.draft?.pasted ?? []);
     // Programmatic input never fires onChange, so clear the pin here or a
     // hand-opened menu would leak into the switched-to chat.
@@ -1358,9 +1382,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Dictate mic stays visible during streaming (hidden only when live is active)
   // so the user can dictate the next prompt while the agent works.
   const showDictateDuringStreaming = !liveHere && isStreamingActive;
-  // Send appears only once there is typed/pasted text: attaching a photo/file
-  // alone keeps the mics visible so the prompt can be dictated afterwards.
-  const showSendOnly = !liveHere && !isStreamingActive && hasText && !recording;
+  // Send appears as soon as the composer carries something sendable: typed
+  // text, a collapsed paste card, or an attached image. Attaching a screenshot
+  // and pressing Send (without typing anything) must work; the old text-only
+  // gate forced the user to invent a caption.
+  const showSendOnly = !liveHere && !isStreamingActive && hasComposerText && !recording;
   // Attachments alone must not hide the mics: user may attach a file/photo
   // and then dictate the prompt. Typed text hides them too — EXCEPT while
   // recording: streaming dictation writes its partials INTO the input as they
@@ -1504,6 +1530,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const askReq = chat?.pendingAsk ?? null;
   const permissionReq = chat?.pendingPermission ?? null;
   const [askFreeText, setAskFreeText] = useState("");
+  // Note typed on a permission card. Non-empty turns the Deny button into
+  // "Deny + instruction": the refusal is delivered first, then the note becomes
+  // the user's next steer so the agent changes course instead of retrying the
+  // same blocked path. Reset on every answer.
+  const [permNote, setPermNote] = useState("");
   // Selected row on the plan-approval card (index into its options; 0 = the
   // pre-highlighted "Approve" option). Reset whenever a new ask lands.
   const [planApprovalSel, setPlanApprovalSel] = useState(0);
@@ -1537,12 +1568,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     id: string,
     allowed: boolean,
     chatId: string,
+    note?: string,
   ) => {
     if (answerSendingRef.current) return;
     answerSendingRef.current = true;
+    const typed = note?.trim() ?? "";
     try {
-      if (await respondPermission(id, allowed)) {
+      if (await respondPermission(id, allowed, typed, chatId)) {
         useStore.getState().setChatPendingPermission(chatId, null);
+        setPermNote("");
+        if (typed) {
+          // The note is the user's next instruction, so it must also show in the
+          // transcript: the backend turned it into a steer, and without this
+          // bubble the agent's change of course would look unprompted.
+          void send(typed);
+        }
       }
     } catch {
       /* keep the card so the answer can be retried */
@@ -2040,7 +2080,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  it retries on a bounded loop (then escalates to a forced abort) instead of
    *  looping forever on a genuinely dead connection. */
   const watchdogAutoRetriedRef = useRef(0);
-  /** True when a create_mcp tool was called this turn — triggers MCP list refresh on done. */
+  /** True when a plugin call may have changed connectors this turn — triggers an
+   *  MCP list refresh on done. */
   const mcpChangedRef = useRef(false);
   const toggleRecordingRef = useRef<() => void>(() => { });
 
@@ -3960,7 +4001,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     reuseMsgId?: string,
     continueAssistantId?: string,
     forceScroll = false,
-    overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[]; restart?: boolean; liveSuffix?: string },
+    overrides?: {
+      mcpServers?: Record<string, McpServerConfig>
+      skills?: string[]
+      plugins?: string[]
+      restart?: boolean
+      liveSuffix?: string
+    },
     forChatId?: string,
   ) => {
     // Per-chat isolation: resolve the ORIGIN chat first (background drains via
@@ -3996,8 +4043,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // was never aborted) and the same tool work ran twice. Only the keyboard
     // path guarded against this. A controller that is already aborted belongs to
     // a dead turn (Stop / watchdog), so it never blocks the retry.
-    const inFlight = abortMapRef.current.get(chatId);
+    //
+    // The local map is only a fast mirror: a turn started by a panel that has
+    // since unmounted (chat switch, workspace switch) exists in the STORE's
+    // authoritative `chatAborts` map only. Adopt that controller here, or the
+    // remounted panel would happily start a second concurrent turn.
+    const inFlight =
+      abortMapRef.current.get(chatId) ??
+      useStore.getState().chatAborts?.[chatId] ??
+      undefined;
     if (inFlight && !inFlight.signal.aborted) {
+      abortMapRef.current.set(chatId, inFlight);
       // Single-flight must never DROP a spoken turn silently. The live pipeline
       // aborts the previous turn and can arrive before that turn's `finally`
       // released the slot, which used to make the utterance vanish with no
@@ -4070,8 +4126,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Without it a recovered turn kept the badge forever: the full answer
     // rendered while the footer still read "failed / The turn failed."
     let sawTurnError = false;
-    // Messages that ask to create/install skills or MCP connectors also grant
-    // the create_skill/create_mcp tools — in EVERY mode (ask, plan, build).
+    // Messages that ask to create/install a plugin also grant the authoring
+    // actions of the ONE `plugin` tool — in EVERY mode (ask, plan, build).
     // The grant is sticky across the conversation: check the current message AND
     // the last several chat messages, so a follow-up like "ادامه بده" keeps the
     // tools it was originally granted (the user's install request is still in
@@ -4159,19 +4215,33 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // doesn't see raw @tokens. The stored transcript keeps the original text
     // with the @mentions. The canonical token is the skill slug (space-free);
     // a legacy display-name fallback is also supported.
-    // Guard: ensure the skill list is loaded before matching, so a mention
-    // typed/pasted before the picker opened (or before the async fetch
-    // resolved) is never missed.
-    if (mentionCatalog().length === 0) {
-      await ensureSkillsList();
+    // Guard: ensure the ATTACHABLE catalog is loaded before matching, so a
+    // mention typed/pasted before the picker opened (or before the async fetch
+    // resolved) is never missed. `ensureSkillsList` fills the OTHER cache
+    // (Settings' editable store), which `mentionCatalog()` does not read — the
+    // old guard therefore loaded the wrong list and the mention stayed
+    // unmatched. The wider catalog is the source of truth here; fall back to
+    // the store list only when the backend has no available-skills route.
+    let mentionRows = mentionCatalog();
+    if (mentionRows.length === 0) {
+      mentionRows = await ensureAvailableSkills();
+      if (mentionRows.length === 0) mentionRows = await ensureSkillsList();
+      setSkillsList(mentionRows);
     }
     const { skills: mentionSkills, cleaned: cleanedText } =
-      extractMentionSkills(text, mentionCatalog());
+      extractMentionSkills(text, mentionRows);
     // Plugin-USE session (the /slug badge): while open, its skills and
     // connectors ride along on EVERY send — unless this very turn carries its
     // own override (a /command turn or explicit @mentions), which wins.
     const session = chat.pluginSession;
     const sessionSkills = session && !overrides?.skills ? session.skills : [];
+    // The open plugin-use session is ONE unit: send its SLUG so the backend
+    // inlines every skill body and tells the model the toolbox is already
+    // loaded, instead of making it re-load each skill separately. An explicit
+    // turn override (a narrowed /plugin call, a queued @mention) wins.
+    const sessionPlugins =
+      session && !overrides?.skills && !overrides?.plugins ? [session.slug] : [];
+    const effectivePlugins = overrides?.plugins ?? sessionPlugins;
     const sessionMcp =
       session && !overrides?.mcpServers ? session.mcpConfig : undefined;
     const effectiveSkills = Array.from(
@@ -4222,8 +4292,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         content: text,
         attachments: atts,
         images: sendImgs,
-                  mcpServers: effectiveMcpServers,
-          skills: effectiveSkills,
+        mcpServers: effectiveMcpServers,
+        skills: effectiveSkills,
+        plugins: effectivePlugins,
         // Capture the CURRENT chat mode on the user bubble so the transcript
         // stays consistent: every user message records which mode it ran in.
         // This also guarantees a retry (which re-sends via send()) inherits the
@@ -4769,7 +4840,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // Batched text must land before any tool/status/retry update, so cards
       // never render ahead of the prose that preceded them.
       if (event.kind !== "text") flushPendingText();
-      if (event.kind === "text") {
+      if (
+        event.kind === "text" &&
+        event.sub === true &&
+        typeof event.branch === "number"
+      ) {
+        // A sub-agent's own narration. It belongs INSIDE its delegation card:
+        // appending it to the assistant content would put the child's words in
+        // the parent transcript and send them back as parent context on the
+        // next request (extra round-trips, duplicated work). The card is
+        // UI-only; the parent's model history never sees this.
+        const current = findMsg()?.toolActivity ?? [];
+        const next = appendBranchNarration(
+          current,
+          event.branch,
+          event.content ?? "",
+        );
+        if (next !== current) {
+          store.updateMessage(assistantMsg.id, { toolActivity: next });
+        }
+        useStore.getState().setStreaming(true, useStore.getState().isThinking);
+      } else if (event.kind === "text") {
         // Keep the current "isThinking" flag untouched — a text chunk must not
         // cancel the composer glow while the model is still reasoning.
         useStore.getState().setStreaming(true, useStore.getState().isThinking);
@@ -4866,9 +4957,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           store.updateMessage(assistantMsg.id, { retry: null });
         }
         ensureLiveBubble();
-        // A create_mcp call this turn means the connector list in the store is
-        // stale — flag it so the `done` handler re-fetches from the sidecar.
-        if (event.tool === "create_mcp") mcpChanged = true;
+        // A plugin call this turn may have saved/removed connectors (they are
+        // authored inside the bundle), so the store's list is stale — flag it
+        // so the `done` handler re-fetches from the sidecar. `create_mcp` stays
+        // for transcripts from the old standalone-tool build.
+        if (event.tool === "plugin" || event.tool === "create_mcp") {
+          mcpChanged = true;
+        }
         // Codex-style: the first browser tool call of a turn docks the Browser
         // viewer tab on the right so the user watches the shared session live.
         // The tools are native now, but a user-added MCP connector could still
@@ -5045,8 +5140,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // so late sub-results are never dropped.
         const next = resolveToolResult(findMsg()?.toolActivity ?? [], event);
         store.updateMessage(assistantMsg.id, { toolActivity: next });
-        // When the AI creates a skill via the create_skill tool, invalidate
-        // the frontend skills cache so the @mention picker picks it up.
+        // When the AI authors a plugin (skills are authored INSIDE it now),
+        // invalidate the frontend skills cache so the @mention picker picks the
+        // new skills up.
         // Must also refresh the component's skillsList state — clearing the
         // module-level cache alone doesn't trigger a re-render.
         // A plugin carries skills, so installing/toggling one changes BOTH
@@ -5305,13 +5401,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         if (seg.id) {
           useStore.getState().appendMessageSegments(assistantMsg.id, [seg]);
           try {
-            useViewerTabs.getState().openArtifact(chat.id, {
-              id: seg.id,
-              title: seg.title,
-              kind: seg.artifactKind,
-              body: seg.content,
-              version: seg.version,
-            });
+            // Artifact tabs are CHAT-scoped: auto-opening a background chat's
+            // artifact used to steal the focused pane with a tab that is not
+            // visible there. Only the focused chat previews automatically; the
+            // card in that chat's transcript opens it when the user returns.
+            if (useStore.getState().activeChatId === chat.id) {
+              useViewerTabs.getState().openArtifact(chat.id, {
+                id: seg.id,
+                title: seg.title,
+                kind: seg.artifactKind,
+                body: seg.content,
+                version: seg.version,
+              });
+            }
           } catch {
             // Opening the preview must never break the stream.
           }
@@ -5568,12 +5670,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         lastEventAtMs = Date.now();
         lastContentAtMs = Date.now();
         ensureLiveBubble();
-        const label =
+        const raw =
           typeof event.content === "string" && event.content.trim()
             ? event.content.trim().slice(0, 120)
             : typeof (event as { stage?: unknown }).stage === "string"
               ? String((event as { stage?: unknown }).stage).slice(0, 120)
               : "Working";
+        // A delegation status carries the raw tool name (`agent__browser`).
+        // Show the sub-agent's own name in the Working pill instead — the
+        // user asked to see WHICH sub-agent is working, not its tool id.
+        const label = isDelegationTool(raw)
+          ? subagentDisplayName(raw, useStore.getState().customSubagents)
+          : raw;
         const lsp = lspStatusFromEvent(event as { stage?: string; tool?: string; status?: string; summary?: string; content?: string; language?: string });
         if (lsp) {
           if (lsp.phase === "done" || lsp.phase === "error") {
@@ -5700,8 +5808,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             });
           }
         }
-        // A create_mcp ran this turn: the connector was saved to the app's user
-        // data folder by the backend, but the store's mcpServers snapshot is only hydrated
+        // A plugin action ran this turn: connectors are saved inside the bundle
+        // by the backend, but the store's mcpServers snapshot is only hydrated
         // once at app startup — re-fetch so Settings → MCP shows it without a
         // restart. Fire-and-forget: a failure here must not break the turn.
         if (mcpChanged) {
@@ -5857,6 +5965,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           videoModel: s.videoModel,
           videoFallbacks: s.videoFallbacks,
           skills: effectiveSkills,
+          plugins: effectivePlugins,
           allowCreate,
           cap: getMode(s.settings, chat.editTarget ? "build" : chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
@@ -5864,6 +5973,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           allowComputer: s.computerUse,
           allowBrowser: s.browserUse,
           subagentModels: s.subagentModels,
+          customSubagents: s.customSubagents ?? [],
           subagentThinking: s.subagentThinking,
           toolFallbacks: toolFallbackEntries(s.toolFallbacks),
           providers: Object.fromEntries(
@@ -6420,9 +6530,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           }
           const parsed = parseMarketplaceAddress(address);
           if (!parsed.repo) return say("That address has no repo — use `owner/repo`.");
-          const key = marketKey(parsed.repo, parsed.path, parsed.git_ref);
-          if (markets.some((m) => marketKey(m.repo, m.path, m.git_ref) === key)) {
-            return say(`Marketplace \`${parsed.repo}\` is already saved.`);
+          const existingMarket = markets.find((m) => sameMarketplace(m, parsed));
+          if (existingMarket) {
+            return say(
+              `Marketplace **${marketplaceLabel(existingMarket)}** is already added — nothing changed.`,
+            );
           }
           const out = await listMarketplace({
             repo: parsed.repo,
@@ -6432,7 +6544,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           if ("error" in out) {
             return say(`Could not read marketplace \`${parsed.repo}\`: ${out.error}`);
           }
-          const label = labelParts.join(" ").trim();
+          // The INDEX's own name is the marketplace's name everywhere else
+          // (Claude's `plugin@marketplace` uses it, and Settings should show
+          // it), so it becomes the label unless the user typed one.
+          const label = labelParts.join(" ").trim() || out.name.trim();
           const source = {
             repo: parsed.repo,
             kind: "plugins" as const,
@@ -6561,10 +6676,50 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         );
       }
       if (sub === "install" && arg) {
-        // A bare word is the NAME of a bundle the user wants made, not a repo to
-        // read: `install` would only fail with "cannot read a repo from …", which
-        // reads as a bug. Hand it to `create` instead of spending a turn on it.
-        if (!looksLikeRepoAddress(arg)) {
+        // Three spellings reach here:
+        //   `/plugin install <repo> [path] [ref]` — read a bundle out of a repo
+        //     (or, when the repo is a marketplace, install the row it names).
+        //   `/plugin install <plugin>@<marketplace>` — Claude Code's scoped
+        //     spelling. The marketplace is the DISCOVERY half, so the row is
+        //     looked up there instead of letting the model author anything.
+        //   `/plugin install <bare word>` — a NAME, not an address: the user
+        //     wants a bundle MADE, so it goes to `create`.
+        // A marketplace label may contain spaces (`My Tools`), and the command
+        // splitter only puts the first word in `arg`. Re-join the tail when the
+        // scoped spelling is clearly what the user typed; a repo address never
+        // becomes scoped this way because its plugin half holds `/`.
+        const scoped =
+          parsePluginInstallSpec(arg) ??
+          (arg.includes("@") ? parsePluginInstallSpec(`${arg} ${rest}`) : null);
+        let installBody: Parameters<typeof installPlugin>[0];
+        /** A marketplace this turn should save, when it was not saved already. */
+        let marketplaceToSave: {
+          repo: string;
+          label?: string;
+          path?: string;
+          git_ref?: string;
+        } | null = null;
+        /** The scoped install's marketplace, for the receipt. */
+        let scopedMarket = "";
+        /** The row's name, used to recognise an already-installed bundle. */
+        let scopedEntryName = "";
+        let repoPath = "";
+        let repoRef = "";
+        if (scoped) {
+          const resolved = await resolvePluginInstall(s.marketplaces ?? [], scoped);
+          if ("error" in resolved) return say(resolved.error);
+          const { entry, source, saved } = resolved;
+          installBody = {
+            repo: entry.repo,
+            ...(entry.repo_path ? { repo_path: entry.repo_path } : {}),
+            ...(entry.repo_ref ? { repo_ref: entry.repo_ref } : {}),
+            ...(entry.skills?.length ? { skills: entry.skills } : {}),
+            name: entry.name,
+          };
+          scopedEntryName = entry.name;
+          scopedMarket = source.label || source.repo;
+          if (!saved) marketplaceToSave = source;
+        } else if (!looksLikeRepoAddress(arg)) {
           // Sending a prompt needs a chat to record it in. Without one there is
           // nothing to fall back to either — and falling through would run the
           // doomed install this guard exists to prevent, so report and stop.
@@ -6598,10 +6753,43 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             ch.id,
           );
           return true;
+        } else {
+          // The words after the repo are the sub-folder and the ref — exactly
+          // the `repo`/`repo_path`/`repo_ref` trio the backend reads.
+          const [path, ref] = rest.split(/\s+/).filter(Boolean);
+          repoPath = path ?? "";
+          repoRef = ref ?? "";
+          installBody = {
+            repo: arg,
+            ...(repoPath ? { repo_path: repoPath } : {}),
+            ...(repoRef ? { repo_ref: repoRef } : {}),
+          };
         }
-        // The words after the repo are the sub-folder and the ref — exactly the
-        // `repo`/`repo_path`/`repo_ref` trio the backend reads.
-        const [path, ref] = rest.split(/\s+/).filter(Boolean);
+        // A second install of a bundle that is already on disk is a no-op, not
+        // an update: the user asked to INSTALL it, and re-reading the repo just
+        // to overwrite the same files (or, worse, land a second bundle when the
+        // name differs) reads as "it installed again". Say it plainly and leave
+        // the bundle untouched; pulling a newer source is `/plugin update`.
+        const installedNow = await listPlugins();
+        if (Array.isArray(installedNow)) {
+          const existing =
+            (scoped && scopedEntryName
+              ? installedForRow(installedNow, {
+                  name: scopedEntryName,
+                  repo: installBody.repo,
+                })
+              : undefined) ?? installedFromAddress(installedNow, installBody);
+          if (existing) {
+            const label = existing.name || existing.slug;
+            return say(
+              `Plugin **${label}** (\`${existing.slug}\`) is already installed — nothing changed.` +
+                (existing.enabled === false
+                  ? " It is currently off; switch it on in Settings → Plugins."
+                  : "") +
+                ` To pull the latest source, use \`/plugin update ${existing.slug}\` or **Update from source** in Settings → Plugins.`,
+            );
+          }
+        }
         // NOTHING here may die silently: the caller `void`s this function, so a
         // rejection renders as "nothing happened" — the reported bug.
         //
@@ -6616,6 +6804,36 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const update = (content: string) => {
           if (status) useStore.getState().updateMessage(status.id, { content });
         };
+        /** Save a marketplace unless the same address is already in the list.
+         *  Returns the label only when the source was NEWLY added. */
+        const saveMarketplace = (m: {
+          repo: string;
+          label?: string;
+          path?: string;
+          git_ref?: string;
+        }): string | null => {
+          const now = useStore.getState().marketplaces ?? [];
+          if (now.some((x) => sameMarketplace(x, m))) return null;
+          const source = {
+            repo: m.repo,
+            kind: "plugins" as const,
+            ...(m.label ? { label: m.label } : {}),
+            ...(m.path ? { path: m.path } : {}),
+            ...(m.git_ref ? { git_ref: m.git_ref } : {}),
+          };
+          useStore.getState().setMarketplaces([...now, source]);
+          return marketplaceLabel(source);
+        };
+        // The ✓ line is the receipt, not a report: counts only, and hooks are
+        // flagged as running with the bundle so nobody is surprised by them.
+        const receipt = (r: PluginInstallResult) =>
+          `✓ Plugin **${r.plugin?.name ?? r.slug}** ${r.installed} — ` +
+          `${(r.skills ?? []).length} skills · ${(r.commands ?? []).length} commands · ` +
+          `${(r.agents ?? []).length} sub-agents · ${(r.hooks ?? []).length} hooks · ` +
+          `${(r.mcp ?? []).length} connectors · ${(r.scripts ?? []).length} scripts` +
+          ((r.hooks ?? []).length ? " (hooks run while the bundle is enabled)" : "");
+        const addedLine = (label: string | null) =>
+          label ? `\nAdded marketplace **${label}** — browse it in Settings → Plugins.` : "";
         try {
           const poll = setInterval(async () => {
             const p = await installProgress();
@@ -6635,26 +6853,122 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             const bar = "▮".repeat(filled) + "▯".repeat(20 - filled);
             update(`⏳ ${label}\n${bar} ${p.done}/${p.total} (${pct}%)`);
           }, 400);
-          const out = await installPlugin({
-            repo: arg,
-            ...(path ? { repo_path: path } : {}),
-            ...(ref ? { repo_ref: ref } : {}),
-          }).finally(() => clearInterval(poll));
+          const out = await installPlugin(installBody).finally(() => clearInterval(poll));
           if ("error" in out) {
+            // A marketplace repo keeps its plugins in SUB-FOLDERS, so installing
+            // its root as one bundle fails ("more than one plugin"). When the
+            // repo carries an index, install the row it names — or its only row
+            // — and save the catalogue instead of reporting a dead end.
+            if (!scoped && !repoPath) {
+              const index = await readMarketplaceIndex({
+                repo: arg,
+                ...(repoRef ? { git_ref: repoRef } : {}),
+              });
+              if (index) {
+                const added = saveMarketplace({
+                  repo: arg,
+                  ...(repoRef ? { git_ref: repoRef } : {}),
+                  ...(index.name.trim() ? { label: index.name.trim() } : {}),
+                });
+                const base = arg.trim().replace(/\/+$/, "").split("/").pop()?.toLowerCase() ?? "";
+                const pick =
+                  index.plugins.find((p) => p.name.trim().toLowerCase() === base) ??
+                  (index.plugins.length === 1 ? index.plugins[0] : null);
+                if (pick) {
+                  // The repo's row may ALREADY be installed: the root read
+                  // failed, but that is not a reason to install the same bundle
+                  // a second time. Register the catalogue, then say it is here.
+                  const liveNow = await listPlugins();
+                  const alreadyPick = Array.isArray(liveNow)
+                    ? (installedForRow(liveNow, pick) ??
+                      installedFromAddress(liveNow, pick))
+                    : undefined;
+                  if (alreadyPick) {
+                    update(
+                      `Plugin **${alreadyPick.name || pick.name}** (\`${alreadyPick.slug}\`) is already installed — nothing changed.\n` +
+                        (added
+                          ? `Added marketplace **${added}** — browse it in Settings → Plugins.`
+                          : `Its marketplace **${index.name.trim() || arg}** is already saved.`),
+                    );
+                    return true;
+                  }
+                  const retry = await installPlugin({
+                    repo: pick.repo,
+                    ...(pick.repo_path ? { repo_path: pick.repo_path } : {}),
+                    ...(pick.repo_ref ? { repo_ref: pick.repo_ref } : {}),
+                    ...(pick.skills?.length ? { skills: pick.skills } : {}),
+                    name: pick.name,
+                  });
+                  if (!("error" in retry)) {
+                    invalidateAvailableSkills();
+                    cmdArgFetchedAt.current = 0;
+                    await ensureCmdArgValues();
+                    window.dispatchEvent(new CustomEvent("coder:plugins-changed"));
+                    update(receipt(retry) + addedLine(added));
+                    return true;
+                  }
+                }
+                const names = index.plugins.map((p) => `\`${p.name}\``).join(", ");
+                const label = index.name.trim() || arg;
+                update(
+                  `✗ Plugin install failed: ${out.error}\n` +
+                    `✓ Added marketplace **${added ?? label}** — it lists ` +
+                    `${index.plugins.length} plugin(s)` +
+                    (names ? `: ${names}` : "") +
+                    `. Install one with \`/plugin install <name>@${label}\`.`,
+                );
+                return true;
+              }
+            }
             update(`✗ Plugin install failed: ${out.error}`);
             return true;
           }
           invalidateAvailableSkills();
           cmdArgFetchedAt.current = 0;
           await ensureCmdArgValues();
-          // The ✓ line is the receipt, not a report: counts only, and hooks are
-          // flagged as running with the bundle so nobody is surprised by them.
+          // Settings → Marketplaces hides installed rows, and its plugin list
+          // is read from the backend: announce the new bundle so an open modal
+          // hides the row (and shows the plugin) without being reopened.
+          window.dispatchEvent(new CustomEvent("coder:plugins-changed"));
+          // A repo can be BOTH an install source and a catalogue. Saving it is
+          // what makes its other plugins installable as `plugin@marketplace`
+          // later (and fills Settings → Marketplaces). A plain bundle repo is
+          // a catalogue of ONE: the backend synthesizes that row, so it is
+          // registered too instead of vanishing after the install.
+          let added = marketplaceToSave ? saveMarketplace(marketplaceToSave) : null;
+          if (!scoped && !repoPath) {
+            // The backend reports the index it SAW (null when the repo is a
+            // plain bundle), so a repo WITH an index pays one read for its own
+            // name; a plain one needs none. `undefined` comes from the
+            // late-install watcher, which cannot know — probe that rare case.
+            if (out.marketplace === null) {
+              const fresh = saveMarketplace({
+                repo: arg,
+                ...(repoRef ? { git_ref: repoRef } : {}),
+                label: out.plugin?.name?.trim() || arg,
+              });
+              if (!added) added = fresh;
+            } else {
+              const index = await readMarketplaceIndex({
+                repo: arg,
+                ...(repoRef ? { git_ref: repoRef } : {}),
+              });
+              // The index's own name is the nicest label, but a failed READ
+              // must not undo the registration: the install just proved the
+              // repo exists, so fall back to the bundle's name.
+              const label = index?.name.trim() || out.plugin?.name?.trim() || arg;
+              const fresh = saveMarketplace({
+                repo: arg,
+                ...(repoRef ? { git_ref: repoRef } : {}),
+                label,
+              });
+              if (!added) added = fresh;
+            }
+          }
           update(
-            `✓ Plugin **${out.plugin?.name ?? out.slug}** ${out.installed} — ` +
-              `${(out.skills ?? []).length} skills · ${(out.commands ?? []).length} commands · ` +
-              `${(out.agents ?? []).length} sub-agents · ${(out.hooks ?? []).length} hooks · ` +
-              `${(out.mcp ?? []).length} connectors · ${(out.scripts ?? []).length} scripts` +
-              ((out.hooks ?? []).length ? " (hooks run while the bundle is enabled)" : ""),
+            receipt(out) +
+              (scopedMarket ? `\nFrom marketplace **${scopedMarket}**.` : "") +
+              addedLine(added),
           );
           return true;
         } catch (err) {
@@ -6741,6 +7055,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         invalidateAvailableSkills();
         void refreshPluginCmds();
         cmdArgFetchedAt.current = 0;
+        // Settings → Marketplaces hides installed rows, so a delete has to
+        // announce itself or the row stays hidden until the modal reopens.
+        if (!("error" in out)) {
+          window.dispatchEvent(new CustomEvent("coder:plugins-changed"));
+        }
         return say(
           "error" in out ? `Plugin ${arg}: ${out.error}` : `Plugin \`${arg}\` deleted.`,
         );
@@ -7061,7 +7380,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const rest = v.slice(word.length).trim();
         const usage: Record<string, string> = {
           "/plugin":
-            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]`, `\/plugin create <description>`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`, `\/plugin marketplace add|remove|list`, `\/plugin search <what you need>`. `install` reads an existing bundle from a repo; to make one, use `create`. To USE a bundle, type its `\/<slug>` command.",
+            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]` or `\/plugin install <plugin>@<marketplace>`, `\/plugin create <description>`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`, `\/plugin marketplace add|remove|list`, `\/plugin search <what you need>`. `install` reads an existing bundle from a repo and saves that repo as a marketplace; to make one, use `create`. To USE a bundle, type its `\/<slug>` command.",
           "/artifact":
             "Usage: `\/artifact list`, `\/artifact create <description>`, `\/artifact update <id> <change>`, `\/artifact remove <id>`.",
           "/schedule":
@@ -7263,6 +7582,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               false,
               {
                 skills,
+                ...(!named && !mcpNarrow ? { plugins: [plug.name] } : {}),
                 ...(bundle.mcpServers ? { mcpServers: bundle.mcpServers } : {}),
               },
               ch.id,
@@ -7550,14 +7870,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     [],
   );
 
-  const submit = (overrideText?: string) => {
+  const submit = async (overrideText?: string) => {
+    // An image still being normalized/read is PART of the message being sent:
+    // pressing Enter during that async round-trip used to send the turn
+    // without the picture (which then appeared in the composer of an
+    // already-sent turn). Wait for the in-flight loads, then read the composer
+    // from the live ref so the just-registered image is included.
+    if (pendingImageLoadsRef.current.size > 0) {
+      await Promise.allSettled([...pendingImageLoadsRef.current.values()]);
+    }
     // Straighten smart punctuation once, on the way out: the composer never
     // rewrites the textarea mid-typing (that scrambled WebKit composition into
     // `ockd`), so a line still carrying `—skills=` is repaired here, where
     // nothing is mid-flight. Prose (non-slash lines) is untouched — the helper
     // only rewrites dash tokens on a `/command` line.
     const typed = normalizeFlagDashes(overrideText ?? input).trim();
-    if (!typed && pastedBlocks.length === 0 && images.length === 0 && !activeQuote) return;
+    // Read images from the ref (not the render closure): the await above may
+    // have replaced the loading stubs with their final paths/data URLs.
+    const imgs = imagesRef.current;
+    if (!typed && pastedBlocks.length === 0 && imgs.length === 0 && !activeQuote) return;
     // Record plain prompts so ArrowUp recalls them; slash commands and
     // skill mentions stay out (they have their own recent-use popups).
     if (typed && !typed.startsWith("/")) {
@@ -7586,9 +7917,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     setNoRootHint("");
     const atts = attachments;
-    const imgs = images;
     setAttachments([]);
-    setImages([]);
+    updateImages(() => []);
     const selectedMcpServers: Record<string, McpServerConfig> = (() => {
       const all = ss.settings.mcpServers ?? {};
       const enabled = ss.settings.mcpEnabled ?? [];
@@ -7618,6 +7948,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         images: imgs,
         mcpServers: selectedMcpServers,
         skills: selectedSkills,
+        plugins: chatObj.pluginSession ? [chatObj.pluginSession.slug] : undefined,
         kind: "queue",
       });
       setInput("");
@@ -7646,6 +7977,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         images: imgs,
         mcpServers: selectedMcpServers,
         skills: selectedSkills,
+        plugins: chatObj.pluginSession ? [chatObj.pluginSession.slug] : undefined,
         steerPending: true,
       });
       setInput("");
@@ -7659,9 +7991,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const steerPrompt = chatObj.goal?.active && !chatObj.goal.paused && v.trim().length > 0 && !v.trim().startsWith("/goal")
         ? `[Active goal: ${chatObj.goal.condition}] ${v}`
         : v;
-      void steerChat(chatObj.id, userMsg.id, steerPrompt, atts, cleanImagesForSend(imgs), {
+      // The steer endpoint has no workspace context, so workspace-relative
+      // attachment paths must be made absolute here (streamChat's payload does
+      // the same for a normal turn).
+      const steerAtts = atts.map((a) =>
+        /^(\/|[a-zA-Z]:[\\/])/.test(a)
+          ? a
+          : `${rootDir}/${a.replace(/^\/+/, "")}`,
+      );
+      void steerChat(chatObj.id, userMsg.id, steerPrompt, steerAtts, cleanImagesForSend(imgs), {
         mcpServers: selectedMcpServers,
         skills: selectedSkills,
+      }).then((ok) => {
+        if (ok) return;
+        // The turn ended between Enter and the POST (or the backend is not
+        // reachable), so no running turn consumed the steer. Never leave the
+        // bubble pending forever: deliver it as the NEXT turn, reusing this
+        // same user message (send clears steerPending, no duplicate bubble).
+        void send(v, atts, imgs, false, userMsg.id, undefined, true, undefined, chatObj.id);
       });
       return;
     }
@@ -7674,7 +8021,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   const queueForLater = () => {
     const typed = input.trim();
-    if (!typed && pastedBlocks.length === 0 && images.length === 0 && !activeQuote) return;
+    const queuedImgs = imagesRef.current;
+    if (!typed && pastedBlocks.length === 0 && queuedImgs.length === 0 && !activeQuote) return;
     // Slash commands run immediately and never enter the chat transcript as
     // raw "/..." text, even when queued via the queue button.
     if (typed.startsWith("/")) {
@@ -7689,7 +8037,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
     if (!chatObj) return;
     const atts = attachments;
-    const imgs = images;
+    const imgs = queuedImgs;
     const all = ss.settings.mcpServers ?? {};
     const enabled = ss.settings.mcpEnabled ?? [];
     const sel: Record<string, McpServerConfig> = {};
@@ -7713,6 +8061,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       images: imgs,
       mcpServers: sel,
       skills: queuedSkills,
+      plugins: chatObj.pluginSession ? [chatObj.pluginSession.slug] : undefined,
       kind: "queue",
     });
     forceScrollToBottom();
@@ -7720,28 +8069,45 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setPastedBlocks([]);
     setActiveQuote(null);
     setAttachments([]);
-    setImages([]);
+    updateImages(() => []);
   };
 
   const addImage = async (p: string, name: string) => {
-    // Normalize first: HEIC / oversized / permission-blocked originals are
-    // converted to a readable temp PNG (like screenshots) so the backend can
-    // always load the path we send. Falls back to the original path if
-    // normalization fails.
-    const norm = await api.normalizeImage(p).catch(() => null);
-    const path = norm?.path || p;
-    const dataUrl =
-      norm?.dataUrl || (await api.readImage(p).catch(() => null)) || undefined;
-    setImages((imgs) => {
-      const hit = imgs.find((i) => i.origPath === p || i.path === p);
-      if (hit) {
-        if (!dataUrl) return imgs;
+    // Register the image IMMEDIATELY with its original path: normalize/read is
+    // an async IPC round-trip, and an Enter press during it used to send the
+    // message WITHOUT the picture (which then appeared in the composer of an
+    // already-sent turn). The stub is replaced in place when loading finishes;
+    // submit() awaits the in-flight promise before it reads the composer.
+    if (!imagesRef.current.some((i) => i.origPath === p || i.path === p)) {
+      updateImages((imgs) => [...imgs, { path: p, name, origPath: p }]);
+    }
+    const job = (async () => {
+      // Normalize first: HEIC / oversized / permission-blocked originals are
+      // converted to a readable temp PNG (like screenshots) so the backend can
+      // always load the path we send. Falls back to the original path if
+      // normalization fails.
+      const norm = await api.normalizeImage(p).catch(() => null);
+      const path = norm?.path || p;
+      const dataUrl =
+        norm?.dataUrl || (await api.readImage(p).catch(() => null)) || undefined;
+      updateImages((imgs) => {
+        const hit = imgs.find((i) => i.origPath === p || i.path === p);
+        // Removed while loading: stay removed (do not resurrect the chip).
+        if (!hit) return imgs;
+        if (!dataUrl && hit.path === path) return imgs;
         return imgs.map((i) =>
-          i.origPath === p || i.path === p ? { ...i, dataUrl } : i,
+          i.origPath === p || i.path === p ? { ...i, path, dataUrl } : i,
         );
+      });
+    })();
+    pendingImageLoadsRef.current.set(p, job);
+    try {
+      await job;
+    } finally {
+      if (pendingImageLoadsRef.current.get(p) === job) {
+        pendingImageLoadsRef.current.delete(p);
       }
-      return [...imgs, { path, name, dataUrl, origPath: p }];
-    });
+    }
   };
 
   const addDroppedFile = (p: string, name: string) => {
@@ -7814,7 +8180,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (f.type.startsWith("image/")) {
         const reader = new FileReader();
         reader.onload = () => {
-          setImages((imgs) =>
+          updateImages((imgs) =>
             imgs.some((i) => i.path === f.name)
               ? imgs
               : [
@@ -7894,7 +8260,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   };
 
   const addShot = (shot: { path: string; dataUrl: string }) => {
-    setImages((imgs) =>
+    updateImages((imgs) =>
       imgs.some((i) => i.path === shot.path)
         ? imgs
         : [
@@ -7954,7 +8320,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   };
 
   const removeImage = (path: string) => {
-    setImages((imgs) => imgs.filter((i) => i.path !== path));
+    updateImages((imgs) => imgs.filter((i) => i.path !== path && i.origPath !== path));
   };
 
   // Build the STT chain: primary first, then ordered fallbacks.
@@ -10724,7 +11090,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                               original index for markToolReverted. */}
                             {m.toolActivity
                               .map((act, i) => ({ act, i }))
-                              .filter(({ act }) => act.tool !== "explore")
+                              .filter(({ act }) => !isDelegationTool(act.tool))
                               .map(({ act, i }) => (
                                 <ToolCallView
                                   key={i}
@@ -10887,8 +11253,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 : "The agent flagged this as important or hard to undo, and is waiting for you."
               : isComputer
                 ? fa
-                  ? "این به عامل اجازه می‌دهد اپ‌های دیگر را از طریق Accessibility Tree ببیند و کنترل کند."
-                  : "This lets the agent see and control other apps via the Accessibility Tree."
+                  ? "این اجازه فقط برای همین کار است؛ تا تأیید نکنید هیچ کلیک، تایپ یا اسکرین‌شاتی روی دسکتاپ انجام نمی‌شود."
+                  : "This covers this task only — nothing is clicked, typed or captured on your desktop until you allow it."
                 : isSsh
                   ? fa
                     ? "این به عامل اجازه می‌دهد با SSH به این سرور متصل شود و آنجا دستور اجرا کند. تا زمانی که اجازه ندهید هیچ دستوری روی سرور اجرا نمی‌شود."
@@ -10944,6 +11310,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 ) : null}
                 <div className="perm-note">{note}</div>
                 {folderNote ? <div className="perm-note">{folderNote}</div> : null}
+                {/* Collapsed on purpose: the note is the exception, not the
+                    habit, so it must not push the two real answers off-screen. */}
+                <details className="perm-note-box">
+                  <summary>
+                    {fa ? "توضیح یا دستور جایگزین…" : "Add a note or instruction…"}
+                  </summary>
+                  <textarea
+                    className="perm-note-input"
+                    value={permNote}
+                    dir={fa ? "rtl" : "ltr"}
+                    rows={2}
+                    placeholder={
+                      fa
+                        ? "مثلاً: از /tmp استفاده کن، به این فایل دست نزن"
+                        : "e.g. use /tmp instead, leave that file alone"
+                    }
+                    onChange={(e) => setPermNote(e.target.value)}
+                  />
+                </details>
                 <div className="perm-buttons">
                   <button
                     type="button"
@@ -10953,10 +11338,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         permissionReq.id,
                         false,
                         chatIdRef.current,
+                        permNote,
                       );
                     }}
                   >
-                    {denyLabel}
+                    {permNote.trim()
+                      ? fa
+                        ? "رد کردن + دستور"
+                        : "Deny + instruction"
+                      : denyLabel}
                   </button>
                   {isConfirm ? (
                     <button
@@ -10971,6 +11361,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       }}
                     >
                       {fa ? "تأیید" : "Confirm"}
+                    </button>
+                  ) : isComputer ? (
+                    // Desktop control has NO persistent grant: the composer
+                    // switch is the standing willingness, and this answer
+                    // covers the task in front of the user. A second button
+                    // that claimed "always" would be lying.
+                    <button
+                      type="button"
+                      className="btn perm-allow"
+                      onClick={() => {
+                        void answerPermission(
+                          permissionReq.id,
+                          true,
+                          chatIdRef.current,
+                        );
+                      }}
+                    >
+                      {fa ? "اجازه برای این کار" : "Allow this task"}
                     </button>
                   ) : (
                     <>
@@ -10992,10 +11400,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         className="btn perm-allow-always"
                         onClick={() => {
                           // scope-aware: "Always allow" persists the grant matching
-                          // the dialog's scope — computer vs ssh vs outside-workspace.
-                          if (permissionReq.scope === "computer") {
-                            useStore.getState().setComputerUse(true);
-                          } else if (permissionReq.scope === "ssh") {
+                          // the dialog's scope — ssh vs outside-workspace. A
+                          // computer card has no "always": desktop approval is
+                          // per task.
+                          if (permissionReq.scope === "ssh") {
                             // Per-host grant: the destination (`user@host`)
                             // lands in trusted-hosts.json and never prompts
                             // again — NOT the whole outside space, and the
@@ -11463,7 +11871,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           className={`mention-item mcp-toggle${on ? " on" : ""} ${i === skillIdx ? "kbd" : ""}`}
                           title={
                             c.kind === "computer"
-                              ? "Desktop control — when off, the agent never gets the computer tool"
+                              ? "Desktop control — when off, the agent never gets the computer tool; when on, each desktop task still asks for your permission"
                               : c.kind === "browser"
                                 ? "Agent browsing — when off, no browser tool is bound and no browser window is opened"
                                 : c.hint

@@ -3,7 +3,8 @@ import { fallbackReason, humanizeError } from '../../lib/errorText'
 import { fmtElapsed } from '../../lib/time'
 import type { ChatMessage } from '../../types'
 import { exploreToolCounts } from '../ExploreCard'
-import { ToolEditGroupView, ToolGroupView, isSubagentCard } from '../ToolCallView'
+import { useStore } from '../../lib/store'
+import { ToolEditGroupView, ToolGroupView, isSubagentCard, subagentDisplayName } from '../ToolCallView'
 import { type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
 
 import { cachedPrepareText } from './shared'
@@ -206,16 +207,26 @@ export function InlineRetryLine({
   const fullDetail = retry.fallback
     ? fallbackReason(retry.reason ?? "", 100000)
     : humanizeError(retry.reason ?? "", 100000);
-  // Sub-agent retries name their owner ("explore") so a compact line still
-  // says WHICH ladder is cycling. Same dedup rule as the banner: repeating
-  // the tool inside an agent label that already names it is noise.
+  // Sub-agent retries name their owner so a compact line still says WHICH
+  // ladder is cycling. The backend sends the profile's own name ("Browser
+  // Navigator subagent"); `retry.tool` stays the raw tool id (`agent__browser`)
+  // because `subRetryInfo` matches cards by it — only its DISPLAY is resolved
+  // here. Same dedup rule as the banner: repeating the tool inside an agent
+  // label that already names it is noise.
+  const subagentRows = useStore((s) => s.customSubagents);
+  const toolName = retry.tool
+    ? subagentDisplayName(retry.tool, subagentRows)
+    : "";
+  const agentLabel = retry.agent ?? "";
+  const namedByAgent =
+    !!retry.tool &&
+    !!agentLabel &&
+    (agentLabel.toLowerCase().includes(retry.tool.toLowerCase()) ||
+      (!!toolName &&
+        agentLabel.toLowerCase().includes(toolName.toLowerCase())));
   const who = [
-    retry.agent ?? "",
-    retry.tool &&
-    retry.agent &&
-    !retry.agent.toLowerCase().includes(retry.tool.toLowerCase())
-      ? `tool: ${retry.tool}`
-      : "",
+    agentLabel,
+    retry.tool && agentLabel && !namedByAgent ? `tool: ${toolName}` : "",
   ]
     .filter(Boolean)
     .join(", ");

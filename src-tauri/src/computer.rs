@@ -54,6 +54,84 @@ const MAX_IMAGE_EDGE: u32 = 2560;
 /// Monotonic counter for screenshot file names.
 static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// What a direct `computer` call is about to do, in the user's words.
+///
+/// A model MAY pass its own `reason` (why this desktop action is needed); that
+/// is used verbatim. Otherwise the act and its target are stated here:
+/// "Take a screenshot of the `Chrome` window", "Type \"hello\" into an app".
+/// The permission card needs something the user can answer, never an empty
+/// "Control the desktop".
+pub fn permission_reason(args: &Value) -> String {
+    if let Some(reason) = args["reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        return reason.to_string();
+    }
+    let action = args["action"].as_str().unwrap_or("screenshot").trim();
+    let window = args["window"]
+        .as_str()
+        .map(str::trim)
+        .filter(|w| !w.is_empty());
+    let point = match (args["x"].as_i64(), args["y"].as_i64()) {
+        (Some(x), Some(y)) => format!(" at ({x}, {y})"),
+        _ => String::new(),
+    };
+    match action {
+        "screenshot" => match window {
+            Some(w) => format!("Take a screenshot of the `{w}` window."),
+            None => "Take a screenshot of the desktop.".to_string(),
+        },
+        "list_screens" => "List the displays and windows of the desktop.".to_string(),
+        "click" => {
+            let right = args["button"]
+                .as_str()
+                .is_some_and(|b| b.eq_ignore_ascii_case("right"));
+            let verb = if right {
+                "Right-click"
+            } else if args["clicks"].as_i64().unwrap_or(1) > 1 {
+                "Double-click"
+            } else {
+                "Click"
+            };
+            format!("{verb} the desktop{point}.")
+        }
+        "double_click" => format!("Double-click the desktop{point}."),
+        "right_click" => format!("Right-click the desktop{point}."),
+        "move" => format!("Move the mouse{point}."),
+        "drag" => match (
+            args["x"].as_i64(),
+            args["y"].as_i64(),
+            args["to_x"].as_i64(),
+            args["to_y"].as_i64(),
+        ) {
+            (Some(x), Some(y), Some(to_x), Some(to_y)) => {
+                format!("Drag the mouse from ({x}, {y}) to ({to_x}, {to_y}).")
+            }
+            _ => "Drag the mouse on the desktop.".to_string(),
+        },
+        "scroll" => {
+            let amount = args["amount"].as_i64().unwrap_or(0);
+            format!("Scroll the desktop by {amount} steps.")
+        }
+        "type" => {
+            let text = args["text"].as_str().unwrap_or_default();
+            let preview: String = text.chars().take(80).collect();
+            if preview.trim().is_empty() {
+                "Type text into an app.".to_string()
+            } else {
+                format!("Type {preview:?} into an app.")
+            }
+        }
+        "key" => match args["key"].as_str().map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => format!("Press the `{key}` key on the desktop."),
+            None => "Press a key on the desktop.".to_string(),
+        },
+        other => format!("Use the desktop ({other})."),
+    }
+}
+
 /// Tool schema advertised to the model when desktop control is enabled.
 pub fn schema() -> Value {
     json!({
@@ -64,8 +142,9 @@ pub fn schema() -> Value {
 move/click/double-click/right-click the mouse, drag, type text, press keys or scroll. A screenshot \
 comes back as an actual image you can look at, and every CHANGING action (click, type, key, \
 scroll, drag) already returns the screen AFTER it acted — only call action=screenshot for a \
-fresh look when you changed nothing. Only available when the user enabled Computer Use in \
-the composer.",
+fresh look when you changed nothing. Page work (including page screenshots) belongs to the \
+browser, not here. Only available when the user enabled Computer Use in the composer, and the \
+first action of a task asks the user for permission with the reason shown.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,7 +166,8 @@ the composer.",
                     "display": {"type": "integer", "description": "1-based display index for action=screenshot (see list_screens). Default: the display under the mouse."},
                     "window": {"type": "string", "description": "App name or window title (substring, case-insensitive) for action=screenshot — captures just that window and raises it first."},
                     "button": {"type": "string", "description": "Mouse button for click/double_click: left (default) or right."},
-                    "clicks": {"type": "integer", "description": "Click count for action=click (default 1; 2 is the same as double_click)."}
+                    "clicks": {"type": "integer", "description": "Click count for action=click (default 1; 2 is the same as double_click)."},
+                    "reason": {"type": "string", "description": "WHY this desktop action is needed for the user's task, in one short sentence — shown in the permission prompt before the first action runs."}
                 },
                 "required": ["action"]
             }

@@ -4,32 +4,39 @@ import type { TraceTab } from './tracePanel'
 import { runTargetKey } from './nvimEdit'
 import { DEFAULT_TERMINAL_SHELL, shellLabel } from './nvimTerminals'
 import { registerChatDeleteHook, useStore, workspaceKey } from './store'
+import { useSidebarView } from './sidebarView'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, replaceChat as replaceViewerLeafTab, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
+import { toWorkspacePath } from './fileTree'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts' | 'media' | 'terminal'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'artifact' | 'artifacts' | 'media' | 'terminal'
+
+/** The page the pane paints when NO tab is shown, and the dock icon that reads
+ *  as active in that state: the Panel (todos — turn usage, terminals, plan).
+ *  The pane body has always fallen back to `<TodosPage />`; this constant
+ *  keeps the dock highlight and the per-page width keyed to the SAME page
+ *  instead of showing no active icon and using the legacy split width. */
+export const FALLBACK_VIEWER_KIND: ViewerKind = 'todos'
 
 /** Kinds that belong to ONE chat: their rail icon follows the focused chat.
  *  Trace/Browser are session surfaces of one run; Plan (the saved plan.md of
- *  `plan/<ws>/<chat>/plan`) is a PER-CHAT document — the disk path is keyed by
- *  chat id, so a workspace-level tab would leak chat A's plan into chat B.
+ *  `plan/<ws>/<chat>/plan`) and Artifact (a document built for one chat) are
+ *  PER-CHAT — their content is keyed by chat id, so a workspace-level tab would
+ *  leak chat A's plan or document into chat B. The Artifacts LIST page remains
+ *  global (one tab, every chat); the individual document tab does not.
  *  Everything else is scoped to the focused chat's WORKSPACE (or global), so
  *  switching chats inside one workspace never rearranges the rail. */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['trace', 'browser', 'plan'])
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['trace', 'browser', 'plan', 'artifact'])
 
 /** Kinds scoped to the WORKSPACE of the focused chat: one tab per workspace
  *  (`<kind>:<wsKey>`), shared by every chat of that workspace. File tabs add
  *  the path (`file:<wsKey>:<path>`), terminals the run target. */
-// `files` is NOT here: the explorer is ONE global tab whose root follows the
-// focused chat. A per-chat explorer gave every chat its own `files:<chatId>`
-// tab, so the rail showed one icon per chat AND activating it pushed the open
-// file tab out of the rail.
-const WORKSPACE_SCOPED_KINDS = new Set<ViewerKind>(['review', 'plan', 'todos', 'text', 'explore', 'file', 'media', 'terminal'])
+const WORKSPACE_SCOPED_KINDS = new Set<ViewerKind>(['review', 'todos', 'text', 'explore', 'file', 'media', 'terminal'])
 
 /** Kinds that are NEVER written to localStorage. A terminal tab is a live pty:
  *  restoring one after a restart would spawn a shell (or an editor) the user
  *  never asked for, and the session id in storage would be meaningless. */
-const EPHEMERAL_KINDS = new Set<ViewerKind>(['terminal'])
+export const EPHEMERAL_KINDS = new Set<ViewerKind>([])
 
 /** Monotonic counter behind "new terminal tab" ids — Date.now alone could
  *  collide when two clicks land in the same millisecond. */
@@ -104,7 +111,6 @@ const VALID_KINDS: ReadonlySet<string> = new Set<ViewerKind>([
   'file',
   'text',
   'explore',
-  'files',
   'artifact',
   'artifacts',
   'media',
@@ -117,8 +123,8 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   trace: 'Trace',
   inbox: 'Inbox',
   schedule: 'Schedule',
-  // Unused: a todos tab keeps its own title.
-  todos: 'Todos',
+  // The page holds turn usage + terminals + the plan, so "Panel" describes it.
+  todos: 'Panel',
   plan: 'Plan',
   browser: 'Browser',
   // Unused: file tabs keep their per-path title (the file name).
@@ -128,7 +134,6 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   text: 'Text',
   // Unused: explore tabs keep their own title ("Explore · <description>").
   explore: 'Explore',
-  files: 'Files',
   artifacts: 'Artifacts',
   // Fallback only: artifact tabs keep their own document title (see
   // viewerTabTitle), otherwise every artifact tab reads "Artifact".
@@ -154,19 +159,58 @@ export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskI
 }
 
 /** Tabs visible while `scope` is focused: global pages + the focused
- *  workspace's own tabs + that chat's trace/browser. A legacy global file tab
- *  (pre chat-scoping: no chat, no workspace) stays visible in every chat so
- *  old sessions don't lose it. Pure, for tests. */
+ *  workspace's own tabs + that chat's trace/browser/plan/artifact. A legacy
+ *  global file tab (pre chat-scoping: no chat, no workspace) stays visible in
+ *  every chat so old sessions don't lose it. Pure, for tests. */
 export function visibleTabs(tabs: ViewerTab[], scope: ViewerScope): ViewerTab[] {
-  return tabs.filter((t) => {
-    if (t.kind === 'file' && !t.chatId && !t.wsKey) return true
-    // A schedule-run trace belongs to the synthetic chat `schedule-<sid>` that
-    //  no focused chat owns — visible from every chat (like a global page).
-    if (t.kind === 'trace' && (t.chatId ?? '').startsWith('schedule-')) return true
-    if (CHAT_SCOPED_KINDS.has(t.kind)) return t.chatId === scope.chatId
-    if (WORKSPACE_SCOPED_KINDS.has(t.kind)) return (t.wsKey ?? '') === scope.wsKey
-    return true
-  })
+  return tabs.filter((t) => tabVisibleInScope(t, scope))
+}
+
+/** Whether ONE tab belongs to the focused scope — the rule `visibleTabs`
+ *  applies, also used for the "recently closed" rows so a closed tab of
+ *  another chat cannot be reopened into this one. Pure, for tests. */
+export function tabVisibleInScope(t: ViewerTab, scope: ViewerScope): boolean {
+  if (t.kind === 'file' && !t.chatId && !t.wsKey) return true
+  // A schedule-run trace belongs to the synthetic chat `schedule-<sid>` that
+  //  no focused chat owns — visible from every chat (like a global page).
+  if (t.kind === 'trace' && (t.chatId ?? '').startsWith('schedule-')) return true
+  if (CHAT_SCOPED_KINDS.has(t.kind)) return t.chatId === scope.chatId
+  if (WORKSPACE_SCOPED_KINDS.has(t.kind)) return (t.wsKey ?? '') === scope.wsKey
+  return true
+}
+
+/** The pane's split tree pruned to the tabs visible in `scope`.
+ *
+ *  The tree is persisted GLOBALLY, so it can hold leaves of other chats (a
+ *  plan/artifact pane from the chat that produced it). The panes paint ONLY
+ *  tree leaves, so without this filter switching chats kept painting another
+ *  chat's plan in its old pane. Hidden leaves are dropped for RENDER only — the
+ *  stored tree keeps them, so switching back restores the layout. Null when no
+ *  leaf is visible in this scope. Pure, for tests. */
+export function visibleViewerTree(
+  tree: ChatTreeNode | null,
+  tabs: ViewerTab[],
+  scope: ViewerScope,
+): ChatTreeNode | null {
+  if (!tree) return null
+  const visible = new Set(visibleTabs(tabs, scope).map((t) => t.id))
+  return normalizeViewerTreeRaw(tree, visible)
+}
+
+/** Terminal tab the terminal strip is ON: the store's active tab when it is one
+ *  of this scope's terminals, else null (the step then starts at an end).
+ *
+ *  `shownViewerTabId` deliberately cannot answer this — it only knows
+ *  TAB_STRIP_KINDS, and a terminal is not one of them (dock pages have no
+ *  top-strip row). Asking it returned `null`, so every step landed on the
+ *  FIRST terminal and the tab chord looked dead in the right pane. Pure. */
+export function activeTerminalTabId(
+  tabs: ViewerTab[],
+  scope: ViewerScope,
+  activeId: string | null | undefined,
+): string | null {
+  if (!activeId) return null
+  return visibleTabs(tabs, scope).some((t) => t.kind === 'terminal' && t.id === activeId) ? activeId : null
 }
 
 /** Terminal tab the Ctrl+X `[` / `]` chord lands on, walking the SAME order
@@ -194,7 +238,7 @@ export function nextTerminalTabId(
 export function cycleTerminalTabs(dir: 1 | -1): void {
   const st = useViewerTabs.getState()
   const scope = viewerScopeForChat(useStore.getState().activeChatId || undefined)
-  const id = nextTerminalTabId(st.tabs, scope, st.activeId, dir)
+  const id = nextTerminalTabId(st.tabs, scope, activeTerminalTabId(st.tabs, scope, st.activeId), dir)
   if (!id) {
     window.dispatchEvent(new CustomEvent('coder:cycle-terminal', { detail: dir }))
     return
@@ -244,7 +288,7 @@ export const TAB_STRIP_KINDS: ReadonlySet<ViewerKind> = new Set<ViewerKind>([
 ])
 
 /** Tabs the pane's top strip draws: the visible tabs of the tab-strip kinds.
- *  Dock pages (todos/git/artifacts/schedule/inbox/terminal + the explorer) are
+ *  Dock pages (todos/git/artifacts/schedule/inbox/terminal) are
  *  NOT here — the bottom dock's fixed icons represent them. Pure, for tests. */
 export function viewerTabRows(tabs: ViewerTab[], scope: ViewerScope, _activeId?: string | null): ViewerTab[] {
   return visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind))
@@ -412,8 +456,9 @@ interface ViewerTabsState {
    *  with one tab per chat: clicking another run retargets the same tab
    *  instead of stacking a tab per run. */
   openExplore: (messageId: string, index: number, title?: string, chatId?: string) => void
-  /** Open the workspace file explorer (one GLOBAL tab; its root follows the
-   *  focused chat). The tree itself is read lazily from disk by the panel. */
+  /** Show the workspace file explorer. It lives in the SIDEBAR (Files view),
+   *  not in this pane: the sidebar is switched to it and opened if collapsed.
+   *  Its root follows the focused chat; the tree is read lazily by the panel. */
   openFiles: () => void
   /** Open the chat's Todos page (turn usage + plan checklist) as its own
    *  closable tab: pages are ordinary tabs now, opened from the rail's "+". */
@@ -442,6 +487,10 @@ interface ViewerTabsState {
    *  reopened from the tab-list menu. */
   closeAllViewers: (chatId?: string) => void
   setActiveViewer: (id: string) => void
+  /** Rename a tab. The new label is user intent, so it persists across a
+   *  restart; a blank name clears it back to the derived default (a terminal
+   *  falls back to its shell/program name). */
+  renameViewer: (id: string, title: string) => void
   /** Last active viewer tab per chat (chatId -> tab id). Multi-window focus
    *  restores each chat's own tab when it becomes focused, so the right
    *  panel (Git/Trace/...) always follows the focused chat. */
@@ -480,32 +529,43 @@ interface ViewerTabsState {
   paneOpen: boolean
   setPaneOpen: (v: boolean) => void
   togglePane: () => void
-  /** Bumped whenever Ctrl/Cmd+F asks for the file explorer's name filter.
-   *  The tree's tab may not be the active one (opening a file switches the
-   *  rail to that file), so the shortcut first ACTIVATES the explorer tab and
-   *  then signals it here; the panel consumes the new value to open + focus
-   *  its filter box. A counter, not a boolean, so repeated finds re-fire. */
+  /** Bumped whenever the explorer's name filter is requested (Ctrl+X E). The
+   *  sidebar may be showing the chats or be collapsed, so the action first shows
+   *  the explorer and then signals it here; the panel consumes each value ONCE
+   *  to open + focus its filter box. A counter, not a boolean, so repeated
+   *  requests re-fire. */
   filesFilterFocusAt: number
-  /** Ctrl/Cmd+F routing: show the file explorer and focus its filter. */
+  /** Show the file explorer in the sidebar. An open FILE is the destination:
+   *  its row is revealed and focused; otherwise the filter box is focused. */
   focusFilesFilter: () => void
   /** Open folders of each chat's file explorer, keyed by chat id.
    *
-   *  Kept HERE, not in the panel's own state, because the rail mounts only the
-   *  active tab: opening a file unmounts the explorer and switching back
-   *  remounted it blank, collapsing every folder the user had opened. Session
-   *  state (not persisted) — a restart starts from the closed tree. */
+   *  Kept HERE, not in the panel's own state, because the explorer unmounts
+   *  whenever the sidebar shows the chats or is collapsed: remounting it blank
+   *  would collapse every folder the user had opened. Session state (not
+   *  persisted) — a restart starts from the closed tree. */
   expandedByChat: Record<string, string[]>
   /** Remember one chat's open folders (the explorer's `expanded` set). */
   setExpandedDirs: (chatId: string | undefined, dirs: readonly string[]) => void
   /** Bumped when the file header asks the explorer to REVEAL one file: the
    *  panel consumes the new value, opens the file's folder chain and highlights
-   *  the row. A counter so asking twice for the same file re-fires. */
-  filesReveal: { chatId: string | null; path: string; at: number } | null
-  /** Header click: show the explorer with `path` revealed + highlighted. */
-  revealFile: (path: string) => void
+   *  the row. A counter so asking twice for the same file re-fires. `focus`
+   *  also hands the caret to that row (Ctrl+X E from the file viewer). */
+  filesReveal: { chatId: string | null; path: string; at: number; focus?: boolean } | null
+  /** Header click: show the explorer with `path` revealed + highlighted.
+   *  `focus` also focuses the file's row once it exists. */
+  revealFile: (path: string, focus?: boolean) => void
 }
 
 const STORAGE_KEY = 'coder:viewerTabs'
+
+/** The explorer lives in the SIDEBAR, not in a pane tab: show it there — switch
+ *  the sidebar to its Files view and open the sidebar if it was collapsed. */
+function showExplorer(): void {
+  useSidebarView.getState().setView('files')
+  const st = useStore.getState()
+  if (!st.sidebarOpen) st.setSidebarOpen(true)
+}
 
 /** A closed viewer tab kept for the "Recently closed" list (newest first). */
 export interface ClosedViewerTab {
@@ -586,7 +646,7 @@ function slimTab(t: ViewerTab): ViewerTab {
   return t
 }
 
-function loadPersisted(): {
+export function loadPersisted(): {
   tabs: ViewerTab[]
   activeId: string | null
   closed: ClosedViewerTab[]
@@ -607,16 +667,34 @@ function loadPersisted(): {
     // One tab per kind per workspace (one per sub-agent for trace tabs).
     // Legacy GLOBAL file tabs (pre chat-scoping, no chatId, id `file:<path>`)
     // are kept so old sessions don't lose them; every other scoped kind
-    // without an owner chat is dropped — its owner is unknowable. Artifact
-    // tabs are global, so an ownerless one is kept too: its id still carries
-    // the artifact id, which is all the panel needs to re-read the body.
+    // without an owner chat is dropped — its owner is unknowable. An artifact
+    // tab written before artifact tabs became chat-scoped can recover its
+    // owner from its id (`artifact:<chatId>:<artifactId>`); without that it is
+    // dropped like any other ownerless scoped tab.
     // Ids keep their persisted shape here (older builds stored
     // `<kind>:<chatId>` for the now workspace-scoped kinds); the one-time
     // scope migration below re-keys them once the chat index is hydrated.
     const seen = new Set<string>()
     const tabs: ViewerTab[] = []
     for (const t of valid) {
-      if (t.kind !== 'file' && !t.chatId && (CHAT_SCOPED_KINDS.has(t.kind) || WORKSPACE_SCOPED_KINDS.has(t.kind))) continue
+      // The owner chat of an older artifact tab lives only in its id.
+      const artifactChatId =
+        t.kind === 'artifact' && !t.chatId && t.id.startsWith('artifact:')
+          ? t.id.split(':')[1] ?? ''
+          : ''
+      // A terminal tab is identified by its WORKSPACE (`terminal:<wsKey>:<target>`)
+      // and carry NO owner chat (`chatId` is ""), so the "ownerless scoped tab is
+      // unknowable" rule below would drop every restored terminal. Its wsKey is
+      // its owner: keep it whenever that is present.
+      if (t.kind === 'terminal') {
+        if (!t.wsKey) continue
+      } else if (
+        t.kind !== 'file' &&
+        !t.chatId &&
+        !artifactChatId &&
+        (CHAT_SCOPED_KINDS.has(t.kind) || WORKSPACE_SCOPED_KINDS.has(t.kind))
+      )
+        continue
       // File tabs keep their full id (`file:<path>` legacy, `file:<chatId>:<path>`
       // scoped): recomputing via viewerTabId would collapse every file of one
       // chat into a single `file:<chatId>` id.
@@ -627,7 +705,12 @@ function loadPersisted(): {
         // path: recomputing via `viewerTabId` collapses every artifact of one
         // chat into a single `artifact:<chatId>` tab and silently drops the
         // rest on reload.
-        t.kind === 'file' || t.kind === 'artifact'
+        // Terminal tabs keep their OWN id: `terminal:<wsKey>:<target>`, where
+        // target is `shell` for the default shell or `shell-<stamp>-<n>` for
+        // every "new terminal". Recomputing it from `chatId` (the generic path
+        // below) dropped the wsKey AND the unique suffix, collapsing every
+        // restored terminal of one chat into a single tab.
+        t.kind === 'file' || t.kind === 'artifact' || t.kind === 'terminal'
           ? t.id
           : t.kind === 'trace' && typeof (t as ViewerTab).traceTaskId === 'string' && (t as ViewerTab).traceTaskId
             ? t.id.startsWith('trace:')
@@ -639,6 +722,8 @@ function loadPersisted(): {
       tabs.push({
         ...t,
         id,
+        // An older artifact tab carried its owner chat only in its id.
+        ...(artifactChatId ? { chatId: artifactChatId } : {}),
         // Tabs persisted before `artifactId` existed carry the id only inside
         // their tab id (`artifact:<chatId>:<artifactId>`) — recover it so the
         // restored panel can still re-read its body instead of showing the
@@ -675,9 +760,10 @@ function persist(tabs: ViewerTab[], activeId: string | null, closed: ClosedViewe
     // would blow the localStorage quota. The tab (title/owner) persists so
     // the tab bar survives a restart; the body is re-opened from the chat.
     //
-    // EPHEMERAL tabs (a terminal's live pty) are dropped ENTIRELY: restoring
-    // one would spawn a fresh shell or editor on the next launch, and its
-    // session id would point at nothing.
+    // EPHEMERAL tabs carry a live session id that means nothing after a
+    // restart. A TERMINAL is no longer one of them: the tab (cwd, program,
+    // args, shell, user-set title) persists so the strip survives a restart, and
+    // its pty is spawned on demand when the tab is shown.
     const keep = (t: ViewerTab) => !EPHEMERAL_KINDS.has(t.kind)
     const slim = tabs.filter(keep).map((t) => slimTab(t))
     localStorage.setItem(
@@ -832,32 +918,29 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       persistPaneOpen(!s.paneOpen)
       return { paneOpen: !s.paneOpen }
     }),
-  focusFilesFilter: () =>
-    set((s) => {
-      // The explorer tab is activated by the same call, because Ctrl/Cmd+F must
-      // work while ANY right-rail tab is showing (an open file, Git, todos…).
-      // Global explorer id (no chatId): one tab for the whole app, so the rail
-      // keeps a single `files` icon and activating it never displaces the open
-      // file tab of whichever chat is focused.
-      const id = viewerTabId('files', '')
-      const entry: ViewerTab = {
-        id,
-        kind: 'files',
-        title: 'Files',
-        createdAt: Date.now(),
+  focusFilesFilter: () => {
+    const s = get()
+    // Ctrl+X E from an OPEN FILE: the explorer should land on that file's own
+    // row (folder chain opened, row highlighted AND focused), not on the
+    // name filter — the user already knows which file they are looking at and
+    // wants to keep walking the tree from there with j/k. With no file tab the
+    // filter box is still the entry point (a place to type a name).
+    const tab = s.tabs.find((t) => t.id === s.activeId)
+    if (tab?.kind === 'file' && tab.filePath) {
+      const rel = toWorkspacePath(tab.fileRoot, tab.filePath) || tab.filePath
+      // An absolute path that is NOT under the tab's root (an agent-written
+      // temp file, say) has no explorer row to land on: fall through to the
+      // filter instead of probing for 30 frames and leaving the caret put.
+      if (!rel.startsWith('/') && !rel.startsWith('~/')) {
+        get().revealFile(rel, true)
+        return
       }
-      const tabs = capTabs(s.tabs.some((t) => t.id === id)
-        ? s.tabs.map((t) => (t.id === id ? entry : t))
-        : [...s.tabs, entry])
-      const next = {
-        tabs,
-        activeId: id,
-        paneOpen: true,
-        filesFilterFocusAt: s.filesFilterFocusAt + 1,
-      }
-      persist(next.tabs, next.activeId)
-      return next
-    }),
+    }
+    // The explorer is shown by the same call: the shortcut must work while the
+    // sidebar lists chats or is collapsed. The panel then consumes the counter.
+    showExplorer()
+    set((st) => ({ filesFilterFocusAt: st.filesFilterFocusAt + 1 }))
+  },
   setExpandedDirs: (chatId, dirs) =>
     set((s) => {
       const cid = chatId ?? currentChatId()
@@ -870,32 +953,15 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       if (prev && prev.length === next.length && prev.every((d, i) => d === next[i])) return s
       return { expandedByChat: { ...s.expandedByChat, [cid]: next } }
     }),
-  revealFile: (path) =>
-    set((s) => {
-      // Same global explorer as `focusFilesFilter`: the tab carries no chatId,
-      // so `activeId` moving to it leaves the chat's open file tab untouched.
-      // The reveal SIGNAL still carries the focused chat, because only that
-      // chat's explorer pane may jump to the file.
-      const cid = currentChatId()
-      const id = viewerTabId('files', '')
-      const entry: ViewerTab = {
-        id,
-        kind: 'files',
-        title: 'Files',
-        createdAt: Date.now(),
-      }
-      const tabs = capTabs(s.tabs.some((t) => t.id === id)
-        ? s.tabs.map((t) => (t.id === id ? entry : t))
-        : [...s.tabs, entry])
-      const next = {
-        tabs,
-        activeId: id,
-        paneOpen: true,
-        filesReveal: { chatId: cid ?? null, path, at: (s.filesReveal?.at ?? 0) + 1 },
-      }
-      persist(next.tabs, next.activeId)
-      return next
-    }),
+  revealFile: (path, focus = false) => {
+    // The reveal SIGNAL carries the focused chat, because only that chat's
+    // explorer may jump to the file.
+    showExplorer()
+    const cid = currentChatId()
+    set((s) => ({
+      filesReveal: { chatId: cid ?? null, path, at: (s.filesReveal?.at ?? 0) + 1, focus },
+    }))
+  },
   openViewer: (tab) =>
     set((s) => {
       const normalized = tab.kind === 'review' ? { ...tab, title: 'Git' } : tab
@@ -1312,7 +1378,7 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
         kind: 'todos',
         chatId: cid,
         wsKey,
-        title: 'Todos',
+        title: 'Panel',
         createdAt: Date.now(),
       }
       const tabs = capTabs(
@@ -1325,22 +1391,7 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openFiles: () =>
-    set((s) => {
-      // One GLOBAL explorer tab: its root follows the focused chat (the panel
-      // resolves that itself), so the rail shows a single `files` icon.
-      const id = viewerTabId('files', '')
-      const entry: ViewerTab = {
-        id,
-        kind: 'files',
-        title: 'Files',
-        createdAt: Date.now(),
-      }
-      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
-      const next = { tabs, activeId: id, paneOpen: true }
-      persist(next.tabs, next.activeId)
-      return next
-    }),
+  openFiles: () => showExplorer(),
   openTerminal: (opts) =>
     set((s) => {
       const cid = opts?.chatId ?? currentChatId()
@@ -1403,8 +1454,8 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      // NOT persisted (see EPHEMERAL_KINDS): a restored terminal tab would
-      // spawn a shell nobody asked for.
+      // Restoring a terminal tab does NOT respawn a shell at launch: the
+      // panel mounts (and opens its pty) only when that tab is actually shown.
       const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       // The panes paint ONLY tree leaves — the same rule openFile documents
       // above. Without revealing the new tab here it existed in `tabs`, showed
@@ -1439,7 +1490,19 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
         // uninvited; nothing eligible → null, and the body rests on todos.
         const scope = viewerScopeForChat(useStore.getState().activeChatId || undefined)
         const surfaces = visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind))
-        activeId = surfaces[Math.min(idx, surfaces.length - 1)]?.id ?? null
+        // A TERMINAL tab closes into its own strip, like VS Code: the pane
+        // falls to the NEXT terminal (wrapping) instead of jumping to the
+        // Todos page or to a file tab that happened to be around. Closing the
+        // last terminal of the scope still leaves the pane to the surfaces.
+        const terminals = visibleTabs(tabs, scope).filter((t) => t.kind === 'terminal')
+        const terminating = removed.kind === 'terminal' && terminals.length > 0
+        // Position among the TERMINAL strip, not among all tabs: the step must
+        // land on the tab that visually takes the closed one's place.
+        const termIdx = Math.max(0, terminals.findIndex((t) => t.id === id))
+        const nextTerminal = terminating
+          ? terminals[Math.min(termIdx, terminals.length - 1)]?.id ?? terminals[0].id
+          : null
+        activeId = nextTerminal ?? surfaces[Math.min(idx, surfaces.length - 1)]?.id ?? null
       }
       const closedTabs = [
         { tab: removed, closedAt: Date.now() },
@@ -1518,6 +1581,16 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       }
       return { tabs, activeId, closedTabs, lastActiveByChat, viewerTree, focusedViewerId }
     }),
+  renameViewer: (id, title) =>
+    set((s) => {
+      const tab = s.tabs.find((t) => t.id === id)
+      if (!tab) return {}
+      const next = String(title ?? '').replace(/\s+/g, ' ').trim().slice(0, 60)
+      if (next === tab.title) return {}
+      const tabs = s.tabs.map((t) => (t.id === id ? { ...t, title: next } : t))
+      persist(tabs, s.activeId, s.closedTabs)
+      return { tabs }
+    }),
   setActiveViewer: (id) =>
     set((s) => {
       const tab = s.tabs.find((t) => t.id === id)
@@ -1546,7 +1619,10 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       // A terminal tab's pty dies WITH the tab, so its entry in "Recently
       // closed" is a tombstone: reopening it would mount a tab whose session id
       // points at nothing. Drop the entry instead of resurrecting it.
-      if (EPHEMERAL_KINDS.has(entry.tab.kind)) {
+      // NOTE: `terminal` is no longer EPHEMERAL — its TAB survives a restart
+      // (cwd/shell/title are persisted). A CLOSED terminal is still a
+      // tombstone: the shell is gone, so there is nothing to bring back.
+      if (EPHEMERAL_KINDS.has(entry.tab.kind) || entry.tab.kind === 'terminal') {
         // Also drop it from the PERSISTED list: a leftover tombstone would come
         // back after a restart and offer a tab that can never be reopened.
         const closedTabs = s.closedTabs.filter((c) => c.tab.id !== id)
@@ -1784,11 +1860,23 @@ export function persistSplitWidth(w: number) {
 /** Smallest strip the chat group keeps while the viewer pane takes the rest. */
 export const CHAT_MIN_WIDTH = 320
 
-export function clampSplitWidth(w: number, vw?: number): number {
-  const width = typeof vw === 'number' && Number.isFinite(vw) ? vw : typeof window !== 'undefined' ? window.innerWidth : 1024
+export function clampSplitWidth(w: number, availableWidth?: number, reserveRight = 0): number {
+  // `availableWidth` is the REAL split container (the editor area = window
+  // minus the sidebar), not necessarily the viewport. Clamping against
+  // `innerWidth` alone let a widened sidebar shrink the editor area while the
+  // viewer kept its pixel width, so the pane overflowed the app's right edge.
+  const width =
+    typeof availableWidth === 'number' && Number.isFinite(availableWidth) && availableWidth > 0
+      ? availableWidth
+      : typeof window !== 'undefined'
+        ? window.innerWidth
+        : 1024
   // Drag may take the pane nearly full-width — the chat keeps a small usable
   // strip (CHAT_MIN_WIDTH); fullscreen hides the chat entirely via CSS.
-  const max = width - CHAT_MIN_WIDTH
+  // `reserveRight` is the docked right panel (Todos/Tools/Terminals): it
+  // occupies pixels on the right of the SAME flex row, so leaving it out of
+  // the math let the two panes overflow each other and the app's right edge.
+  const max = width - CHAT_MIN_WIDTH - Math.max(0, reserveRight)
   return Math.max(320, Math.min(max, w))
 }
 

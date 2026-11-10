@@ -46,7 +46,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("browser_resize", "Set the emulated viewport size."),
     ("browser_emulate_media", "Emulate dark mode / reduced motion / forced colors."),
     ("browser_handle_dialog", "Accept or dismiss the page's next alert/confirm/prompt."),
-    ("browser_file_upload", "Attach local files to a file input by `ref`. The result carries the page afterwards with fresh refs."),
+    ("browser_file_upload", "Attach local files to a file input by `ref` or `selector`. The result carries the page afterwards with fresh refs."),
     ("browser_drag", "Drag from `ref` to `to_ref`. The result carries the page afterwards with fresh refs."),
     ("browser_tabs", "List, open, switch or close tabs."),
 ];

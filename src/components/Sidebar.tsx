@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { APP_DIR, useStore, workspaceKey } from "../lib/store";
 export { useStore };
 import { themeById } from "../lib/themes";
@@ -8,9 +8,98 @@ import { copyToClipboard } from "../lib/clipboard";
 import { detectDir, prepareContent } from "../lib/bidi";
 import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch } from "../lib/shortcuts";
-import { edgeScroll, liveExtents, menuLeft, menuTop, captureDragSlots, slotExtents, slotShifts, tabForPoint, tabMove, type DragSlots } from "../lib/tabBar";
-import { previewOrder } from "../lib/tabOrder";
+import { focusChatInput, focusChatInputSoon } from "../lib/chatFocus";
+import { menuLeft, menuTop } from "../lib/tabBar";
 import { WindowStripCluster } from "./WindowStripCluster";
+import { useSidebarView, type SidebarView } from "../lib/sidebarView";
+
+// The explorer is only parsed once the Files view is first shown.
+const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
+
+/** The open-workspace chat list. A component of its own because it mounts and
+ *  unmounts with the drilled-in folder; its key handler walks the chat ROWS
+ *  (j/k, gg/G, Ctrl+D/U) rather than scrolling the box, so Enter can open the
+ *  focused chat. */
+function SidebarChatList({
+  className,
+  children,
+  focusSeq = 0,
+  landChatId = null,
+  onKeyDown,
+}: {
+  className: string;
+  children: React.ReactNode;
+  /** Bumped by the sidebar after drilling INTO a workspace: land the caret
+   *  on the active chat row so j/k work without a second click (the clicked
+   *  workspace row unmounts, so WebKit would leave the caret on <body>). */
+  focusSeq?: number;
+  /** The chat that should take the caret on that landing. When the workspace
+   *  has no chats (or the id is stale) the first chat, then the header, then
+   *  the list itself is used. */
+  landChatId?: string | null;
+  onKeyDown?: React.KeyboardEventHandler<HTMLDivElement>;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const served = useRef(0);
+  useEffect(() => {
+    if (!focusSeq || focusSeq === served.current) return;
+    served.current = focusSeq;
+    const host = ref.current;
+    if (!host) return;
+    const target =
+      (landChatId &&
+        host.querySelector<HTMLElement>(
+          `[data-chat-id="${CSS.escape(landChatId)}"]`,
+        )) ||
+      host.querySelector<HTMLElement>("[data-chat-id]") ||
+      host.querySelector<HTMLElement>("[data-open-ws]") ||
+      host;
+    // Land once now, then confirm on the next frames: WebKit sometimes hands
+    // the caret back to the input that was focused before the drill-in (the
+    // sidebar search box) when the clicked row unmounts.
+    let tries = 0;
+    const land = () => {
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: "nearest" });
+      if (document.activeElement !== target && tries++ < 2) {
+        requestAnimationFrame(land);
+      }
+    };
+    requestAnimationFrame(land);
+  }, [focusSeq]);
+  return (
+    <div ref={ref} className={className} tabIndex={-1} onKeyDown={onKeyDown}>
+      {children}
+    </div>
+  );
+}
+
+/** Last workspace-focus request this module has acted on. The sidebar content
+ *  UNMOUNTS while the panel is collapsed, so an effect keyed on the store
+ *  counter would replay the last Ctrl+X W on every remount — opening the
+ *  sidebar with Ctrl+X E would then bounce back to the workspace list. Each
+ *  request value is consumed exactly once, like FilesPanel does for its
+ *  filter-focus counter. */
+let servedWorkspaceListFocusSeq = useStore.getState().workspaceListFocusSeq;
+
+/** Same one-shot guard for the OPEN-sidebar landing: bumping `sidebarFocusSeq`
+ *  (e.g. Cmd/Ctrl+B opening the sidebar) must focus the ACTIVE workspace row
+ *  exactly once, not again every time the sidebar content remounts. */
+let servedSidebarFocusSeq = useStore.getState().sidebarFocusSeq;
+
+/** The two views of the sidebar switch, in display order. */
+const SIDEBAR_VIEWS: ReadonlyArray<{ id: SidebarView; label: string; icon: React.ReactNode }> = [
+  {
+    id: "chats",
+    label: "Chats",
+    icon: <path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" />,
+  },
+  {
+    id: "files",
+    label: "Files",
+    icon: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />,
+  },
+];
 
 type ChatSummary = {
   id: string;
@@ -72,14 +161,17 @@ function readOpenWorkspace(): string | null {
 /**
  * Build sidebar groups from the PERSISTED workspace list (workspaces are
  * first-class and outlive their chats), then attach chats by workspace key.
- * Workspace order is user-controlled — only the chats INSIDE each workspace
- * sort by recency. Pinned workspaces float to the very top (in pin order).
+ * Pinned workspaces float to the very top (in pin order); everything else is
+ * ordered by last activation (newest first), falling back to the newest chat
+ * timestamp for workspaces not touched since this ordering was introduced.
+ * Chats INSIDE each workspace sort by pin, then recency.
  */
 export function buildGroups<T extends { id: string; root?: string | null; updatedAt: number; createdAt: number }>(
   chats: T[],
   workspaces: Workspace[],
   pinnedWorkspaces: string[],
   pinnedChats: string[],
+  lastUsedAt: Record<string, number> = {},
 ): Group<T>[] {
   const chatsByRoot = new Map<string, T[]>();
   for (const c of chats) {
@@ -129,6 +221,14 @@ export function buildGroups<T extends { id: string; root?: string | null; update
     const i = pinnedWorkspaces.indexOf(key);
     return i === -1 ? Infinity : i;
   };
+  const latestByKey = new Map<string, number>();
+  for (const [key, list] of chatsByRoot) {
+    latestByKey.set(key, Math.max(0, ...list.map((c) => c.updatedAt)));
+  }
+  for (const g of groups) {
+    latestByKey.set(g.key, Math.max(latestByKey.get(g.key) ?? 0, ...g.chats.map((c) => c.updatedAt)));
+  }
+  const recency = (key: string) => lastUsedAt[key] ?? latestByKey.get(key) ?? 0;
   const leftovers = [...chatsByRoot.entries()].map(([key, list]) => {
     sortChats(list);
     const root = list.find((c) => c.root)?.root ?? "";
@@ -139,22 +239,15 @@ export function buildGroups<T extends { id: string; root?: string | null; update
       chats: list,
     };
   });
-  leftovers.sort((a, b) => {
-    const ar = pinRank(a.key);
-    const br = pinRank(b.key);
-    if (ar !== br) return ar - br;
-    const aLatest = Math.max(...a.chats.map((c) => c.updatedAt), 0);
-    const bLatest = Math.max(...b.chats.map((c) => c.updatedAt), 0);
-    return bLatest - aLatest;
-  });
 
   const ordered = [...groups, ...leftovers];
-  // Pinned float to top, in pin order; the rest keep the persisted order.
+  // Pinned float to top, in pin order; then most recently activated wins.
+  // Array#sort is stable, so equal timestamps keep the persisted order.
   ordered.sort((a, b) => {
     const ar = pinRank(a.key);
     const br = pinRank(b.key);
     if (ar !== br) return ar - br;
-    return 0;
+    return recency(b.key) - recency(a.key);
   });
   return ordered;
 }
@@ -329,6 +422,9 @@ function SidebarContent({
   openWsKey: string | null;
   setOpenWsKey: (key: string | null) => void;
 }) {
+  /** Incremented when the sidebar is REVEALED (Cmd/Ctrl+B): the content lands
+   *  the caret on the ACTIVE workspace row instead of the search box. */
+  const sidebarFocusSeq = useStore((s) => s.sidebarFocusSeq);
   // Subscribe to a lightweight chat SUMMARY (id/title/root/timestamps + flags),
   // not the full chat objects: message/stream/draft edits rebuild the chat
   // record but leave the summary identical, so the sidebar list does not
@@ -365,11 +461,15 @@ function SidebarContent({
   );
   const workspaces = useStore((s) => s.workspaces);
   const activeChatId = useStore((s) => s.activeChatId);
+  const activeWorkspaceKey = useStore((s) => s.activeWorkspaceKey);
+  const workspaceLastUsedAt = useStore((s) => s.workspaceLastUsedAt);
+  const workspaceListFocusSeq = useStore((s) => s.workspaceListFocusSeq);
   const workspaceColors = useStore((s) => s.workspaceColors);
   const theme = useStore((s) => s.theme);
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces);
   const pinnedChats = useStore((s) => s.pinnedChats);
   const unreadChats = useStore((s) => s.unreadChats);
+  const view = useSidebarView((s) => s.view);
   // Clock for the relative "Xm ago" activity ages below: refreshed every 30s
   // so a stale label never sits for long. One integer state, one interval.
   const [nowTick, setNowTick] = useState(() => Date.now());
@@ -381,6 +481,11 @@ function SidebarContent({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [search, setSearch] = useState("");
+  // Bumped when the user drills INTO a workspace: the ACTIVE CHAT row takes
+  // the caret (the clicked folder row unmounted with the projects list, and
+  // WebKit does not move focus to the new list on its own). Falling back to
+  // the first chat / header keeps an empty workspace usable.
+  const [openListFocusSeq, setOpenListFocusSeq] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Multi-select state for bulk-deleting chats within a workspace.
@@ -476,8 +581,8 @@ function SidebarContent({
   // as hover/scroll state). `chats` is rebuilt by the store on each streamed
   // token, so this still recomputes during streaming.
   const groups = useMemo(
-    () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats),
-    [chats, workspaces, pinnedWorkspaces, pinnedChats],
+    () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats, workspaceLastUsedAt),
+    [chats, workspaces, pinnedWorkspaces, pinnedChats, workspaceLastUsedAt],
   );
 
   // The drilled-into workspace. The find-guard doubles as deletion handling:
@@ -489,14 +594,28 @@ function SidebarContent({
   );
 
   // Drill in / back. Both clear the search: a query typed for folder filtering
-  // must not silently become a chat filter inside the opened folder.
+  // must not silently become a chat filter inside the opened folder. Clicking
+  // a row also ACTIVATES that workspace: the chat area (tabs + windows) follows
+  // the project whose chats the user is browsing.
   const openWorkspace = (key: string) => {
+    useStore.getState().switchWorkspace(key);
     setOpenWsKey(key);
+    setOpenListFocusSeq((n) => n + 1);
     setSearch("");
   };
   const closeWorkspace = () => {
     setOpenWsKey(null);
     setSearch("");
+    // The back button unmounts with the drilled-in header: park the caret on
+    // the projects list so j/k (and gg/G, Ctrl+D/U) keep walking it after a
+    // mouse trip into a workspace and back.
+    let tries = 0;
+    const land = () => {
+      const list = listRef.current;
+      if (list) list.focus({ preventScroll: true });
+      else if (tries++ < 10) requestAnimationFrame(land);
+    };
+    requestAnimationFrame(land);
   };
 
   // Sidebar search: debounced, title-only (never scans message bodies — that
@@ -533,93 +652,367 @@ function SidebarContent({
   };
 
   // ---------------------------------------------------------------------------
-  // Folder drag & drop — the same slide-preview mechanics as the chat tab bar:
-  // the dragged row stays as a muted landing slot and its neighbours glide one
-  // slot toward the freed hole via animated transforms (no mid-drag reflow).
+  // Workspace list keyboard navigation (Ctrl+X W lands on the active row).
+  // Workspaces are ordered by pin, then recency, so drag-reorder is gone: the
+  // list would just snap back on the next activation. Plain j/k and Up/Down
+  // move the row focus; Ctrl/Cmd+J enters at the first row and Ctrl/Cmd+K
+  // returns to the search. Enter activates + opens the folder, Escape hands
+  // the caret back to the chat.
   // ---------------------------------------------------------------------------
   const listRef = useRef<HTMLDivElement>(null);
-  const [dragKey, setDragKey] = useState<string | null>(null);
-  const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
-  // Row boxes captured ONCE at drag start (see captureDragSlots): hit-testing
-  // and slide distances both read these, never the live boxes — the live ones
-  // carry the slide transforms, which fed the next hit-test and made the
-  // preview oscillate (the drag visibly jumped). Vertical lists flow
-  // top→bottom in both ltr and rtl, so the flow sign is always 1.
-  const slotsRef = useRef<DragSlots | null>(null);
+  const [wsFocusKey, setWsFocusKey] = useState<string | null>(null);
+  // First `g` of `gg` (Neovim: jump to the first row) for each list.
+  const wsGAt = useRef(0);
+  const chatGAt = useRef(0);
 
-  const clearDrag = () => {
-    setDragKey(null);
-    setDropTarget(null);
-    slotsRef.current = null;
+  const focusWorkspaceRow = (key: string) => {
+    setWsFocusKey(key);
+    requestAnimationFrame(() => {
+      const row = listRef.current?.querySelector<HTMLElement>(
+        `[data-ws-id="${CSS.escape(key)}"]`,
+      );
+      row?.focus({ preventScroll: true });
+      row?.scrollIntoView({ block: "nearest" });
+    });
   };
 
-  const folderKeys = visibleFolders.map((g) => g.key);
-  // Exact per-row pixel deltas from the CAPTURED slots: every row lands where
-  // the commit reflows it, whatever its height.
-  const shifts = dragKey && dropTarget && slotsRef.current
-    ? slotShifts(slotsRef.current, dragKey, dropTarget.id, dropTarget.after)
-    : null;
-
-  /** Row extents for geometric drop checks — captured slots when available
-   *  (scroll-compensated, transform-free), live boxes as the fallback. */
-  const rowExtents = () =>
-    slotsRef.current
-      ? slotExtents(slotsRef.current)
-      : listRef.current
-        ? liveExtents(listRef.current, "data-ws-id", "y")
-        : [];
-
-  const onFolderDragStart = (e: React.DragEvent, key: string) => {
-    setDragKey(key);
-    e.dataTransfer.effectAllowed = "move";
-    try {
-      e.dataTransfer.setData("text/plain", key);
-    } catch {
-      /* ignore dataTransfer restrictions (rare) */
-    }
-    const list = listRef.current;
-    slotsRef.current = list
-      ? captureDragSlots(
-          list,
-          visibleFolders.map((g) => g.key),
-          (k) => list.querySelector<HTMLElement>(`[data-ws-id="${CSS.escape(k)}"]`),
-          "y",
-          1,
-        )
-      : null;
+  const focusWorkspaceSearch = () => {
+    const box = searchInputRef.current;
+    if (!box) return;
+    box.focus({ preventScroll: true });
+    box.select?.();
   };
 
-  const onListDragOver = (e: React.DragEvent) => {
-    if (!dragKey) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    const list = listRef.current;
-    if (!list) return;
-    // Dragging near a list edge scrolls it, so off-screen rows stay reachable.
-    const delta = edgeScroll(e.clientY, list.getBoundingClientRect(), "y");
-    if (delta) list.scrollTop += delta;
-    const at = tabForPoint(rowExtents(), e.clientY, 1, "y");
-    if (!at) return;
-    setDropTarget((prev) =>
-      prev && prev.id === at.id && prev.after === at.after ? prev : at,
+  const moveWorkspaceFocus = (delta: number) => {
+    const keys = visibleFolders.map((g) => g.key);
+    if (keys.length === 0) return;
+    const current =
+      wsFocusKey && keys.includes(wsFocusKey)
+        ? wsFocusKey
+        : activeWorkspaceKey && keys.includes(activeWorkspaceKey)
+          ? activeWorkspaceKey
+          : keys[0];
+    const idx = keys.indexOf(current);
+    // Plain k / ArrowUp stops at the top row; the search box is reached with
+    // Ctrl/Cmd+K (handled by the list keydown), never by a bare k.
+    const next = Math.max(
+      0,
+      Math.min(keys.length - 1, idx + delta),
     );
+    focusWorkspaceRow(keys[next]);
   };
 
-  const onListDragLeave = (e: React.DragEvent) => {
-    if (e.target !== e.currentTarget) return;
-    setDropTarget(null);
-  };
-
-  const onListDrop = (e: React.DragEvent) => {
-    if (!dragKey) return;
-    e.preventDefault();
-    const at = tabForPoint(rowExtents(), e.clientY, 1, "y");
-    if (at && at.id !== dragKey) {
-      const next = previewOrder(folderKeys, dragKey, at.id, at.after);
-      useStore.getState().setWorkspaceOrder(next);
+  /** Hand the caret from the search box to the FIRST row of the current
+   *  sidebar view — a workspace row in the projects list, or the opened
+   *  workspace's header while drilled in. Pinned workspaces sort first, so
+   *  this honours them instead of jumping to the active (possibly unpinned)
+   *  workspace further down the list. `Ctrl+K` comes back to the search box
+   *  from either view. */
+  const focusFirstWorkspace = () => {
+    const host = document.querySelector<HTMLElement>(".sidebar .sidebar-list");
+    const first =
+      (activeChatId &&
+        host?.querySelector<HTMLElement>(
+          `[data-chat-id="${CSS.escape(activeChatId)}"]`,
+        )) ||
+      host?.querySelector<HTMLElement>("[data-ws-id]") ||
+      host?.querySelector<HTMLElement>("[data-chat-id]") ||
+      host?.querySelector<HTMLElement>("[data-open-ws]") ||
+      null;
+    if (first) {
+      const key = first.getAttribute("data-ws-id");
+      if (key) setWsFocusKey(key);
+      first.focus({ preventScroll: true });
+      first.scrollIntoView({ block: "nearest" });
+      return;
     }
-    clearDrag();
+    // Empty list (or it has not committed yet): the list itself still owns
+    // the key handler, so the next j/k keeps working instead of typing into
+    // the search field.
+    host?.focus({ preventScroll: true });
   };
+
+  /** `gg` / `G`: first and last workspace row (Neovim's jumps). */
+  const focusWorkspaceEdge = (edge: "top" | "bottom") => {
+    const keys = visibleFolders.map((g) => g.key);
+    if (keys.length === 0) return;
+    focusWorkspaceRow(edge === "top" ? keys[0] : keys[keys.length - 1]);
+  };
+
+  /** How many rows a Ctrl+D / Ctrl+U step covers: half a screenful. Measured
+   *  from a real row so the list's spacing is included. */
+  const workspaceHalfPage = () => {
+    const host = listRef.current;
+    const row = host?.querySelector<HTMLElement>("[data-ws-id]");
+    const rowH = Math.max(1, row?.getBoundingClientRect().height || 34);
+    return Math.max(1, Math.floor((host?.clientHeight ?? 320) / rowH / 2));
+  };
+
+  const onWorkspaceListKeyDown = (e: React.KeyboardEvent) => {
+    if (e.defaultPrevented) return;
+    const target = e.target as HTMLElement | null;
+    // j/k must never steal keystrokes from the rename input or the search box.
+    const typing = target?.closest("input, textarea, select, [contenteditable='true']");
+    const k = (e.code || "").replace(/^Key/, "").toLowerCase() || e.key.toLowerCase();
+    // Plain j/k (Vim style) step the row focus. Modified J/K are NOT row
+    // movement: Ctrl/Cmd+J enters the list from the search box and Ctrl/Cmd+K
+    // returns there, so workspaces move up/down with plain j/k only.
+    const modifier = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+    const down =
+      e.key === "ArrowDown" ||
+      (plain && k === "j");
+    const up =
+      e.key === "ArrowUp" ||
+      (plain && k === "k");
+    // Ctrl/Cmd+K from ANY row hands the caret back to the search box — the
+    // list's top entry. Mirrors Ctrl/Cmd+J, which enters the list at its
+    // first (pinned-first) row. A bare k/ArrowUp never leaves the list.
+    if (modifier && k === "k" && !typing) {
+      e.preventDefault();
+      focusWorkspaceSearch();
+      return;
+    }
+    if (typing) return;
+    // Neovim jumps and half-page steps over the SAME row focus as j/k:
+    // gg = first workspace, G = last, Ctrl+D / Ctrl+U = half a screenful.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && k === "g") {
+      if (e.shiftKey) {
+        e.preventDefault();
+        wsGAt.current = 0;
+        focusWorkspaceEdge("bottom");
+        return;
+      }
+      const now = Date.now();
+      if (now - wsGAt.current <= 800) {
+        wsGAt.current = 0;
+        e.preventDefault();
+        focusWorkspaceEdge("top");
+        return;
+      }
+      wsGAt.current = now;
+      e.preventDefault();
+      return;
+    }
+    // Any other key ends a pending `gg` (Neovim's timeout_leave).
+    wsGAt.current = 0;
+    if (modifier && (k === "d" || k === "u")) {
+      e.preventDefault();
+      moveWorkspaceFocus((k === "d" ? 1 : -1) * workspaceHalfPage());
+      return;
+    }
+    if (down || up) {
+      e.preventDefault();
+      moveWorkspaceFocus(down ? 1 : -1);
+      return;
+    }
+    if (e.key === "Enter") {
+      // A nested action (the row's + button, rename input, …) owns Enter.
+      if (target?.closest("button, a, input, textarea, select, [contenteditable='true']")) return;
+      const keys = visibleFolders.map((g) => g.key);
+      const key =
+        wsFocusKey && keys.includes(wsFocusKey)
+          ? wsFocusKey
+          : activeWorkspaceKey && keys.includes(activeWorkspaceKey)
+            ? activeWorkspaceKey
+            : keys[0];
+      if (!key) return;
+      e.preventDefault();
+      openWorkspace(key);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      const chatId = useStore.getState().activeChatId;
+      setWsFocusKey(null);
+      if (chatId) requestAnimationFrame(() => focusChatInput(chatId));
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Chat list keyboard navigation (inside an opened workspace): plain j/k and
+  // Up/Down walk the CHAT rows, Enter opens the focused chat and parks the
+  // caret in its composer, gg/G jump to the edges, Ctrl+D/U step half a screen.
+  // Ctrl+K returns to the search box, exactly like the projects list.
+  // ---------------------------------------------------------------------------
+  const chatRowElements = () =>
+    Array.from(
+      document.querySelectorAll<HTMLElement>(".sidebar .sidebar-list [data-chat-id]"),
+    );
+
+  /** Step the row focus. With no row focused yet, the ACTIVE chat is the
+   *  starting point; an empty focus starts at the first (j) or last (k) row. */
+  const moveChatFocus = (delta: number) => {
+    const rows = chatRowElements();
+    if (rows.length === 0) return;
+    const focused = (document.activeElement as HTMLElement | null)
+      ?.closest?.("[data-chat-id]")
+      ?.getAttribute("data-chat-id");
+    let idx = rows.findIndex(
+      (r) => r.getAttribute("data-chat-id") === focused,
+    );
+    if (idx === -1) {
+      idx = rows.findIndex(
+        (r) => r.getAttribute("data-chat-id") === activeChatId,
+      );
+      if (idx === -1) idx = delta > 0 ? -1 : rows.length;
+    }
+    const next = Math.max(0, Math.min(rows.length - 1, idx + delta));
+    rows[next].focus({ preventScroll: true });
+    rows[next].scrollIntoView({ block: "nearest" });
+  };
+
+  const focusChatEdge = (edge: "top" | "bottom") => {
+    const rows = chatRowElements();
+    if (rows.length === 0) return;
+    const row = edge === "top" ? rows[0] : rows[rows.length - 1];
+    row.focus({ preventScroll: true });
+    row.scrollIntoView({ block: "nearest" });
+  };
+
+  const chatHalfPage = () => {
+    const rows = chatRowElements();
+    const host = document.querySelector<HTMLElement>(".sidebar .sidebar-list");
+    const rowH = Math.max(1, rows[0]?.getBoundingClientRect().height || 34);
+    return Math.max(1, Math.floor((host?.clientHeight ?? 320) / rowH / 2));
+  };
+
+  const onChatListKeyDown = (e: React.KeyboardEvent) => {
+    if (e.defaultPrevented) return;
+    const target = e.target as HTMLElement | null;
+    // A rename field / the bulk-select checkbox keeps its own keystrokes.
+    if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
+    const k = (e.code || "").replace(/^Key/, "").toLowerCase() || e.key.toLowerCase();
+    const modifier = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+    if (modifier && k === "k") {
+      e.preventDefault();
+      focusWorkspaceSearch();
+      return;
+    }
+    if (e.key === "Enter") {
+      // A nested action (header back/new-chat button, …) owns Enter.
+      if (target?.closest("button, a")) return;
+      const id =
+        target?.closest<HTMLElement>("[data-chat-id]")?.getAttribute("data-chat-id") ||
+        activeChatId ||
+        chatRowElements()[0]?.getAttribute("data-chat-id");
+      if (!id) return;
+      e.preventDefault();
+      useStore.getState().openChat(id);
+      // The chat window commits a frame or two after openChat; the helper
+      // probes CHAT-SCOPED until its composer exists.
+      focusChatInputSoon(id);
+      return;
+    }
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && k === "g") {
+      if (e.shiftKey) {
+        e.preventDefault();
+        chatGAt.current = 0;
+        focusChatEdge("bottom");
+        return;
+      }
+      const now = Date.now();
+      if (now - chatGAt.current <= 800) {
+        chatGAt.current = 0;
+        e.preventDefault();
+        focusChatEdge("top");
+        return;
+      }
+      chatGAt.current = now;
+      e.preventDefault();
+      return;
+    }
+    chatGAt.current = 0;
+    if (modifier && (k === "d" || k === "u")) {
+      e.preventDefault();
+      moveChatFocus((k === "d" ? 1 : -1) * chatHalfPage());
+      return;
+    }
+    const down = e.key === "ArrowDown" || (plain && k === "j");
+    const up = e.key === "ArrowUp" || (plain && k === "k");
+    if (down || up) {
+      e.preventDefault();
+      moveChatFocus(down ? 1 : -1);
+    }
+  };
+
+  // Ctrl+X W: reveal the WORKSPACE LIST (the projects list) and put the caret
+  // on the active workspace's ROW — never on the search box, and never on the
+  // workspace the user had drilled into. W is also the way BACK to the list:
+  // the request closes the drill-in first, so the rows only mount on a later
+  // commit. The landing therefore retries for a short window, then falls back
+  // to the first row and finally to the list itself. The search box is
+  // deliberately NOT a fallback: landing there made the chord look inert and
+  // made j/k type into the query instead of walking the rows.
+  //
+  // The effect never touches the Chats/Files view: App.tsx owns that switch,
+  // and replaying it here would pull a freshly revealed Files view back.
+  // Ctrl/Cmd+K is what returns to the search box.
+  const landedSeq = useRef(0);
+  useEffect(() => {
+    if (!workspaceListFocusSeq) return;
+    if (workspaceListFocusSeq === servedWorkspaceListFocusSeq) return;
+    servedWorkspaceListFocusSeq = workspaceListFocusSeq;
+    setSearch("");
+    setOpenWsKey(null);
+    const startedAt = Date.now();
+    const land = () => {
+      if (landedSeq.current === workspaceListFocusSeq) return;
+      const active = useStore.getState().activeWorkspaceKey;
+      const host = listRef.current;
+      const row =
+        (active &&
+          host?.querySelector<HTMLElement>(
+            `[data-ws-id="${CSS.escape(active)}"]`,
+          )) ||
+        host?.querySelector<HTMLElement>("[data-ws-id]") ||
+        null;
+      if (row) {
+        row.focus({ preventScroll: true });
+        row.scrollIntoView({ block: "nearest" });
+        setWsFocusKey(row.getAttribute("data-ws-id"));
+        landedSeq.current = workspaceListFocusSeq;
+        return;
+      }
+      // The projects list has not committed yet (the drill-in is closing) or
+      // it is empty. Retry briefly, then park the caret on the list itself so
+      // the next keys still belong to the workspace view.
+      if (Date.now() - startedAt < 400) {
+        requestAnimationFrame(land);
+        return;
+      }
+      host?.focus({ preventScroll: true });
+      landedSeq.current = workspaceListFocusSeq;
+    };
+    requestAnimationFrame(() => requestAnimationFrame(land));
+  }, [workspaceListFocusSeq]);
+
+  // Opening the sidebar (Cmd/Ctrl+B, the titlebar toggle, …) lands the caret on
+  // the ACTIVE workspace row — the workspace the user is in — instead of the
+  // search box. The request counter is bumped by App.tsx when the sidebar is
+  // revealed from the keyboard; it is consumed once per value.
+  useEffect(() => {
+    if (!sidebarFocusSeq) return;
+    if (sidebarFocusSeq === servedSidebarFocusSeq) return;
+    servedSidebarFocusSeq = sidebarFocusSeq;
+    const key = useStore.getState().activeWorkspaceKey;
+    if (openGroup) {
+      // Drilled in: the opened workspace's header button is the row here.
+      const row = listRef.current?.querySelector<HTMLElement>(
+        `[data-open-ws="${CSS.escape(openGroup.key)}"]`,
+      );
+      const btn =
+        row?.querySelector<HTMLElement>("button, [tabindex='0'], [tabindex='-1']") ??
+        row;
+      btn?.focus({ preventScroll: true });
+      return;
+    }
+    if (!key) return;
+    if (visibleFolders.some((g) => g.key === key)) focusWorkspaceRow(key);
+    else requestAnimationFrame(() => focusWorkspaceSearch());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sidebarFocusSeq]);
 
   const startRename = (chat: Chat | ChatSummary) => {
     setRenamingId(chat.id);
@@ -1109,6 +1502,8 @@ function SidebarContent({
     return (
       <div
         key={c.id}
+        data-chat-id={c.id}
+        tabIndex={-1}
         className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}${selectingWsKey === gKey ? " selecting" : ""}`}
         draggable
         onDragStart={(e) => {
@@ -1125,6 +1520,14 @@ function SidebarContent({
           e.dataTransfer.effectAllowed = "move";
         }}
         onClick={() => useStore.getState().openChat(c.id)}
+        onMouseDown={(e) => {
+          // WebKit does not focus a clicked div: move the row focus here so
+          // j/k keep walking the chat list after a mouse click (fields and
+          // nested buttons keep their own clicks).
+          const t = e.target as HTMLElement | null;
+          if (t?.closest("input, textarea, select, [contenteditable='true'], button, a")) return;
+          e.currentTarget.focus({ preventScroll: true });
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
           // WebKit grabs the word under the pointer on right-mousedown; clear
@@ -1245,8 +1648,22 @@ function SidebarContent({
     );
   };
 
-  return (
-    <div className="sidebar-inner">
+  // While the Files view is up the chat list is hidden, so a chat that needs
+  // the user (working, asking, unread) would go unnoticed: the Chats segment
+  // carries a dot instead.
+  const chatsAttention = chats.some(
+    (c) =>
+      c.hasStreaming ||
+      c.pendingPermission !== null ||
+      c.pendingAsk !== null ||
+      (c.id !== activeChatId && unreadChats.includes(c.id)),
+  );
+
+  // Window chrome shared by BOTH views (drag strip, resize handle, switch). It
+  // sits first in each return below, so the switch keeps its DOM node when the
+  // view changes and its thumb slides instead of remounting.
+  const chrome = (
+    <>
       {/* macOS traffic-light strip: with the native title bar hidden the
           window buttons overlay this corner — the window-strip cluster
           (sidebar toggle + workspace + direction) lives here so those
@@ -1263,6 +1680,73 @@ function SidebarContent({
         title="Drag to resize sidebar"
         onMouseDown={onResizeStart}
       />
+      {/* Chats ⇄ Files switch: a segmented control whose thumb slides under the
+          active segment (data-view drives the CSS transform). */}
+      <div
+        className="sidebar-switch"
+        role="tablist"
+        aria-label="Sidebar view"
+        data-view={view}
+        onKeyDown={(e) => {
+          if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+          e.preventDefault();
+          const next = view === "chats" ? "files" : "chats";
+          useSidebarView.getState().setView(next);
+          e.currentTarget.querySelector<HTMLElement>(`[data-view-id="${next}"]`)?.focus();
+        }}
+      >
+        <span className="sidebar-switch-thumb" aria-hidden="true" />
+        {SIDEBAR_VIEWS.map((v) => (
+          <button
+            key={v.id}
+            type="button"
+            role="tab"
+            data-view-id={v.id}
+            className={"sidebar-switch-btn" + (view === v.id ? " active" : "")}
+            aria-selected={view === v.id}
+            tabIndex={view === v.id ? 0 : -1}
+            aria-label={v.label}
+            title={v.label}
+            onClick={() => useSidebarView.getState().setView(v.id)}
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              {v.icon}
+            </svg>
+            {v.id === "chats" && view === "files" && chatsAttention ? (
+              <span className="sidebar-switch-dot" title="A chat needs your attention" />
+            ) : null}
+          </button>
+        ))}
+      </div>
+    </>
+  );
+
+  if (view === "files") {
+    return (
+      <div className="sidebar-inner">
+        {chrome}
+        <div className="sidebar-files-view">
+          <Suspense fallback={null}>
+            <FilesPanel />
+          </Suspense>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="sidebar-inner">
+      {chrome}
       <div className="sidebar-head">
         <div className="sidebar-search-box">
           <svg
@@ -1286,7 +1770,37 @@ function SidebarContent({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Escape") setSearch("");
+              const k =
+                (e.code || "").replace(/^Key/, "").toLowerCase() ||
+                e.key.toLowerCase();
+              const modifier =
+                (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
+              const plain =
+                !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+              // Plain j/k stay ordinary search text (a query may start with
+              // "j" or "k"). Ctrl/Cmd+J (or ArrowDown) enters the list at the
+              // FIRST workspace row — pinned workspaces sort first — and the
+              // list's own handler walks from there; Ctrl/Cmd+K comes back
+              // here from any row.
+              const navDown =
+                (plain && e.key === "ArrowDown") || (modifier && k === "j");
+              if (navDown) {
+                e.preventDefault();
+                focusFirstWorkspace();
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                // First Esc clears the query; an already-empty box hands the
+                // caret back to the chat, like Esc on a workspace row.
+                if (search) {
+                  setSearch("");
+                  return;
+                }
+                const chatId = useStore.getState().activeChatId;
+                setWsFocusKey(null);
+                if (chatId) requestAnimationFrame(() => focusChatInput(chatId));
+              }
             }}
             spellCheck={false}
             dir={dir}
@@ -1311,10 +1825,15 @@ function SidebarContent({
             </button>
           )}
         </div>
+        {/* "New workspace" belongs to the PROJECTS list only: inside an opened
+            workspace the header's + (new chat) is the one action, and two +
+            buttons side by side read as the same control. */}
         <div className="sidebar-head-actions">
           <button
             className="sidebar-head-btn"
             title="New workspace"
+            hidden={!!openGroup}
+            style={openGroup ? { display: "none" } : undefined}
             onClick={newWorkspace}
           >
             <svg
@@ -1336,7 +1855,12 @@ function SidebarContent({
         /* ---------------------------------------------------------------
          * Opened workspace: back header + that workspace's chat list.
          * --------------------------------------------------------------- */
-        <div className="sidebar-list">
+        <SidebarChatList
+          className="sidebar-list"
+          focusSeq={openListFocusSeq}
+          landChatId={activeChatId}
+          onKeyDown={onChatListKeyDown}
+        >
           {colorOpen !== null && (
             <div className="color-backdrop" onClick={() => setColorOpen(null)} />
           )}
@@ -1346,6 +1870,8 @@ function SidebarContent({
           >
             <div
               className="sidebar-group-head sidebar-ws-head"
+              data-open-ws={openGroup.key}
+              tabIndex={-1}
               onContextMenu={(e) => {
                 // The kebab is gone — right-clicking the folder header opens
                 // its menu (Rename / Color / Change folder… / Select chats).
@@ -1446,19 +1972,29 @@ function SidebarContent({
               {openChats.length} chats found
             </div>
           )}
-        </div>
+        </SidebarChatList>
       ) : (
         /* ---------------------------------------------------------------
          * Projects list: ONE flat list of folder rows, no collapse. Click
-         * a row to drill into its chats; drag rows to reorder (slide
-         * preview, exactly like the chat tab bar).
+         * a row (or press Enter on the focused row) to activate the
+         * workspace and drill into its chats. Ordering is automatic:
+         * pinned first, then most recently activated.
          * --------------------------------------------------------------- */
         <div
           ref={listRef}
-          className="sidebar-list"
-          onDragOver={onListDragOver}
-          onDrop={onListDrop}
-          onDragLeave={onListDragLeave}
+          className="sidebar-list sidebar-ws-list"
+          role="list"
+          tabIndex={-1}
+          aria-label="Workspaces"
+          onKeyDown={onWorkspaceListKeyDown}
+          onMouseDown={(e) => {
+            // WebKit does not focus a clicked div/button. Focus the row
+            // explicitly so j/k (and gg/G, Ctrl+D/U) work after a mouse click,
+            // exactly like the explorer. Fields keep their own clicks.
+            const t = e.target as HTMLElement | null;
+            if (t?.closest("input, textarea, select, [contenteditable='true']")) return;
+            t?.closest<HTMLElement>("[data-ws-id]")?.focus({ preventScroll: true });
+          }}
         >
           {colorOpen !== null && (
             <div className="color-backdrop" onClick={() => setColorOpen(null)} />
@@ -1473,35 +2009,21 @@ function SidebarContent({
           {visibleFolders.map((g) => {
             const color = workspaceColors[g.key] || "var(--accent)";
             const isPinned = pinnedWorkspaces.includes(g.key);
-            const shift = shifts?.get(g.key) ?? 0;
+            const isActive = g.key === activeWorkspaceKey;
+            const isKeyboardFocus = g.key === wsFocusKey;
             return (
               <div
                 key={g.key}
                 data-ws-id={g.key}
-                className={`sidebar-group sidebar-folder${dragKey === g.key ? " dragging" : ""}`}
+                role="listitem"
+                tabIndex={-1}
+                className={`sidebar-group sidebar-folder${isActive ? " active" : ""}${isKeyboardFocus ? " kbd-focus" : ""}`}
                 style={
                   {
                     "--ws": color,
-                    transform:
-                      shift !== 0
-                        ? `translateY(${shift}px)`
-                        : undefined,
                   } as React.CSSProperties
                 }
-                draggable
-                onDragStart={(e) => onFolderDragStart(e, g.key)}
-                onDragEnd={clearDrag}
-                onKeyDown={(e) => {
-                  // Alt+Arrow moves the focused folder without dragging.
-                  const target = tabMove(folderKeys, g.key, e.key, e.altKey, "y");
-                  if (!target) return;
-                  e.preventDefault();
-                  useStore
-                    .getState()
-                    .setWorkspaceOrder(
-                      previewOrder(folderKeys, g.key, target.toId, target.after),
-                    );
-                }}
+                onFocus={() => setWsFocusKey(g.key)}
                 onContextMenu={(e) => {
                   // Row actions live here (right-click), not on the row:
                   // Delete workspace belongs on the projects list, while the

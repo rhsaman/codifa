@@ -7,6 +7,7 @@ import { listPlugins } from "../lib/plugins";
 import { PanelChevron, ToolsIcon } from "./PanelIcons";
 import { ensureSkillsList, getSkillsList } from "../lib/skills";
 import {
+  pluginDisplayName,
   skillOwner,
   turnStart,
   turnUsage,
@@ -100,6 +101,12 @@ export function TurnUsageSection({
 
   const usage: TurnUsage = turnUsage(messages);
   const owners = usagePlugins(usage, catalog, plugins);
+  // A plugin the agent LOADED this turn (load_plugin / plugin run) is a used
+  // row, not mere context like an owning plugin. Without this a toolbox with no
+  // skill or connector of its own never appeared on the card at all.
+  const loadedPlugins = new Set(
+    (usage.plugins ?? []).map((p) => pluginDisplayName(p.name, plugins)),
+  );
   // "Used" here means the model LOADED the connector this turn (`use_mcp`) or
   // called one of its tools — a connector can be enabled and never touched, and
   // that distinction is the whole point: an untouched one cost the turn an index
@@ -172,7 +179,17 @@ export function TurnUsageSection({
   }
   rows.sort((a, b) => Number(b.state === "used") - Number(a.state === "used"));
   for (const name of owners) {
-    rows.push({ key: `plugin-${name}`, kind: "plugin", name, sub: "Plugin", state: "plain", title: "Plugin that provides this turn's tools" });
+    const used = loadedPlugins.has(name);
+    rows.push({
+      key: `plugin-${name}`,
+      kind: "plugin",
+      name,
+      sub: used ? "Loaded this turn" : "Plugin",
+      state: used ? "used" : "plain",
+      title: used
+        ? "Loaded by the agent this turn"
+        : "Plugin that provides this turn's tools",
+    });
   }
   const usedCount = rows.filter((r) => r.state === "used").length;
   const idleCount = rows.filter((r) => r.state === "idle").length;

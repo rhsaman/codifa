@@ -1,5 +1,6 @@
 import type { DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
 import { isBrowserTool } from "./mcpTools";
+import { isDelegationTool } from "./subagents";
 
 /**
  * The file a writer call targets, as the model spelled it.
@@ -89,14 +90,19 @@ export function normalizeToolName(tool?: string): string {
   return t === "task" || t === "subagent" ? "explore" : t;
 }
 
-/** True when a tool name means "load a skill", including the foreign names
- *  models use for it (`skill`, `load_skill_file`). The backend folds those to
- *  `load_skill` before emitting, but a transcript saved by an older build can
- *  still carry a raw one, and every skill-specific rule (prose result, no file
- *  rows) must match it. */
+/** True when a tool name means "load a skill/plugin", including the foreign
+ *  names models use for it (`skill`, `load_skill_file`). The backend folds
+ *  those to `load_plugin` before emitting, but a transcript saved by an older
+ *  build can still carry `load_skill`, and every skill-specific rule (prose
+ *  result, no file rows) must match both. */
 export function isSkillTool(tool?: string): boolean {
   const t = (tool ?? "").trim().toLowerCase().replace(/[-\s]/g, "_");
-  return t === "load_skill" || t === "skill" || t === "load_skill_file";
+  return (
+    t === "load_plugin" ||
+    t === "load_skill" ||
+    t === "skill" ||
+    t === "load_skill_file"
+  );
 }
 
 /** Recursively normalize a card and its nested children (one-time, on load). */
@@ -170,7 +176,63 @@ function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivi
     // to top-level cards in the chat, and the Explore panel showed "No tool
     // calls". The branch must survive re-emits.
     branch: incoming.branch ?? existing.branch,
+    // Narration is appended by its own helper; a re-emit must never wipe it.
+    narration: incoming.narration ?? existing.narration,
   };
+}
+
+/** Cap the narration kept on one card. The side panel shows the whole log, but
+ *  a multi-minute browser run can stream a lot of prose; keeping only the tail
+ *  bounds memory without losing the latest context. */
+export const NARRATION_MAX_CHARS = 24_000;
+
+/**
+ * Append a sub-agent's branch-tagged narration to ITS delegation card.
+ *
+ * A branch-tagged `text` event is the child talking to the user, not output of
+ * the parent turn: routing it into the assistant `content` would both misplace
+ * it (above/outside the explore card) and feed it back as parent context on the
+ * next request. It belongs on the card only — the chat shows the latest line,
+ * the side panel the full log — so this helper never touches message content.
+ *
+ * Chunks are concatenated verbatim (models stream tokens, so inserting a
+ * newline per event would produce one word per line). Returns the SAME array
+ * when no card matches, letting callers skip a store update.
+ */
+export function appendBranchNarration(
+  activities: ToolActivity[],
+  branch: number,
+  chunk: string,
+): ToolActivity[] {
+  const text = chunk ?? "";
+  if (!text.trim()) return activities;
+  // The branch card is top-level; nested child events never own narration.
+  let idx = -1;
+  for (let i = activities.length - 1; i >= 0; i--) {
+    const a = activities[i];
+    if (isDelegationTool(a.tool) && a.branch === branch) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0) return activities;
+  const card = activities[idx];
+  let narration = (card.narration ?? "") + text;
+  if (narration.length > NARRATION_MAX_CHARS) {
+    narration = `…${narration.slice(narration.length - NARRATION_MAX_CHARS)}`;
+  }
+  const next = activities.slice();
+  next[idx] = { ...card, narration };
+  return next;
+}
+
+/** Latest non-empty line of a run's narration, for the compact chat card. */
+export function latestNarrationLine(activity: ToolActivity): string {
+  const lines = (activity.narration ?? "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return lines.length ? lines[lines.length - 1] : "";
 }
 
 /**
@@ -211,11 +273,11 @@ export function applyToolEvent(
     let lastTaskIdx = -1;
     if (branch === undefined) {
       for (let i = 0; i < activities.length; i++) {
-        if (activities[i].tool === "explore") lastTaskIdx = i;
+        if (isDelegationTool(activities[i].tool)) lastTaskIdx = i;
       }
     }
     const next = activities.map((a, idx) => {
-      if (a.tool === "explore") {
+      if (isDelegationTool(a.tool)) {
         // Parallel fan-out: nest each branch's sub-events under ITS OWN card.
         if (branch !== undefined) {
           if (a.branch !== branch) return a;
@@ -383,6 +445,7 @@ export function resolveToolResult(
         resultText:
           typeof event.result === "string" &&
           (TEXT_RESULT_TOOLS.has(act.tool) ||
+            isDelegationTool(act.tool) ||
             isSkillTool(act.tool) ||
             isBrowserTool(act.tool))
             ? event.result
@@ -502,7 +565,7 @@ export function filesFromNativeResult(
   // chip that hides the actual memory text.
   if (
     tool === "run_terminal" ||
-    tool === "explore" ||
+    isDelegationTool(tool) ||
     tool === "search_memory" ||
     tool === "save_memory" ||
     // A skill load answers with the skill's own markdown body — prose, not a

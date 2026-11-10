@@ -12,6 +12,13 @@ export default defineConfig(({ mode }) => {
   const webOnly = mode === 'webonly'
   return {
     plugins: [react()],
+    // Vite's default order prefers `.js` over `.ts`. A stray `tsc` emit (or an
+    // editor's "compile on save") drops `.js` twins next to the sources, and
+    // those STALE compiled modules then shadow the `.ts` files that carry the
+    // fix. Keep the real sources first so that can never happen again.
+    resolve: {
+      extensions: ['.ts', '.tsx', '.mts', '.mjs', '.js', '.jsx', '.json'],
+    },
     build: {
       outDir: 'dist',
       sourcemap: true,

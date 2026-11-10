@@ -468,11 +468,18 @@ fn bench_codifa(task: &Task, model: &str) -> Result<RunMetrics, String> {
         system_prompt: String::new(),
         system_suffix: String::new(),
         skills: vec![],
+        plugins: vec![],
         context_window: 0,
         chat_id: chat_id.clone(),
         mcp_servers: Value::Null,
         mcp_active: Default::default(),
         subagent_models: Default::default(),
+        custom_subagents: Default::default(),
+        subagent_kind: None,
+        // The bench runs the builtin research set: no profile prompt, no
+        // declared tool list, no pack-skill focus.
+        subagent_profile: false,
+        subagent_focus: String::new(),
         providers: Default::default(),
         data_root: data_root.to_string_lossy().to_string(),
         allow_computer: false,
@@ -501,6 +508,8 @@ fn bench_codifa(task: &Task, model: &str) -> Result<RunMetrics, String> {
         subagent_thinking: Default::default(),
         tool_fallbacks: Default::default(),
         images: vec![],
+        // No composer file attachments: the bench prompt is self-contained.
+        attachments: vec![],
         web_search_auto_fetch: 0,
         cap: None,
     };

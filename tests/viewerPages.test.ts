@@ -106,6 +106,13 @@ console.log('2) id, title and visibility follow the shared rules:')
     viewerTabTitle({ kind: 'schedule', title: 'whatever' }) === 'Schedule',
     viewerTabTitle({ kind: 'schedule', title: 'whatever' }),
   )
+  // The page also lists turn usage and background terminals, so its shared
+  // label is "Panel" — not "Todos".
+  check(
+    'the todos kind now shows the Panel label',
+    viewerTabTitle({ kind: 'todos', title: 'whatever' }) === 'Panel',
+    viewerTabTitle({ kind: 'todos', title: 'whatever' }),
+  )
   const tabs = useViewerTabs.getState().tabs
   check('the schedule page is visible in every chat', visibleTabs(tabs, scopeC1).some((t) => t.kind === 'schedule'))
   check('…including one with no tabs of its own', visibleTabs(tabs, { wsKey: WS, chatId: 'zzz' }).some((t) => t.kind === 'schedule'))
@@ -146,9 +153,17 @@ console.log('4) the "+" menu opens only Browser/Trace; the dock owns the pages:'
     check(`the menu can open the ${kind} page`, barSrc.includes(`key: "${kind}"`), kind)
   }
   const dockSrc = barSrc
-  for (const kind of ['files', 'todos', 'artifacts', 'review', 'schedule', 'inbox', 'terminal']) {
+  for (const kind of ['todos', 'artifacts', 'review', 'schedule', 'inbox', 'terminal']) {
     check(`the dock opens the ${kind} page`, dockSrc.includes(`kind: "${kind}"`), kind)
   }
+  // With no tab shown the pane body paints the Panel fallback page, so the
+  // Panel icon must be the pressed one — the dock must never read "nothing is
+  // open" while the Panel content is on screen.
+  check(
+    'the Panel icon is active when no tab is shown',
+    barSrc.includes('const shownKind = shownTab?.kind ?? FALLBACK_VIEWER_KIND') &&
+      barSrc.includes('const active = shownKind === d.kind'),
+  )
   // No page owns a fixed icon any more: those buttons are gone from the file.
   for (const btn of [
     'ViewerFilesButton',
@@ -239,7 +254,7 @@ console.log('7) a rail icon marks the page ON SCREEN, not merely an open tab:')
   // that was open but NOT the one on screen closed its tab (the pressed state
   // was "a tab with this id exists"), so the page vanished and a second press
   // was needed to see it again.
-  // `chatId` matters here: a chat-scoped kind (files, review…) without one is
+  // `chatId` matters here: a chat-scoped kind (trace, browser…) without one is
   // filtered out of EVERY chat, so the checks below would pass for the wrong
   // reason (the tab would be invisible, not merely inactive).
   const tab = (id: string, kind: string, extra: Record<string, unknown> = {}): any => ({
@@ -249,22 +264,22 @@ console.log('7) a rail icon marks the page ON SCREEN, not merely an open tab:')
     createdAt: 1,
     ...extra,
   })
-  const tabs: any[] = [tab('files:c1', 'files', { chatId: 'c1' }), tab('inbox', 'inbox')]
+  const tabs: any[] = [tab('artifacts', 'artifacts'), tab('inbox', 'inbox')]
 
   check('the active tab is the shown one', shownViewerTabId(tabs, 'inbox', scopeC1) === 'inbox')
   check(
     'an open tab that is not active is NOT shown',
-    shownViewerTabId(tabs, 'inbox', scopeC1) !== 'files:c1',
+    shownViewerTabId(tabs, 'inbox', scopeC1) !== 'artifacts',
   )
   check(
     'promoting the open tab makes it the shown one',
-    shownViewerTabId(tabs, 'files:c1', scopeC1) === 'files:c1',
+    shownViewerTabId(tabs, 'artifacts', scopeC1) === 'artifacts',
   )
   check('an empty pane shows no page', shownViewerTabId([], null, scopeC1) === null)
   // The bug this locks: a stale activeId (restart / closed tab) used to fall
   // through to `visible[0]` and paint a leftover dock page (the one-per-
   // workspace Git diff) in a chat that never opened it — while the strip drew
-  // no row for it, so the pane read "no tab open". Dock pages (files/inbox
+  // no row for it, so the pane read "no tab open". Dock pages (artifacts/inbox
   // here) must never win a fallback: the pane rests on the todos page.
   check(
     'a stale activeId never promotes a dock page',

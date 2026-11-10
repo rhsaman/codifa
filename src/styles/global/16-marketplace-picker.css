@@ -1,0 +1,138 @@
+/* Marketplace picker: one searchable dropdown instead of a chip per repo. */
+.settings-modal .mp-picker {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.settings-modal .mp-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 240px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.14s ease;
+}
+
+.settings-modal .mp-trigger:hover,
+.settings-modal .mp-trigger.open {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.settings-modal .mp-trigger-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: start;
+}
+
+.settings-modal .mp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  flex: none;
+}
+
+.settings-modal .mp-chevron {
+  opacity: 0.6;
+  font-size: 11px;
+}
+
+.settings-modal .mp-pop {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  inset-inline-start: 0;
+  width: min(420px, 86vw);
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 14px;
+  background: var(--bg-panel, var(--bg));
+  box-shadow: 0 14px 40px -12px rgba(0, 0, 0, 0.55);
+}
+
+.settings-modal .mp-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 6px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  max-width: none;
+}
+
+.settings-modal .mp-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.settings-modal .mp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.settings-modal .mp-row.active {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.settings-modal .mp-row.selected .mp-row-name {
+  color: var(--accent);
+}
+
+.settings-modal .mp-row-name {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.settings-modal .mp-row-sub {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.55;
+  font-size: 11.5px;
+}
+
+.settings-modal .mp-spacer {
+  flex: 1;
+}
+
+.settings-modal .mp-loading {
+  opacity: 0.55;
+}
+
+.settings-modal .mp-row-x {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.settings-modal .mp-row:hover .mp-row-x,
+.settings-modal .mp-row.active .mp-row-x {
+  opacity: 0.6;
+}
+
+.settings-modal .mp-row-x:hover {
+  opacity: 1;
+}

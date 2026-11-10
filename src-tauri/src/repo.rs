@@ -91,7 +91,7 @@ const SKIP_FILES: [&str; 9] = [
     ".mcp.json",
 ];
 /// Cap on the files that travel with one skill: the prompt carries only their
-/// NAMES (a body is read on demand through `load_skill`), so the cap bounds
+/// NAMES (a body is read on demand through `load_plugin`), so the cap bounds
 /// bundle bloat, not prompt size. An office skill library — the ZCode document
 /// packs ship 40+ files of scripts and references — needs the room.
 const MAX_EXTRA_FILES: usize = 100;
@@ -540,6 +540,19 @@ fn is_skill_file(path: &str) -> bool {
     leaf(path).eq_ignore_ascii_case("skill.md")
 }
 
+/// Whether one skill file belongs to the folders a marketplace row names.
+///
+/// The row's paths are relative to the bundle's source folder, while the skill
+/// carries its repo path, so an exact match or a suffix match both count. The
+/// leaf is compared case-insensitively because `SKILL.md` is read that way.
+fn skill_in_row(path: &str, wanted: &[String]) -> bool {
+    let path = path.trim_start_matches('/').to_ascii_lowercase();
+    wanted.iter().any(|w| {
+        let w = w.trim_matches('/').to_ascii_lowercase();
+        path == format!("{w}/skill.md") || path.ends_with(&format!("/{w}/skill.md"))
+    })
+}
+
 /// Whether `path` is a Claude Code command: `<anything>/commands/<name>.md`.
 fn is_command_file(path: &str) -> bool {
     markdown_under(path, "commands")
@@ -743,8 +756,32 @@ where
 /// Read a whole plugin bundle: manifest, skills and connectors, in the exact
 /// shape `plugins::create_plugin` already accepts.
 pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String> {
+    read_plugin_filtered(spec, sub, git_ref, &[])
+}
+
+/// Read one bundle, keeping only the skill folders a marketplace row names.
+///
+/// The filter is applied BEFORE the files are read: a row that publishes four
+/// skills out of a repo holding twenty (`anthropics/skills`) must not download
+/// the other sixteen. An empty list reads every skill. A list that matches
+/// nothing falls back to every skill, so a malformed index cannot install an
+/// empty bundle.
+pub fn read_plugin_filtered(
+    spec: &str,
+    sub: &str,
+    git_ref: &str,
+    wanted_skills: &[String],
+) -> Result<Value, String> {
     install_progress_set("listing", 0, 0);
     let repo = Repo::open(spec, sub, git_ref)?;
+    // A repo can be BOTH a plugin and a marketplace. The index file is already
+    // in the tree walk this install paid for, so reporting it costs nothing —
+    // the caller uses it to register the repo as a catalogue without a second
+    // GitHub read (and WITHOUT trying to read an index on every plain install).
+    let marketplace = INDEX_FILES
+        .iter()
+        .find(|p| repo.files().iter().any(|f| f == *p))
+        .map(|p| p.to_string());
     let (root, manifest_path) = locate(&repo)?;
     let manifest = match &manifest_path {
         Some(path) => {
@@ -759,12 +796,22 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
     } else {
         format!("{root}/")
     };
-    let skill_paths: Vec<String> = repo
+    let all_skill_paths: Vec<String> = repo
         .files()
         .iter()
         .filter(|p| p.starts_with(prefix.as_str()) && is_skill_file(p))
         .cloned()
         .collect();
+    let skill_paths: Vec<String> = if wanted_skills.is_empty() {
+        all_skill_paths
+    } else {
+        let kept: Vec<String> = all_skill_paths
+            .iter()
+            .filter(|p| skill_in_row(p, wanted_skills))
+            .cloned()
+            .collect();
+        if kept.is_empty() { all_skill_paths } else { kept }
+    };
     // Scripts travel with the bundle too: a plugin whose commands are code would
     // otherwise install as an empty shell. Read from `<root>/scripts/<name>/`
     // with the same manifest the writer produces, so a reinstall updates them.
@@ -945,6 +992,7 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
         "hooks": hooks,
         "hook_files": hook_files,
         "mcp": read_connectors(&repo, &root),
+        "marketplace": marketplace,
     }))
 }
 
@@ -1091,16 +1139,12 @@ fn index_cache_key(spec: &str, sub: &str, git_ref: &str) -> String {
 /// one go through the install path that already exists.
 pub fn read_index(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String> {
     let repo = Repo::open(spec, sub, git_ref)?;
-    let path = INDEX_FILES
+    let Some(path) = INDEX_FILES
         .iter()
         .find(|p| repo.files().iter().any(|f| f == *p))
-        .ok_or_else(|| {
-            format!(
-                "no marketplace index in {} — expected {}",
-                repo.describe(),
-                INDEX_FILES.join(" or ")
-            )
-        })?;
+    else {
+        return plain_bundle_index(&repo);
+    };
     let raw = repo.read(path)?;
     let parsed: Value =
         serde_json::from_str(&raw).map_err(|e| format!("{path} is not valid JSON: {e}"))?;
@@ -1117,6 +1161,84 @@ pub fn read_index(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String>
         "source": repo.describe(),
         "count": plugins.len(),
         "plugins": plugins,
+    }))
+}
+
+/// The catalogue of a repo that carries NO index: the repo itself, as one row.
+///
+/// `/plugin install <repo>` registers every successful source as a marketplace,
+/// and the user expects that source to be browsable. A plain bundle repo has no
+/// index to read, so it is a catalogue of ONE — this row. A repo holding
+/// SEVERAL bundles has no unambiguous row to synthesize, so it keeps the
+/// "no marketplace index" error and asks for `repo_path` instead.
+fn plain_bundle_index(repo: &Repo) -> Result<Value, String> {
+    let no_index = || {
+        format!(
+            "no marketplace index in {} — expected {}",
+            repo.describe(),
+            INDEX_FILES.join(" or ")
+        )
+    };
+    let (root, manifest_path) = match locate(repo) {
+        Ok(found) => found,
+        // Several plugin folders: only an index can say which row is which.
+        Err(_) => return Err(no_index()),
+    };
+    // A manifest alone is not a bundle: `read_plugin` reads parts from files,
+    // so advertising a manifest-only repo would list a row that cannot install.
+    let carries_parts = repo.files().iter().any(|p| {
+        is_skill_file(p)
+            || is_command_file(p)
+            || is_prompt_file(p)
+            || is_agent_file(p)
+            || is_hooks_file(p)
+            || is_script_manifest(p)
+            || leaf(p).eq_ignore_ascii_case("mcp.json")
+            || leaf(p).eq_ignore_ascii_case(".mcp.json")
+    });
+    if !carries_parts {
+        return Err(no_index());
+    }
+    let manifest = manifest_path
+        .as_ref()
+        .and_then(|p| repo.read(p).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let name = manifest["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| repo.repo_name());
+    let description = manifest["description"].as_str().unwrap_or("").trim().to_string();
+    // Point the row at the folder that actually holds the bundle, so an install
+    // from the row is the same read `/plugin install <repo>` just did.
+    let (spec, base, _) = repo.install_args();
+    let repo_path = match (base.is_empty(), root.is_empty()) {
+        (_, true) => base,
+        (true, false) => root,
+        (false, false) => format!("{base}/{root}"),
+    };
+    let row = json!({
+        "name": name,
+        "description": description,
+        "version": manifest["version"].as_str().unwrap_or(""),
+        "author": manifest["author"]["name"]
+            .as_str()
+            .or_else(|| manifest["author"].as_str())
+            .unwrap_or(""),
+        "category": "",
+        "skills": [],
+        "repo": spec,
+        "repo_path": repo_path,
+        "repo_ref": "",
+    });
+    Ok(json!({
+        "name": name,
+        "description": description,
+        "source": repo.describe(),
+        "count": 1,
+        "plugins": [row],
     }))
 }
 
@@ -1196,53 +1318,26 @@ fn index_entry(repo: &Repo, entry: &Value) -> Option<Value> {
         // a keyword seed is derived from, so it must survive the browse →
         // install hop; an index without categories leaves it empty.
         "category": entry["category"].as_str().unwrap_or("").trim(),
+        // The row may publish only SOME of the skills its source folder holds:
+        // anthropics/skills points five rows at `./` and names each row's
+        // folders here. Without this list a row called "document-skills"
+        // installed every skill in the repo.
+        "skills": entry["skills"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
         "repo": repo_spec,
         "repo_path": path,
         "repo_ref": source["ref"].as_str().unwrap_or("").trim().to_string(),
     }))
 }
 
-pub fn read_skill(spec: &str, sub: &str, git_ref: &str, hint: &str) -> Result<Value, String> {
-    let repo = Repo::open(spec, sub, git_ref)?;
-    let candidates: Vec<String> = repo
-        .files()
-        .iter()
-        .filter(|p| is_skill_file(p))
-        .cloned()
-        .collect();
-    if candidates.is_empty() {
-        return Err(format!(
-            "no SKILL.md in {} — point `repo_path` at the skill's folder",
-            repo.describe()
-        ));
-    }
-    let want = crate::skills::safe_file(&hint.trim().to_lowercase(), "");
-    let by_hint = candidates.iter().find(|path| {
-        let dir = parent(path);
-        let folder = dir.rsplit('/').next().unwrap_or(dir);
-        !want.is_empty() && crate::skills::safe_file(&folder.to_lowercase(), "") == want
-    });
-    let pick = by_hint.or_else(|| {
-        if candidates.len() == 1 {
-            candidates.first()
-        } else {
-            None
-        }
-    });
-    let Some(path) = pick else {
-        let list = candidates
-            .iter()
-            .map(|p| format!("  {p}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!(
-            "{} holds {} skills — pass `repo_path` with one of:\n{list}",
-            repo.describe(),
-            candidates.len()
-        ));
-    };
-    read_skill_at(&repo, path)
-}
 
 fn read_command_at(repo: &Repo, path: &str) -> Result<Value, String> {
     let raw = repo.read(path)?;

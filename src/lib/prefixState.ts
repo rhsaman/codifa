@@ -4,31 +4,39 @@
  * `App.tsx` owns the chord: `Ctrl+X` arms the prefix and the NEXT key runs it.
  * Both the bare scroll keys and the sidebar's bare `j`/`k` are CAPTURE
  * listeners, so they would see that second key before the chord handler does
- * and swallow it (a scroll, or a chat step). Subscribing here lets them stand
- * down for the one key that belongs to the chord.
+ * — they consult this flag and bail while it is armed.
  *
- * Kept in its own module so the two panes share one implementation instead of
- * each re-reading the event.
+ * This MUST live at module scope with its own listener: it used to be fed only
+ * by `watchPrefixFlag()` from a mounted vim-scroll pane, so on a screen with no
+ * such pane (an empty workspace, a chat that renders no pane) the flag read
+ * `false` forever and every `Ctrl+X` chord behaved erratically — arming worked
+ * but the second key was treated as ordinary typing.
  */
 
 let armed = false
 
-/** Bind once per window: mirrors the `coder:prefix` broadcast of App.tsx. */
-export function watchPrefixFlag(): () => void {
-  const onPrefix = (e: Event) => {
+if (typeof window !== 'undefined') {
+  // Bound at module load, exactly once per module instance — never tied to a
+  // component's lifetime. A duplicate registration is harmless (it writes the
+  // same boolean); a MISSING one breaks every chord, which is what this fixes.
+  window.addEventListener('coder:prefix', (e) => {
     armed = !!(e as CustomEvent).detail
-  }
-  window.addEventListener('coder:prefix', onPrefix)
-  return () => window.removeEventListener('coder:prefix', onPrefix)
+  })
 }
 
-/** Whether `Ctrl+X` is waiting for its second key right now. */
 export function isPrefixArmed(): boolean {
   return armed
 }
 
-/** Test-only override: the unit tests drive the guard without a DOM window,
- *  so there is no `coder:prefix` broadcast to listen to. */
+/** Test hook: drive the flag without dispatching an event. */
 export function setPrefixArmedForTest(v: boolean): void {
   armed = v
+}
+
+/** Kept for callers that still want an explicit subscription. The module-level
+ *  listener above already mirrors every broadcast, so this only returns a
+ *  no-op unsubscribe: registering another listener would be dead weight, and
+ *  the call site is the safest place to keep documenting that. */
+export function watchPrefixFlag(): () => void {
+  return () => {}
 }

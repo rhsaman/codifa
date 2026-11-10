@@ -25,6 +25,17 @@ pub const MANIFEST: &str = "plugin.json";
 /// library is a single container behind a single switch.
 pub const BUILTIN_BUNDLE_NAME: &str = "builtin plugin";
 pub const BUILTIN_BUNDLE_SLUG: &str = "builtin-plugin";
+/// The catalog line for the built-in library.
+///
+/// The library is ONE bundle of ~24 shipped skills, and the catalog shows only
+/// the first few skill names plus "+N more" — so this line is the ONLY trigger
+/// the agent sees for everything hidden behind that count. Lifting one skill's
+/// description (what the old refresh did) advertised the whole library as
+/// "UI/UX design intelligence" and made the live-test harness, browser
+/// automation, writing and research skills invisible: a live-test request had
+/// nothing in the catalog to match. Keep the major capabilities, most
+/// actionable first; the catalog clips the tail, not the head.
+pub const BUILTIN_BUNDLE_DESCRIPTION: &str = "Built-in library: live-test and debug Codifa's UI in a browser harness, drive the browser, design/review frontends, plus research, writing, planning, git, data and translation.";
 /// The seeded Docker connector bundle. The bundle and the connector key share
 /// one name, so `mcp__docker-mcp__*` tool names match the Settings row.
 pub const DOCKER_BUNDLE: &str = "docker-mcp";
@@ -45,6 +56,10 @@ const SOURCE_PATH: &str = "source_path";
 /// source address (an UPDATE call carries only the address).
 const SOURCE_CATEGORY: &str = "source_category";
 const SOURCE_REF: &str = "source_ref";
+/// The skill folders a marketplace ROW publishes, when it names them. Kept with
+/// the address so "update from source" re-reads the same selection instead of
+/// pulling in every skill the source folder happens to hold.
+const SOURCE_SKILLS: &str = "source_skills";
 /// Manifest key holding per-connector metadata: `{name: {description}}`.
 ///
 /// Deliberately NOT stored inside the connector's own config: `mcp.json` values
@@ -335,7 +350,7 @@ pub fn find_skill_dir(root: &Path, slug: &str, name_or_slug: &str) -> Option<Pat
 /// Slug of the ENABLED plugin that carries a skill called `name_or_slug`.
 ///
 /// Needed because a plugin's skills are served from the plugin folder, not from
-/// the standalone `<root>/skills` store: without this, `load_skill` (and the
+/// the standalone `<root>/skills` store: without this, `load_plugin` (and the
 /// `/skills/file` route) answered "skill not found" for every skill the prompt
 /// catalog had just advertised. Disabled plugins are skipped, so switching a
 /// plugin off stays a real off switch.
@@ -433,6 +448,38 @@ mod tests {
     /// A bundle made ONLY of commands and a sub-agent — the shape the reporter's
     /// `claude-model-advisor` has, and the one that used to fail with "nothing to
     /// install": no SKILL.md, no mcp.json, no scripts/.
+    /// The schema advertises a profile as `agent__<slug>` (whitespace folded to
+    /// `_`). Dispatch strips the prefix and looks the profile up by that same
+    /// slug — a pack with a human-readable frontmatter name must resolve, or it
+    /// silently runs the builtin explore prompt instead of its own.
+    #[test]
+    fn a_spaced_agent_name_resolves_from_its_delegation_slug() {
+        let root = temp_root("spaced-agent");
+        create_plugin(
+            &root,
+            &json!({
+                "name": "Reviewer Pack",
+                "description": "test plugin: Reviewer Pack",
+                "slug": "reviewer-pack",
+                "agents": [{
+                    "name": "Code Reviewer",
+                    "description": "Reviews a diff",
+                    "tools": ["Read", "WebSearch"],
+                    "prompt": "You review diffs."
+                }]
+            }),
+        )
+        .expect("a pack with a spaced agent name must install");
+
+        let row = find_plugin_agent(&root, "code_reviewer")
+            .expect("the advertised slug must resolve the profile");
+        assert_eq!(row["name"], "Code Reviewer");
+        // A slug the model could not have called still resolves nothing.
+        assert!(find_plugin_agent(&root, "code_reviewer_two").is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_bundle_of_commands_and_agents_is_a_real_install() {
         let root = temp_root("commands-only");
@@ -440,6 +487,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Advisor",
+                "description": "test plugin: Advisor",
                 "slug": "advisor",
                 "commands": [{
                     "name": "model-check",
@@ -575,6 +623,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Guarded",
+                "description": "test plugin: Guarded",
                 "slug": "guarded",
                 "hooks": {"PreToolUse": [{
                     "matcher": "write",
@@ -682,6 +731,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Notes",
+                "description": "test plugin: Notes",
                 "skills": [{"name": "Notes", "content": "x"}],
                 "mcp": {"notes": {"command": "npx"}}
             }),
@@ -691,6 +741,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Search",
+                "description": "test plugin: Search",
                 "skills": [{"name": "Search", "content": "x"}],
                 "mcp": {"search": {"command": "npx"}}
             }),
@@ -719,6 +770,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Notes",
+                "description": "test plugin: Notes",
                 "skills": [{"name": "Notes", "content": "x"}]
             }),
         )
@@ -727,6 +779,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Search",
+                "description": "test plugin: Search",
                 "skills": [{"name": "Search", "content": "y"}]
             }),
         )
@@ -751,6 +804,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Release Notes",
+                "description": "test plugin: Release Notes",
                 "description": "turns git log into notes",
                 "skills": [{
                     "name": "Release Notes",
@@ -816,13 +870,15 @@ mod tests {
     #[test]
     fn a_plugin_skill_can_be_located_and_read() {
         // A plugin's skills live in `<root>/plugins/<slug>/skills/`, not in the
-        // standalone store. `load_skill` used to read only the store, so every
+        // standalone store. `load_skill` used to read only the store (the loader is
+        // `load_plugin` now), so every
         // skill the catalog advertised from a plugin answered "skill not found".
         let root = temp_root("locate");
         create_plugin(
             &root,
             &json!({
                 "name": "Release Notes",
+                "description": "test plugin: Release Notes",
                 "skills": [{
                     "name": "Release Notes",
                     "content": "# steps\n\nread the log",
@@ -851,62 +907,6 @@ mod tests {
     }
 
     #[test]
-    fn install_lands_without_keyword_fields() {
-        // Skills are matched on their DESCRIPTIONS (like Claude Code), so an
-        // install must not grow a `fa_keywords` field anywhere: not on the
-        // bundle, not on a skill — whatever the marketplace row or an older
-        // manifest carried.
-        let src = temp_root("seed-src");
-        fs::create_dir_all(src.join("skills/sec"))
-            .unwrap();
-        fs::write(src.join("plugin.json"), r#"{"name":"Sentry Security","version":"1.0.0"}"#).unwrap();
-        fs::write(
-            src.join("skills/sec/SKILL.md"),
-            "---\nname: sec\ndescription: Automated API security auditing\nfa_keywords: مانیتورینگ\n---\n# sec\nBody.",
-        )
-        .unwrap();
-        let root = temp_root("seed-install");
-        let out = install_plugin(
-            &root,
-            &json!({
-                "repo": src.to_str().unwrap(),
-                "category": "xyzzynotknown",
-                "description": "Assorted utilities for folders",
-            }),
-        )
-        .unwrap();
-        assert!(
-            out["plugin"].get("fa_keywords").is_none(),
-            "the bundle view must not carry keywords, got {:?}",
-            out["plugin"].get("fa_keywords")
-        );
-        let manifest: Value = serde_json::from_str(
-            &fs::read_to_string(plugin_dir(&root, "sentry-security").join(MANIFEST)).unwrap(),
-        )
-        .unwrap();
-        assert!(
-            manifest.get("fa_keywords").is_none(),
-            "the manifest must not carry keywords"
-        );
-        let rows = enabled_plugin_skills(&root);
-        let skill = rows
-            .iter()
-            .find(|r| r["name"] == "sec")
-            .expect("the installed skill must be listed")
-            .clone();
-        assert!(
-            skill.get("fa_keywords").is_none(),
-            "the skill row must not carry keywords, got {:?}",
-            skill.get("fa_keywords")
-        );
-        // A REINSTALL must behave the same way.
-        let again = install_plugin(&root, &json!({"repo": src.to_str().unwrap()})).unwrap();
-        assert!(again["plugin"].get("fa_keywords").is_none());
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&src);
-    }
-
-    #[test]
     fn a_marketplace_skill_row_keeps_its_description() {
         // Reported: an installed skill showed a blank card line. The row's own
         // frontmatter has to survive the trip into a bundle at BOTH levels,
@@ -916,8 +916,7 @@ mod tests {
         fs::create_dir_all(src.join("writer")).unwrap();
         fs::write(
             src.join("writer/SKILL.md"),
-            "---\nname: Lex Writer\ndescription: Writes copy that sells\n\
-             fa_keywords: نویسندگی, متن تبلیغاتی\n---\n# writer\nBody.",
+            "---\nname: Lex Writer\ndescription: Writes copy that sells\n---\n# writer\nBody.",
         )
         .unwrap();
         let out = install_from_marketplace(
@@ -931,10 +930,6 @@ mod tests {
             manifest["description"],
             json!("Writes copy that sells"),
             "the bundle card must not be blank"
-        );
-        assert!(
-            manifest.get("fa_keywords").is_none(),
-            "the legacy frontmatter key must not be copied onto the bundle"
         );
         let dir = skill_dir_for(&root, "Lex Writer").unwrap();
         let md = fs::read_to_string(dir.join("skill.md")).unwrap();
@@ -1031,35 +1026,6 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_fa_line_is_tolerated_but_not_carried() {
-        // A skill.md written by an older build still carries `fa_keywords:` in
-        // its frontmatter. The parser ignores the key (no error, no crash) and
-        // nothing reads or rewrites it: the line stays inert until the next
-        // save regenerates the frontmatter without it.
-        let root = temp_root("legacy-fa-line");
-        let src = temp_root("legacy-fa-src");
-        fs::create_dir_all(src.join("writer")).unwrap();
-        fs::write(
-            src.join("writer/SKILL.md"),
-            "---\nname: Lex Writer\ndescription: Writes copy that sells\n\
-             fa_keywords: نویسندگی\n---\n# writer\nBody.",
-        )
-        .unwrap();
-        install_from_marketplace(
-            &root,
-            &json!({"kind": "skills", "repo": src.to_str().unwrap()}),
-        )
-        .unwrap();
-        let dir = skill_dir_for(&root, "Lex Writer").unwrap();
-        let md = fs::read_to_string(dir.join("skill.md")).unwrap();
-        let (name, _, desc) = crate::skills::parse_frontmatter_pub(&md);
-        assert_eq!(name, "Lex Writer");
-        assert_eq!(desc, "Writes copy that sells");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&src);
-    }
-
-    #[test]
     fn install_records_the_address() {
         // "Update from source" needs the ARGUMENTS, not a display string.
         // The install source is a plain folder, which `repo.rs` reads through
@@ -1091,65 +1057,91 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_plugin_by_hand_writes_no_keywords() {
-        // A bundle created by hand (from the chat or the agent's tool) must land
-        // without a `fa_keywords` field: matching runs off descriptions, so the
-        // manifest carries no trigger list at all.
-        let root = temp_root("create-keywords");
-        let created = create_plugin(
-            &root,
-            &json!({
-                "name": "Demo",
-                "skills": [{"name": "Demo", "content": "x"}]
-            }),
-        )
-        .unwrap();
-        assert!(created.get("fa_keywords").is_none());
-        let manifest: Value = serde_json::from_str(
-            &fs::read_to_string(plugin_dir(&root, "demo").join(MANIFEST)).unwrap(),
-        )
-        .unwrap();
-        assert!(manifest.get("fa_keywords").is_none());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn install_writes_no_keywords_on_skills_that_carry_none() {
-        // A bundle installed from a marketplace must land with no `fa_keywords`
-        // anywhere — on the bundle or on its skills — and a legacy key a repo's
-        // skill.md still carries must not be copied into the store either.
-        let src = temp_root("skill-seed-src");
-        fs::create_dir_all(src.join("skills/guard")).unwrap();
+    fn a_marketplace_row_keeps_its_own_name_across_reinstalls() {
+        // Five rows can share one source folder (anthropics/skills). The row's
+        // name is the bundle's identity: without it every row landed as the
+        // repo-named bundle, and "update from source" created a second copy.
+        let src = temp_root("row-name-src");
+        fs::create_dir_all(src.join("skills/alpha")).unwrap();
+        fs::write(src.join("plugin.json"), r#"{"name":"Repo Name"}"#).unwrap();
         fs::write(
-            src.join("plugin.json"),
-            r#"{"name":"Sentry Guard","version":"1.0.0"}"#,
+            src.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\n---\nbody",
         )
         .unwrap();
-        fs::write(
-            src.join("skills/guard/SKILL.md"),
-            "---\nname: guard\ndescription: Automated API security auditing and vulnerability scanning\n---\n# guard\nBody.",
-        )
-        .unwrap();
-        let root = temp_root("skill-seed");
-        install_plugin(
+        let root = temp_root("row-name-out");
+        let out = install_plugin(
             &root,
             &json!({
                 "repo": src.to_str().unwrap(),
-                "category": "security",
-                "description": "API security testing",
+                "name": "Row Name",
+                "slug": "row-name",
             }),
         )
         .unwrap();
-        let rows = enabled_plugin_skills(&root);
-        let skill = rows
+        assert_eq!(out["slug"], "row-name");
+        assert_eq!(out["plugin"]["name"], "Row Name");
+
+        let again = install_plugin(
+            &root,
+            &json!({
+                "repo": src.to_str().unwrap(),
+                "name": "Row Name",
+                "slug": "row-name",
+            }),
+        )
+        .unwrap();
+        assert_eq!(again["installed"], "updated");
+        assert_eq!(again["slug"], "row-name");
+        let folders: Vec<String> = fs::read_dir(plugins_dir(&root))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        assert_eq!(folders, ["row-name"], "a reinstall must not create a second bundle");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn install_honours_the_skill_folders_a_marketplace_row_publishes() {
+        // A row can point at a repo root and name only some of its skills
+        // (anthropics/skills publishes five rows from `./`). Installing the
+        // row must land that subset, not every skill in the repo.
+        let src = temp_root("row-skills-src");
+        fs::create_dir_all(src.join("skills/alpha")).unwrap();
+        fs::create_dir_all(src.join("skills/beta")).unwrap();
+        fs::create_dir_all(src.join("skills/gamma")).unwrap();
+        fs::write(src.join("plugin.json"), r#"{"name":"Demo"}"#).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            fs::write(
+                src.join(format!("skills/{name}/SKILL.md")),
+                format!("---\nname: {name}\ndescription: {name} skill\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let root = temp_root("row-skills-out");
+        let out = install_plugin(
+            &root,
+            &json!({
+                "repo": src.to_str().unwrap(),
+                "skills": ["./skills/alpha", "skills/gamma"],
+            }),
+        )
+        .unwrap();
+        let mut names: Vec<&str> = out["skills"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|r| r["name"] == "guard")
-            .expect("the installed skill must be listed")
-            .clone();
-        assert!(
-            skill.get("fa_keywords").is_none(),
-            "the skill row must not carry keywords, got {:?}",
-            skill.get("fa_keywords")
+            .filter_map(|s| s.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["alpha", "gamma"], "{out}");
+        // The selection is remembered, so "update from source" re-reads the
+        // same subset instead of adding `beta` on the next install.
+        assert_eq!(
+            out["plugin"]["source_skills"],
+            json!(["skills/alpha", "skills/gamma"])
         );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
@@ -1165,6 +1157,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Toolkit",
+                "description": "test plugin: Toolkit",
                 "scripts": [{"name": "Ping"}, {"name": "Probe", "language": "py"}]
             }),
         )
@@ -1181,7 +1174,8 @@ mod tests {
 
         assert!(create_plugin(
             &root,
-            &json!({"name": "Broken", "scripts": [{"name": "x", "language": "cobol"}]}),
+            &json!({"name": "Broken",
+                "description": "test plugin: Broken", "scripts": [{"name": "x", "language": "cobol"}]}),
         )
         .is_err());
         // The cap is a real ceiling rather than a silent truncation.
@@ -1206,6 +1200,7 @@ mod tests {
             &root,
             &json!({
                 "name": "Toolkit",
+                "description": "test plugin: Toolkit",
                 "scripts": [{
                     "name": "Greet",
                     "language": "bash",
@@ -1296,7 +1291,6 @@ mod tests {
             .find(|r| r["name"] == "fs")
             .expect("the connector row");
         assert_eq!(row["description"], "Filesystem access");
-        assert!(row.get("fa_keywords").is_none(), "{row}");
         assert!(row["cfg"].get("description").is_none(), "{row}");
 
         // Deleting from the page targets the same bundle.
@@ -1327,6 +1321,7 @@ mod tests {
 mod bundle;
 mod install;
 mod parts;
+mod toolbox;
 mod scripts;
 mod skills_connectors;
 mod store;
@@ -1352,6 +1347,7 @@ pub use scripts::run_plugin_script;
 pub use skills_connectors::*;
 #[allow(unused_imports)] // some items are only referenced under cfg(test)
 pub use store::*;
+pub use toolbox::*;
 #[allow(unused_imports)] // used by agent tests under cfg(test)
 pub(crate) use bundle::refresh_builtin_bundle_view;
 #[allow(unused_imports)] // used by agent tests under cfg(test)

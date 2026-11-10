@@ -29,6 +29,7 @@
 
 const {
   parseMarketplaceAddress,
+  parsePluginInstallSpec,
   findMarketplaces,
   marketKey,
 } = await import('../src/lib/plugins.ts')
@@ -163,6 +164,37 @@ console.log('4) duplicate addresses collapse and the install command is exact:')
     line,
   )
   check('the marketplace name is shown', line.includes('(One)'), line)
+}
+
+console.log("5) parsePluginInstallSpec reads Claude Code's plugin@marketplace spelling:")
+{
+  const scoped = parsePluginInstallSpec('prompts.chat@prompts.chat')
+  check(
+    'plugin and marketplace split at @',
+    scoped?.plugin === 'prompts.chat' && scoped?.marketplace === 'prompts.chat',
+    scoped,
+  )
+  check('owner/repo@ref stays a repo address', parsePluginInstallSpec('owner/repo@v1') === null)
+  check(
+    'an SSH address stays a repo address',
+    parsePluginInstallSpec('git@github.com:owner/repo') === null,
+  )
+  check(
+    'a marketplace URL after @ is allowed',
+    parsePluginInstallSpec('plug@https://github.com/f/prompts.chat')?.marketplace ===
+      'https://github.com/f/prompts.chat',
+  )
+  check('a bare name has no marketplace', parsePluginInstallSpec('eurusd') === null)
+  check(
+    'an empty half is rejected',
+    parsePluginInstallSpec('@market') === null && parsePluginInstallSpec('plug@') === null,
+  )
+
+  const markets = [{ repo: 'f/prompts.chat', kind: 'plugins' }]
+  check(
+    "a repo's last segment finds the marketplace saved as owner/repo",
+    findMarketplaces(markets, 'prompts.chat').length === 1,
+  )
 }
 
 if (failed > 0) {

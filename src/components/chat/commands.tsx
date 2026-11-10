@@ -50,12 +50,13 @@ export function describeScheduleFlags(flags: ScheduleFlags): string {
   return flags.plugins.length ? `plugins=[${flags.plugins.join(", ")}]` : "";
 }
 
-/** True when a message asks to create/edit/install/import skills or MCP connectors,
- *  so the agent gets the `create_skill` / `create_mcp` tools for the turn.
+/** True when a message asks to create/edit/install/import skills or MCP
+ *  connectors, so the authoring actions of the ONE `plugin` tool are granted
+ *  for the turn (skills and connectors are authored inside a plugin now).
  *  Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
  *  action; اسکیل/مهارت → skill target) so Persian-only prompts work too.
- *  `create_skill` overwrites an existing skill with the same name, so the same
- *  grant covers both creating AND editing a skill. */
+ *  A plugin `create`/`update` replaces parts by name, so the same grant covers
+ *  both creating AND editing. */
 export function wantsSkillOrMcp(text: string): boolean {
   const low = text.toLowerCase();
   const action =

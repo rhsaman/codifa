@@ -48,6 +48,7 @@ console.log('1) دو explore موازی → دو کارت مستقل، هر کد
       tool: 'explore',
       status: 'running',
       args: { description: 'Find the auth flow', prompt: 'where is login handled' },
+      narration: 'Reading src/auth.ts\nNow tracing the login handler',
     },
     {
       tool: 'explore',
@@ -81,6 +82,11 @@ console.log('1) دو explore موازی → دو کارت مستقل، هر کد
     'هدر کارت دوم توضیح خودش را دارد',
     text.includes('Map the settings store'),
     text.slice(0, 300),
+  )
+  check(
+    'آخرین جملهٔ ساب‌ایجنت در کارت دیده می‌شود',
+    text.includes('Now tracing the login handler'),
+    text.slice(0, 400),
   )
   check(
     'دو پیل جدا (نه یک ×2)',

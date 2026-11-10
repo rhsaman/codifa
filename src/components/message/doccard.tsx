@@ -3,6 +3,7 @@ import { detectDir, isMostlyRtlText, prepareContent } from '../../lib/bidi'
 import { copyToClipboard } from '../../lib/clipboard'
 import { getHighlightedLines } from '../../lib/highlight'
 import { resolveLocalMedia } from '../../lib/mediaUrl'
+import { useStore } from '../../lib/store'
 import { useViewerTabs } from '../../lib/viewerTabs'
 import { ChartBlock } from '../ChartBlock'
 import { FileChip, FileIcon, openWorkspaceFile } from '../FileIcon'
@@ -11,8 +12,12 @@ import { ReactNode, lazy, memo, useMemo, useRef, useState } from 'react'
 
 export function PlanDocCard({
   planDoc,
+  messageId,
 }: {
   planDoc: { title: string; body: string };
+  /** Owning message: the card's plan belongs to ITS chat, which is not always
+   *  the focused chat (several chat windows can be open at once). */
+  messageId?: string;
 }) {
   const [copied, setCopied] = useState(false);
   // Direction follows the plan body's own language (see detectDir).
@@ -29,6 +34,17 @@ export function PlanDocCard({
     const clipped = text.length > 600 ? `${text.slice(0, 600).trimEnd()}…` : text;
     return prepareContent(clipped);
   }, [planDoc.body]);
+  const openFullPlan = () => {
+    const st = useStore.getState();
+    // The plan belongs to the message's OWN chat. The window's focus handler
+    // runs AFTER this click, so without resolving the owner first a card in a
+    // background chat window opened the already-focused chat's plan.
+    const owner = messageId
+      ? st.chats.find((c) => c.messages.some((m) => m.id === messageId))
+      : undefined;
+    if (owner && st.activeChatId !== owner.id) st.focusWindow(owner.id);
+    useViewerTabs.getState().openPlan(owner?.id);
+  };
   return (
     <div className="plan-doc-card" dir={appDir}>
       <div className="plan-doc-head">
@@ -97,7 +113,7 @@ export function PlanDocCard({
       <button
         type="button"
         className="plan-doc-open"
-        onClick={() => useViewerTabs.getState().openPlan()}
+        onClick={openFullPlan}
       >
         View full plan
         <svg

@@ -246,9 +246,45 @@ fn fold_block_scalars(block: &str) -> String {
     out.join("\n")
 }
 
+/// Optional match keywords declared in a skill's frontmatter.
+///
+/// `keywords:` and `triggers:` are accepted so a skill can name its own trigger
+/// words in ANY language. They are used ONLY by automatic matching
+/// ([`crate::skill_router::auto_match_hint`]); they are not shown in the UI and
+/// never replace the description as the catalog trigger.
+fn parse_match_keywords(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(rest) = raw.strip_prefix("---") else {
+        return out;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return out;
+    };
+    for line in fold_block_scalars(&rest[..end]).lines() {
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(
+            key.trim().to_lowercase().as_str(),
+            "keywords" | "triggers"
+        ) {
+            continue;
+        }
+        let val = val.trim();
+        let val = val.trim_start_matches('[').trim_end_matches(']');
+        for part in val.split([',', '،', '|', ';']) {
+            let part = part.trim().trim_matches('"').trim_matches('\'').trim();
+            if !part.is_empty() && !out.iter().any(|k| k.eq_ignore_ascii_case(part)) {
+                out.push(part.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Parse `name`, `slug`, `description` from skill.md frontmatter. Any other
-/// key — including a `fa_keywords:` line left over in files written by older
-/// builds — is silently ignored.
+/// key is silently ignored here; [`parse_match_keywords`] reads `keywords:` and
+/// `triggers:` separately for automatic matching.
 fn parse_frontmatter(raw: &str) -> (String, String, String) {
     let mut name = String::new();
     let mut slug = String::new();
@@ -389,6 +425,7 @@ pub fn list_skills(root: &Path) -> Value {
         if name.is_empty() {
             continue;
         }
+        let match_keywords = parse_match_keywords(&raw);
         // Strip the frontmatter block from the body (mirror of list_skills).
         let content = if raw.starts_with("---") {
             raw.find("\n---")
@@ -422,6 +459,7 @@ pub fn list_skills(root: &Path) -> Value {
             "path": md.to_string_lossy(),
             "content": content,
             "files": files,
+            "match_keywords": match_keywords,
         }));
     }
     // Mirror the Python layer's ordering (name asc) and key order (name first)
@@ -432,9 +470,9 @@ pub fn list_skills(root: &Path) -> Value {
 
 /// Read one extra file of an ALREADY RESOLVED skill folder.
 ///
-/// Split out of `read_skill_file` because a skill's folder is not always under
-/// `<root>/skills`: a plugin's skills live in `<root>/plugins/<slug>/skills/`,
-/// and the caller has to locate the plugin before it can read a file of it.
+/// A skill's folder is not always under `<root>/skills`: a plugin's skills live
+/// in `<root>/plugins/<slug>/skills/`, so the caller locates the plugin (or the
+/// skill's folder) first and then reads a file of it.
 pub fn read_extra_file(dir: &Path, name: &str, file: &str) -> Result<Value, String> {
     let Some(safe) = sanitize_extra_filename(file) else {
         return Err("invalid file name".into());
@@ -443,14 +481,6 @@ pub fn read_extra_file(dir: &Path, name: &str, file: &str) -> Result<Value, Stri
         Ok(content) => Ok(json!({ "name": name, "file": safe, "content": content })),
         Err(_) => Err(format!("file not found: {safe}")),
     }
-}
-
-/// GET /skills/file?name=...&file=...
-pub fn read_skill_file(root: &Path, name: &str, file: &str) -> Result<Value, String> {
-    let Some(dir) = find_skill_dir(root, name) else {
-        return Err(format!("skill not found: {name}"));
-    };
-    read_extra_file(&dir, name, file)
 }
 
 /// POST /skills/sync — create/update/delete a skill (mirror of persist_skill).
@@ -487,7 +517,7 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     // NOT validated here: an empty body means "keep the stored one" (see the
     // preservation block below), and whether there IS a stored body is only
     // known once the folder is resolved. Validating here is what made
-    // `create_skill` reject a delete or an extra-file-only save.
+    // `plugin action=create` reject a delete or an extra-file-only save.
     let mut description = body["description"].as_str().unwrap_or("").trim().to_string();
     let slug = skill_slug(&name);
 
@@ -542,7 +572,7 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
         // NOTHING came in: keep the stored text (minus its own stack) — a
         // caller that only adds/removes an extra file, renames, or edits the
         // frontmatter must not have to resend the whole markdown (the model
-        // routinely calls `create_skill` exactly that way). Creating a NEW
+        // routinely calls `plugin action=create` exactly that way). Creating a NEW
         // skill still requires a body, so an empty store plus an empty body is
         // an error, never an empty skill.md.
         let stored = strip_frontmatter(&existing_raw).trim().to_string();
@@ -830,31 +860,6 @@ fn write_marker(dir: &Path, origin: &str, shipped_fp: &str, file_hash: &str) {
     );
 }
 
-/// Mark a skill folder as "the user (or the model on their behalf) owns this
-/// file": the seeder will never overwrite it again.
-///
-/// Called by `create_skill` after a successful write, because a skill the model
-/// edited is the user's text too — otherwise the NEXT shipped update would
-/// silently discard that edit.
-pub fn mark_user_edit(dir: &Path) {
-    let prev = read_marker(dir).map(|m| m.shipped_fp).unwrap_or_default();
-    let md = fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
-    write_marker(dir, "user", &prev, &sha1_hex(md.as_bytes()));
-}
-
-/// Who owns this skill file, according to the `.shipped` marker:
-/// `Some("user")`, `Some("seeded")`, or `None` when there is no marker (a skill
-/// seeded by an older build).
-///
-/// `cfg(test)` on purpose: the ownership claim itself happens through
-/// `mark_user_edit`, so the only reader is a test asserting that the seeder will
-/// leave a model-written skill alone. Compiled only for tests, it cannot drift
-/// into a production path that reads provenance it does not act on.
-#[cfg(test)]
-pub fn marker_origin(dir: &Path) -> Option<String> {
-    read_marker(dir).map(|m| m.origin)
-}
-
 /// `true` when the marker PROVES the app seeded this copy (`origin == "seeded"`).
 ///
 /// The rename cleanup deletes on this, not on "not user-owned": an UNMARKED
@@ -1057,6 +1062,32 @@ mod tests {
     }
 
     #[test]
+    fn match_keywords_read_both_comma_styles() {
+        // A Persian list often uses the Arabic comma; treating the whole list
+        // as one phrase would either bloat it past the prose guard or match on
+        // the wrong words.
+        let raw = "---\nname: Test\ndescription: d\nkeywords: live test UI، تست لایو, renderer harness\ntriggers: تست فرانت\n---\nbody";
+        assert_eq!(
+            parse_match_keywords(raw),
+            vec!["live test UI", "تست لایو", "renderer harness", "تست فرانت"]
+        );
+    }
+
+    #[test]
+    fn shipped_test_ui_declares_the_live_test_keywords() {
+        // The built-in harness is named in English, so its Persian trigger
+        // words are what let a request like "تست لایو از پنل" find it without
+        // an @mention. A future edit must not silently drop them.
+        let keys = parse_match_keywords(include_str!("../skills/test-ui.md"));
+        for expected in ["تست لایو", "تست UI", "تست فرانت", "live test UI"] {
+            assert!(
+                keys.iter().any(|k| k.as_str() == expected),
+                "missing {expected:?} in {keys:?}"
+            );
+        }
+    }
+
+    #[test]
     fn safe_file_matches_python() {
         assert_eq!(safe_file("my skill.md", "skill"), "my-skill.md");
         assert_eq!(safe_file("..", "item"), "item");
@@ -1064,17 +1095,16 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_parses_like_python_and_ignores_legacy_fa() {
-        let raw = "---\nname: Test\nslug: test\ndescription: d\nfa_keywords: a, b\n---\n\n# Test\nbody";
+    fn frontmatter_parses_like_python_and_ignores_unknown_keys() {
+        let raw = "---\nname: Test\nslug: test\ndescription: d\nlegacy_field: a, b\n---\n\n# Test\nbody";
         let (name, slug, desc) = parse_frontmatter(raw);
         assert_eq!(name, "Test");
         assert_eq!(slug, "test");
         assert_eq!(desc, "d");
-        // A `fa_keywords:` line left over from an older build is an unknown key:
-        // silently ignored, never an error.
+        // An unknown key is ignored silently, never an error.
         assert!(
             parse_frontmatter(raw).0 == "Test",
-            "the legacy key must not break parsing"
+            "an unknown key must not break parsing"
         );
         // Heading fallback when frontmatter is absent.
         let (name2, _, _) = parse_frontmatter("# Only heading\nbody");
@@ -1331,7 +1361,6 @@ mod tests {
         // The card renders the bundle's own description, so the fold
         // has to lift it up from the skills it holds.
         assert!(!bundle["description"].as_str().unwrap_or("").is_empty());
-        assert!(bundle.get("fa_keywords").is_none());
 
         // Both are still reachable: the catalog reads the bundle's skills.
         let listed = catalog(&store);
@@ -1445,7 +1474,6 @@ mod tests {
         assert_eq!(first, vec!["Movie Finder".to_string()]);
         let listed = catalog(&store);
         assert_eq!(listed["skills"][0]["name"], "Movie Finder");
-        assert!(listed["skills"][0].get("fa_keywords").is_none());
 
         // Second run is a no-op: the stored copy already matches the shipped one.
         assert!(seed_builtin_skills(&store, &shipped).is_empty());
@@ -1649,26 +1677,6 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// The sync reply no longer reports a keyword count: skills are matched on
-    /// their description, so there is nothing to count.
-    #[test]
-    fn sync_skill_reply_has_no_keyword_count() {
-        let tmp = std::env::temp_dir().join(format!("codifa-kwcount-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        let store = tmp.join("store");
-        let reply = sync_skill(
-            &store,
-            &json!({
-                "name": "With Kws",
-                "description": "d",
-                "content": "c",
-            }),
-        )
-        .expect("write");
-        assert!(reply.get("fa_keyword_count").is_none(), "{reply}");
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
     /// A skill seeded by an older build (no marker) is adopted: a later shipped
     /// change must still overwrite it, because the user never touched it.
     #[test]
@@ -1704,10 +1712,10 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// `create_skill` (the model-side writer) marks the folder as user-owned so
-    /// a later shipped update cannot revert an edit the model just made.
+    /// A model-written skill is the user's text: the seeder's hash check sees
+    /// that the stored bytes are not the ones it wrote and never overwrites them.
     #[test]
-    fn mark_user_edit_protects_a_model_written_skill() {
+    fn a_model_written_skill_survives_a_shipped_update() {
         let tmp = std::env::temp_dir().join(format!("codifa-usermark-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let store = tmp.join("store");
@@ -1718,7 +1726,7 @@ mod tests {
         seed_builtin_skills(&store, &shipped);
 
         // The model rewrites the shipped skill on the user's behalf, exactly as
-        // the `create_skill` dispatch does.
+        // the plugin authoring dispatch does.
         sync_skill(
             &store,
             &json!({
@@ -1728,8 +1736,6 @@ mod tests {
             }),
         )
         .expect("write");
-        let dir = find_skill_dir(&store, "Movie Finder").expect("dir");
-        mark_user_edit(&dir);
 
         // Even an upstream rewrite must not clobber it.
         fs::write(

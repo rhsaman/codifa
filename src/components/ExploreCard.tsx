@@ -1,15 +1,17 @@
 import type { ToolActivity } from "../types";
+import { useStore } from "../lib/store";
+import { latestNarrationLine } from "../lib/toolActivity";
 import { useViewerTabs } from "../lib/viewerTabs";
-import { StatusIcon, toolLabel, useRunningClock } from "./ToolCallView";
+import { StatusIcon, subagentDisplayName, toolLabel, useRunningClock } from "./ToolCallView";
 
-/** Short label of an explore (sub-agent) run: the model's own description when
- *  it supplied one, else the run summary, else a plain "Explore". */
-export function exploreTitle(activity: ToolActivity): string {
+/** Short label of a sub-agent run: the model's own description when it supplied
+ *  one, else the run summary, else the sub-agent's own name. */
+export function exploreTitle(activity: ToolActivity, fallback = "Explore"): string {
   const args = (activity.args ?? {}) as Record<string, unknown>;
   const desc = typeof args.description === "string" ? args.description.trim() : "";
   const summary = typeof activity.summary === "string" ? activity.summary.trim() : "";
   const first = (desc || summary).split("\n")[0] ?? "";
-  return first.length > 120 ? `${first.slice(0, 120)}…` : first || "Explore";
+  return first.length > 120 ? `${first.slice(0, 120)}…` : first || fallback;
 }
 
 /** One tally entry: how many times a tool ran inside an explore run. */
@@ -114,10 +116,13 @@ export function ExploreCard({
   const now = useRunningClock(running);
   const ms =
     running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs;
-  const title = exploreTitle(activity);
+  const subagentRows = useStore((s) => s.customSubagents);
+  const agentName = subagentDisplayName(activity.tool, subagentRows);
+  const title = exploreTitle(activity, agentName);
   const counts = exploreToolCounts(activity);
   const total = exploreCallTotal(activity);
   const state = statusLabel(activity.status);
+  const narration = latestNarrationLine(activity);
 
   return (
     <div className={`tool-card explore ${activity.status}${running ? " running" : ""}`}>
@@ -139,7 +144,7 @@ export function ExploreCard({
           >
             <StatusIcon status={activity.status} />
           </span>
-          <span className="trace-pill trace-pill-sub">Explore</span>
+          <span className="trace-pill trace-pill-sub">{agentName}</span>
           <span className="trace-head-desc" dir="auto" title={title}>
             {title}
           </span>
@@ -162,6 +167,18 @@ export function ExploreCard({
                 <span className="explore-tool-n">{`×${c.count}`}</span>
               </span>
             ))}
+          </div>
+        )}
+        {narration && (
+          <div
+            className="explore-narration"
+            dir="auto"
+            title={narration.length > 300 ? `${narration.slice(0, 300)}…` : narration}
+          >
+            <span className="explore-narration-mark" aria-hidden="true">
+              “
+            </span>
+            <span className="explore-narration-line">{narration}</span>
           </div>
         )}
       </div>

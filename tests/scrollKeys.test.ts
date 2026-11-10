@@ -3,7 +3,7 @@
 // The viewer and the git diff hand these letters to a scroll container instead
 // of the caret, so the interesting behaviour is the direction mapping and the
 // guard that keeps typing (and other panes) intact.
-import { SCROLL_FAST_MULTIPLIER, SCROLL_STEP_PX, canScrollFrom, scrollDelta } from '../src/lib/scrollKeys'
+import { SCROLL_FAST_MULTIPLIER, SCROLL_STEP_PX, canScrollFrom, edgeDelta, halfPageDelta, scrollDelta } from '../src/lib/scrollKeys'
 
 export {}
 let failures = 0
@@ -40,7 +40,32 @@ console.log('3) scrollDelta — Shift is the fast (coarse) step:')
   check('fast keeps the axis', scrollDelta('j', true)?.dx === 0)
 }
 
-console.log('4) canScrollFrom — only a target inside the pane may scroll it:')
+console.log('4) halfPageDelta — Ctrl+D / Ctrl+U move half a viewport:')
+{
+  check('down is half the height', JSON.stringify(halfPageDelta('down', 800)) === JSON.stringify({ dx: 0, dy: 400 }))
+  check('up is negative', JSON.stringify(halfPageDelta('up', 800)) === JSON.stringify({ dx: 0, dy: -400 }))
+  check('an odd height rounds', halfPageDelta('down', 733)?.dy === 367)
+  check('a tiny viewport still moves a pixel', halfPageDelta('down', 1)?.dy === 1)
+  check('no horizontal component', halfPageDelta('down', 800)?.dx === 0)
+}
+
+console.log('5) edgeDelta — gg pins the top, G the bottom:')
+{
+  const view = { scrollTop: 240, scrollHeight: 2000, clientHeight: 600 }
+  check('gg scrolls up by the current offset', edgeDelta('top', view)?.dy === -240)
+  check('G scrolls to the last page', edgeDelta('bottom', view)?.dy === 1160)
+  check(
+    'G at the bottom is a no-op (never negative)',
+    edgeDelta('bottom', { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 })?.dy === 0,
+  )
+  check(
+    'gg at the top is a no-op',
+    edgeDelta('top', { scrollTop: 0, scrollHeight: 2000, clientHeight: 600 })?.dy === 0,
+  )
+  check('edge jumps have no horizontal component', edgeDelta('bottom', view)?.dx === 0)
+}
+
+console.log('6) canScrollFrom — only a target inside the pane may scroll it:')
 {
   // Minimal stand-ins: the function only uses `closest` and `contains`.
   const makeEl = (opts: { editable?: boolean; inside?: boolean }): Element =>

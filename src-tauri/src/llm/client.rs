@@ -161,7 +161,7 @@ pub fn gemini_native_api(base: &str) -> String {
 ///
 /// Chat streams through this endpoint instead of the native
 /// `streamGenerateContent` shape. The native body has no `tools` field in this
-/// client, while the system prompt tells the model to call `load_skill`,
+/// client, while the system prompt tells the model to call `load_plugin`,
 /// `use_mcp`, `read`, … — so Gemini tried to emit function calls nobody had
 /// declared and ended the turn with `finishReason: MALFORMED_FUNCTION_CALL`.
 /// Google's compat endpoint takes the SAME OpenAI messages/tools this agent

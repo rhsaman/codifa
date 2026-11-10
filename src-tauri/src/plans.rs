@@ -281,6 +281,20 @@ pub fn has_heading(text: &str) -> bool {
     text.lines().any(|l| l.trim_start().starts_with('#'))
 }
 
+/// Whether a title or heading names a plan (English or Persian).
+///
+/// The same rule decides two things: a plan-mode artifact whose title/heading
+/// names a plan IS the plan (not a supporting document), and such a document
+/// must stay off the Artifacts page — it belongs to the Plan tab.
+pub fn looks_like_plan_name(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| matches!(w, "plan" | "plans" | "planning"))
+        || text.contains("پلن")
+        || text.contains("طرح")
+}
+
 /// Build the plan DOCUMENT out of the prose a plan-mode turn produced, round by
 /// round, in order.
 ///

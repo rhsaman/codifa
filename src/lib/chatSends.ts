@@ -21,7 +21,11 @@ type SendFn = (
   reuseMsgId?: string,
   continueAssistantId?: string,
   forceScroll?: boolean,
-  overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[] },
+  overrides?: {
+    mcpServers?: Record<string, McpServerConfig>
+    skills?: string[]
+    plugins?: string[]
+  },
 ) => void
 
 const registry = new Map<string, SendFn>()
@@ -68,6 +72,7 @@ export function sendQueuedNext(chatId: string): boolean {
   fn(next.text, next.attachments ?? [], next.images ?? [], undefined, undefined, undefined, undefined, {
     mcpServers: next.mcpServers,
     skills: next.skills,
+    plugins: next.plugins,
   })
   return true
 }
@@ -93,6 +98,7 @@ export function sendPendingSteerNext(chatId: string): boolean {
     {
       mcpServers: pending.mcpServers,
       skills: pending.skills,
+      plugins: pending.plugins,
     },
   )
   return true

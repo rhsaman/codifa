@@ -12,7 +12,7 @@
  * the letter types into nowhere.
  */
 import { useEffect } from 'react'
-import { applyScroll, scrollDelta } from './scrollKeys'
+import { applyScroll, edgeDelta, halfPageDelta, scrollDelta, type ScrollDelta } from './scrollKeys'
 import { physicalKey } from './shortcuts'
 import { isPrefixArmed, watchPrefixFlag } from './prefixState'
 import {
@@ -88,10 +88,21 @@ export function useVimScroll(
     // Announce this pane so panePointer knows which panes exist; an intent
     // (a click on it, or a programmatic mark) then hands the keys over.
     registerVimRegion(intent)
+    // `gg` is two strokes: the first arms this timestamp, the second within
+    // Neovim's timeout jumps to the top. Any other key disarms it.
+    let gAt = 0
+    const GG_TIMEOUT_MS = 800
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return
       if (isPrefixArmed()) return
-      if (e.ctrlKey || e.metaKey || e.altKey) return
+      if (e.altKey || e.shiftKey && (e.ctrlKey || e.metaKey)) return
+      const key = physicalKey(e)
+      const mod = (e.ctrlKey || e.metaKey) && !e.shiftKey
+      // Ctrl/Cmd+D and Ctrl/Cmd+U are half-page scrolls (Neovim). Every OTHER
+      // modified chord belongs to the app, not to a scroll pane.
+      const halfDown = mod && key === 'd'
+      const halfUp = mod && key === 'u'
+      if ((e.ctrlKey || e.metaKey) && !halfDown && !halfUp) return
       // Only the pane the user is working in may take the letters — judged
       // by panePointer's intent race (last click vs typing), because the
       // keydown target in WebKit is the STALE input the caret never left.
@@ -102,28 +113,49 @@ export function useVimScroll(
       // steal `j`/`k` from the composer the caret is actually sitting in.
       if (isEditableTarget(e.target as Node | null)) return
       if (decideVimOwner(snapshotIntent(), intent, e.target as Node | null) !== 'scroll') return
-      const delta = scrollDelta(physicalKey(e), e.shiftKey)
-      if (!delta) return
       const target = e.target instanceof Element && root.contains(e.target) ? (e.target as HTMLElement) : root
       const el = document.activeElement as HTMLElement | null
       const focusInside = !!el && el !== document.body && el !== document.documentElement && root.contains(el)
       const host = scrollableHost(focusInside && el ? el : target, root)
       if (!host) return
-      // Bare press only: consume it so nothing else (caret movement, the
-      // chat list) also reacts.
-      e.preventDefault()
-      e.stopPropagation()
+      // One path for every command: claim the key, scroll, and tell consumers
+      // (the transcript's stick-to-bottom releases its pin on this event).
+      const run = (delta: ScrollDelta, smooth: boolean) => {
+        e.preventDefault()
+        e.stopPropagation()
+        if (!delta.dx && !delta.dy) return
+        if (applyScroll(host, delta, smooth)) {
+          window.dispatchEvent(new CustomEvent('coder:vim-scroll', { detail: host }))
+        }
+      }
+      const plain = !e.ctrlKey && !e.metaKey && !e.altKey
+      if (plain && !e.shiftKey && key === 'g') {
+        const now = Date.now()
+        if (now - gAt <= GG_TIMEOUT_MS) {
+          gAt = 0
+          run(edgeDelta('top', host), false)
+          return
+        }
+        // First `g`: arm and swallow it (nothing else uses a bare g).
+        gAt = now
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
+      gAt = 0
+      if (plain && e.shiftKey && key === 'g') {
+        run(edgeDelta('bottom', host), false)
+        return
+      }
+      if (halfDown || halfUp) {
+        run(halfPageDelta(halfDown ? 'down' : 'up', host.clientHeight), !e.repeat)
+        return
+      }
+      const delta = scrollDelta(key, e.shiftKey)
+      if (!delta) return
       // Single taps glide (smooth); held-key auto-repeat steps instantly so
       // holding `j` stays snappy instead of lagging behind its own glide.
-      const moved = applyScroll(host, delta, !e.repeat)
-      if (moved) {
-        // The user scrolled with the keyboard — let scroll consumers know, so
-        // behaviours like the transcript's stick-to-bottom (which snaps the
-        // viewport back on every content resize) release the pin. A glide
-        // spans several frames, so this fires once per KEYPRESS, before the
-        // first frame moves.
-        window.dispatchEvent(new CustomEvent('coder:vim-scroll', { detail: host }))
-      }
+      run(delta, !e.repeat)
     }
     document.addEventListener('keydown', onKey, true)
     return () => {

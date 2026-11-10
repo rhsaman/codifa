@@ -1,23 +1,20 @@
 use super::*;
 
-/// The explore sub-agent's round budget is `SUBAGENT_MAX_STEPS`; the MAIN agent
-/// has no round cap at all.
+/// Neither the main agent nor a sub-agent has a round cap.
 ///
 /// A capped main turn was cut mid-work with `finish_reason: tool_calls` on every
 /// round — no final answer and no "what is done / what remains" — so the user's
 /// follow-up message paid another full-context round-trip just to continue the
-/// same task, and the work was left half-finished. The main loop is bounded by
-/// the model itself (it stops calling tools), by the Stop button, and by the
-/// history fold/compaction that keeps the prompt inside the context window —
-/// never by an arbitrary round count.
-/// Main-agent wrap-up: how many steps before a step cap the wrap-up nudge
-/// lands (once). Traced Oct 29: three of twenty runs ran into a cap and were
-/// cut with `finish_reason: tool_calls` on every round — no final answer, no
-/// "what is done / what remains", and the user's follow-up message paid another
-/// full-context round-trip just to continue. The explore sub-agent already
-/// gets the same treatment (its two budget nudges), and the wording asks for a
-/// clean stop, not for quality to be traded away: finish what is in flight,
-/// never start new work, and report.
+/// same task, and the work was left half-finished. The same happened to browser
+/// sub-agents on a 12-step cap. Both loops are bounded by the model itself (it
+/// stops calling tools), by the Stop button, and by the history fold/compaction
+/// that keeps the prompt inside the context window — never by an arbitrary
+/// round count. Do not reintroduce a sub-agent step budget.
+///
+/// `MAIN_WRAPUP_STEPS_LEFT` is the wrap-up distance for a CAPPED loop (the
+/// helper is still unit-tested with a finite cap). An uncapped turn passes
+/// `usize::MAX`, so the nudge never fires and cannot ask a working agent to
+/// stop early.
 pub(super) const MAIN_WRAPUP_STEPS_LEFT: usize = 5;
 /// Mid-turn auto-compaction: how many times ONE turn may fold its history.
 /// A single turn can run MAX_STEPS tool calls, so a fold has to be possible
@@ -109,19 +106,16 @@ pub(super) const COMPACT_MAX_OUTPUT: usize = 4096;
 /// `compact::compact_history` additionally caps the TOTAL across all attempts
 /// (`COMPACT_TOTAL_BUDGET_SECS`), so this per-attempt value can stay short.
 pub(super) const COMPACT_TIMEOUT_SECS: u64 = 90;
-/// The explore sub-agent must answer in seconds, not minutes — a much smaller
-/// step budget than the main agent's, with a forced final report (below).
-pub(super) const SUBAGENT_MAX_STEPS: usize = 12;
-
-/// The step budget the explore prompt itself promises ("a fixed 3-step
-/// budget"). The model overshoots it: in the last traced corpus 45 of 63
-/// explore runs entered round 4, and those rounds alone cost 853_902 of the
-/// 1_758_022 uncached explore tokens (48.6%) — every one of them re-sending a
-/// conversation that was already large. The near-exhaustion nudge below only
-/// fires at step 9 of 12, far too late to change the shape of a run, so the
-/// reminder has to land where the promised budget actually runs out.
-pub(super) const EXPLORE_BUDGET_STEPS: usize = 3;
-/// How many times ONE explore sub-agent may be attempted before the parent
+// Sub-agents run WITHOUT a step cap, exactly like the main agent.
+//
+// A hard `SUBAGENT_MAX_STEPS` (12) cut traced browser runs off mid-list: the
+// child was still opening the posts it had been asked to read, and the parent
+// received `[Tool budget exhausted]` plus raw tool dumps instead of an answer.
+// "Finish the work you started" beats a token target: a half-finished report
+// forces the parent to re-delegate the same question and pay twice. The idle
+// guard and the attempt ladder still bound a WEDGED provider; a healthy run is
+// allowed to finish. Do not reintroduce a step budget here.
+/// How many times ONE sub-agent may be attempted before the parent
 /// gives up on it.
 ///
 /// Deliberately the SAME ladder as the main agent (10 attempts, 10s apart —
@@ -141,11 +135,11 @@ pub(super) const EXPLORE_BUDGET_STEPS: usize = 3;
 pub(super) const SUBAGENT_RUNG_ATTEMPTS: usize = 1;
 
 pub(super) const SUBAGENT_MAX_ATTEMPTS: usize = 10;
-/// Fixed backoff between explore attempts — mirrors the main agent's fixed
+/// Fixed backoff between sub-agent attempts — mirrors the main agent's fixed
 /// 10s cadence (RECONNECT_DELAY_MS in api.ts). The ATTEMPT COUNT, not a clock,
-/// is what ends the ladder. Each attempt is still bounded by the model call
-/// itself, never by a wall-clock timer: a slow but healthy provider is NOT a
-/// failure.
+/// is what ends the ladder. An attempt that is slow but healthy is never cut by
+/// this timer; it is bounded by its own wall-clock window
+/// (`subagent_budget_secs`, which still ends with a written report).
 pub(super) const SUBAGENT_RETRY_BACKOFF_MS: u64 = 10_000;
 /// How long ONE sub-agent attempt may stay COMPLETELY silent — not a single
 /// event from its own run (no tool call, no text, no usage) — before it is
@@ -184,6 +178,55 @@ pub(super) fn subagent_idle_secs() -> u64 {
 /// to the next fallback model. The LSP heartbeat still extends a cold start up
 /// to the hard ceiling (idle + 120s).
 pub(super) const SUBAGENT_ATTEMPT_IDLE_SECS: u64 = 120;
+
+/// Wall-clock budget for one sub-agent attempt: `(soft, hard)` seconds.
+///
+/// A sub-agent exists to make the MAIN agent faster. The idle guard only
+/// catches SILENCE, so the traced desktop run stayed alive for 1_851 s while
+/// continuously producing events (56× `command+tab`, 165 LLM calls): busy, but
+/// making no progress. The attempt is therefore also bounded in WALL time:
+///
+///   * at `soft` the child is told to stop exploring and write its report —
+///     one short nudge, then it keeps whatever time it needs;
+///   * at `hard` the loop breaks and the existing end-of-turn path asks the
+///     model for a final report with tools disabled, so the parent still gets
+///     the evidence gathered instead of a dead card.
+///
+/// The budget is per KIND, because desktop/browser work is inherently slower
+/// than a code lookup. The soft/hard pair keeps a legitimate long run possible
+/// while guaranteeing the parent is not blocked indefinitely. A hard step cap
+/// is still NOT reintroduced: the counter here is time, and a model that is
+/// genuinely making progress gets its full window.
+///
+/// `CODIFA_SUBAGENT_BUDGET_SECS` overrides the HARD budget for every kind
+/// (tests and slow machines); the soft budget follows at 60% of it.
+pub(super) fn subagent_budget_secs(kind: &str) -> (u64, u64) {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_hard = *OVERRIDE.get_or_init(|| {
+        std::env::var("CODIFA_SUBAGENT_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    });
+    let hard = override_hard.unwrap_or(match kind {
+        // GUI work: one click plus a screenshot can take seconds, and a
+        // multi-step flow is normal. Still bounded well below the traced
+        // 30-minute run.
+        "computer" => 480,
+        // Browser work in the traced corpus had p50 116s / p90 240s, with ONE
+        // legitimate 74-tool collection run at 546s. The soft nudge lands at
+        // 360s (it can still finish), and the hard mark sits above the longest
+        // healthy run — a cut at 360s would have thrown that collection away
+        // and forced the parent to delegate it again.
+        "browser" => 600,
+        // Research: a broad question over a big tree needs a few minutes.
+        "research" | "explore" => 330,
+        // A bundle/custom profile may do real work (build, test, export).
+        _ => 420,
+    });
+    let soft = (hard * 3 / 5).max(30).min(hard);
+    (soft, hard)
+}
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 pub(super) const TOOL_RESULT_CAP: usize = 4000;
 

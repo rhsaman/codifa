@@ -1,5 +1,5 @@
 import { listMcp } from '../../lib/api'
-import { MarketplaceEntry, MarketplaceIndex, deletePlugin, installPlugin, isRowInstalling, listMarketplace, listPlugins, marketKey, parseMarketplaceAddress, subscribeInstallChanges, togglePlugin } from '../../lib/plugins'
+import { MarketplaceEntry, MarketplaceIndex, deletePlugin, installPlugin, installedForRow, installedFromAddress, isRowInstalling, listMarketplace, listPlugins, marketKey, marketplaceLabel, parseMarketplaceAddress, sameMarketplace, subscribeInstallChanges, togglePlugin } from '../../lib/plugins'
 import { forgetPluginCommands, invalidateAvailableSkills, invalidateSkillsList } from '../../lib/skills'
 import { DEFAULT_MARKETPLACES, useStore } from '../../lib/store'
 import { moveAt, useDragReorder } from '../../lib/useDragReorder'
@@ -7,6 +7,7 @@ import { useInfiniteGrid } from '../../lib/useInfiniteGrid'
 import type { MarketplaceSource, PluginInfo, SearchPluginConfig, SearchPluginKind } from '../../types'
 import { PluginDetail } from '../PluginDetail'
 import { CSSProperties, useCallback, useEffect, useReducer, useRef, useState } from 'react'
+import { ALL_MARKETS, MarketplacePicker } from './MarketplacePicker'
 import { CARD_BATCH, GripDots, SEARCH_ENGINE_KINDS, providerHue } from './rows'
 
 export function MarketplaceEditor() {
@@ -16,6 +17,8 @@ export function MarketplaceEditor() {
   const [repo, setRepo] = useState('')
   const [label, setLabel] = useState('')
   const [showAdd, setShowAdd] = useState(false)
+  /** Marketplace the grid is scoped to: `ALL_MARKETS` (default) or a marketKey. */
+  const [selected, setSelected] = useState(ALL_MARKETS)
   /** One loaded index per marketplace, keyed by install address: a kind tab
    *  merges EVERY one of them into one grid, so no chip needs picking first. */
   const [indexes, setIndexes] = useState<Record<string, MarketplaceIndex>>({})
@@ -41,9 +44,10 @@ export function MarketplaceEditor() {
   const [, bumpInstalls] = useReducer((n: number) => n + 1, 0)
   useEffect(() => subscribeInstallChanges(bumpInstalls), [bumpInstalls])
 
-  /** Which rows are already here, so a browsed plugin can say so and the button
-   *  reads "Update". Matched by the ADDRESS it was installed from, not by name:
-   *  two marketplaces may list the same plugin under different names. */
+  /** Which rows are already here. Matching is by REPO + bundle name/slug:
+   *  the address alone cannot tell two rows sharing one source folder apart
+   *  (`anthropics/skills` publishes five rows from `./`), while the name alone
+   *  would hide a same-named plugin installed from another marketplace. */
   const refreshInstalled = useCallback(async () => {
     const out = await listPlugins()
     if (Array.isArray(out)) setInstalled(out)
@@ -54,6 +58,15 @@ export function MarketplaceEditor() {
   // and every finished bundle read "Install" again.
   useEffect(() => {
     void refreshInstalled()
+  }, [refreshInstalled])
+
+  // A delete (or an install from the chat) must re-show the row in the
+  // catalogue: the installed list is what hides it, so it has to follow the
+  // same event every other plugin surface uses.
+  useEffect(() => {
+    const onChanged = () => void refreshInstalled()
+    window.addEventListener('coder:plugins-changed', onChanged)
+    return () => window.removeEventListener('coder:plugins-changed', onChanged)
   }, [refreshInstalled])
 
   /** Load one marketplace's index into the merged map (each read is cached
@@ -83,8 +96,10 @@ export function MarketplaceEditor() {
   // EVERY marketplace of the kind loads for its tab: the grid below merges
   // all of them, so the Skills tab shows the union, not one repo's rows.
   // A failed read leaves its slot empty (the error line says which repo) and
-  // the chip's click, or Refresh, retries it.
-  const kindMarkets = marketplaces
+  // picking that marketplace in the dropdown, or Refresh, retries it.
+  // Newest-added first: the list is stored oldest → newest (an add appends),
+  // so the display order is its reverse. The merged grid follows the same order.
+  const kindMarkets = [...marketplaces].reverse()
   const kindKeyList = kindMarkets.map((m) => marketKey(m.repo, m.path, m.git_ref)).join('\n')
   /** Latest map for the load-all effect, without re-subscribing it on each
    *  landed index. */
@@ -115,12 +130,22 @@ export function MarketplaceEditor() {
       ...(parsed.path ? { path: parsed.path } : {}),
       ...(parsed.git_ref ? { git_ref: parsed.git_ref } : {}),
     }
-    const key = marketKey(source.repo, source.path, source.git_ref)
-    if (!marketplaces.some((m) => marketKey(m.repo, m.path, m.git_ref) === key)) {
-      setMarketplaces([...marketplaces, source])
+    // Adding the same catalogue twice used to be a SILENT no-op: the form
+    // cleared and nothing said why the list did not grow. Say it instead.
+    const existing = marketplaces.find((m) => sameMarketplace(m, source))
+    if (existing) {
+      setError('')
+      setNote(
+        `Marketplace "${marketplaceLabel(existing)}" is already added — nothing changed.`,
+      )
+      setRepo('')
+      setLabel('')
+      return
     }
+    setError('')
+    setNote('')
+    setMarketplaces([...marketplaces, source])
     setRepo('')
-    setLabel('')
     setLabel('')
     setShowAdd(false)
     void loadIndex(source)
@@ -129,8 +154,9 @@ export function MarketplaceEditor() {
   const remove = (m: MarketplaceSource) => {
     if (!window.confirm(`Remove marketplace "${m.label ?? m.repo}"? Installed plugins stay.`)) return
     const key = marketKey(m.repo, m.path, m.git_ref)
+    setSelected((cur) => (cur === key ? ALL_MARKETS : cur))
     setMarketplaces(
-      marketplaces.filter((x) => marketKey(x.repo, x.path, x.git_ref) !== key),
+      marketplaces.filter((x) => !sameMarketplace(x, m)),
     )
     setIndexes((cur) => {
       if (!(key in cur)) return cur
@@ -151,10 +177,35 @@ export function MarketplaceEditor() {
     // re-click after a tab switch, and the chat path all meet here.
     if (isRowInstalling(key)) return
     setError('')
+    // A row that is already installed must never be installed a second time.
+    // The grid hides such rows, but a stale installed list (or a click racing
+    // the first refresh) could still reach here; ask the backend for the live
+    // truth before paying another repo read.
+    const live = await listPlugins()
+    const pool = Array.isArray(live) ? live : installed
+    const already =
+      installedForRow(pool, entry) ??
+      installedFromAddress(pool, {
+        repo: entry.repo,
+        repo_path: entry.repo_path,
+        repo_ref: entry.repo_ref,
+      })
+    if (already) {
+      if (Array.isArray(live)) setInstalled(live)
+      setNote(
+        `${already.name || entry.name} is already installed (${already.slug}) — nothing changed. ` +
+          'Update it in Plugins if the source changed.',
+      )
+      return
+    }
     const out = await installPlugin({
       repo: entry.repo,
       ...(entry.repo_path ? { repo_path: entry.repo_path } : {}),
       ...(entry.repo_ref ? { repo_ref: entry.repo_ref } : {}),
+      // The ROW's name is the bundle's name. Without it a row pointing at a
+      // shared source folder (five anthropics/skills rows all use `./`) landed
+      // as one repo-named bundle, so the row could never tell it was installed.
+      name: entry.name,
       // No `kind` is sent: the row decides. A repo with ONE skill and no
       // manifest becomes a single-skill bundle, a connector-only row a
       // single-connector one, and a real bundle stays a bundle — so every row
@@ -163,6 +214,8 @@ export function MarketplaceEditor() {
       // category the row advertised.
       ...(entry.category ? { category: entry.category } : {}),
       ...(entry.description ? { description: entry.description } : {}),
+      // A row may publish only some of the skills in its source folder.
+      ...(entry.skills?.length ? { skills: entry.skills } : {}),
     })
     if ('error' in out) {
       setError(`${entry.name}: ${out.error}`)
@@ -187,21 +240,53 @@ export function MarketplaceEditor() {
     }).catch(() => { })
   }
 
-  const installedKeys = new Set(
-    installed.map((p) => marketKey(p.source_repo ?? '', p.source_path, p.source_ref)),
-  )
   const loading = loadingKeys.length > 0
   // Merge EVERY marketplace of the kind into one list, deduped by install
   // address: the same plugin advertised by two repos shows once.
+  const sel = kindMarkets.some((m) => marketKey(m.repo, m.path, m.git_ref) === selected)
+    ? selected
+    : ALL_MARKETS
+  const scopeMarkets =
+    sel === ALL_MARKETS
+      ? kindMarkets
+      : kindMarkets.filter((m) => marketKey(m.repo, m.path, m.git_ref) === sel)
+  const scopeName =
+    sel !== ALL_MARKETS && scopeMarkets[0] ? scopeMarkets[0].label ?? scopeMarkets[0].repo : ''
+  const counts: Record<string, number | undefined> = {}
+  for (const m of kindMarkets) {
+    const k = marketKey(m.repo, m.path, m.git_ref)
+    counts[k] = indexes[k]?.plugins?.length
+  }
+  const allTotal = new Set(
+    kindMarkets.flatMap((m) =>
+      (indexes[marketKey(m.repo, m.path, m.git_ref)]?.plugins ?? []).map((e) =>
+        marketKey(e.repo, e.repo_path, e.repo_ref),
+      ),
+    ),
+  ).size
+  const selectMarket = (key: string) => {
+    setSelected(key)
+    setVisible(CARD_BATCH)
+    // A repo whose first read failed retries the moment it is picked.
+    const m = kindMarkets.find((x) => marketKey(x.repo, x.path, x.git_ref) === key)
+    if (m && !indexes[key] && !loadingKeys.includes(key)) void loadIndex(m)
+  }
   const seen = new Set<string>()
-  const allEntries = kindMarkets.flatMap(
+  const allEntries = scopeMarkets.flatMap(
     (m) => indexes[marketKey(m.repo, m.path, m.git_ref)]?.plugins ?? [],
   )
   const q = filter.trim().toLowerCase()
+  /** Rows hidden because their bundle is already installed. Kept for the
+   *  empty state: "all installed" must not read as "nothing matches". */
+  let installedHidden = 0
   const matches = allEntries.filter((e) => {
     const key = marketKey(e.repo, e.repo_path, e.repo_ref)
     if (seen.has(key)) return false
     seen.add(key)
+    if (installedForRow(installed, e)) {
+      installedHidden++
+      return false
+    }
     return !q || `${e.name} ${e.description} ${e.author} ${e.category ?? ''}`.toLowerCase().includes(q)
   })
   /** Latest hidden-count for the scroll sentinel's callback, without
@@ -254,32 +339,15 @@ export function MarketplaceEditor() {
             </button>
           </div>
         ) : (
-          <div className="market-tabs" role="tablist">
-            {marketplaces
-              .map((m) => {
-              const key = marketKey(m.repo, m.path, m.git_ref)
-              const name = m.label ?? m.repo
-              return (
-                <span key={key} className="market-tab">
-                  <button
-                    className="market-tab-name"
-                    onClick={() => void loadIndex(m, true)}
-                    title={`Reload ${m.repo}${m.path ? ` · ${m.path}` : ''}${m.git_ref ? ` @ ${m.git_ref}` : ''}`}
-                  >
-                    {name}
-                  </button>
-                  <button
-                    className="market-tab-x"
-                    aria-label={`Remove ${name}`}
-                    title="Remove this marketplace — plugins already installed stay"
-                    onClick={() => remove(m)}
-                  >
-                    ×
-                  </button>
-                </span>
-              )
-            })}
-          </div>
+          <MarketplacePicker
+            markets={kindMarkets}
+            selected={sel}
+            counts={counts}
+            total={allTotal}
+            loadingKeys={loadingKeys}
+            onSelect={selectMarket}
+            onRemove={remove}
+          />
         )}
 
         {showAdd && (
@@ -327,15 +395,15 @@ export function MarketplaceEditor() {
       <div className="field">
           <div className="field-head">
             <label>
-              All plugins from every marketplace
+              {sel === ALL_MARKETS ? 'All plugins from every marketplace' : `Plugins from ${scopeName}`}
               {matches.length > 0 ? <span className="pm-count">{matches.length}</span> : null}
             </label>
             <span className="plugin-spacer" />
             <button
               className="btn tiny secondary"
               disabled={loading}
-              onClick={() => kindMarkets.forEach((m) => void loadIndex(m, true))}
-              title="Reread every index from GitHub instead of the saved copies"
+              onClick={() => scopeMarkets.forEach((m) => void loadIndex(m, true))}
+              title="Reread the index from GitHub instead of the saved copy"
             >
               Refresh
             </button>
@@ -384,6 +452,14 @@ export function MarketplaceEditor() {
                 </button>
                 .
               </div>
+            ) : installedHidden > 0 && !q ? (
+              /* Everything here is already installed. Saying "nothing
+                 matches" would blame the query for what is really a state. */
+              <div className="hint empty-state">
+                All {installedHidden} plugin{installedHidden === 1 ? '' : 's'} here{' '}
+                {installedHidden === 1 ? 'is' : 'are'} installed. Update them in Plugins,
+                or delete one to see it in the marketplace again.
+              </div>
             ) : (
               <div className="hint empty-state">Nothing matches.</div>
             )
@@ -392,10 +468,9 @@ export function MarketplaceEditor() {
               <div className="market-grid">
                 {shown.map((entry) => {
                   const key = marketKey(entry.repo, entry.repo_path, entry.repo_ref)
-                  const have = installedKeys.has(key)
                   const installing = isRowInstalling(key)
                   return (
-                    <div key={key} className={`market-card${have ? ' installed' : ''}`}>
+                    <div key={key} className="market-card">
                       <div className="market-card-head">
                         <span
                           className="pm-avatar"
@@ -411,11 +486,11 @@ export function MarketplaceEditor() {
                           </span>
                         </div>
                         <button
-                          className={`btn tiny ${have ? 'secondary' : ''}`}
+                          className="btn tiny"
                           disabled={installing}
                           onClick={() => void install(entry)}
                         >
-                          {installing ? 'Installing…' : have ? 'Update' : 'Install'}
+                          {installing ? 'Installing…' : 'Install'}
                         </button>
                       </div>
                       {entry.description ? (
@@ -425,7 +500,6 @@ export function MarketplaceEditor() {
                         {entry.category && entry.author ? (
                           <span className="market-card-cat">{entry.category}</span>
                         ) : null}
-                        {have ? <span className="market-card-installed">✓ Installed</span> : null}
                       </div>
                     </div>
                   )
@@ -555,6 +629,12 @@ export function PluginBundleEditor() {
       repo: p.source_repo,
       ...(p.source_path ? { repo_path: p.source_path } : {}),
       ...(p.source_ref ? { repo_ref: p.source_ref } : {}),
+      // Keep the SAME bundle: without the name/slug the reinstall would derive
+      // a repo-named slug and create a second bundle beside the original.
+      name: p.name,
+      slug: p.slug,
+      // Re-read the same subset the row selected, not every skill in the repo.
+      ...(p.source_skills?.length ? { skills: p.source_skills } : {}),
     })
     setBusy('')
     if ('error' in out) {

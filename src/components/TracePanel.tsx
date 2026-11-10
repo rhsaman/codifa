@@ -8,6 +8,7 @@ import { clearChatTraces, getChatTraces } from "../lib/api";
 import { copyToClipboard } from "../lib/clipboard";
 import type { TraceEntry } from "../types";
 import { countOccurrences, countTraceEntryHits, stepHitIndex } from "../lib/diffSearch";
+import { useVimScroll } from "../lib/useVimScroll";
 
 type ActiveRef = { current: HTMLElement | null };
 
@@ -1000,6 +1001,9 @@ export function TracePanel(props?: {
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
   const [stuck, setStuck] = useState(true);
+  // Shared vim scroll keys over the trace list (j/k, gg/G, Ctrl+D/U). The list
+  // is the pane's scroll box, so it is both the region and the scroll host.
+  useVimScroll(listRef);
   // Height of the content above the viewport before an older page is prepended,
   // used to keep the viewport exactly where the user was (no jump).
   const prependAnchorRef = useRef<number | null>(null);

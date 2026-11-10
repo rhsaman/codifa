@@ -51,7 +51,7 @@ let indexReply: { status: number; body: unknown } = { status: 200, body: INDEX }
   return new Response('', { status: 404 })
 }
 
-const { listMarketplace } = await import('../src/lib/plugins.ts')
+const { listMarketplace, resolvePluginInstall, installedForRow, installedFromAddress, pluginSlug } = await import('../src/lib/plugins.ts')
 const { invalidateSidecarCache } = await import('../src/lib/api.ts')
 
 let failed = 0
@@ -123,6 +123,146 @@ console.log('5) the address is sent as the exact three args an install repeats:'
   check('repo is in the query', seen.includes('repo=acme%2Fmarket'), seen)
   check('path is in the query', /[?&]path=plugins/.test(seen), seen)
   check('ref is in the query', /[?&]git_ref=main/.test(seen), seen)
+}
+
+console.log('6) resolvePluginInstall turns plugin@marketplace into an install row:')
+{
+  invalidateSidecarCache()
+  indexReply = { status: 200, body: INDEX }
+  const saved = await resolvePluginInstall(
+    [{ repo: 'acme/market', label: 'Demo Market' }],
+    { plugin: 'Ponytail', marketplace: 'Demo Market' },
+  )
+  check('the row is found by marketplace label', !('error' in saved) && saved.entry.repo === 'acme/ponytail', saved)
+  check('a saved marketplace is reported as saved', !('error' in saved) && saved.saved === true, saved)
+
+  const byRepo = await resolvePluginInstall([{ repo: 'acme/market' }], {
+    plugin: 'Ponytail',
+    marketplace: 'market',
+  })
+  check("the repo's last segment matches", !('error' in byRepo) && byRepo.entry.name === 'Ponytail', byRepo)
+
+  const direct = await resolvePluginInstall([], {
+    plugin: 'Ponytail',
+    marketplace: 'acme/market',
+  })
+  check('a repo address works with no saved source', !('error' in direct) && direct.saved === false, direct)
+  check('the index name becomes the source label', !('error' in direct) && direct.source.label === 'Demo Market', direct)
+
+  const oneRow = await resolvePluginInstall(
+    [{ repo: 'acme/market', label: 'Demo Market' }],
+    { plugin: 'Wrong Name', marketplace: 'Demo Market' },
+  )
+  check(
+    'a one-row catalogue installs its only row',
+    !('error' in oneRow) && oneRow.entry.name === 'Ponytail',
+    oneRow,
+  )
+
+  indexReply = {
+    status: 200,
+    body: {
+      ...INDEX,
+      count: 2,
+      plugins: [
+        INDEX.plugins[0],
+        { name: 'Other', description: 'other', repo: 'acme/other' },
+      ],
+    },
+  }
+  const missing = await resolvePluginInstall(
+    [{ repo: 'acme/market', label: 'Demo Market' }],
+    { plugin: 'Nope', marketplace: 'Demo Market' },
+  )
+  check(
+    'an unknown plugin lists what a multi-row index has',
+    'error' in missing && missing.error.includes('Ponytail') && missing.error.includes('Other'),
+    missing,
+  )
+
+  const noMarket = await resolvePluginInstall([], { plugin: 'Ponytail', marketplace: 'nowhere' })
+  check(
+    'an unknown marketplace explains how to add it',
+    'error' in noMarket && noMarket.error.includes('/plugin marketplace add'),
+    noMarket,
+  )
+}
+
+console.log('7) a marketplace row is hidden only when ITS bundle is installed:')
+{
+  check('a name becomes the backend slug', pluginSlug('Prompts.Chat') === 'prompts.chat')
+  check('spaces become one dash each', pluginSlug('My  Tools') === 'my--tools')
+
+  const installed = [
+    {
+      name: 'designlang',
+      slug: 'designlang',
+      source_repo: 'https://github.com/Manavarya09/design-extract',
+    },
+    // A root install of anthropics/skills: ONE bundle holding every skill.
+    { name: 'skills', slug: 'skills', source_repo: 'anthropics/skills' },
+  ]
+  check(
+    'the URL install hides the row saved as owner/repo',
+    installedForRow(installed, {
+      name: 'designlang',
+      repo: 'Manavarya09/design-extract',
+    })?.slug === 'designlang',
+  )
+  check(
+    'a root bundle does not hide rows it does not represent',
+    installedForRow(installed, { name: 'document-skills', repo: 'anthropics/skills' }) ===
+      undefined,
+  )
+  check(
+    'the same name in another repo is not hidden',
+    installedForRow(installed, { name: 'designlang', repo: 'someone/else' }) === undefined,
+  )
+}
+
+console.log('8) an install address recognises the bundle already on disk:')
+{
+  const installed = [
+    {
+      name: 'Ponytail',
+      slug: 'ponytail',
+      source_repo: 'https://github.com/acme/ponytail',
+      source_path: '',
+      source_ref: 'main',
+    },
+    {
+      name: 'Skills',
+      slug: 'skills',
+      source_repo: 'anthropics/skills',
+      source_path: 'skills',
+      source_ref: '',
+    },
+  ]
+  check(
+    'a URL install matches the short owner/repo address',
+    installedFromAddress(installed, { repo: 'acme/ponytail', repo_ref: 'main' })?.slug ===
+      'ponytail',
+  )
+  check(
+    'a different ref is a different install',
+    installedFromAddress(installed, { repo: 'acme/ponytail', repo_ref: 'dev' }) === undefined,
+  )
+  check(
+    'a different sub-folder is a different install',
+    installedFromAddress(installed, { repo: 'anthropics/skills' }) === undefined,
+  )
+  check(
+    'the exact sub-folder matches',
+    installedFromAddress(installed, {
+      repo: 'anthropics/skills',
+      repo_path: 'skills',
+    })?.slug === 'skills',
+  )
+  check(
+    'a bundle with no recorded source never matches',
+    installedFromAddress([{ name: 'local', slug: 'local' }], { repo: 'acme/ponytail' }) ===
+      undefined,
+  )
 }
 
 if (failed > 0) {

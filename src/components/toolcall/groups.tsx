@@ -2,8 +2,9 @@ import { fixZwsp, prepareContent } from '../../lib/bidi'
 import { parseDownloadProgress } from '../../lib/downloadProgress'
 import { fileBasename } from '../../lib/fileTypes'
 import { reviewPathOf } from '../../lib/reviewTurn'
-import { diffStatsFromUnified, editTargetOf } from '../../lib/toolActivity'
+import { diffStatsFromUnified, editTargetOf, isSkillTool } from '../../lib/toolActivity'
 import { useViewerTabs } from '../../lib/viewerTabs'
+import { useStore } from '../../lib/store'
 import type { ToolActivity } from '../../types'
 import { openWorkspaceFile } from '../FileIcon'
 import { Fragment, KeyboardEvent, memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
@@ -12,7 +13,7 @@ import { ToolArgs, argsTextFor, fmtArgValue, rowDetail } from './args'
 import { DiffPreview, useDiffPreview } from './diff'
 import { IconSparkle, fmtTime } from './editGroup'
 import { IconChevron, StatusIcon, TerminalRowIcon } from './icons'
-import { canonicalTool, isSubagentCard, toolIcon, toolLabel, useRunningClock } from './naming'
+import { canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel, useRunningClock } from './naming'
 import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
 
 export const ToolGroupView = memo(function ToolGroupView({
@@ -30,6 +31,7 @@ export const ToolGroupView = memo(function ToolGroupView({
   // Every run starts collapsed — including runs with web calls, whose hits are
   // one click away inside the expanded rows.
   const [open, setOpen] = useState(false);
+  const subagentRows = useStore((s) => s.customSubagents);
   const running = activities.some((a) => a.activity.status === "running");
   // Live clock so the group total ticks while any call is still running.
   const now = useRunningClock(running);
@@ -53,7 +55,7 @@ export const ToolGroupView = memo(function ToolGroupView({
     .filter(({ activity }) => isSubagentCard(activity))
     .map(({ activity, index }) => ({
       key: index,
-      label: toolLabel(activity.tool),
+      label: subagentDisplayName(activity.tool, subagentRows),
       desc: shortArg(String(activity.args?.description ?? ""), 70),
       running: activity.status === "running",
     }));
@@ -200,8 +202,17 @@ export function subArgSummary(activity: ToolActivity): string {
     return "";
   }
 
-  // load_skill: the skill's own name is the whole story — printing `name:x`
-  // as a `key:value` arg (the generic fallback below) reads like machine output.
+  // load_plugin/load_skill: the plugin or skill's own name is the whole story —
+  // printing `slug:x` as a `key:value` arg (the generic fallback below) reads
+  // like machine output.
+  if (canonicalTool(activity.tool) === "load_plugin") {
+    const what = [args.slug, args.skill]
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+      .join(" / ");
+    if (what) return shortArg(what, 60);
+    const q = String(args.query ?? "");
+    return q ? shortArg(q, 48) : "";
+  }
   if (canonicalTool(activity.tool) === "load_skill") {
     const skill = String(args.name ?? args.file ?? "");
     if (skill) return shortArg(skill, 60);
@@ -366,6 +377,7 @@ export const ToolSubRow = memo(function ToolSubRow({
     running && activity.startedAt
       ? now - activity.startedAt
       : activity.elapsedMs;
+  const subagentRows = useStore((s) => s.customSubagents);
   const subSummary = subArgSummary(activity);
   return (
     <>
@@ -374,7 +386,9 @@ export const ToolSubRow = memo(function ToolSubRow({
       >
         <StatusIcon status={activity.status} />
         <span className="tool-sub-name">
-          {toolLabel(activity.tool)}
+          {isSubagentCard(activity)
+            ? subagentDisplayName(activity.tool, subagentRows)
+            : toolLabel(activity.tool)}
         </span>
         <span className="tool-sub-args" title={subSummary}>
           {subSummary}
@@ -382,7 +396,7 @@ export const ToolSubRow = memo(function ToolSubRow({
         {/* The backend stamps the tool NAME as the summary; for a skill load
             that only repeats the label, so the row would read
             "Load Skill  ponytail  load_skill". */}
-        {activity.summary && canonicalTool(activity.tool) !== "load_skill" && (
+        {activity.summary && !isSkillTool(activity.tool) && (
           <span className="tool-sub-summary">{fixZwsp(activity.summary)}</span>
         )}
         <span className="tool-ms">{fmtTime(ms)}</span>
@@ -427,7 +441,10 @@ export const TraceRow = memo(function TraceRow({
     running && activity.startedAt
       ? now - activity.startedAt
       : activity.elapsedMs;
-  const label = toolLabel(activity.tool);
+  const subagentRows = useStore((s) => s.customSubagents);
+  const label = isSubagentCard(activity)
+    ? subagentDisplayName(activity.tool, subagentRows)
+    : toolLabel(activity.tool);
   const detail = rowDetail(activity);
 
   const argsText = argsTextFor(activity);
@@ -482,7 +499,7 @@ export const TraceRow = memo(function TraceRow({
               that only repeats the head label — the skill name is the real
               detail. */}
           {activity.summary &&
-            canonicalTool(activity.tool) !== "load_skill" && (
+            !isSkillTool(activity.tool) && (
               <div className="trace-expand-section">
                 <span className="trace-expand-key">Summary</span>
                 <span className="trace-expand-val" dir="auto">
@@ -724,7 +741,10 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     running && activity.startedAt
       ? now - activity.startedAt
       : activity.elapsedMs;
-  const label = toolLabel(activity.tool);
+  const subagentRows = useStore((s) => s.customSubagents);
+  const label = isSubagentCard(activity)
+    ? subagentDisplayName(activity.tool, subagentRows)
+    : toolLabel(activity.tool);
   const detail = rowDetail(activity);
 
   const argsText = argsTextFor(activity);
@@ -833,7 +853,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
               that only repeats the head label — the skill name is the real
               detail. */}
           {activity.summary &&
-            canonicalTool(activity.tool) !== "load_skill" && (
+            !isSkillTool(activity.tool) && (
               <div className="trace-expand-section">
                 <span className="trace-expand-key">Summary</span>
                 <span className="trace-expand-val" dir="auto">

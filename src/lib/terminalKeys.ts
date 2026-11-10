@@ -4,9 +4,9 @@
  *  Cmd/Ctrl + one of these is an APP chord, never shell input: the platform's
  *  close chord (Cmd+W on Apple, Ctrl+W elsewhere) closes the active tab,
  *  M = fullscreen (bottom panel; a right-pane terminal tab fullscreens the
- *  pane), X = the app's prefix (Ctrl+X J is the ONLY way to toggle the bottom
- *  panel). J stays reserved so ^J never reaches the shell as a newline that
- *  would run the half-typed line. The OTHER half of the W chord is NOT
+ *  pane), X = the app's prefix (Ctrl+X J jumps INTO the bottom panel, Ctrl+X
+ *  K leaves it for the chat). J stays reserved so ^J never reaches the shell
+ *  as a newline that would run the half-typed line. The OTHER half of the W chord is NOT
  *  reserved: bare Ctrl+W on Apple is the shell's delete-previous-word (^W).
  *  Checked on
  *  `keypress` as well as `keydown` — see the caller — and `code` is checked
@@ -24,10 +24,11 @@ const CLOSE_CHORD_KEY = 'w'
 
 /** The second key of the Ctrl+X prefix, as ran inside the terminal: xterm must
  *  NOT send it to the shell, and App.tsx runs the chord with it (`j` toggles
- *  the terminal panel, `[`/`]` cycle the terminal tabs). Declared here so the
- *  guard stays the single source of what the shell never sees. `v` toggles the
- *  live voice session. */
-export const PREFIX_SECOND_KEYS = ['j', 'u', 'r', 'c', 'v', ' ', '[', ']'] as const
+ *  the bottom terminal panel, `k` leaves it for the chat, `p` opens the Panel,
+ *  `[`/`]` cycle the terminal tabs). Declared here so the guard stays the
+ *  single source of what the shell never sees. `v` toggles the live voice
+ *  session. */
+export const PREFIX_SECOND_KEYS = ['j', 'k', 'u', 'r', 'c', 'v', 'w', 'p', ' ', '[', ']'] as const
 
 export interface TerminalChordEvent {
   type: string

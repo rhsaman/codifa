@@ -12,7 +12,7 @@ import {
   tabMove,
   type DragSlots,
 } from "../lib/tabBar";
-import { shownViewerTabId, TAB_STRIP_KINDS, useViewerScope, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerScope, type ViewerTab } from "../lib/viewerTabs";
+import { FALLBACK_VIEWER_KIND, shownViewerTabId, TAB_STRIP_KINDS, tabVisibleInScope, useViewerScope, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerScope, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, CloseTabsIcon, type TabListSection } from "./TabListMenu";
@@ -109,14 +109,6 @@ function ArtifactsIcon() {
   );
 }
 
-/** Folder glyph for the file-explorer tab. */
-const FilesIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
-    <path d="M3 13h18" opacity="0.6" />
-  </svg>
-);
-
 /** Document glyph for a chat artifact tab (a page the agent built). A page
  *  with a folded corner and text lines — distinct from TerminalIcon's prompt
  *  chevron and from ArtifactsIcon's container box. */
@@ -161,7 +153,6 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   media: () => <ReviewIcon />,
   text: PlanIcon,
   explore: ExploreIcon,
-  files: FilesIcon,
   artifact: ArtifactIcon,
   artifacts: ArtifactsIcon,
   terminal: TerminalIcon,
@@ -223,7 +214,9 @@ export function buildViewerTabListSections(
     {
       label: "Recently closed tabs",
       entries: closed
-        .filter((c) => TAB_STRIP_KINDS.has(c.tab.kind))
+        // A closed tab of another chat must not be offered here either:
+        // reopening it would add a tab that renders nowhere in this scope.
+        .filter((c) => TAB_STRIP_KINDS.has(c.tab.kind) && tabVisibleInScope(c.tab, scope))
         .map((c) => ({
           key: `closed-${c.tab.id}`,
           title: viewerTabTitle(c.tab),
@@ -653,8 +646,11 @@ export function ViewerDockBar() {
   const activeId = useViewerTabs((s) => s.activeId);
   const scope = useViewerScope();
   // Same rule the pane body uses: the pressed dock button mirrors the page
-  // that is actually painted right now.
+  // that is actually painted right now. No shown tab → the body paints the
+  // Panel fallback page, so the Panel icon must read as active instead of
+  // leaving the whole dock blank.
   const shownTab = allTabs.find((t) => t.id === shownViewerTabId(allTabs, activeId, scope));
+  const shownKind = shownTab?.kind ?? FALLBACK_VIEWER_KIND;
   const vt = () => useViewerTabs.getState();
   // Finished-but-unread schedule runs: the Inbox icon carries the count. A run
   // still in flight never counts (see unseenRunCount), so "running" is silent.
@@ -667,8 +663,7 @@ export function ViewerDockBar() {
   );
   const changedCount = useUncommittedCount(dockRoot);
   const dock: Array<{ kind: ViewerKind; title: string; icon: React.ReactNode; badge?: number; onPress: () => void }> = [
-    { kind: "files", title: "Files", icon: <FilesIcon />, onPress: () => vt().openFiles() },
-    { kind: "todos", title: "Todos", icon: <TodosIcon />, onPress: () => vt().openTodos(scope.chatId) },
+    { kind: "todos", title: "Panel", icon: <TodosIcon />, onPress: () => vt().openTodos(scope.chatId) },
     { kind: "review", title: "Git diff", icon: <ReviewIcon />, badge: changedCount, onPress: () => vt().openGitDiff(scope.chatId) },
     { kind: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onPress: () => vt().openArtifacts() },
     { kind: "schedule", title: "Schedule", icon: <ScheduleIcon />, onPress: () => vt().openSchedule() },
@@ -678,7 +673,7 @@ export function ViewerDockBar() {
   return (
     <div className="viewer-dock" role="toolbar" aria-label="Pane pages">
       {dock.map((d) => {
-        const active = shownTab?.kind === d.kind;
+        const active = shownKind === d.kind;
         return (
           <button
             key={d.kind}

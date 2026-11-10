@@ -1,9 +1,10 @@
 //! Native `/doc/read` — a Rust port of `backend/doc_tools.py`'s read/render
 //! paths for the right-hand file viewer (and for the agent reading documents).
 //!
-//! Formats: `.pdf` (text), `.docx` (paragraphs + tables as markdown), `.xlsx`/
-//! `.xlsm`/`.xls` (sheets as TSV), `.csv` (TSV, delimiter sniffed) and any text
-//! file. `render_document` produces the styled HTML the viewer injects.
+//! Formats: `.pdf` (text), `.docx` (paragraphs + tables as markdown), `.pptx`
+//! (slide text), `.xlsx`/`.xlsm`/`.xls` (sheets as TSV), `.csv` (TSV, delimiter
+//! sniffed) and any text file. `render_document` produces the styled HTML the
+//! viewer injects.
 //!
 //! PDF *visual* preview is deliberately NOT rasterized here: the viewer shows
 //! the raw file through the Tauri asset protocol, which the webview renders
@@ -16,15 +17,14 @@ use std::path::Path;
 use calamine::Reader;
 use serde_json::{json, Value};
 
-/// Refuse to parse files beyond 100 MB (mirrors doc_tools.MAX_DOC_BYTES).
+/// Refuse to parse a file beyond 100 MB for the HTML VIEWER, which renders the
+/// whole thing on screen. The agent's text reads have no size cap: they window
+/// the extracted text (see `tools::read`), so a large file stays readable.
 const MAX_DOC_BYTES: u64 = 100 * 1024 * 1024;
-/// Per-call text cap — the viewer paginates via `pages`/`sheet`.
-const MAX_DOC_READ_CHARS: usize = 24_000;
+/// Hard row/column bounds of the HTML viewer. Text reads are uncapped.
 const MAX_XLSX_ROWS: usize = 800;
 const MAX_XLSX_COLS: usize = 60;
 const MAX_XLSX_SHEETS: usize = 12;
-/// Default page window for a PDF text read.
-const MAX_PDF_PAGES: usize = 200;
 
 fn check_size(path: &Path) -> Result<(), String> {
     let size = fs::metadata(path)
@@ -47,12 +47,12 @@ fn ext_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Parse a 1-based inclusive page spec like "3" / "1-3,7" (default: first N).
+/// Parse a 1-based inclusive page spec like "3" / "1-3,7" (default: ALL pages).
 /// Returns 0-based indices (mirrors doc_tools._parse_page_ranges).
 fn parse_page_ranges(spec: &str, total: usize) -> Result<Vec<usize>, String> {
     let spec = spec.trim();
     if spec.is_empty() {
-        return Ok((0..total.min(MAX_PDF_PAGES)).collect());
+        return Ok((0..total).collect());
     }
     let mut picked: Vec<usize> = Vec::new();
     for part in spec.split(',') {
@@ -135,15 +135,17 @@ fn cell_to_string(cell: &calamine::Data) -> String {
 // Text-family readers
 // ---------------------------------------------------------------------------
 
-/// `max_chars` bounds one read: the 24k default protects the agent's context,
-/// while the viewer passes a much larger cap (a repo README outgrows 24k).
+/// `max_chars` bounds one read: the viewer passes its own page size, while
+/// `usize::MAX` (the agent's 0 default) returns the whole file — `tools::read`
+/// windows the extracted text instead of withholding it here.
 fn read_text_file(path: &Path, max_chars: usize) -> Result<String, String> {
-    check_size(path)?;
     let file = fs::File::open(path).map_err(|e| format!("cannot read file: {e}"))?;
     // UTF-8 worst case is 4 bytes/char — `take` bounds the read without
-    // pre-allocating, and a single `read` can legally return short.
+    // pre-allocating, and a single `read` can legally return short. A finite
+    // max_chars is the VIEWER's page size; `usize::MAX` (the agent default)
+    // means the whole file, so the byte bound must not overflow.
     let mut buf = Vec::new();
-    file.take(max_chars.saturating_mul(4) as u64 + 4)
+    file.take(max_chars.saturating_mul(4).saturating_add(4) as u64)
         .read_to_end(&mut buf)
         .map_err(|e| format!("cannot read file: {e}"))?;
     let text = String::from_utf8_lossy(&buf).into_owned();
@@ -167,7 +169,6 @@ fn sniff_delimiter(sample: &str) -> char {
 }
 
 fn load_csv_rows(path: &Path) -> Result<(Vec<Vec<String>>, char), String> {
-    check_size(path)?;
     let mut file = fs::File::open(path).map_err(|e| format!("cannot read file: {e}"))?;
     let mut raw = Vec::new();
     file.read_to_end(&mut raw)
@@ -186,12 +187,7 @@ fn load_csv_rows(path: &Path) -> Result<(Vec<Vec<String>>, char), String> {
         .from_reader(text.as_bytes());
     for rec in rdr.records() {
         let rec = rec.map_err(|e| format!("cannot parse CSV: {e}"))?;
-        rows.push(
-            rec.iter()
-                .take(MAX_XLSX_COLS)
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        rows.push(rec.iter().map(|s| s.to_string()).collect());
     }
     Ok((rows, delimiter))
 }
@@ -203,12 +199,9 @@ fn read_csv(path: &Path, pages: &str) -> Result<String, String> {
         return Ok("[empty csv]".into());
     }
     let indices: Vec<usize> = if pages.trim().is_empty() {
-        (0..total.min(MAX_XLSX_ROWS)).collect()
+        (0..total).collect()
     } else {
         parse_page_ranges(pages, total)?
-            .into_iter()
-            .take(MAX_XLSX_ROWS)
-            .collect()
     };
     let picked: Vec<Vec<String>> = indices
         .iter()
@@ -218,7 +211,7 @@ fn read_csv(path: &Path, pages: &str) -> Result<String, String> {
     Ok(format!(
         "CSV: {total} row(s), showing {}\n\n{}\n\n[showing {} of {total} rows]",
         picked.len(),
-        render_table(&picked, MAX_XLSX_ROWS, MAX_XLSX_COLS),
+        render_table(&picked, usize::MAX, usize::MAX),
         picked.len()
     ))
 }
@@ -226,7 +219,6 @@ fn read_csv(path: &Path, pages: &str) -> Result<String, String> {
 /// Read a spreadsheet with calamine — covers `.xlsx`/`.xlsm` (openpyxl's job)
 /// and `.xls` (xlrd's job) in one path.
 fn read_spreadsheet(path: &Path, sheet: &str) -> Result<String, String> {
-    check_size(path)?;
     let mut wb = calamine::open_workbook_auto(path)
         .map_err(|e| format!("cannot open Excel file: {e}"))?;
     let names = wb.sheet_names().to_vec();
@@ -240,30 +232,22 @@ fn read_spreadsheet(path: &Path, sheet: &str) -> Result<String, String> {
         }
         vec![sheet.to_string()]
     } else {
-        names.iter().take(MAX_XLSX_SHEETS).cloned().collect()
+        names.clone()
     };
     let mut out: Vec<String> = vec![format!("Excel: {} sheet(s)", names.len())];
     for name in &wanted {
         let range = wb
             .worksheet_range(name)
             .map_err(|e| format!("cannot read sheet {name:?}: {e}"))?;
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        let mut truncated = false;
-        for (r, row) in range.rows().enumerate() {
-            if r >= MAX_XLSX_ROWS {
-                truncated = true;
-                break;
-            }
-            rows.push(row.iter().map(cell_to_string).collect());
-        }
-        let total_rows = range.rows().count();
+        let rows: Vec<Vec<String>> = range
+            .rows()
+            .map(|row| row.iter().map(cell_to_string).collect())
+            .collect();
+        let total_rows = rows.len();
         out.push(format!(
             "### sheet: {name} ({total_rows} rows)\n{}",
-            render_table(&rows, MAX_XLSX_ROWS, MAX_XLSX_COLS)
+            render_table(&rows, usize::MAX, usize::MAX)
         ));
-        if truncated {
-            out.push(format!("[sheet {name:?} truncated at {MAX_XLSX_ROWS} rows]"));
-        }
     }
     Ok(out.join("\n\n"))
 }
@@ -273,16 +257,25 @@ fn read_spreadsheet(path: &Path, sheet: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 fn read_pdf(path: &Path, pages: &str, max_chars: usize) -> Result<String, String> {
-    check_size(path)?;
-    let text = pdf_extract::extract_text(path)
+    // Some real PDFs arrive with bytes appended AFTER their final `%%EOF` —
+    // the user's signed bank statement carried the delivering HTML page there.
+    // lopdf locates the trailer by scanning only the LAST 512 bytes for `%%EOF`,
+    // so that tail hid the real one and every read died with "failed parsing
+    // cross reference table: invalid start value". Cutting at the last EOF
+    // keeps the document intact (an incremental update's last xref is the live
+    // one) and drops only trailing junk.
+    let mut bytes = fs::read(path).map_err(|e| format!("cannot open PDF: {e}"))?;
+    if let Some(end) = bytes.windows(5).rposition(|w| w == b"%%EOF") {
+        bytes.truncate(end + 5);
+    }
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    // Per-page extraction gives the REAL page count (the whole-document text
+    // only carries a form feed "when it can", so a 4-page statement came back
+    // as one page and `pages: "2"` was rejected as out of range).
+    let raw_pages = pdf_extract::extract_text_from_mem_by_pages(&bytes)
         .map_err(|e| format!("cannot open PDF: {e}"))?;
-    // pdf-extract separates pages with a form feed when it can; otherwise the
-    // whole document is one block.
-    let raw_pages: Vec<String> = if text.contains('\u{c}') {
-        text.split('\u{c}').map(|p| p.to_string()).collect()
-    } else {
-        vec![text]
-    };
     let total = raw_pages.len();
     let indices = parse_page_ranges(pages, total)?;
     let mut out: Vec<String> = vec![format!(
@@ -428,7 +421,7 @@ fn docx_body_lines(body: &roxmltree::Node, max_chars: usize) -> Vec<String> {
             }
             "tbl" => {
                 let rows = docx_table_rows(&child);
-                let table = render_table(&rows, MAX_XLSX_ROWS, MAX_XLSX_COLS);
+                let table = render_table(&rows, usize::MAX, usize::MAX);
                 chars += table.chars().count();
                 lines.push(table);
             }
@@ -443,7 +436,6 @@ fn docx_body_lines(body: &roxmltree::Node, max_chars: usize) -> Vec<String> {
 }
 
 fn read_docx(path: &Path, max_chars: usize) -> Result<String, String> {
-    check_size(path)?;
     let xml = read_zip_entry(path, "word/document.xml")?;
     let doc = roxmltree::Document::parse(&xml)
         .map_err(|e| format!("cannot open Word file: {e}"))?;
@@ -458,6 +450,75 @@ fn read_docx(path: &Path, max_chars: usize) -> Result<String, String> {
         return Ok("[empty document]".into());
     }
     Ok(lines.join("\n"))
+}
+
+// ---------------------------------------------------------------------------
+// PPTX (slide text)
+// ---------------------------------------------------------------------------
+
+/// Paragraph lines of one slide: every `<a:t>` run under each `<a:p>`, joined
+/// in order. Covers text boxes, titles and table cells (all use `a:p`/`a:t`).
+fn pptx_slide_lines(xml: &str) -> Result<Vec<String>, String> {
+    let doc = roxmltree::Document::parse(xml)
+        .map_err(|e| format!("cannot open PowerPoint slide: {e}"))?;
+    let mut lines: Vec<String> = Vec::new();
+    for p in doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "p")
+    {
+        let text: String = p
+            .descendants()
+            .filter(|n| n.is_element() && n.tag_name().name() == "t")
+            .filter_map(|n| n.text())
+            .collect();
+        let text = text.trim();
+        if !text.is_empty() {
+            lines.push(text.to_string());
+        }
+    }
+    Ok(lines)
+}
+
+fn read_pptx(path: &Path, max_chars: usize) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|e| format!("cannot open PowerPoint file: {e}"))?;
+    let zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("cannot open PowerPoint file: {e}"))?;
+    // Own the name list before opening slides: the iterator borrows the
+    // archive, and each slide is read through `read_zip_entry`.
+    let mut slides: Vec<(usize, String)> = zip
+        .file_names()
+        .filter_map(|name| {
+            let name = name.ok()?;
+            let num = name
+                .strip_prefix("ppt/slides/slide")?
+                .strip_suffix(".xml")?
+                .parse::<usize>()
+                .ok()?;
+            Some((num, name.to_string()))
+        })
+        .collect();
+    slides.sort_unstable_by_key(|(num, _)| *num);
+    if slides.is_empty() {
+        return Ok("[empty presentation — no slides]".into());
+    }
+    let mut out: Vec<String> = vec![format!("PPTX: {} slide(s)", slides.len())];
+    let mut chars = 0usize;
+    for (num, name) in slides {
+        let xml = read_zip_entry(path, &name)?;
+        let lines = pptx_slide_lines(&xml)?;
+        let body = if lines.is_empty() {
+            "[no text on this slide]".to_string()
+        } else {
+            lines.join("\n")
+        };
+        chars += body.chars().count();
+        out.push(format!("=== slide {num} ===\n{body}"));
+        if chars >= max_chars {
+            out.push(format!("[truncated at {max_chars} chars]"));
+            break;
+        }
+    }
+    Ok(out.join("\n\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -613,16 +674,19 @@ fn render_docx_html(path: &Path) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// Read a document's text (dispatches by extension). Mirrors read_document.
-/// `max_chars` caps the returned text — 0 means the 24k agent default.
+/// `max_chars` caps the returned text — 0 means the whole file; the agent's
+/// reader windows the extracted text afterwards, so it needs no cap here.
 pub fn read_document(path: &str, sheet: &str, pages: &str, max_chars: usize) -> Result<String, String> {
-    let max_chars = if max_chars == 0 { MAX_DOC_READ_CHARS } else { max_chars };
+    let max_chars = if max_chars == 0 { usize::MAX } else { max_chars };
     let p = Path::new(path);
     match ext_of(path).as_str() {
         ".pdf" => read_pdf(p, pages, max_chars),
         ".docx" => read_docx(p, max_chars),
+        ".pptx" => read_pptx(p, max_chars),
         ".xlsx" | ".xlsm" | ".xls" => read_spreadsheet(p, sheet),
         ".csv" => read_csv(p, pages),
         ".doc" => Err(".doc is the legacy Word format — re-save as .docx first".into()),
+        ".ppt" => Err(".ppt is the legacy PowerPoint format — re-save as .pptx first".into()),
         _ => read_text_file(p, max_chars),
     }
 }
@@ -654,9 +718,9 @@ pub struct DocReadBody {
     pub sheet: String,
     #[serde(default)]
     pub pages: String,
-    /// Text cap for this read; 0 keeps the 24k agent default. The viewer
-    /// passes a much larger value — its output goes to the screen, not a
-    /// model context window.
+    /// Text cap for this read; 0 means the WHOLE file (the agent windows the
+    /// result itself). The viewer passes its own page size — its output goes to
+    /// the screen, not a model context window.
     #[serde(default)]
     pub max_chars: usize,
 }

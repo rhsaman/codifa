@@ -312,10 +312,11 @@ export function ChatTabBar() {
   const workspaces = useStore((s) => s.workspaces);
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces);
   const pinnedChats = useStore((s) => s.pinnedChats);
+  const workspaceLastUsedAt = useStore((s) => s.workspaceLastUsedAt);
   const workspaceColors = useStore((s) => s.workspaceColors);
   const menuGroups = useMemo(
-    () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats),
-    [chats, workspaces, pinnedWorkspaces, pinnedChats],
+    () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats, workspaceLastUsedAt),
+    [chats, workspaces, pinnedWorkspaces, pinnedChats, workspaceLastUsedAt],
   );
   const menuChat = menuChatId ? chats.find((c) => c.id === menuChatId) ?? null : null;
   const menuTargets = menuChat

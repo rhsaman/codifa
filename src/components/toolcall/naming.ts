@@ -1,6 +1,7 @@
 import { bareToolName, mcpServerOf } from '../../lib/mcpTools'
 import { diffStatsFromUnified } from '../../lib/toolActivity'
-import type { ToolActivity } from '../../types'
+import type { CustomSubagent, ToolActivity } from '../../types'
+import { DELEGATION_PREFIX, isDelegationTool, subagentIdOf } from '../../lib/subagents'
 import { useEffect, useState } from 'react'
 import { ToolEditGroupView } from './editGroup'
 import { ToolGroupView } from './groups'
@@ -63,6 +64,7 @@ export const TOOL_LABEL: Record<string, string> = {
   create_skill: "Create Skill",
   create_mcp: "Create MCP",
   load_skill: "Load Skill",
+  load_plugin: "Load Plugin",
   update_plan: "Update Plan",
   git_status: "Git Status",
   git_diff: "Git Diff",
@@ -152,6 +154,7 @@ export const TOOL_ICON: Record<string, string> = {
   create_skill: "⚙",
   create_mcp: "🔌",
   load_skill: "📘",
+  load_plugin: "📦",
   update_plan: "📝",
   git_status: "🌿",
   git_diff: "📊",
@@ -176,6 +179,39 @@ export function toolLabel(tool: string): string {
   return TOOL_LABEL[canonical] ?? canonical;
 }
 
+/** Prefix the backend advertises every sub-agent profile under: the tool the
+ *  model calls is `agent__<id>` (a custom row's stable id, or a bundle agent's
+ *  frontmatter name). The builtin research agent keeps the bare `explore`.
+ *
+ *  Re-exported from `lib/subagents` so the event fold and the render layer
+ *  share ONE predicate — a custom agent that is a sub-agent card in the chat
+ *  must also nest its children and open its own panel. */
+export { DELEGATION_PREFIX, isDelegationTool, subagentIdOf };
+
+/** The name shown in the chat while a sub-agent works.
+ *
+ *  A custom sub-agent (Settings → Sub-agents) carries its own `name`, so the
+ *  card and the Working pill say "Browser Navigator" instead of the raw tool
+ *  id. A plugin profile has no row in the store — the readable form of its id
+ *  is the honest fallback, and `explore` stays "Explore". */
+export function subagentDisplayName(
+  tool: string,
+  rows: CustomSubagent[],
+): string {
+  if (tool === "explore") return "Explore";
+  const id = subagentIdOf(tool);
+  if (!id) return toolLabel(tool);
+  const row = rows.find((r) => r.id === id);
+  const name = row?.name?.trim();
+  if (name) return name;
+  const pretty = id
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+  return pretty || "Sub-agent";
+}
+
 /** Natural-language piece per tool category for the group header sentence
  *  ("9 commands, 3 searches, 2 notes") — the Claude-app-style summary line
  *  instead of a raw tool-name tally. */
@@ -196,6 +232,7 @@ export const TOOL_NOUN: Record<string, [string, string]> = {
   vision: ["image lookup", "image lookups"],
   create_skill: ["skill saved", "skills saved"],
   create_mcp: ["connector added", "connectors added"],
+  load_plugin: ["plugin loaded", "plugins loaded"],
   update_plan: ["plan update", "plan updates"],
   git_status: ["status check", "status checks"],
   git_diff: ["diff check", "diff checks"],
@@ -222,7 +259,7 @@ export function groupSummary(activities: ToolActivity[]): string {
  *  folded into `explore` at BOTH ingest points (normalizeToolName in
  *  makeToolActivity for the live stream, normalizeToolActivity for the store's
  *  load migration), so a card reaching this predicate always says `explore`. */
-export const isSubagentCard = (a: ToolActivity) => a.tool === "explore";
+export const isSubagentCard = (a: ToolActivity) => isDelegationTool(a.tool);
 
 /** Legacy alias kept for existing tests/callers. */
 export const isExploreCard = isSubagentCard;

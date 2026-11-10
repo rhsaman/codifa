@@ -31,7 +31,11 @@ pub(super) fn is_mutating_depth(cmd: &str, depth: usize) -> bool {
 
     // Every pipeline/chain segment is inspected, and `xargs` is followed into
     // its argument: `ls | xargs rm` writes even though `ls` does not.
-    scrubbed.split([';', '|', '&', '\n']).any(|seg| {
+    //
+    // Quote-aware: a `;`/`|`/`&` inside a quoted argument belongs to that
+    // argument. MEASURED: `sed -e 's/a|b/c/' f` was shredded into a fake
+    // segment `b/c/'` and judged as a command name.
+    split_unquoted(&scrubbed, &[';', '|', '&', '\n']).iter().any(|seg| {
         let words: Vec<&str> = seg.split_whitespace().collect();
         let Some(first) = words.first() else {
             return false;

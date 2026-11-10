@@ -35,6 +35,7 @@ import type {
   SttFallback,
   TtsFallback,
   MediaFallback,
+  CustomSubagent,
   ToolFallback,
   ThinkingLevel,
   TokenUsage,
@@ -93,6 +94,7 @@ import { modelReasoning } from './context'
 import { supportsReasoning } from './thinking'
 import { TOOL_FALLBACK_SLOTS as TOOL_SLOT_KEYS, toolFallbackEntries, withOtherSlotsFilled } from './toolSlots'
 import { normalizeToolActivity } from './toolActivity'
+import { focusChatInputSoon } from './chatFocus'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
 
 // Pure helper groups extracted verbatim (see src/lib/store/*) — re-exported so
@@ -191,6 +193,131 @@ function normalizeToolFallbacks(raw: unknown): Record<string, ToolFallback[]> {
     if (!(TOOL_SLOT_KEYS as readonly string[]).includes(slot)) continue
     const rows = normalizeToolFallbackRows(list)
     if (rows.length) out[slot] = rows
+  }
+  return out
+}
+
+/** The two sub-agents every install ships with (Settings → Sub-agents). They
+ *  are BUILT-IN: always present, read-only in Settings, and never deletable
+ *  there. Both run on the Tools → "Sub-agent" model row, and both stay inert
+ *  unless the parent turn has the matching switch on (Browser Use / Computer
+ *  Use). */
+export function defaultCustomSubagents(): CustomSubagent[] {
+  return [
+    {
+      id: 'browser',
+      name: 'Browser Navigator',
+      description:
+        'Drives the real browser: opens pages, reads their rendered content, clicks, types and inspects the page. Use for anything about a live page — page screenshots and page checks are browser work, not desktop work.',
+      prompt: [
+        'You are a browser sub-agent. You drive a real browser through the browser tools. You own all page work: navigating, reading rendered content, clicking, typing, scrolling and page screenshots.',
+        '',
+        'HOW TO WORK',
+        '- Start with browser_navigate for a URL. Its result already carries the page summary and fresh refs: read it. Do NOT call browser_snapshot again right after a navigate unless the result has no page data.',
+        '- Re-snapshot only when the page changed in a way the last result does not show, or when the refs you need went stale. A plain browser_snapshot on an unchanged page returns a short "unchanged" note, not the page again: trust it and keep the refs you already have. Pass full=true only for a deliberate re-read.',
+        '- Complete the WHOLE delegated task in this run, including its verification. Do not stop after a partial step expecting a follow-up call.',
+        '- Before an IRREVERSIBLE action (post, publish, send, upload, delete, pay), check the current state and make sure it did not already happen. If a tool call was cut off, verify the result before repeating it.',
+        '- Prefer the rendered text you were asked for. Take a screenshot only when the user asked for one or when text and layout cannot answer the question.',
+        '- For a list, grid or profile, collect the item URLs with ONE browser_evaluate (for example Array.from(document.querySelectorAll("a")).map(a => a.href)) and navigate directly to the exact URLs you still need. Do not click tiles one by one.',
+        '- If browser_evaluate returns null/[] or a value you already had, stop probing that way: use browser_find or the page text, and report what the page exposes. After two empty probes, stop.',
+        '- After an action whose result already shows the new page, do not screenshot or snapshot it again just to confirm the change.',
+        '',
+        'IDENTITY AND ACCOUNT',
+        '- The logged-in account is shown ONLY by site navigation or account controls (the Profile link, the avatar menu, "Logged in as ..."). A name on a post, feed card or comment belongs to its AUTHOR, not to the session.',
+        '- If the account is not visible in the nav/account controls, say so. Never infer it from a post author or guess it.',
+        '',
+        'PLUGINS',
+        '- Installed plugins are already listed in your catalog. Load one with load_plugin only when the task clearly needs its toolbox; do not load a plugin just because it exists.',
+        '- Reading or checking a page is browser work: browser tools are enough. Do not load a plugin merely to read one page.',
+        '',
+        'BOUNDARIES',
+        '- Never use desktop/computer tools: native app windows belong to the desktop agent, not to you.',
+        '- If the task needs a native app, report that it must go to the desktop agent instead of trying to do it here.',
+        '',
+        'FINISH',
+        '- Finish with a short factual report: the URLs visited, what you saw, what you did, and what you could not verify. Quote exact text when identity, counts or dates matter. Never invent page content.',
+      ].join('\n'),
+      kind: 'browser',
+    },
+    {
+      id: 'computer',
+      name: 'Desktop Operator',
+      description:
+        'Controls the machine desktop: native app windows, screenshots, mouse and keyboard. Use only when the work must happen in a real app rather than a page; file creation and export (PPTX/DOCX/XLSX/PDF) is a terminal-script job, and page content and page screenshots belong to the browser agent. The user is asked for permission before this agent runs.',
+      prompt: [
+        'You are a desktop sub-agent. You control the machine with the computer tool.',
+        '',
+        '- THE DESKTOP IS THE LAST RESORT: use it only for an app that has no usable command line.',
+        '- File creation, conversion and export (PPTX/DOCX/XLSX/PDF, a deck or report built from data, converting a document) are NOT desktop work: do them with `run_terminal` in ONE call using python-pptx/python-docx/openpyxl or `soffice --headless`. Never drive PowerPoint/Word/Excel menus for work a script can do.',
+        '- Take a screenshot first; act only on what you can see.',
+        '- Every changing action (click, type, key, scroll) returns the screen afterwards — do not screenshot again right after.',
+        '- Prefer keyboard shortcuts over pixel hunting when one exists.',
+        '- Page content — including screenshots of a page — is NOT desktop work; the browser agent owns it.',
+        '- Do the smallest sequence that finishes the goal, then stop.',
+        '- If a click or key changes nothing twice, stop repeating it: try a different control, or report that the app did not respond.',
+        '- Report what you did and what is now on screen. Never claim an action succeeded without seeing its result.',
+      ].join('\n'),
+      kind: 'computer',
+    },
+  ]
+}
+
+/** IDs of the shipped (built-in) sub-agents. They are real rows in
+ *  `customSubagents` because the backend resolves delegation from that list,
+ *  but Settings treats them as fixed: no Edit, no Delete. */
+export const BUILTIN_SUBAGENT_IDS = ['browser', 'computer'] as const
+
+export function isBuiltinSubagent(id: string): boolean {
+  const key = id.trim().toLowerCase()
+  return (BUILTIN_SUBAGENT_IDS as readonly string[]).includes(key)
+}
+
+/** Keep the shipped Browser Navigator / Desktop Operator rows in the list and
+ *  keep them CANONICAL. They are built-in now: Settings cannot edit them, so
+ *  the app's definitions win over any stale persisted copy (an old prompt,
+ *  kind or renamed row). User-made rows are left untouched. */
+export function withBuiltinSubagents(rows: CustomSubagent[]): CustomSubagent[] {
+  const shipped = new Set<string>(BUILTIN_SUBAGENT_IDS)
+  const custom = rows.filter((row) => !shipped.has(row.id))
+  return [...defaultCustomSubagents(), ...custom]
+}
+
+/** Normalize the persisted custom sub-agent list (Settings → Sub-agents): trim,
+ *  drop rows that cannot be delegated (no id or no prompt), de-dupe ids in
+ *  first-wins order and settle `kind` to a known value. */
+export function normalizeCustomSubagents(raw: unknown): CustomSubagent[] {
+  if (!Array.isArray(raw)) return []
+  const out: CustomSubagent[] = []
+  const seen = new Set<string>()
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue
+    const r = row as Record<string, unknown>
+    const id = typeof r.id === 'string' ? r.id.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-') : ''
+    const prompt = typeof r.prompt === 'string' ? r.prompt.trim() : ''
+    if (!id || !prompt || seen.has(id)) continue
+    seen.add(id)
+    const kind = r.kind === 'browser' || r.kind === 'computer' ? r.kind : 'research'
+    const tools = Array.isArray(r.tools)
+      ? r.tools.filter((t): t is string => typeof t === 'string' && !!t.trim()).map((t) => t.trim())
+      : []
+    const plugins = Array.isArray(r.plugins)
+      ? Array.from(
+          new Set(
+            r.plugins
+              .filter((p): p is string => typeof p === 'string' && !!p.trim())
+              .map((p) => p.trim()),
+          ),
+        )
+      : []
+    out.push({
+      id,
+      name: typeof r.name === 'string' && r.name.trim() ? r.name.trim() : id,
+      description: typeof r.description === 'string' ? r.description.trim() : '',
+      prompt,
+      kind,
+      ...(tools.length ? { tools: Array.from(new Set(tools)) } : {}),
+      ...(plugins.length ? { plugins } : {}),
+    })
   }
   return out
 }
@@ -392,17 +519,27 @@ function smartAppendDir(fallback: ChatLayout): ChatSplitDir {
 
 /** Explicit opens never replace: hidden chats open beside focus. */
 
-/** Persist a split tree plus its legacy mirrors (visible ids, sizes, layout). */
-function persistTreeMirrors(tree: ChatTreeNode | null, fallbackLayout: ChatLayout): { visibleChatIds: string[]; chatWindowSizes: Record<string, number>; chatLayout: ChatLayout } {
-  persistChatTree(tree)
+/** Pure mirror of a split tree (visible ids, per-window sizes, layout).
+ *  Inactive workspace snapshots use this so they never touch the legacy
+ *  localStorage keys, which always describe the ACTIVE workspace. */
+function treeMirrors(tree: ChatTreeNode | null, fallbackLayout: ChatLayout): { visibleChatIds: string[]; chatWindowSizes: Record<string, number>; chatLayout: ChatLayout } {
   if (!tree) return { visibleChatIds: [], chatWindowSizes: {}, chatLayout: fallbackLayout }
   const visibleChatIds = collectChatIds(tree)
   const chatWindowSizes = sizesByChat(tree)
   const chatLayout: ChatLayout = tree.kind === 'split' ? (tree.dir === 'row' ? 'horizontal' : 'vertical') : fallbackLayout
-  persistVisibleChats(visibleChatIds)
-  persistWindowSizes(chatWindowSizes)
-  persistChatLayout(chatLayout)
   return { visibleChatIds, chatWindowSizes, chatLayout }
+}
+
+/** Persist a split tree plus its legacy mirrors (visible ids, sizes, layout). */
+function persistTreeMirrors(tree: ChatTreeNode | null, fallbackLayout: ChatLayout): { visibleChatIds: string[]; chatWindowSizes: Record<string, number>; chatLayout: ChatLayout } {
+  persistChatTree(tree)
+  const mirrors = treeMirrors(tree, fallbackLayout)
+  if (tree) {
+    persistVisibleChats(mirrors.visibleChatIds)
+    persistWindowSizes(mirrors.chatWindowSizes)
+    persistChatLayout(mirrors.chatLayout)
+  }
+  return mirrors
 }
 
 /** Ensure a tree exists from a flat visible list (migration / first split). */
@@ -573,8 +710,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated || persistSuspended) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
-    const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+    const { settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, customSubagents, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+    const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, customSubagents, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -671,6 +808,10 @@ export function setPersistSuspended(v: boolean): void {
 
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
   if (persistSuspended) return Promise.resolve()
+  // Per-workspace tabs/layout are localStorage-only, so they are written here
+  // as well — this is the path the quit flush uses, and the active snapshot
+  // must match the live top-level fields at that moment.
+  persistWorkspaceBuckets(s)
   const { settings, chats, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
@@ -968,6 +1109,26 @@ interface State {
   /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
   pinnedChats: string[]
   workspaces: Workspace[]
+  /** The workspace whose chats the tab bar / chat area currently shows. The
+   *  top-level view fields below (activeChatId / openChatIds / visibleChatIds /
+   *  chatTree / …) always describe THIS workspace; every other workspace's
+   *  view waits in `workspaceViews` until it is activated again. */
+  activeWorkspaceKey: string
+  /** Per-workspace view snapshots (tabs, focused chat, split tree, sizes,
+   *  layout, window fullscreen, recently closed tabs). Persisted to
+   *  localStorage as one bundle (`coder:workspaceViews.v1`). */
+  workspaceViews: Record<string, WorkspaceViewSnapshot>
+  /** Last activation timestamp per workspace key (sidebar click, opening one
+   *  of its chats from elsewhere, or creating a chat there). Pinned rows
+   *  float above this order; everything else sorts newest first. */
+  workspaceLastUsedAt: Record<string, number>
+  /** Incremented by Ctrl+X W: the sidebar reveals the workspace list (closing
+   *  any drill-in) and focuses the active workspace's row when it sees a
+   *  value it has not handled yet. */
+  workspaceListFocusSeq: number
+  /** Incremented when the sidebar is REVEALED (Cmd/Ctrl+B or the titlebar
+   *  toggle): the sidebar lands the caret on the ACTIVE workspace row. */
+  sidebarFocusSeq: number
   chats: Chat[]
   /** Chat ids deleted in the UI but not yet removed from the sidecar DB. */
   deletedChatIds: string[]
@@ -994,6 +1155,9 @@ interface State {
    *  Persisted in localStorage `coder:chatTree`; visibleChatIds /
    *  chatWindowSizes / chatLayout mirror it for legacy readers. */
   chatTree: ChatTreeNode | null
+  /** Split layout stashed by the single/multi window toggle, so expanding
+   *  restores every pane in place. Per workspace (part of the view snapshot). */
+  savedChatTree: ChatTreeNode | null
   /** Chat ids whose agent FINISHED a turn (sent a message) while the user was
    *  looking at another chat → steady green dot in the sidebar. Session-scoped
    *  (not persisted); cleared when the user opens the chat (setActiveChat). */
@@ -1044,6 +1208,9 @@ interface State {
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
   setProviderReasoningMap: (id: string, reasoningMap: Record<string, boolean>) => void
+  /** Per-model image-input capability from the live `/models` catalog.
+   *  Absent key = unknown; `false` routes captures through the Vision slot. */
+  setProviderVisionMap: (id: string, visionMap: Record<string, boolean>) => void
   /** Record that a provider+model DEMONSTRABLY reasoned: its response streamed
    *  reasoning content. Positive evidence only — a call that produced no
    *  reasoning proves nothing, so `false` is never written. */
@@ -1206,6 +1373,10 @@ interface State {
    *  and a fallback never overrides the tool's reasoning level. */
   toolFallbacks: Record<string, ToolFallback[]>
   setToolFallbacks: (slot: string, rows: ToolFallback[]) => void
+  /** User-created sub-agents (Settings → Sub-agents). Every one of them runs on
+   *  the Tools → "Sub-agent" model row; none carries its own model. */
+  customSubagents: CustomSubagent[]
+  setCustomSubagents: (rows: CustomSubagent[]) => void
   /** Tool result cache TTL (minutes). */
   cacheTtlMinutes: number
   setMemoryTtlConfig: (c: { cache?: number }) => void
@@ -1237,6 +1408,14 @@ interface State {
   newChat: (mode?: AgentMode) => string
   newChatInRoot: (root: string, mode?: AgentMode) => string
   createWorkspace: (root: string) => string
+  /** Activate a workspace: snapshot the current view, restore that workspace's
+   *  tabs/windows/split layout, and (when it has history but no tabs) open its
+   *  most recent chat. Empty workspaces land on an empty chat area. */
+  switchWorkspace: (key: string) => void
+  /** Ctrl+X W: ask the sidebar to reveal + focus the projects/workspace list. */
+  requestWorkspaceListFocus: () => void
+  /** Cmd/Ctrl+B: ask the sidebar to focus the ACTIVE workspace row. */
+  requestSidebarFocus: () => void
   setWorkspaceOrder: (keys: string[]) => void
   deleteChat: (id: string) => void
   deleteWorkspace: (key: string) => void
@@ -1552,17 +1731,26 @@ function applyChatBody(body: Chat, prepend = false): void {
   const src = body as Chat & { messages?: ChatMessage[] }
   const page = Array.isArray(src.messages) ? src.messages : []
   const pageStart = typeof src.bodyStart === 'number' ? src.bodyStart : 0
+  // A steerPending flag from a crashed/ended turn can never be consumed:
+  // the body read that just landed is cold. Clear it so the bubble does not
+  // read "steering" forever (a live turn's own flags are in `c.messages`
+  // and are untouched by a prepended history page).
+  const liveTurn = page.some((m) => m.streaming)
+  const cleanPage =
+    !liveTurn && page.some((m) => m.steerPending)
+      ? page.map((m) => (m.steerPending ? { ...m, steerPending: false } : m))
+      : page
   useStore.setState((s) => {
     let changed = false
     const chats = s.chats.map((c) => {
       if (c.id !== body.id) return c
       changed = true
-      let messages = page
+      let messages = cleanPage
       if (prepend) {
         // A duplicate can only come from a re-request of an already loaded
         // page; keeping the first (older) copy preserves chronological order.
         const existing = new Set(c.messages.map((m) => m.id))
-        messages = [...page.filter((m) => !existing.has(m.id)), ...c.messages]
+        messages = [...cleanPage.filter((m) => !existing.has(m.id)), ...c.messages]
       }
       const bodyStart = pageStart
       const bodyTotal =
@@ -1590,7 +1778,7 @@ function applyChatBody(body: Chat, prepend = false): void {
   // Cheap (string lengths only) and recomputed on every page, so a chat that
   // has paged deep into its history is weighed by what it actually holds.
   const applied = useStore.getState().chats.find((c) => c.id === body.id)
-  bodyBytes.set(body.id, approxBytes(applied?.messages ?? page))
+  bodyBytes.set(body.id, approxBytes(applied?.messages ?? cleanPage))
 }
 
 /** A chat whose transcript a live turn is still appending to.
@@ -1855,6 +2043,343 @@ export function workspaceKey(root: string): string {
   return root || '__none__'
 }
 
+/** One workspace's live chat-area layout. The store's top-level view fields
+ *  mirror the ACTIVE workspace's snapshot; inactive snapshots live in
+ *  `workspaceViews` and are restored by `switchWorkspace`. */
+export interface WorkspaceViewSnapshot {
+  activeChatId: string
+  openChatIds: string[]
+  visibleChatIds: string[]
+  chatWindowSizes: Record<string, number>
+  chatLayout: ChatLayout
+  chatTree: ChatTreeNode | null
+  savedChatTree: ChatTreeNode | null
+  windowFullscreenId: string | null
+  recentlyClosedChatTabs: { id: string; at: number }[]
+}
+
+interface WorkspaceBucketState {
+  activeKey: string
+  views: Record<string, WorkspaceViewSnapshot>
+  lastUsedAt: Record<string, number>
+}
+
+const WORKSPACE_VIEWS_KEY = 'coder:workspaceViews.v1'
+
+function emptyWorkspaceView(layout: ChatLayout): WorkspaceViewSnapshot {
+  return {
+    activeChatId: '',
+    openChatIds: [],
+    visibleChatIds: [],
+    chatWindowSizes: {},
+    chatLayout: layout,
+    chatTree: null,
+    savedChatTree: null,
+    windowFullscreenId: null,
+    recentlyClosedChatTabs: [],
+  }
+}
+
+function liveWorkspaceView(s: {
+  activeChatId: string
+  openChatIds: string[]
+  visibleChatIds: string[]
+  chatWindowSizes: Record<string, number>
+  chatLayout: ChatLayout
+  chatTree: ChatTreeNode | null
+  savedChatTree: ChatTreeNode | null
+  windowFullscreenId: string | null
+  recentlyClosedChatTabs: { id: string; at: number }[]
+}): WorkspaceViewSnapshot {
+  return {
+    activeChatId: s.activeChatId,
+    openChatIds: s.openChatIds,
+    visibleChatIds: s.visibleChatIds,
+    chatWindowSizes: s.chatWindowSizes,
+    chatLayout: s.chatLayout,
+    chatTree: s.chatTree,
+    savedChatTree: s.savedChatTree,
+    windowFullscreenId: s.windowFullscreenId,
+    recentlyClosedChatTabs: s.recentlyClosedChatTabs,
+  }
+}
+
+/** Root folder owning a workspace key ('' for the "No project" bucket). */
+function workspaceRootForKey(
+  s: { workspaces: Workspace[]; chats: Chat[] },
+  key: string,
+): string {
+  const ws = s.workspaces.find((w) => w.key === key)
+  if (ws) return ws.root ?? ''
+  const chat = s.chats.find((c) => workspaceKey(c.root ?? '') === key)
+  if (chat) return chat.root ?? ''
+  return key === '__none__' ? '' : key
+}
+
+/** Drop ids that left the workspace and re-derive a usable view.
+ *
+ *  The stored snapshot can be stale in three ways: a chat was deleted, it was
+ *  moved to another workspace, or it was never in this workspace at all
+ *  (legacy globals). Every id is checked against the chats that CURRENTLY
+ *  belong to `key`. When the workspace has history but no surviving tab the
+ *  most recently updated chat is opened — that is the "click a workspace and
+ *  its last chat appears" behavior. */
+function sanitizeWorkspaceView(
+  view: WorkspaceViewSnapshot | undefined,
+  chats: Chat[],
+  key: string,
+  fallbackLayout: ChatLayout,
+): WorkspaceViewSnapshot {
+  const owned = chats.filter((c) => workspaceKey(c.root ?? '') === key)
+  const valid = new Set(owned.map((c) => c.id))
+  const base = view ?? emptyWorkspaceView(fallbackLayout)
+  const newest =
+    [...owned].sort(
+      (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || (b.createdAt ?? 0) - (a.createdAt ?? 0),
+    )[0]?.id ?? ''
+
+  const openChatIds: string[] = []
+  for (const id of base.openChatIds) {
+    if (valid.has(id) && !openChatIds.includes(id)) openChatIds.push(id)
+  }
+  let activeChatId = valid.has(base.activeChatId) ? base.activeChatId : ''
+  if (!activeChatId) activeChatId = openChatIds[openChatIds.length - 1] ?? newest
+  if (activeChatId && !openChatIds.includes(activeChatId)) openChatIds.push(activeChatId)
+
+  let chatTree = normalizeTree(base.chatTree, valid)
+  let visibleChatIds: string[] = []
+  if (chatTree) {
+    visibleChatIds = collectChatIds(chatTree)
+  } else {
+    for (const id of base.visibleChatIds) {
+      if (valid.has(id) && !visibleChatIds.includes(id)) visibleChatIds.push(id)
+    }
+    if (visibleChatIds.length === 0 && activeChatId) visibleChatIds = [activeChatId]
+  }
+  // A visible window always needs a tab: a stale split can otherwise show a
+  // window whose tab is gone (and closing it then has nowhere to fall back).
+  for (const id of visibleChatIds) {
+    if (!openChatIds.includes(id)) openChatIds.push(id)
+  }
+  if (chatTree && !visibleChatIds.includes(activeChatId)) {
+    activeChatId = visibleChatIds[0] ?? activeChatId
+  }
+  if (!activeChatId && visibleChatIds[0]) activeChatId = visibleChatIds[0]
+
+  const chatWindowSizes: Record<string, number> = {}
+  for (const [id, n] of Object.entries(base.chatWindowSizes)) {
+    if (valid.has(id) && Number.isFinite(n)) chatWindowSizes[id] = n
+  }
+  const treeDir = chatTree && chatTree.kind === 'split' ? chatTree.dir : null
+  return {
+    activeChatId,
+    openChatIds,
+    visibleChatIds,
+    chatWindowSizes,
+    chatLayout: treeDir ? (treeDir === 'row' ? 'horizontal' : 'vertical') : normalizeChatLayout(base.chatLayout || fallbackLayout),
+    chatTree,
+    savedChatTree: normalizeTree(base.savedChatTree, valid),
+    windowFullscreenId:
+      base.windowFullscreenId && valid.has(base.windowFullscreenId) ? base.windowFullscreenId : null,
+    recentlyClosedChatTabs: base.recentlyClosedChatTabs.filter((r) => valid.has(r.id)),
+  }
+}
+
+/** Snapshot fields as the store's live top-level view fields. */
+function viewFields(view: WorkspaceViewSnapshot) {
+  return {
+    activeChatId: view.activeChatId,
+    openChatIds: view.openChatIds,
+    visibleChatIds: view.visibleChatIds,
+    chatWindowSizes: view.chatWindowSizes,
+    chatLayout: view.chatLayout,
+    chatTree: view.chatTree,
+    savedChatTree: view.savedChatTree,
+    windowFullscreenId: view.windowFullscreenId,
+    recentlyClosedChatTabs: view.recentlyClosedChatTabs,
+  }
+}
+
+/** Write a view to the legacy single-workspace localStorage keys. Only the
+ *  ACTIVE workspace may do this — every legacy reader assumes those keys
+ *  describe what is on screen right now. */
+function persistViewToLegacy(view: WorkspaceViewSnapshot): void {
+  persistOpenState(view.openChatIds, view.activeChatId)
+  persistVisibleChats(view.visibleChatIds)
+  persistWindowSizes(view.chatWindowSizes)
+  persistChatLayout(view.chatLayout)
+  persistChatTree(view.chatTree)
+  persistSavedChatTree(view.savedChatTree)
+  persistWindowFullscreen(view.windowFullscreenId)
+}
+
+/** Put one chat in focus inside a workspace snapshot, matching the live
+ *  single/multi-window semantics. Pure: inactive snapshots must not touch the
+ *  legacy localStorage mirrors. */
+function focusChatInView(
+  view: WorkspaceViewSnapshot,
+  id: string,
+  layout: ChatLayout,
+): WorkspaceViewSnapshot {
+  const openChatIds = view.openChatIds.includes(id) ? view.openChatIds : [...view.openChatIds, id]
+  const single = leafCount(view.chatTree) <= 1 && view.visibleChatIds.length <= 1
+  if (single) {
+    return {
+      ...view,
+      activeChatId: id,
+      openChatIds,
+      visibleChatIds: [id],
+      chatTree: null,
+      chatWindowSizes: {},
+    }
+  }
+  if (view.chatTree && containsChat(view.chatTree, id)) {
+    return { ...view, activeChatId: id, openChatIds }
+  }
+  const base = ensureTree(view.chatTree, view.visibleChatIds, layout)
+  const chatTree = base ? openBeside(base, id, view.activeChatId, smartAppendDir(layout)) : null
+  const mirrors = treeMirrors(chatTree, layout)
+  return {
+    ...view,
+    activeChatId: id,
+    openChatIds,
+    visibleChatIds: mirrors.visibleChatIds.length > 0 ? mirrors.visibleChatIds : view.visibleChatIds,
+    chatWindowSizes: mirrors.chatWindowSizes,
+    chatLayout: mirrors.chatLayout,
+    chatTree,
+  }
+}
+
+/** Merge a moved workspace's snapshot into an existing destination snapshot:
+ *  keep the destination's layout/active chat, append any tabs the source had
+ *  open. Used by `moveWorkspace` when two projects are merged. */
+function mergeWorkspaceViews(
+  dest: WorkspaceViewSnapshot,
+  source: WorkspaceViewSnapshot,
+  layout: ChatLayout,
+): WorkspaceViewSnapshot {
+  const openChatIds = [...dest.openChatIds]
+  for (const id of source.openChatIds) if (!openChatIds.includes(id)) openChatIds.push(id)
+  return {
+    ...dest,
+    openChatIds,
+    visibleChatIds: dest.visibleChatIds.length > 0 ? dest.visibleChatIds : source.visibleChatIds,
+    chatWindowSizes: { ...source.chatWindowSizes, ...dest.chatWindowSizes },
+    chatTree: dest.chatTree ?? source.chatTree,
+    savedChatTree: dest.savedChatTree ?? source.savedChatTree,
+    windowFullscreenId: dest.windowFullscreenId ?? source.windowFullscreenId,
+    recentlyClosedChatTabs: [
+      ...dest.recentlyClosedChatTabs,
+      ...source.recentlyClosedChatTabs.filter(
+        (r) => !dest.recentlyClosedChatTabs.some((d) => d.id === r.id),
+      ),
+    ].slice(0, 8),
+    chatLayout: dest.chatLayout || layout,
+  }
+}
+
+function readStringArray(raw: unknown): string[] {
+  return Array.isArray(raw)
+    ? raw.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : []
+}
+
+function readNumberMap(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const n = typeof v === 'number' ? v : Number(v)
+    if (k && Number.isFinite(n)) out[k] = n
+  }
+  return out
+}
+
+function readRecentTabs(raw: unknown): { id: string; at: number }[] {
+  if (!Array.isArray(raw)) return []
+  const out: { id: string; at: number }[] = []
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue
+    const rec = row as { id?: unknown; at?: unknown }
+    if (typeof rec.id !== 'string' || !rec.id) continue
+    out.push({ id: rec.id, at: typeof rec.at === 'number' ? rec.at : 0 })
+  }
+  return out.slice(0, 8)
+}
+
+function readWorkspaceView(raw: unknown): WorkspaceViewSnapshot | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  return {
+    activeChatId: typeof r.activeChatId === 'string' ? r.activeChatId : '',
+    openChatIds: readStringArray(r.openChatIds),
+    visibleChatIds: readStringArray(r.visibleChatIds),
+    chatWindowSizes: readNumberMap(r.chatWindowSizes),
+    chatLayout: normalizeChatLayout(r.chatLayout),
+    chatTree:
+      r.chatTree && typeof r.chatTree === 'object' ? (r.chatTree as ChatTreeNode) : null,
+    savedChatTree:
+      r.savedChatTree && typeof r.savedChatTree === 'object'
+        ? (r.savedChatTree as ChatTreeNode)
+        : null,
+    windowFullscreenId:
+      typeof r.windowFullscreenId === 'string' && r.windowFullscreenId
+        ? r.windowFullscreenId
+        : null,
+    recentlyClosedChatTabs: readRecentTabs(r.recentlyClosedChatTabs),
+  }
+}
+
+/** Read the per-workspace view bundle (localStorage). Structural validation
+ *  only: chat ids are checked against the loaded chats later, once `load()`
+ *  knows which chats still exist. */
+function loadWorkspaceBuckets(): WorkspaceBucketState | null {
+  try {
+    const raw = localStorage.getItem(WORKSPACE_VIEWS_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object') return null
+    const views: Record<string, WorkspaceViewSnapshot> = {}
+    if (parsed.views && typeof parsed.views === 'object') {
+      for (const [key, value] of Object.entries(parsed.views as Record<string, unknown>)) {
+        if (!key) continue
+        const view = readWorkspaceView(value)
+        if (view) views[key] = view
+      }
+    }
+    return {
+      activeKey: typeof parsed.activeKey === 'string' ? parsed.activeKey : '',
+      views,
+      lastUsedAt: readNumberMap(parsed.lastUsedAt),
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Write the bundle. The ACTIVE workspace is snapshotted from the live
+ *  top-level fields, so callers never have to keep `workspaceViews` in sync
+ *  on every tab/layout change. */
+function persistWorkspaceBuckets(s: {
+  activeWorkspaceKey: string
+  workspaceViews: Record<string, WorkspaceViewSnapshot>
+  workspaceLastUsedAt: Record<string, number>
+} & Parameters<typeof liveWorkspaceView>[0]): void {
+  try {
+    const views = {
+      ...s.workspaceViews,
+      [s.activeWorkspaceKey]: liveWorkspaceView(s),
+    }
+    const payload: WorkspaceBucketState = {
+      activeKey: s.activeWorkspaceKey,
+      views,
+      lastUsedAt: s.workspaceLastUsedAt,
+    }
+    localStorage.setItem(WORKSPACE_VIEWS_KEY, JSON.stringify(payload))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 /** Last path segment of a root folder, for a compact workspace label. */
 function workspaceLabel(root: string): string {
   const trimmed = root.replace(/[\\/]+$/, '')
@@ -1867,6 +2392,12 @@ function makeWorkspace(root: string): Workspace {
   const key = workspaceKey(root)
   return { key, root: root || null, label: workspaceLabel(root) }
 }
+
+/** Workspace view bundle read once at module init (the active snapshot itself
+ *  still comes from the legacy top-level localStorage keys, which every view
+ *  action keeps current). */
+const initialWorkspaceBuckets =
+  typeof window !== 'undefined' ? loadWorkspaceBuckets() : null
 
 export const useStore = create<State>((set, get) => ({
   loaded: false,
@@ -1903,6 +2434,7 @@ export const useStore = create<State>((set, get) => ({
   subagentModels: {},
   subagentThinking: {},
   toolFallbacks: {},
+  customSubagents: defaultCustomSubagents(),
   cacheTtlMinutes: 60,
   historyLimit: 0,
   /** Bytes of skill catalog allowed in the system prompt each turn (see
@@ -1924,6 +2456,11 @@ export const useStore = create<State>((set, get) => ({
   pinnedWorkspaces: [],
   pinnedChats: [],
   workspaces: [],
+  activeWorkspaceKey: initialWorkspaceBuckets?.activeKey || '__none__',
+  workspaceViews: initialWorkspaceBuckets?.views ?? {},
+  workspaceLastUsedAt: initialWorkspaceBuckets?.lastUsedAt ?? {},
+  workspaceListFocusSeq: 0,
+  sidebarFocusSeq: 0,
   chats: [],
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
@@ -1934,6 +2471,7 @@ export const useStore = create<State>((set, get) => ({
   chatWindowSizes: typeof window !== 'undefined' ? loadWindowSizes() : {},
   chatLayout: typeof window !== 'undefined' ? loadChatLayout() : 'vertical',
   chatTree: typeof window !== 'undefined' ? loadChatTree() : null,
+  savedChatTree: typeof window !== 'undefined' ? loadSavedChatTree() : null,
   recentlyClosedChatTabs: [],
   chatFullscreen: typeof window !== 'undefined' ? loadChatFullscreen() : false,
   windowFullscreenId: typeof window !== 'undefined' ? loadWindowFullscreen() : null,
@@ -2085,9 +2623,22 @@ export const useStore = create<State>((set, get) => ({
       const queued = pruneQueued(withMode.queued)
       const base = queued === withMode.queued ? withMode : { ...withMode, queued }
       if (Array.isArray(next.messages)) bodyBytes.set(base.id, approxBytes(next.messages))
+      const messages = Array.isArray(base.messages) ? base.messages : []
+      // A `steerPending` bubble only means something while ITS turn is live.
+      // Persisted bodies strip `streaming` (the writer rewrites it as
+      // `interrupted`), so after a restart nothing is running: clear the flag
+      // instead of leaving the bubble reading "steering" forever and letting
+      // the post-turn drain silently re-send a message the user moved on
+      // from. A background reload that kept the chat in memory may still show
+      // a live stream — keep those flags so the running turn can consume them.
+      const liveTurn = messages.some((m) => m.streaming)
+      const cleanMessages =
+        !liveTurn && messages.some((m) => m.steerPending)
+          ? messages.map((m) => (m.steerPending ? { ...m, steerPending: false } : m))
+          : messages
       return {
         ...base,
-        messages: Array.isArray(base.messages) ? base.messages : [],
+        messages: cleanMessages,
         hydrated: Array.isArray(next.messages),
       }
     }) as Chat[]
@@ -2276,6 +2827,61 @@ export const useStore = create<State>((set, get) => ({
       }
     }
 
+    // ---------------------------------------------------------------------
+    // Per-workspace views. The legacy global keys restored above are the
+    // CURRENT workspace's view; migrate them into the bundle once, then
+    // restore the workspace the user was last in.
+    // ---------------------------------------------------------------------
+    const knownWorkspaceKeys = new Set(workspaces.map((w) => w.key))
+    const bundleActive = initialWorkspaceBuckets?.activeKey ?? ''
+    const bundleIsUsable =
+      !!bundleActive &&
+      (knownWorkspaceKeys.has(bundleActive) ||
+        bundleActive === '__none__' ||
+        loadedChats.some((c) => workspaceKey(c.root ?? '') === bundleActive))
+    const activeWorkspaceKey = bundleIsUsable
+      ? bundleActive
+      : workspaceKey(
+          loadedChats.find((c) => c.id === activeId)?.root ??
+            (typeof raw.root === 'string' ? raw.root : ''),
+        )
+    const legacyView: WorkspaceViewSnapshot = {
+      activeChatId: activeId,
+      openChatIds,
+      visibleChatIds,
+      chatWindowSizes: get().chatWindowSizes,
+      chatLayout: get().chatLayout,
+      chatTree,
+      savedChatTree: get().savedChatTree,
+      windowFullscreenId: get().windowFullscreenId,
+      recentlyClosedChatTabs: get().recentlyClosedChatTabs,
+    }
+    const workspaceViews: Record<string, WorkspaceViewSnapshot> = {}
+    for (const [key, view] of Object.entries(initialWorkspaceBuckets?.views ?? {})) {
+      workspaceViews[key] = sanitizeWorkspaceView(view, loadedChats, key, get().chatLayout)
+    }
+    // The live legacy keys are authoritative for the workspace that was open
+    // when the app quit — never let an older bundle snapshot win.
+    const restoredView = sanitizeWorkspaceView(
+      legacyView,
+      loadedChats,
+      activeWorkspaceKey,
+      get().chatLayout,
+    )
+    workspaceViews[activeWorkspaceKey] = restoredView
+    // Drop bundle entries for workspaces that no longer exist (deleted while
+    // another profile/key was active) so the bundle cannot grow forever.
+    for (const key of Object.keys(workspaceViews)) {
+      if (key !== '__none__' && !knownWorkspaceKeys.has(key)) {
+        const hasChats = loadedChats.some((c) => workspaceKey(c.root ?? '') === key)
+        if (!hasChats) delete workspaceViews[key]
+      }
+    }
+    const activeRoot = workspaceRootForKey(
+      { workspaces, chats: loadedChats },
+      activeWorkspaceKey,
+    )
+
     // Merge MCP connectors from the sidecar's user data folder into the UI
     // settings so they show up in Settings → MCP (the folder wins, since it
     // also holds agent-created connectors not in the persisted settings).
@@ -2348,7 +2954,7 @@ export const useStore = create<State>((set, get) => ({
       settingsHydrated: settings !== null || !hasSettingsFile,
       settings: loadedSettings,
       builtinMcp: builtins,
-      root,
+      root: activeRoot || root,
       fontSize,
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
       backupPath: typeof (raw as Record<string, unknown>).backupPath === 'string'
@@ -2368,6 +2974,15 @@ export const useStore = create<State>((set, get) => ({
       // Per-tool fallback lists live in the SETTINGS document (they belong to
       // the UI), so they are read from `raw`, not from a store-level key.
       toolFallbacks: normalizeToolFallbacks((raw as Record<string, unknown>).toolFallbacks),
+      // Custom sub-agents live in the SETTINGS document too. The two shipped
+      // rows (Browser Navigator, Desktop Operator) are BUILT-IN: they are
+      // always present and cannot be edited or deleted in Settings, so a file
+      // that lost them gets them back. User rows otherwise load verbatim.
+      customSubagents: withBuiltinSubagents(
+        (raw as Record<string, unknown>).customSubagents === undefined
+          ? []
+          : normalizeCustomSubagents((raw as Record<string, unknown>).customSubagents),
+      ),
       // Empty means "auto": resolveSttLanguage() then follows the UI direction.
       sttLanguage: typeof raw.sttLanguage === 'string' ? raw.sttLanguage.trim().toLowerCase() : 'fa',
       ttsProviderId:
@@ -2496,11 +3111,19 @@ export const useStore = create<State>((set, get) => ({
       pinnedChats: Array.isArray(raw.pinnedChats) ? raw.pinnedChats : [],
       scheduleRunsSeen: normalizeScheduleRunsSeen((raw as { scheduleRunsSeen?: unknown }).scheduleRunsSeen),
       workspaces,
+      activeWorkspaceKey,
+      workspaceViews,
+      workspaceLastUsedAt: initialWorkspaceBuckets?.lastUsedAt ?? {},
       chats: loadedChats,
-      activeChatId: activeId,
-      openChatIds,
-      visibleChatIds,
-      chatTree,
+      activeChatId: restoredView.activeChatId,
+      openChatIds: restoredView.openChatIds,
+      visibleChatIds: restoredView.visibleChatIds,
+      chatWindowSizes: restoredView.chatWindowSizes,
+      chatLayout: restoredView.chatLayout,
+      chatTree: restoredView.chatTree,
+      savedChatTree: restoredView.savedChatTree,
+      windowFullscreenId: restoredView.windowFullscreenId,
+      recentlyClosedChatTabs: restoredView.recentlyClosedChatTabs,
       // Self-clean pre-existing empty chats left on disk by older builds (a
       // fresh tab used to persist immediately). They stay usable in-memory
       // but are queued for file deletion on the next persist; live chats that
@@ -2535,6 +3158,10 @@ export const useStore = create<State>((set, get) => ({
   },
 
   persist: () => {
+    // Tabs/layout/window state lives in localStorage: refresh the bundle for
+    // the ACTIVE workspace on every persist pass (including while a reply is
+    // streaming, which skips the DB write below).
+    persistWorkspaceBuckets(get())
     // Never rewrite the whole DB per SSE token while a reply is streaming.
     // Instead of deferring EVERYTHING until the stream ends (which lost the
     // whole in-flight turn on a power cut), write a throttled chats-only
@@ -2800,6 +3427,16 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
+  setProviderVisionMap: (id, visionMap) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => (p.id === id ? { ...p, visionMap } : p)),
+      },
+    }))
+    get().persist()
+  },
+
   /** Record that a provider+model DEMONSTRABLY reasoned (its response streamed
    *  reasoning content). Positive evidence only: a call that produced no
    *  reasoning proves nothing, so `false` is never written and a model that
@@ -2996,6 +3633,12 @@ export const useStore = create<State>((set, get) => ({
   },
   setSttFallbacks: (f) => {
     set({ sttFallbacks: normalizeSttFallbacks(f) })
+    get().persist()
+  },
+  setCustomSubagents: (rows) => {
+    // Built-ins cannot be removed through the UI; keep them even if a caller
+    // sends a list without them.
+    set({ customSubagents: withBuiltinSubagents(normalizeCustomSubagents(rows)) })
     get().persist()
   },
   setToolFallbacks: (slot, rows) => {
@@ -3263,9 +3906,12 @@ export const useStore = create<State>((set, get) => ({
   newChat: (mode) => {
     const chat = makeChat(mode ?? 'ask')
     const s = useStore.getState()
-    const prevRoot = s.chats.find((c) => c.id === s.activeChatId)?.root
-    const lastRoot = [...s.chats].reverse().find((c) => c.root)?.root
-    chat.root = prevRoot ?? lastRoot ?? s.root
+    const key = s.activeWorkspaceKey
+    // A new chat always belongs to the ACTIVE workspace: its root is the
+    // project the chat area currently shows ('' for the "No project" bucket),
+    // never whatever root happened to be selected last in another workspace.
+    const root = workspaceRootForKey(s, key)
+    chat.root = root || undefined
     const activeChatId = chat.id
     set((st) => {
       const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
@@ -3273,46 +3919,35 @@ export const useStore = create<State>((set, get) => ({
       // New chat replaces single-window view; in multi-window it always
       // opens a new window (never replaces) placed along the best axis.
       const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
+      const workspaceLastUsedAt = { ...st.workspaceLastUsedAt, [key]: Date.now() }
       if (single) {
         persistVisibleChats([activeChatId])
         persistChatTree(null)
-        return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
+        return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false, workspaceLastUsedAt }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
       const chatTree = openBeside(base, activeChatId, st.activeChatId, smartAppendDir(st.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
-      return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
+      return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false, workspaceLastUsedAt }
     })
     get().persist()
+    // Land the caret in the NEW chat's composer: every entry point (Ctrl/Cmd+T,
+    // the tab bar's "+", the empty-state button, a workspace's own +, "/new")
+    // creates the chat through here, so none of them can forget. The panel
+    // commits a frame later; the helper probes CHAT-SCOPED and gives up after
+    // a handful of frames instead of settling for the previous window.
+    focusChatInputSoon(activeChatId)
     return activeChatId
   },
 
   newChatInRoot: (root, mode) => {
     const key = workspaceKey(root ?? '')
-    const chat = makeChat(mode ?? 'ask')
-    chat.root = root || undefined
-    const activeChatId = chat.id
-    set((st) => {
-      // Register the workspace if unknown (kept in place thereafter).
-      let workspaces = st.workspaces
-      if (!workspaces.some((w) => w.key === key)) {
-        workspaces = [...workspaces, makeWorkspace(root ?? '')]
-      }
-      const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
-      persistOpenState(openChatIds, activeChatId)
-      const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
-      if (single) {
-        persistVisibleChats([activeChatId])
-        persistChatTree(null)
-        return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
-      }
-      const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      const chatTree = openBeside(base, activeChatId, st.activeChatId, smartAppendDir(st.chatLayout))
-      const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
-      return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
-    })
-    get().persist()
-    return activeChatId
+    // Register the workspace (kept in place thereafter) and ACTIVATE it before
+    // the chat is created: tabs are per workspace, so a chat created here must
+    // land in this workspace's view, never in whatever was on screen before.
+    if (!get().workspaces.some((w) => w.key === key)) get().createWorkspace(root ?? '')
+    if (get().activeWorkspaceKey !== key) get().switchWorkspace(key)
+    return get().newChat(mode)
   },
 
   createWorkspace: (root) => {
@@ -3326,6 +3961,58 @@ export const useStore = create<State>((set, get) => ({
     })
     get().persist()
     return key
+  },
+
+  switchWorkspace: (key) => {
+    const s = get()
+    const now = Date.now()
+    const lastUsedAt = { ...s.workspaceLastUsedAt, [key]: now }
+    // Clicking the workspace that is already active only bumps its recency —
+    // the live top-level fields are already its view, so there is nothing to
+    // snapshot/restore (and no tab flash).
+    if (key === s.activeWorkspaceKey) {
+      set({ workspaceLastUsedAt: lastUsedAt })
+      persistWorkspaceBuckets(useStore.getState())
+      return
+    }
+    const views = { ...s.workspaceViews }
+    views[s.activeWorkspaceKey] = sanitizeWorkspaceView(
+      liveWorkspaceView(s),
+      s.chats,
+      s.activeWorkspaceKey,
+      s.chatLayout,
+    )
+    const restored = sanitizeWorkspaceView(
+      views[key],
+      s.chats,
+      key,
+      s.chatLayout,
+    )
+    views[key] = restored
+    const nextRoot = workspaceRootForKey(s, key)
+    set({
+      activeWorkspaceKey: key,
+      workspaceViews: views,
+      workspaceLastUsedAt: lastUsedAt,
+      ...viewFields(restored),
+      // Moving into another project re-arms the outside-workspace permission
+      // prompts, exactly like setRoot does.
+      root: nextRoot,
+      outsideAllowed: false,
+      outsideFolders: [],
+    })
+    // Keep the legacy single-workspace keys on the ACTIVE view so a restart
+    // (and every legacy reader) sees the currently shown tabs.
+    persistViewToLegacy(restored)
+    persistWorkspaceBuckets(useStore.getState())
+  },
+
+  requestWorkspaceListFocus: () => {
+    set((s) => ({ workspaceListFocusSeq: s.workspaceListFocusSeq + 1 }))
+  },
+
+  requestSidebarFocus: () => {
+    set((s) => ({ sidebarFocusSeq: s.sidebarFocusSeq + 1 }))
   },
 
   setWorkspaceOrder: (keys) => {
@@ -3374,6 +4061,21 @@ export const useStore = create<State>((set, get) => ({
       delete chatAborts[id]
       const chatBusy = { ...s.chatBusy }
       delete chatBusy[id]
+      // Inactive workspace snapshots may still hold the deleted chat (the
+      // user can delete a chat from a sidebar folder that is not the active
+      // workspace). Prune it there too so switching back never resurrects a
+      // dead tab.
+      const workspaceViews = { ...s.workspaceViews }
+      for (const [key, view] of Object.entries(workspaceViews)) {
+        if (key === s.activeWorkspaceKey) continue
+        const held =
+          view.activeChatId === id ||
+          view.openChatIds.includes(id) ||
+          view.visibleChatIds.includes(id) ||
+          view.recentlyClosedChatTabs.some((r) => r.id === id) ||
+          (view.chatTree ? containsChat(view.chatTree, id) : false)
+        if (held) workspaceViews[key] = sanitizeWorkspaceView(view, chats, key, s.chatLayout)
+      }
       return {
         chats,
         activeChatId,
@@ -3383,6 +4085,7 @@ export const useStore = create<State>((set, get) => ({
         chatTree,
         chatAborts,
         chatBusy,
+        workspaceViews,
         deletedChatIds: [...s.deletedChatIds, id],
         pinnedChats: s.pinnedChats.filter((k) => k !== id),
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
@@ -3412,44 +4115,81 @@ export const useStore = create<State>((set, get) => ({
       )
       const pinnedWorkspaces = s.pinnedWorkspaces.filter((k) => k !== key)
       const pinnedChats = s.pinnedChats.filter((k) => !doomedIds.has(k))
-      const activeChatId = s.chats.some((c) => c.id === s.activeChatId && workspaceKey(c.root ?? '') !== key)
-        ? s.activeChatId
-        : chats[chats.length - 1]?.id ?? ''
-      const openChatIds = s.openChatIds.filter((cid) => !doomedIds.has(cid))
-      if (activeChatId && !openChatIds.includes(activeChatId)) openChatIds.push(activeChatId)
-      persistOpenState(openChatIds, activeChatId)
-      const validIds = new Set(chats.map((c) => c.id))
-      const baseTreeWs = s.chatTree ?? buildFromList(s.visibleChatIds, treeDirFromLayout(s.chatLayout))
-      let pruned: ChatTreeNode | null = baseTreeWs
-      for (const dead of doomedIds) pruned = removeChat(pruned, dead)
-      const normalizedWs = normalizeTree(pruned, validIds)
-      const fallbackWs = normalizeVisibleChats(s.visibleChatIds.filter((cid) => !doomedIds.has(cid)), validIds, activeChatId)
-      const chatTreeWs = normalizedWs ?? (fallbackWs.length > 0 ? buildFromList(fallbackWs, treeDirFromLayout(s.chatLayout)) : null)
-      const mirrorsWs = persistTreeMirrors(chatTreeWs, s.chatLayout)
-      const visibleChatIds = mirrorsWs.visibleChatIds.length > 0 ? mirrorsWs.visibleChatIds : fallbackWs
       const chatAborts = { ...s.chatAborts }
       for (const id of doomed) delete chatAborts[id]
+      // Drop the deleted workspace's snapshot + recency, then re-validate the
+      // remaining snapshots against the chats that still exist.
+      const workspaceLastUsedAt = { ...s.workspaceLastUsedAt }
+      delete workspaceLastUsedAt[key]
+      const workspaceViews: Record<string, WorkspaceViewSnapshot> = {}
+      for (const [k, view] of Object.entries(s.workspaceViews)) {
+        if (k === key) continue
+        workspaceViews[k] = sanitizeWorkspaceView(view, chats, k, s.chatLayout)
+      }
+      const deletedChatIds = s.chats
+        .filter((c) => workspaceKey(c.root ?? '') === key)
+        .map((c) => c.id)
+      const deletedWorkspaceRoots = s.chats
+        .filter((c) => workspaceKey(c.root ?? '') === key)
+        .map((c) => c.root ?? '')
+
+      if (s.activeWorkspaceKey !== key) {
+        // Deleting a background workspace: the live view keeps its workspace
+        // and focus; only stale ids (never expected here) are re-derived.
+        const live = sanitizeWorkspaceView(
+          liveWorkspaceView(s),
+          chats,
+          s.activeWorkspaceKey,
+          s.chatLayout,
+        )
+        workspaceViews[s.activeWorkspaceKey] = live
+        persistViewToLegacy(live)
+        return {
+          ...viewFields(live),
+          chats,
+          workspaces,
+          pinnedWorkspaces,
+          pinnedChats,
+          chatAborts,
+          workspaceViews,
+          workspaceLastUsedAt,
+          unreadChats: s.unreadChats.filter((cid) => !doomedIds.has(cid)),
+          deletedChatIds: [...s.deletedChatIds, ...deletedChatIds],
+          deletedWorkspaceRoots: [...s.deletedWorkspaceRoots, ...deletedWorkspaceRoots],
+        }
+      }
+
+      // The ACTIVE workspace is going away: land on the most recently used
+      // remaining workspace (falling back to any other project) and restore
+      // its snapshotted tabs. With none left, the chat area becomes empty.
+      const candidates = new Set<string>()
+      for (const w of workspaces) candidates.add(w.key)
+      for (const c of chats) candidates.add(workspaceKey(c.root ?? ''))
+      const fallbackKey =
+        [...candidates].sort(
+          (a, b) => (workspaceLastUsedAt[b] ?? 0) - (workspaceLastUsedAt[a] ?? 0),
+        )[0] ?? '__none__'
+      const restored =
+        workspaceViews[fallbackKey] ??
+        sanitizeWorkspaceView(undefined, chats, fallbackKey, s.chatLayout)
+      workspaceViews[fallbackKey] = restored
+      persistViewToLegacy(restored)
       return {
+        ...viewFields(restored),
         chats,
         workspaces,
         pinnedWorkspaces,
         pinnedChats,
-        activeChatId,
-        openChatIds,
-        visibleChatIds,
-        chatTree: chatTreeWs,
-        chatWindowSizes: mirrorsWs.chatWindowSizes,
-        chatLayout: mirrorsWs.chatLayout,
         chatAborts,
+        activeWorkspaceKey: fallbackKey,
+        workspaceViews,
+        workspaceLastUsedAt,
+        root: workspaceRootForKey({ workspaces, chats }, fallbackKey),
+        outsideAllowed: false,
+        outsideFolders: [],
         unreadChats: s.unreadChats.filter((cid) => !doomedIds.has(cid)),
-        deletedChatIds: [
-          ...s.deletedChatIds,
-          ...s.chats.filter((c) => workspaceKey(c.root ?? '') === key).map((c) => c.id),
-        ],
-        deletedWorkspaceRoots: [
-          ...s.deletedWorkspaceRoots,
-          ...s.chats.filter((c) => workspaceKey(c.root ?? '') === key).map((c) => c.root ?? ''),
-        ],
+        deletedChatIds: [...s.deletedChatIds, ...deletedChatIds],
+        deletedWorkspaceRoots: [...s.deletedWorkspaceRoots, ...deletedWorkspaceRoots],
       }
     })
     get().persist()
@@ -3539,18 +4279,79 @@ export const useStore = create<State>((set, get) => ({
         workspaceColors[nextKey] = workspaceColors[key]
       }
       delete workspaceColors[key]
-      return {
+      const chats = s.chats.map((c) =>
+        workspaceKey(c.root ?? '') === key
+          ? { ...c, root: nextRoot || undefined, updatedAt: Date.now() }
+          : c,
+      )
+      // Carry this workspace's tab/layout snapshot to its new key (merging it
+      // into an existing destination's snapshot when both become one project).
+      const workspaceViews = { ...s.workspaceViews }
+      const movingView = s.activeWorkspaceKey === key ? liveWorkspaceView(s) : workspaceViews[key]
+      delete workspaceViews[key]
+      const movingSanitized = movingView
+        ? sanitizeWorkspaceView(movingView, chats, nextKey, s.chatLayout)
+        : null
+      if (movingSanitized) {
+        const dest = workspaceViews[nextKey]
+        workspaceViews[nextKey] = dest
+          ? mergeWorkspaceViews(
+              sanitizeWorkspaceView(dest, chats, nextKey, s.chatLayout),
+              movingSanitized,
+              s.chatLayout,
+            )
+          : movingSanitized
+      }
+      const workspaceLastUsedAt = { ...s.workspaceLastUsedAt }
+      if (workspaceLastUsedAt[key] !== undefined) {
+        workspaceLastUsedAt[nextKey] = Math.max(
+          workspaceLastUsedAt[nextKey] ?? 0,
+          workspaceLastUsedAt[key],
+        )
+        delete workspaceLastUsedAt[key]
+      }
+      const base = {
         workspaces,
-        chats: s.chats.map((c) =>
-          workspaceKey(c.root ?? '') === key
-            ? { ...c, root: nextRoot || undefined, updatedAt: Date.now() }
-            : c,
-        ),
+        chats,
         workspaceColors,
         pinnedWorkspaces: s.pinnedWorkspaces.map((k) => (k === key ? nextKey : k)),
-        root: s.root === prevRoot ? nextRoot : s.root,
-        deletedWorkspaceRoots: prevRoot ? [...s.deletedWorkspaceRoots, prevRoot] : s.deletedWorkspaceRoots,
+        workspaceViews,
+        workspaceLastUsedAt,
+        deletedWorkspaceRoots: prevRoot
+          ? [...s.deletedWorkspaceRoots, prevRoot]
+          : s.deletedWorkspaceRoots,
       }
+      if (s.activeWorkspaceKey === key) {
+        // The active workspace was renamed: keep showing its chats under the
+        // new key (the merged snapshot is authoritative when the target
+        // already existed).
+        const restored = workspaceViews[nextKey] ?? emptyWorkspaceView(s.chatLayout)
+        workspaceViews[nextKey] = restored
+        persistViewToLegacy(restored)
+        return {
+          ...base,
+          ...viewFields(restored),
+          activeWorkspaceKey: nextKey,
+          root: nextRoot,
+          outsideAllowed: false,
+          outsideFolders: [],
+        }
+      }
+      if (s.activeWorkspaceKey === nextKey) {
+        // A background workspace was merged INTO the active one: its open
+        // tabs become tabs of the active workspace. The live view stays
+        // authoritative, so drop the snapshot copy (persist rewrites it).
+        delete workspaceViews[nextKey]
+        const openChatIds = [...s.openChatIds]
+        if (movingSanitized) {
+          for (const id of movingSanitized.openChatIds) {
+            if (!openChatIds.includes(id)) openChatIds.push(id)
+          }
+        }
+        persistOpenState(openChatIds, s.activeChatId)
+        return { ...base, openChatIds }
+      }
+      return { ...base }
     })
     get().persist()
     return nextKey
@@ -3568,6 +4369,10 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setActiveChat: (id) => {
+    const target = get().chats.find((c) => c.id === id)
+    if (target && workspaceKey(target.root ?? '') !== get().activeWorkspaceKey) {
+      get().switchWorkspace(workspaceKey(target.root ?? ''))
+    }
     set((s) => {
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
@@ -3616,6 +4421,14 @@ export const useStore = create<State>((set, get) => ({
   },
 
   openChat: (id) => {
+    const target = get().chats.find((c) => c.id === id)
+    if (!target) return
+    // Chats belong to a workspace: opening one from anywhere (search, tab
+    // list, sidebar of another project) activates its workspace first so the
+    // tab bar and window layout are that workspace's view.
+    if (workspaceKey(target.root ?? '') !== get().activeWorkspaceKey) {
+      get().switchWorkspace(workspaceKey(target.root ?? ''))
+    }
     set((s) => {
       if (!s.chats.some((c) => c.id === id)) return {}
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
@@ -3749,6 +4562,11 @@ export const useStore = create<State>((set, get) => ({
   },
 
   openInWindow: (id) => {
+    const target = get().chats.find((c) => c.id === id)
+    if (!target) return
+    if (workspaceKey(target.root ?? '') !== get().activeWorkspaceKey) {
+      get().switchWorkspace(workspaceKey(target.root ?? ''))
+    }
     set((s) => {
       if (!s.chats.some((c) => c.id === id)) return {}
       const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [s.activeChatId], s.chatLayout)
@@ -3776,23 +4594,24 @@ export const useStore = create<State>((set, get) => ({
       if (visibleIds.length > 1) {
         // Collapse: stash the split layout (nested dirs + per-window sizes, so
         // expand restores every pane in place at the same size) and keep only
-        // the focused window. Tabs stay open.
+        // the focused window. Tabs stay open. The stash is PER WORKSPACE.
         const activeChatId =
           s.activeChatId && visibleIds.includes(s.activeChatId)
             ? s.activeChatId
             : visibleIds[visibleIds.length - 1] ?? ''
         if (!activeChatId) return {}
-        persistSavedChatTree(s.chatTree ?? buildFromList(visibleIds, treeDirFromLayout(s.chatLayout)))
+        const savedChatTree = s.chatTree ?? buildFromList(visibleIds, treeDirFromLayout(s.chatLayout))
+        persistSavedChatTree(savedChatTree)
         persistVisibleChats([activeChatId])
         persistChatTree(null)
         persistWindowSizes({})
-        return { chatTree: null, visibleChatIds: [activeChatId], chatWindowSizes: {}, activeChatId }
+        return { savedChatTree, chatTree: null, visibleChatIds: [activeChatId], chatWindowSizes: {}, activeChatId }
       }
       // Expand: bring back the previously open windows exactly as they were
       // (saved tree keeps positions and sizes), then add any tab opened while
       // single beside the focused one.
       const validIds = new Set(s.chats.map((c) => c.id))
-      const chatTree = restoreMultiTree(loadSavedChatTree(), s.openChatIds, validIds, s.activeChatId, treeDirFromLayout(s.chatLayout))
+      const chatTree = restoreMultiTree(s.savedChatTree, s.openChatIds, validIds, s.activeChatId, treeDirFromLayout(s.chatLayout))
       if (!chatTree) return {}
       const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
       return {
@@ -3844,6 +4663,10 @@ export const useStore = create<State>((set, get) => ({
   },
 
   focusWindow: (id) => {
+    const target = get().chats.find((c) => c.id === id)
+    if (target && workspaceKey(target.root ?? '') !== get().activeWorkspaceKey) {
+      get().switchWorkspace(workspaceKey(target.root ?? ''))
+    }
     set((s) => {
       if (!s.chats.some((c) => c.id === id)) return {}
       if (s.activeChatId === id) return {}
@@ -4253,10 +5076,98 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setChatRoot: (id, root) => {
-    set((s) => ({
-      root: s.activeChatId === id ? root : s.root,
-      chats: s.chats.map((c) => (c.id === id ? { ...c, root, updatedAt: Date.now() } : c)),
-    }))
+    set((s) => {
+      const chat = s.chats.find((c) => c.id === id)
+      if (!chat) return {}
+      const nextRoot = root ?? ''
+      const prevKey = workspaceKey(chat.root ?? '')
+      const nextKey = workspaceKey(nextRoot)
+      const chats = s.chats.map((c) =>
+        c.id === id ? { ...c, root: nextRoot || undefined, updatedAt: Date.now() } : c,
+      )
+      if (prevKey === nextKey) {
+        return { chats, root: s.activeChatId === id ? nextRoot : s.root }
+      }
+      // Register a destination that does not exist yet (unless it is the
+      // implicit "No project" bucket, which has no persisted workspace row).
+      const workspaces =
+        nextKey === '__none__' || s.workspaces.some((w) => w.key === nextKey)
+          ? s.workspaces
+          : [...s.workspaces, makeWorkspace(nextRoot)]
+      const workspaceViews = { ...s.workspaceViews }
+      const prevLive = s.activeWorkspaceKey === prevKey
+      const destLive = s.activeWorkspaceKey === nextKey
+      const prevView = prevLive
+        ? liveWorkspaceView(s)
+        : workspaceViews[prevKey] ?? emptyWorkspaceView(s.chatLayout)
+      const destBase = destLive
+        ? liveWorkspaceView(s)
+        : workspaceViews[nextKey] ?? emptyWorkspaceView(s.chatLayout)
+      const wasOpen = prevView.openChatIds.includes(id)
+      const movingFocus = s.activeChatId === id
+      // Prune the chat from its old workspace (the updated `chats` list no
+      // longer owns it there, so sanitize drops its tab/tree leaf).
+      const prevSanitized = sanitizeWorkspaceView(prevView, chats, prevKey, s.chatLayout)
+      workspaceViews[prevKey] = prevSanitized
+      let dest = sanitizeWorkspaceView(destBase, chats, nextKey, s.chatLayout)
+      if (wasOpen || movingFocus) {
+        dest = {
+          ...dest,
+          openChatIds: dest.openChatIds.includes(id)
+            ? dest.openChatIds
+            : [...dest.openChatIds, id],
+        }
+      }
+      if (movingFocus) dest = focusChatInView(dest, id, s.chatLayout)
+      const workspaceViewsWithDest = { ...workspaceViews, [nextKey]: dest }
+
+      if (movingFocus) {
+        // Following the moved chat keeps it on screen: the destination becomes
+        // the active workspace and its restored view is the live top-level one.
+        persistViewToLegacy(dest)
+        return {
+          chats,
+          workspaces,
+          workspaceViews: workspaceViewsWithDest,
+          workspaceLastUsedAt: { ...s.workspaceLastUsedAt, [nextKey]: Date.now() },
+          activeWorkspaceKey: nextKey,
+          ...viewFields(dest),
+          root: nextRoot,
+          outsideAllowed: false,
+          outsideFolders: [],
+        }
+      }
+      if (prevLive) {
+        // A background chat was moved out of the ACTIVE workspace: the live
+        // view loses that tab but stays on its current chat/workspace.
+        persistViewToLegacy(prevSanitized)
+        return {
+          chats,
+          workspaces,
+          workspaceViews: workspaceViewsWithDest,
+          ...viewFields(prevSanitized),
+        }
+      }
+      if (destLive) {
+        // A chat moved INTO the active workspace: make its tab reachable here
+        // (without stealing focus from what the user is currently reading).
+        const openChatIds = s.openChatIds.includes(id)
+          ? s.openChatIds
+          : [...s.openChatIds, id]
+        persistOpenState(openChatIds, s.activeChatId)
+        // The active snapshot is rewritten from the live fields on persist, so
+        // do not leave a divergent copy behind.
+        delete workspaceViewsWithDest[nextKey]
+        return {
+          chats,
+          workspaces,
+          workspaceViews: workspaceViewsWithDest,
+          workspaceLastUsedAt: { ...s.workspaceLastUsedAt, [nextKey]: Date.now() },
+          openChatIds,
+        }
+      }
+      return { chats, workspaces, workspaceViews: workspaceViewsWithDest }
+    })
     get().persist()
   },
 

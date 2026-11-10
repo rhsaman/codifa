@@ -86,7 +86,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         // explore rounds. Read/search here is for what the step already NAMED.
         (
             "read",
-            "Read files this step KNOWS (discovery is `explore`). One call covers all: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400}] reads one window PER ENTRY (several files or windows cost one call; overlaps merge). An entry without `path` reuses filePath. Headers give the file's TOTAL lines, and a large file's FIRST window carries its definition outline — jump to the line you need, don't walk window by window.",
+            "Read files this step KNOWS (discovery is `explore`). One call covers all: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400}] reads one window PER ENTRY (several files/windows cost one call; overlaps merge). An entry without `path` reuses filePath. Headers give the file's TOTAL lines, and a large file's FIRST window carries its definition outline — jump to the line you need. Omit `limit` to read until the result budget; a cut names the exact resume `offset`. PDFs and Office docs read as TEXT too.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
@@ -139,24 +139,8 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
             }),
         ),
         (
-            "create_skill",
-            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass `description` — one short ENGLISH line saying WHEN to use it; the agent picks skills by matching the request against it. To install from a repo pass `repo` instead of `content`. To EDIT, `load_skill` first then send the revised body; pass previous_name when renaming.",
-            json!({
-                "name": {"type": "string", "description": "Skill name (also the folder slug)"},
-                "description": {"type": "string", "description": "REQUIRED. One-line ENGLISH summary of when to use this skill"},
-                "content": {"type": "string", "description": "The skill body: step-by-step instructions the agent follows"},
-                "previous_name": {"type": "string", "description": "Old name when renaming"},
-                "repo": {"type": "string", "description": "Install from a repo instead of `content`: `owner/repo`, a GitHub URL, or a local folder"},
-                "repo_path": {"type": "string", "description": "install: sub-folder holding SKILL.md (default: discover)"},
-                "repo_ref": {"type": "string", "description": "install: branch/tag/commit (default: default branch)"},
-                "extra_files": {"type": "object", "description": "Optional extra files: filename -> content"},
-                "deleted_files": {"type": "array", "items": {"type": "string"}, "description": "Extra files to delete"},
-                "delete": {"type": "boolean", "description": "Delete the skill instead of writing it"}
-            }),
-        ),
-        (
             "update_plan",
-            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Call it ONCE after writing the plan, then again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one. While a long step runs you may report its percent done via the optional \"progress\" field (0-100); the UI draws a small bar. Issue it IN THE SAME STEP as your other tool calls (or inside `batch` ops), never as a solo round.",
+            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Use it for EVERY multi-step task — including a plugin workflow with several steps — right after you know the steps and BEFORE the first action. Call it again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one. While a long step runs you may report its percent done via the optional \"progress\" field (0-100); the UI draws a small bar. Issue it IN THE SAME STEP as your other tool calls (or inside `batch` ops), never as a solo round.",
             json!({
                 "items": {
                     "type": "array",
@@ -203,20 +187,8 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
             }),
         ),
         (
-            "create_mcp",
-            "Create or update an MCP connector (the `/mcp` flow). Pass EITHER command (+ optional args/env) for a stdio server, OR url for an HTTP one. To EDIT an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it (the old file is removed so no stale duplicate is left). The connector is saved but stays off until the user enables it in the composer's MCP picker.",
-            json!({
-                "name": {"type": "string", "description": "Connector name (also the file name)"},
-                "command": {"type": "string", "description": "Executable for a stdio server (e.g. npx)"},
-                "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments for the stdio command"},
-                "env": {"type": "object", "description": "Optional environment variables for the stdio server"},
-                "url": {"type": "string", "description": "Endpoint for an HTTP connector (instead of command)"},
-                "previous_name": {"type": "string", "description": "Old name when renaming an existing connector"}
-            }),
-        ),
-        (
             "batch",
-            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}, {\"tool\": \"edit_file\", ...}, {\"tool\": \"run_terminal\", ...}]. Batchable: read, grep, glob, find_symbol, the lsp_* lookups, run_terminal, edit_file, write_file, current_time, system_stats (max 10). Every result comes back COMPLETE, labeled per op, run in order — a later op sees an earlier edit's effects. Plan the WHOLE step here: all the lookups you expect to need, the edits, and the verification command together. A wave that needs a result you do not have yet waits for your next round.",
+            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}, {\"tool\": \"edit_file\", ...}, {\"tool\": \"run_terminal\", ...}]. Batchable: read, grep, glob, find_symbol, the lsp_* lookups, run_terminal, edit_file, write_file, update_plan, current_time, system_stats (max 10). Every result comes back COMPLETE, labeled per op, run in order — a later op sees an earlier edit's effects. Plan the WHOLE step here: all the lookups you expect to need, the edits, and the verification command together. A wave that needs a result you do not have yet waits for your next round.",
             json!({
                 "ops": {
                     "type": "array",
@@ -233,14 +205,13 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
             }),
         ),
         (
-            "load_skill",
-            "Load a skill's FULL body BEFORE work it covers. ONE call can load SEVERAL skills: names=[\"A\",\"B\"] returns every body together — ask for all the skills the task needs here, a second load call costs a round-trip. Issue it IN THE SAME STEP as your other tool calls, never as a solo round. `query` searches every installed skill, `bundle` lists one plugin bundle's skills.",
+            "load_plugin",
+            "Load a PLUGIN — the toolbox the user installed. Find the plugin first: match the request against a plugin description OR one of the skill names listed under it, then load that plugin. `slug` alone loads EVERYTHING inside it: every skill body, every MCP connector tool (callable from your next step) and the script/command inventory. `slug` + `skill` reads just ONE skill body FROM that plugin — still pass the slug; never load a bare skill name. `query` searches every installed plugin and skill by name and description and returns the owning plugin. `file` reads one extra file of that skill.",
             json!({
-                "name": {"type": "string", "description": "Name or slug"},
-                "names": {"type": "array", "items": {"type": "string"}, "description": "SEVERAL skills in THIS one call — every body comes back together"},
-                "query": {"type": "string", "description": "Words when the name is unknown"},
-                "bundle": {"type": "string", "description": "Plugin bundle slug: list that bundle's skills"},
-                "file": {"type": "string", "description": "Extra file of that skill (single-name form only)"}
+                "slug": {"type": "string", "description": "Plugin slug (or display name). Always required to load; alone it loads the whole toolbox"},
+                "query": {"type": "string", "description": "Words when the plugin is unknown: searches every installed plugin and skill"},
+                "skill": {"type": "string", "description": "With `slug`: read ONE skill body from that plugin"},
+                "file": {"type": "string", "description": "With `slug`+`skill`: read one extra file of that skill"}
             }),
         ),
         // Plugins bundle skills + MCP connectors into ONE switchable unit. The
@@ -275,6 +246,12 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
                     }
                 },
                 "deleted_skills": {"type": "array", "items": {"type": "string"}},
+                "mcp": {
+                    "type": "object",
+                    "description": "MCP connectors: {serverName: {command, args, env} | {url, headers}}. Saved into the bundle's own mcp.json; they activate with the plugin.",
+                    "additionalProperties": {"type": "object"}
+                },
+                "deleted_mcp": {"type": "array", "items": {"type": "string"}, "description": "Connector names to remove from the bundle"},
                 "commands": {"type": "array", "description": "Slash commands: name (typed after `/`), description, content (body; `$ARGUMENTS`, `$1`..`$9`).", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "content": {"type": "string"}}, "required": ["name"]}},
                 "deleted_commands": {"type": "array", "items": {"type": "string"}},
                 "agents": {"type": "array", "description": "Sub-agent profiles: each is a delegation tool that ALWAYS runs on the Explore model row.", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string", "description": "WHEN to delegate"}, "tools": {"type": "array", "items": {"type": "string"}, "description": "Omit for all; can only NARROW"}, "prompt": {"type": "string", "description": "Its system prompt"}}, "required": ["name", "prompt"]}},
@@ -351,7 +328,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         ),
         (
             "explore",
-            "Delegate research that needs MANY rounds (how an area works, where X is wired up). It reads, greps, globs and runs LSP lookups, then returns the FULL findings. Fire SEVERAL TIMES IN THE SAME STEP — parallel calls run CONCURRENTLY for ONE round-trip — one focused question per area; prefer 2-4 focused explores over one giant one. Read a file whose path you already know directly instead of delegating it. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
+            "Delegate research that needs MANY rounds (how an area works, where X is wired up) or external facts. It reads, greps, globs, runs LSP lookups, and can `web_search` / `fetch_url` for docs, packages and current information, then returns the FULL findings. Give each call its whole question end to end — do not split one question across calls. Fire SEVERAL TIMES IN THE SAME STEP for INDEPENDENT areas: parallel calls run CONCURRENTLY for ONE round-trip; prefer 2-4 focused explores over one giant one. Read a file whose path you already know directly instead of delegating it. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
             json!({
                 "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
                 "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
@@ -421,20 +398,14 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
         .chain(lsp_position_schemas())
         .chain(extra.drain(..))
         .collect();
-    let mut out: Vec<Value> = schemas
+    let out: Vec<Value> = schemas
         .iter()
-        // The skill/connector AUTHORING tools are bound only for a turn that
-        // actually asked for them (see AgentRequest::allow_create). `artifact`
-        // is deliberately NOT in this list: whether a turn builds one is the
-        // MODEL's decision, not something `allow_create` (a prompt-text guess)
-        // can predict — gating it made a correctly phrased request ship a
-        // hard-coded HTML mock instead. `plugin` is likewise absent: it is the
-        // one door to a bundle's scripts, so a plain turn keeps `list`/`run`
-        // (see the narrowing below) and the create path gets its full action
-        // set — which is what an artifact with a Rust backend needs to RUN it.
-        .filter(|(name, _, _)| {
-            allow_create || !matches!(*name, "create_skill" | "create_mcp")
-        })
+        // `plugin` is the ONE authoring door: skills and connectors are created
+        // inside a bundle through `plugin action=create/update`, never through a
+        // standalone skill/connector tool. `artifact` is deliberately not gated:
+        // whether a turn builds one is the MODEL's decision, not something
+        // `allow_create` (a prompt-text guess) can predict — gating it made a
+        // correctly phrased request ship a hard-coded HTML mock instead.
         .map(|(name, desc, props)| {
             json!({
                 "type": "function",
@@ -446,20 +417,35 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
             })
         })
         .collect();
-    if !allow_create {
-        compact_plugin_schema(&mut out);
-        compact_schedule_schema(&mut out);
-    }
+    // `allow_create` no longer narrows anything here. It USED to swap `plugin`
+    // for `compact_plugin_schema` (action enum down to ["list", "run"]), and
+    // that was half the "[Schedule: update ...] is silently refused" bug: the
+    // flag is a prompt-text guess that an ordinary request never sets, so a user
+    // who plainly said "update the schedule" was handed a `list`-only enum and
+    // the model could not even NAME the action. Both authoring stores live
+    // outside the workspace (`~/.codifa/plugins/`, `~/.codifa/schedules/`), so
+    // neither the mode nor this guess has any business hiding the enum; the
+    // call-time gates (`plugin_mode_refusal`, `schedule_mode_refusal`) plus the
+    // `headless` compaction in `turn.rs` are what actually protect the stores.
+    //
+    // The parameter is KEPT deliberately: it is the request's authoring intent,
+    // still read at the call site in `turn.rs`, and dropping it here would make
+    // that difference invisible to the next reader.
+    let _ = allow_create;
     out
 }
 
-/// Swap the `schedule` tool's full schema for the list-only one, the exact
-/// mirror of `compact_plugin_schema`: `schedule` STAYS in the tool list in every
-/// turn (the model can always answer "what is scheduled" without burning a
-/// round on a refusal), but the authoring prose and the create/update/toggle/
-/// delete enum only ride on a turn that may actually write. The full schema is
-/// ~1.1K chars re-sent on every round-trip, and a read-only turn advertising
-/// `action=create` only invites the call its own backstop then refuses.
+/// Swap the `schedule` tool's full schema for the list-only one.
+///
+/// This is NOT a mode compact: it applies to an UNATTENDED run only, which has
+/// nobody to approve a change to the schedule store. A user-invoked turn keeps
+/// the full enum in every mode, Ask and Plan included — `schedule` writes to
+/// `~/.codifa/schedules/`, which is not the workspace, so `write_files` (the only
+/// thing that tells the modes apart) has nothing to say about it. Narrowing it by
+/// mode was the "[Schedule: update …]" bug: the user issued the command and got a
+/// read-only refusal. The full schema is ~1.1K chars re-sent every round-trip, and
+/// an unattended run advertising `action=create` only invites the call its own
+/// backstop then refuses.
 pub(super) fn compact_schedule_schema(schemas: &mut [Value]) {
     for s in schemas.iter_mut() {
         if s["function"]["name"] != "schedule" {
@@ -470,7 +456,7 @@ pub(super) fn compact_schedule_schema(schemas: &mut [Value]) {
             "function": {
                 "name": "schedule",
                 "description": "List the user's scheduled tasks (name, cron, on/off). \
-Creating or editing one is not available in this mode.",
+An unattended run cannot create, edit, toggle or delete one.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -606,60 +592,364 @@ pub(super) fn media_tool_schemas(image_default: &str, video_default: &str) -> Ve
 /// Each description carries the profile's own text (that is how the model learns
 /// WHEN to delegate to it), and the parameter shape is `explore`'s — a profile
 /// never asks for different arguments.
-pub(super) fn delegation_schemas(root: &std::path::Path) -> Vec<Value> {
-    crate::plugins::enabled_plugin_agents(root)
+///
+/// Custom sub-agents whose `kind` needs a composer switch (`browser` /
+/// `computer`) are advertised ONLY while that switch is on. Advertising them
+/// with the switch off sent the model into a dead end: it delegated expecting
+/// browser tools and the child was bound to the research set instead.
+pub(super) fn delegation_schemas(
+    root: &std::path::Path,
+    custom: &[Value],
+    allow_browser: bool,
+    allow_computer: bool,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    // One tool name may exist only once: a bundle profile and a custom row can
+    // share a slug, and duplicate function names make providers reject the
+    // whole request. The user's own row wins.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Custom sub-agents (Settings → Sub-agents) join the SAME table as bundle
+    // profiles: the model sees one `agent__<id>` tool per profile, no matter
+    // where it came from. A browser/computer row carries the boundary of its
+    // driver in the description, so "take a screenshot" cannot drift into the
+    // desktop agent when the page itself is what the user asked about.
+    for row in custom
         .iter()
-        .filter_map(|row| {
-            let name = row["name"].as_str()?.trim();
-            let prompt = row["prompt"].as_str().unwrap_or_default().trim();
-            if name.is_empty() || prompt.is_empty() {
-                return None;
+        .filter(|row| custom_subagent_reachable(row, allow_browser, allow_computer))
+    {
+        let id = row["id"].as_str().unwrap_or_default().trim();
+        let name = row["name"].as_str().unwrap_or(id).trim();
+        let prompt = row["prompt"].as_str().unwrap_or_default().trim();
+        if id.is_empty() || prompt.is_empty() || !seen.insert(delegation_tool_name(id)) {
+            continue;
+        }
+        let kind = profile_kind(Some(row));
+        let description = row["description"].as_str().unwrap_or_default().trim();
+        let mut head = if description.is_empty() {
+            format!("Delegate to the `{name}` sub-agent")
+        } else {
+            format!("Delegate to the `{name}` sub-agent: {description}")
+        };
+        match kind.as_str() {
+            "browser" => head.push_str(
+                " Page work only: navigate, read, click, type, scroll and page screenshots. \
+Native apps/windows belong to the desktop agent.",
+            ),
+            "computer" => head.push_str(
+                " Native apps/windows only: browser page work — including page screenshots — \
+belongs to the browser agent, not here.",
+            ),
+            _ => {}
+        }
+        out.push(delegation_schema_value(&head, "", id, kind == "computer"));
+    }
+    // Bundle profiles come second, so a custom row with the same slug keeps the
+    // name. A disabled bundle contributes nothing: its switch is the control.
+    // A plugin profile has no stored `kind`, so its declared tools decide the
+    // same way Settings decides a custom row's — and a browser/desktop bundle
+    // agent follows the same composer switch as a custom one.
+    for row in crate::plugins::enabled_plugin_agents(root) {
+        let name = row["name"].as_str().unwrap_or_default().trim();
+        let prompt = row["prompt"].as_str().unwrap_or_default().trim();
+        if name.is_empty() || prompt.is_empty() || !seen.insert(delegation_tool_name(name)) {
+            continue;
+        }
+        let kind = profile_kind(Some(&row));
+        if (kind == "browser" && !allow_browser) || (kind == "computer" && !allow_computer) {
+            continue;
+        }
+        let description = row["description"].as_str().unwrap_or_default().trim();
+        let bundle = row["plugin"].as_str().unwrap_or_default().trim();
+        let mut head = if description.is_empty() {
+            format!("Delegate to the `{name}` sub-agent")
+        } else {
+            format!("Delegate to the `{name}` sub-agent: {description}")
+        };
+        match kind.as_str() {
+            "browser" => head.push_str(
+                " Page work only: navigate, read, click, type, scroll and page screenshots. \
+Native apps/windows belong to the desktop agent.",
+            ),
+            "computer" => head.push_str(
+                " Native apps/windows only: browser page work — including page screenshots — \
+belongs to the browser agent, not here.",
+            ),
+            _ => {}
+        }
+        let tail = if bundle.is_empty() {
+            String::new()
+        } else {
+            format!(" (from the `{bundle}` plugin)")
+        };
+        out.push(delegation_schema_value(
+            &head,
+            &tail,
+            name,
+            kind == "computer",
+        ));
+    }
+    out
+}
+
+/// Whether a custom sub-agent can actually be reached on THIS turn. A browser /
+/// computer profile is only usable while the matching composer switch is on
+/// (its child turn would otherwise be bound to the research set), so it is
+/// neither advertised nor named in the prompt while the switch is off.
+fn custom_subagent_reachable(
+    row: &Value,
+    allow_browser: bool,
+    allow_computer: bool,
+) -> bool {
+    match profile_kind(Some(row)).as_str() {
+        "browser" => allow_browser,
+        "computer" => allow_computer,
+        _ => true,
+    }
+}
+
+/// The ID of a reachable custom sub-agent of `kind` with a real prompt, or
+/// `None`.
+///
+/// Used to give a browser/computer profile OWNERSHIP of its driver: when such
+/// an agent exists, the parent turn keeps only the delegation tool. Without
+/// that, a model takes the shortest path it can see — traced live, "open
+/// digikala" called `browser_navigate` directly and the Browser Navigator
+/// profile never ran, no matter what the prompt said.
+pub(super) fn reachable_subagent_id(
+    custom: &[Value],
+    kind: &str,
+    allow_browser: bool,
+    allow_computer: bool,
+) -> Option<String> {
+    custom.iter().find_map(|row| {
+        if profile_kind(Some(row)).as_str() != kind {
+            return None;
+        }
+        if !custom_subagent_reachable(row, allow_browser, allow_computer) {
+            return None;
+        }
+        let id = row["id"].as_str().unwrap_or_default().trim();
+        let prompt = row["prompt"].as_str().unwrap_or_default().trim();
+        // An empty prompt cannot be delegated to, so it must NOT take the
+        // driver away — that would leave the turn with no browser at all.
+        if id.is_empty() || prompt.is_empty() {
+            return None;
+        }
+        Some(id.to_string())
+    })
+}
+
+/// The system-prompt counterpart of [`delegation_schemas`]: name EVERY agent
+/// this turn can reach — custom rows AND enabled bundle profiles — and state
+/// the selection contract.
+///
+/// The contract is deliberately about MATCHING, not about using the list:
+/// delegation is automatic when a piece needs an agent's capability, but a
+/// task that needs nothing special stays with the main agent. That is what
+/// keeps a "find a laptop" page task away from the desktop agent.
+pub(super) fn delegation_prompt_hint(
+    root: &std::path::Path,
+    custom: &[Value],
+    allow_browser: bool,
+    allow_computer: bool,
+) -> String {
+    /// Add one agent line, deduped by the tool name the dispatcher will see.
+    fn push_line(
+        lines: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+        name: &str,
+        key: &str,
+        description: &str,
+        origin: &str,
+    ) -> Option<String> {
+        let tool = delegation_tool_name(key);
+        if name.trim().is_empty() || !seen.insert(tool.clone()) {
+            return None;
+        }
+        let raw = description.trim();
+        let mut desc: String = raw.chars().take(140).collect();
+        if desc.chars().count() < raw.chars().count() {
+            desc.push('…');
+        }
+        let suffix = if origin.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" — plugin `{}`", origin.trim())
+        };
+        lines.push(if desc.is_empty() {
+            format!("- {} (`{tool}`){suffix}", name.trim())
+        } else {
+            format!("- {} (`{tool}`): {desc}{suffix}", name.trim())
+        });
+        Some(tool)
+    }
+
+    const MAX_LINES: usize = 32;
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut browser_owner: Option<String> = None;
+    let mut computer_owner: Option<String> = None;
+    let mut extra = 0usize;
+
+    // Custom rows first: a user-made profile wins a name collision.
+    for row in custom
+        .iter()
+        .filter(|row| custom_subagent_reachable(row, allow_browser, allow_computer))
+    {
+        let id = row["id"].as_str().unwrap_or_default().trim();
+        let prompt = row["prompt"].as_str().unwrap_or_default().trim();
+        if id.is_empty() || prompt.is_empty() {
+            continue;
+        }
+        if lines.len() >= MAX_LINES {
+            extra += 1;
+            continue;
+        }
+        let name = row["name"].as_str().unwrap_or(id).trim();
+        let desc = row["description"].as_str().unwrap_or_default();
+        if let Some(tool) = push_line(&mut lines, &mut seen, name, id, desc, "") {
+            match profile_kind(Some(row)).as_str() {
+                "browser" if browser_owner.is_none() => browser_owner = Some(tool),
+                "computer" if computer_owner.is_none() => computer_owner = Some(tool),
+                _ => {}
             }
-            let description = row["description"].as_str().unwrap_or_default().trim();
-            let bundle = row["plugin"].as_str().unwrap_or_default().trim();
-            let head = if description.is_empty() {
-                format!("Delegate to the `{name}` sub-agent")
-            } else {
-                format!("Delegate to the `{name}` sub-agent: {description}")
-            };
-            Some(json!({
+        }
+    }
+    // Bundle profiles join the same list: a sub-agent is a sub-agent whether
+    // the user wrote it or a plugin shipped it. Its declared tools decide the
+    // kind, so a bundle's browser/desktop agent follows the composer switch
+    // exactly like a custom row. Ownership stays with the custom row: a
+    // bundle's driver agent is an extra tool, not the turn's canonical one.
+    for row in crate::plugins::enabled_plugin_agents(root) {
+        let name = row["name"].as_str().unwrap_or_default().trim();
+        let prompt = row["prompt"].as_str().unwrap_or_default().trim();
+        if name.is_empty() || prompt.is_empty() {
+            continue;
+        }
+        let kind = profile_kind(Some(&row));
+        if (kind == "browser" && !allow_browser) || (kind == "computer" && !allow_computer) {
+            continue;
+        }
+        if lines.len() >= MAX_LINES {
+            extra += 1;
+            continue;
+        }
+        let desc = row["description"].as_str().unwrap_or_default();
+        let bundle = row["plugin"].as_str().unwrap_or_default();
+        // A plugin browser/desktop agent is an EXTRA tool, not the turn's
+        // canonical driver owner: ownership stays with the built-in custom row
+        // (Browser Navigator / Desktop Operator), so the parent's direct tools
+        // are not withdrawn because some bundle happened to declare one.
+        push_line(&mut lines, &mut seen, name, name, desc, bundle);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut text = format!(
+        "\n\nSUB-AGENTS — delegate only the work that actually needs one.\n\
+Each line is a separate agent with its own tools and a short context. Match each PIECE \
+of the request against these descriptions:\n\
+- Give ONE agent the WHOLE end-to-end job in a SINGLE call: include every step it needs \
+and the verification of the result. Never split one job into sequential calls to the \
+same agent (open → check → publish as three calls costs three main-agent round-trips).\n\
+- Delegate a piece only when its description clearly covers it and that agent can do it \
+better than you.\n\
+- Use the FEWEST agents that cover the request — one is the normal case.\n\
+- Call more than one IN THE SAME STEP only when the request genuinely splits into \
+independent pieces that need DIFFERENT agents — those calls run CONCURRENTLY. Browser/desktop \
+agents still run one at a time over their shared page/desktop. Never call two agents for the \
+same piece.\n\
+- Never call an agent just because it exists, and never delegate the whole list.\n\
+- If no agent clearly matches, do the piece yourself (broad code research stays `explore`).\n\
+- A sub-agent's report IS the result: do not spawn a desktop step to verify or illustrate it.\n{}",
+        lines.join("\n")
+    );
+    if extra > 0 {
+        text.push_str(&format!(
+            "\n- …and {extra} more sub-agents, advertised as `agent__*` tools; use one only \
+when its description matches."
+        ));
+    }
+    // State the ownership explicitly: the parent's schema no longer carries the
+    // direct driver, and a weak model that still remembers `browser_navigate`
+    // from an older turn must know why it is gone and what to call instead.
+    if let Some(tool) = browser_owner {
+        text.push_str(&format!(
+            "\nPage work — navigating, reading, clicking, typing, scrolling and any \
+screenshot of a page — belongs to `{tool}`. The parent turn has NO direct `browser_*` \
+tools while it exists; delegate page work through it, and never use the desktop agent to \
+look at a page."
+        ));
+    }
+    if let Some(tool) = computer_owner {
+        text.push_str(&format!(
+            "\nNative-app work belongs to `{tool}`, and ONLY when the app has no usable \
+command line. File creation, conversion and export (PPTX/DOCX/XLSX/PDF, a deck or report \
+built from data, converting a document) are NOT desktop work: do them with ONE \
+`run_terminal` call using python-pptx/python-docx/openpyxl or `soffice --headless`, which is \
+also what the sub-agent itself is told. The parent turn has NO direct `computer` tool while \
+`{tool}` exists; page content (including page screenshots) is NOT desktop work."
+        ));
+    }
+    text
+}
+
+/// One delegation tool entry. `head` already names the sub-agent; `tail` adds
+/// where it came from (a bundle). `key` is the profile NAME for a bundle agent
+/// and the stable ID for a custom one — both end up as `agent__<slug>`.
+///
+/// `wants_reason` is true for a desktop agent: the delegation is gated by a
+/// user permission prompt, so the model must say WHY the desktop is needed
+/// instead of leaving the popup to guess from the task text.
+fn delegation_schema_value(head: &str, tail: &str, key: &str, wants_reason: bool) -> Value {
+    let mut properties = json!({
+        "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
+        "prompt": {"type": "string", "description": "The full task for the sub-agent"}
+    });
+    let mut required = vec!["description", "prompt"];
+    if wants_reason {
+        properties["reason"] = json!({
+            "type": "string",
+            "description": "WHY this task needs the desktop, in one short sentence — shown to \
+the user in the permission prompt before anything runs. Desktop is for apps with no usable \
+CLI; file creation/export belongs to run_terminal instead."
+        });
+        required.push("reason");
+    }
+    let reason_note = if wants_reason {
+        ", and `reason` (one sentence: why the desktop is needed)"
+    } else {
+        ""
+    };
+    json!({
                 "type": "function",
                 "function": {
-                    "name": delegation_tool_name(name),
+                    "name": delegation_tool_name(key),
                     "description": format!(
-                        "{head}{} Args: description (SHORT label for the UI) and prompt \
-                         (the full task for that sub-agent). Every sub-agent runs on the \
-                         Explore model row of Settings → Tools.",
-                        if bundle.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (from the `{bundle}` plugin)")
-                        }
+                        "{head}{tail} Args: description (SHORT label for the UI), prompt \
+                         (the FULL task for that sub-agent — include every step and the \
+                         verification, so one call finishes the whole job instead of \
+                         repeating it in a later call){reason_note}. Every sub-agent runs on \
+                         the Sub-agent model row of Settings → Tools."
                     ),
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
-                            "prompt": {"type": "string", "description": "The full task for the sub-agent"}
-                        },
-                        "required": ["description", "prompt"]
+                        "properties": properties,
+                        "required": required
                     }
                 }
-            }))
-        })
-        .collect()
+    })
 }
 
 /// Swap the `plugin` tool's full schema for the compact one: a plain turn keeps
 /// the door to a bundle's scripts (`list`/`run`) but NOT the authoring prose.
-/// The full schema is ~2.9K chars and is re-sent on every round-trip, so the
-/// authoring description would tax every turn to describe actions this one
-/// cannot call. This is ALSO the honest gate in read-only modes: `allow_create`
-/// is sticky (granted by an authoring request earlier in the history), so an
-/// Ask turn can still carry it — with the full enum the model then names
-/// `action=update` where only `run` is possible. A mode that cannot write
-/// files therefore gets the compact form too; the loop keeps a second gate for
-/// a stale transcript.
+///
+/// NO LONGER CALLED by `tool_schemas`: the request/mode narrowing it implements
+/// was the second half of the "[Schedule: update …] is silently refused" bug.
+/// Kept as the documented compact form; the gate that actually protects the
+/// store is `plugin_mode_refusal` plus the `allow_create` check at the call site
+/// in `turn.rs`.
+#[allow(dead_code)]
 pub(super) fn compact_plugin_schema(schemas: &mut [Value]) {
     for s in schemas.iter_mut() {
         if s["function"]["name"] != "plugin" {
@@ -744,6 +1034,50 @@ pub(super) fn lsp_position_schemas() -> Vec<(&'static str, &'static str, Value)>
     ]
 }
 
+/// Every native tool a PROFILE sub-agent may be granted.
+///
+/// The MAIN work set (read / write / edit / terminal / web / memory / LSP) PLUS
+/// the discovery tools the main agent deliberately delegates (`glob`,
+/// `lsp_diagnostics`), MINUS everything that belongs to the turn the USER
+/// started: delegation (`explore`), the plan (`update_plan`), user interaction
+/// (`ask_user`, `confirm_action`), artifacts, schedules, plugin authoring and
+/// the parent's `use_mcp` door. `load_plugin` is deliberately INCLUDED: a
+/// sub-agent discovers and loads any installed toolbox on its own.
+///
+/// A profile's declared `tools` narrows this table. Parent capabilities
+/// (`retain_allowed_tools`) still gate the result afterwards, so an Ask/Plan
+/// turn cannot become writable just because a profile names `Write`.
+pub(super) fn subagent_schemas() -> Vec<Value> {
+    const PARENT_ONLY: [&str; 8] = [
+        "explore",
+        "update_plan",
+        "ask_user",
+        "confirm_action",
+        "artifact",
+        "schedule",
+        "plugin",
+        "use_mcp",
+    ];
+    let mut out = tool_schemas(false, false);
+    // `tool_schemas` omits DISCOVERY so the main agent delegates it. A profile
+    // doing its own research needs the same tools `explore` has.
+    for schema in research_schemas() {
+        let name = schema["function"]["name"].as_str().unwrap_or_default();
+        if !out
+            .iter()
+            .any(|s| s["function"]["name"].as_str() == Some(name))
+        {
+            out.push(schema);
+        }
+    }
+    out.retain(|s| {
+        s["function"]["name"]
+            .as_str()
+            .is_some_and(|n| !PARENT_ONLY.contains(&n))
+    });
+    out
+}
+
 /// Tool schemas for the explore SUB-AGENT: the UNBOUNDED search set — `glob`
 /// discovery — plus the memory tools, which BOTH roles share (see tool_schemas).
 /// It shares `read`/`grep`/`find_symbol` and the position-based LSP lookups with
@@ -754,7 +1088,7 @@ pub(super) fn research_schemas() -> Vec<Value> {
     let schemas: &[(&str, &str, Value)] = &[
         (
             "read",
-            "Read files you already KNOW. ONE call covers several: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400},{\"path\":\"b.ts\"},…] reads one window per entry (several files and several windows alike); an entry without `path` reuses filePath. Overlapping or adjacent windows of one file arrive merged. Default window 400 lines; each header states the file's TOTAL lines — jump to the window you need instead of walking the file.",
+            "Read files you already KNOW. ONE call covers several: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400},{\"path\":\"b.ts\"},…] reads one window per entry (several files and several windows alike); an entry without `path` reuses filePath. Overlapping or adjacent windows of one file arrive merged. Omit `limit` to read until the result budget; each header states the file's TOTAL lines and a cut names the exact resume `offset`. PDFs and Office docs read as TEXT too.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
@@ -806,7 +1140,7 @@ pub(super) fn research_schemas() -> Vec<Value> {
         ),
         (
             "batch",
-            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole research step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}] (max 10). Batchable: read, grep, glob, find_symbol, the lsp_* lookups, current_time, system_stats. Every result comes back COMPLETE, labeled per op. Plan the WHOLE search phase here — every lookup you expect to need in one round; a wave that needs a result you do not have yet waits for your next round.",
+            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole research step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}] (max 10). Batchable: read, grep, glob, find_symbol, the lsp_* lookups, current_time, system_stats — plus run_terminal and the file writers WHEN they are in your tool list. Every result comes back COMPLETE, labeled per op. Plan the WHOLE search phase here — every lookup you expect to need in one round; a wave that needs a result you do not have yet waits for your next round.",
             json!({
                 "ops": {
                     "type": "array",
@@ -859,7 +1193,7 @@ pub(super) fn research_schemas() -> Vec<Value> {
             }),
         ),
     ];
-    lsp_position_schemas()
+    let mut out: Vec<Value> = lsp_position_schemas()
         .into_iter()
         .chain(schemas.iter().map(|(name, desc, props)| (*name, *desc, props.clone())))
         .map(|(name, desc, props)| {
@@ -872,7 +1206,19 @@ pub(super) fn research_schemas() -> Vec<Value> {
                 },
             })
         })
-        .collect()
+        .collect();
+    // A sub-agent is not limited to what its row attached in Settings: it can
+    // discover and load ANY enabled toolbox, exactly like the main agent. The
+    // main agent finds the catalog in its system prompt; a sub-agent gets it
+    // from `skill_router::build_subagent_section`. Taking the schema from
+    // `tool_schemas` keeps the two descriptions byte-identical.
+    if let Some(schema) = tool_schemas(false, false)
+        .into_iter()
+        .find(|s| s["function"]["name"].as_str() == Some("load_plugin"))
+    {
+        out.push(schema);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

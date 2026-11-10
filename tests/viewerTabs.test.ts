@@ -313,6 +313,9 @@ console.log('12) split width — drag may take the pane nearly full-width:')
   check('beyond the strip clamps to it', clampSplitWidth(1500, 1280) === 1280 - CHAT_MIN_WIDTH, clampSplitWidth(1500, 1280))
   check('mid drag kept', clampSplitWidth(400, 1280) === 400, clampSplitWidth(400, 1280))
   check('min width kept', clampSplitWidth(100, 1280) === 320, clampSplitWidth(100, 1280))
+  // The editor area is narrower than the window once the sidebar is open: a
+  // pane sized for the window must shrink so it cannot spill past the app.
+  check('sidebar-narrowed area clamps the pane', clampSplitWidth(1120, 960) === 960 - CHAT_MIN_WIDTH, clampSplitWidth(1120, 960))
 }
 
 console.log('13) openPlan — one plan tab per CHAT, auto-opens pane:')

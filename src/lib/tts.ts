@@ -141,6 +141,62 @@ export function setTtsRetryConfig(cfg: Record<string, unknown>): void {
   if (delay !== undefined) TTS_RETRY_DELAY_MS = Math.max(0, delay)
 }
 
+// ── Mixed Persian/English pronunciation ───────────────────────────────────────────────────────────────────────
+// A Persian voice reads Latin letters unpredictably. Known tech words are
+// rewritten the way a Persian speaker says them («plugin» -> «پلاگین»); other
+// ALL-CAPS acronyms are spelled letter by letter; code-ish tokens
+// (create_plugin, bundle.rs, camelCase) are split into plain words.
+const SPOKEN_TERMS: Record<string, string> = {
+  api: 'ای پی آی', cli: 'سی ال آی', json: 'جیسون', plugin: 'پلاگین', plugins: 'پلاگین‌ها',
+  bundle: 'باندل', code: 'کد', file: 'فایل', files: 'فایل‌ها', server: 'سرور', client: 'کلاینت',
+  github: 'گیت‌هاب', git: 'گیت', docker: 'داکر', python: 'پایتون', javascript: 'جاوااسکریپت',
+  typescript: 'تایپ‌اسکریپت', react: 'ری‌اکت', rust: 'راست', tauri: 'توری', electron: 'الکترون',
+  node: 'نود', npm: 'ان پی ام', http: 'اچ تی تی پی', https: 'اچ تی تی پی اس', url: 'یو آر ال',
+  html: 'اچ تی ام ال', css: 'سی اس اس', sql: 'اس کیو ال', ui: 'یو آی', ux: 'یو اکس', ai: 'ای آی',
+  tts: 'تی تی اس', stt: 'اس تی تی', bug: 'باگ', debug: 'دیباگ', commit: 'کامیت', branch: 'برنچ',
+  merge: 'مرج', build: 'بیلد', deploy: 'دیپلوی', app: 'اپ', chat: 'چت', token: 'توکن',
+  prompt: 'پرامپت', model: 'مدل', provider: 'پروایدر', endpoint: 'اندپوینت',
+  command: 'کامند', slash: 'اسلش', terminal: 'ترمینال', error: 'ارور', log: 'لاگ',
+  config: 'کانفیگ', tool: 'تول', agent: 'ایجنت', create: 'کریت', root: 'روت', body: 'بادی',
+  bluetooth: 'بلوتوث', wifi: 'وای‌فای', windows: 'ویندوز', mac: 'مک', macos: 'مک‌اواس',
+  linux: 'لینوکس', ios: 'آی‌اواس', android: 'اندروید', rs: 'آر اس', ts: 'تی اس',
+  tsx: 'تی اس اکس', js: 'جی اس', py: 'پای', md: 'ام دی', css3: 'سی اس اس',
+}
+const LETTER_NAMES: Record<string, string> = {
+  a: 'ای', b: 'بی', c: 'سی', d: 'دی', e: 'ای', f: 'اف', g: 'جی', h: 'ایچ', i: 'آی', j: 'جی', k: 'کی',
+  l: 'ال', m: 'ام', n: 'ان', o: 'او', p: 'پی', q: 'کیو', r: 'آر', s: 'اس', t: 'تی', u: 'یو',
+  v: 'وی', w: 'دابلیو', x: 'اکس', y: 'وای', z: 'زد',
+}
+
+/**
+ * Rewrite code-ish tokens and Latin tech words into text a Persian voice says
+ * correctly. Pure Latin sentences (no Persian letters) are left alone: the
+ * server reads those with an English voice setting.
+ */
+export function spokenForm(text: string): string {
+  if (!/[A-Za-z]/.test(text)) return text
+  if (!/[؀-ۿ]/.test(text)) return text
+  let out = text
+  // File paths and line references (src/components/Chat.tsx:8127-8135) are noise
+  // when spoken: drop them whole instead of reading every segment and digit.
+  out = out.replace(/[\w.@-]+(?:\/[\w.@-]+)+(?::\d+(?:[-–]\d+)?)?/g, ' ')
+  out = out.replace(/([A-Za-z])[:](\d+)(?:[-–]\d+)?/g, '$1')
+  // create_plugin, my-file -> words; bundle.rs, v1.2 -> "bundle نقطه rs".
+  out = out.replace(/([A-Za-z0-9])[_]+(?=[A-Za-z0-9])/g, '$1 ')
+  out = out.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+  out = out.replace(/([A-Za-z])\.(?=[A-Za-z])/g, '$1 نقطه ')
+  out = out.replace(/([A-Za-z])\/(?=[A-Za-z])/g, '$1 ')
+  out = out.replace(/:\s*(?=\d)/g, ' ')
+  // Known terms first (whole word), then spell leftover ALL-CAPS acronyms.
+  out = out.replace(/(?<![A-Za-z])([A-Za-z]{1,12})(?![A-Za-z])/g, (m, w: string) => {
+    const hit = SPOKEN_TERMS[w.toLowerCase()]
+    if (hit) return hit
+    if (/^[A-Z]{2,5}$/.test(w)) return w.toLowerCase().split('').map((c) => LETTER_NAMES[c] ?? c).join(' ')
+    return m
+  })
+  return out.replace(/[ \t]{2,}/g, ' ')
+}
+
 /** A chunk needs at least this many letters to be worth a synthesis request. */
 const MIN_SPEECH_LETTERS = 5
 
@@ -173,6 +229,38 @@ export function normalizeSpeechChunks(chunks: string[]): string[] {
   if (carry) {
     if (out.length > 0) out[out.length - 1] = `${out[out.length - 1]} ${carry}`
     else out.push(carry)
+  }
+  return out
+}
+
+/** Longest packed chunk (chars). Matches splitTtsSentences' own 160 cap with margin. */
+const PACK_MAX_CHARS = 200
+
+/**
+ * Pack short consecutive sentences into chunks of up to PACK_MAX_CHARS.
+ *
+ * Every synthesis request pays a fixed cost (the reference voice is re-processed
+ * on each diffusion step), so a 2 s sentence costs nearly as much as a 6 s one.
+ * Fewer, fuller chunks cut total time; the FIRST chunk stays untouched so speech
+ * still starts as soon as one sentence is ready. Only chunks that end a
+ * sentence (. ! ? … ؟) are glued to the next one, so a heading or a list item
+ * keeps its own pause.
+ */
+export function packSpeechChunks(chunks: string[], keepFirst = true, maxLen = PACK_MAX_CHARS): string[] {
+  const out: string[] = []
+  const floor = keepFirst ? 1 : 0
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i]
+    if (out.length <= floor) {
+      out.push(c)
+      continue
+    }
+    const last = out[out.length - 1]
+    if (/[.!?…؟]$/.test(last) && last.length + 1 + c.length <= maxLen) {
+      out[out.length - 1] = `${last} ${c}`
+    } else {
+      out.push(c)
+    }
   }
   return out
 }
@@ -320,7 +408,7 @@ export async function playTts(
   // remote chain on any error. Remote selection uses the chain directly.
   const fetchOne = (sentence: string, signal: AbortSignal): Promise<Blob> =>
     fetchSentenceRobust(sentence, chain, signal)
-  const sentences = normalizeSpeechChunks(splitTtsSentences(text))
+  const sentences = packSpeechChunks(normalizeSpeechChunks(splitTtsSentences(spokenForm(text))))
   // متن خیلی کوتاه: همان مسیر تک‌فایل قبلی (بدون صف).
   const queue = sentences.length > 1 ? sentences : sentences.length === 1 ? sentences : [text]
   // NOTE: local sentences are NOT merged into batches anymore. The Persian
@@ -515,7 +603,12 @@ export async function playTtsStream(
         if (speaksTail) readyEnd = full.length
       }
       if (readyEnd > committed.length) {
-        queue.push(...normalizeSpeechChunks(splitTtsSentences(full.slice(committed.length, readyEnd))))
+        queue.push(
+          ...packSpeechChunks(
+            normalizeSpeechChunks(splitTtsSentences(spokenForm(full.slice(committed.length, readyEnd)))),
+            queue.length === 0,
+          ),
+        )
         committed = full.slice(0, readyEnd)
         tailText = ''
         tailSince = Date.now()

@@ -119,7 +119,7 @@ pub fn owner_of<'a>(connectors: &'a [ConnectorEntry], tool: &str) -> Option<&'a 
 ///
 /// Accepts the exact server name, any case/space variant of it, and a plain
 /// misspelling is NOT guessed — the caller answers with the real list instead,
-/// the same way `load_skill` does.
+/// the same way `load_plugin` does.
 pub fn resolve_server(connectors: &[ConnectorEntry], asked: &str) -> Option<String> {
     let norm = |s: &str| s.trim().to_lowercase().replace(['-', '_', ' '], "");
     let n = norm(asked);

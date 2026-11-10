@@ -46,15 +46,6 @@ pub fn skill_dir_for(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
     None
 }
 
-/// The folder an EDIT of this skill should pin: its own folder, whether it
-/// lives standalone under `<data>/skills` or inside a bundle under
-/// `<data>/plugins`. None when nothing is stored under the name yet — a first
-/// create is not an update.
-pub fn skill_update_dir(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
-    skill_dir_for(root, name_or_slug)
-        .or_else(|| crate::skills::find_skill_dir_pub(root, name_or_slug))
-}
-
 /// Write one skill into the bundle that owns it, or into a NEW one named after it.
 ///
 /// A skill has no store of its own any more, so "where does this skill go" is
@@ -191,8 +182,8 @@ pub fn save_bundle_connector(root: &Path, body: &Value) -> Result<Value, String>
 /// An explicit `slug` wins: Settings opens a bundle's page and saves the row
 /// from there, so the bundle on screen IS the target — without this, saving a
 /// connector into an existing bundle silently created a SECOND bundle named
-/// after the connector. Only when no slug is given (the agent's `create_mcp`
-/// tool) does the owner lookup decide, and a rename looks up `previous_name`
+/// after the connector. Only when no slug is given (a caller that names just
+/// the connector) does the owner lookup decide, and a rename looks up `previous_name`
 /// first so it finds the row it is moving. `None` means a brand-new connector
 /// that needs a single-part bundle of its own.
 pub(super) fn connector_target(root: &Path, body: &Value, name: &str, previous: &str) -> Option<String> {
@@ -202,28 +193,6 @@ pub(super) fn connector_target(root: &Path, body: &Value, name: &str, previous: 
     }
     connector_owner(root, name)
         .or_else(|| if previous.is_empty() { None } else { connector_owner(root, previous) })
-}
-
-/// Whether saving this connector is an EDIT of one already on disk (same bundle
-/// slug, same name, or a rename of `previous`), with the owning bundle's folder
-/// — a brand-new connector returns None, because creating is not updating.
-pub fn connector_update_target(
-    root: &Path,
-    body: &Value,
-    name: &str,
-    previous: &str,
-) -> Option<(String, PathBuf)> {
-    let slug = body["slug"].as_str().unwrap_or("").trim();
-    if !slug.is_empty() && read_manifest(root, slug).is_some() {
-        let dir = plugin_dir(root, slug);
-        return Some((slug.to_string(), dir));
-    }
-    connector_owner(root, name)
-        .or_else(|| if previous.is_empty() { None } else { connector_owner(root, previous) })
-        .map(|slug| {
-            let dir = plugin_dir(root, &slug);
-            (slug, dir)
-        })
 }
 
 /// Which bundle holds a connector by that name (first match, slug order).

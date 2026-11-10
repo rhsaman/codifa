@@ -1108,10 +1108,18 @@ tr[data-search-current] .fv-mark,
   /* Animated open/close: the panel root stays mounted (sessions keep running
      while hidden — same contract as the old display:none toggle) and the
      height+fade transition runs in both directions. The xterm refits from its
-     own ResizeObserver as the height settles. */
+     own ResizeObserver as the height settles.
+
+     FOLD, not a slide. The old 260ms height curve (with a 200ms fade on top)
+     read as lag: Ctrl+X J felt like it "did nothing" until it finished. 110ms
+     then 70ms still read as slow when the panel is toggled constantly, so this
+     is a hard, near-instant fold: ~40ms open, ~40ms close, the fade on the
+     same clock so nothing trails behind the box.
+     `prefers-reduced-motion` drops it entirely. */
   transition:
-    height 0.26s cubic-bezier(0.4, 0, 0.2, 1),
-    opacity 0.2s ease;
+    height 0.04s cubic-bezier(0.32, 0, 0.24, 1),
+    opacity 0.04s linear,
+    transform 0.04s cubic-bezier(0.32, 0, 0.24, 1);
 }
 
 .terminal-panel[data-open='false'] {
@@ -1120,9 +1128,24 @@ tr[data-search-current] .fv-mark,
   height: 0 !important;
   min-height: 0;
   opacity: 0;
+  transform: translateY(4px);
   overflow: hidden;
   pointer-events: none;
   border-top-color: transparent;
+}
+
+/* A KEYBOARD jump (Ctrl+X J into the panel, Ctrl+X K back out) is a move of the
+   caret, not a reveal to watch: it must land the caret in the shell in the same
+   frame, with no slide to sit through. The component stamps this for one frame
+   around the toggle, so a mouse click still gets the (short) animation. */
+.terminal-panel[data-instant='true'] {
+  transition: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-panel {
+    transition: none;
+  }
 }
 
 /* Terminal fullscreen (Ctrl+M while the terminal has focus): overlays the
@@ -1277,6 +1300,35 @@ tr[data-search-current] .fv-mark,
 
 .terminal-tab-shell {
   font-weight: 600;
+}
+
+/* Inline rename box (double-click a chip). Sized to the chip so the strip does
+   not jump, and inheriting the chip's type so the switch reads as an edit of
+   the label in place rather than a form appearing over it. */
+.terminal-tab-renaming {
+  padding: 2px 4px;
+}
+
+.terminal-tab-rename {
+  width: 11ch;
+  min-width: 6ch;
+  max-width: 22ch;
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--accent, var(--border));
+  background: var(--bg-input, var(--bg-panel));
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  outline: none;
+  user-select: text;
+}
+
+/* Focus ring from the theme's accent, no literal fallback: this region must
+   paint no hard-coded colour (the border above already carries the accent). */
+.terminal-tab-rename:focus {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
 .terminal-tab-cwd {
@@ -1921,6 +1973,9 @@ tr[data-search-current] .fv-mark,
 
 .viewer-pane-body .viewer-pane-spacer {
   flex: 1 1 auto;
+  /* Full header height: it carries the window drag region (double-click
+     maximizes), so the whole empty stretch must be hittable. */
+  align-self: stretch;
   min-width: 8px;
 }
 
@@ -2127,8 +2182,12 @@ tr[data-search-current] .fv-mark,
   /* Physical layout: the dock reads left-to-right in RTL too. */
   direction: ltr;
   border: 0;
-  border-top: 1px solid color-mix(in srgb, currentColor 10%, transparent);
-  background: color-mix(in srgb, var(--text) 3%, transparent);
+  /* No divider above the icon row: the dock is part of the same surface as the
+     page above it (the panel draws one unbroken plane). */
+  border-top: 0;
+  /* Same surface as the panel behind it: the dock is just a row of glyphs on
+     the pane, NOT a tinted strip of its own. */
+  background: transparent;
   -webkit-app-region: no-drag;
 }
 
@@ -2360,6 +2419,41 @@ tr[data-search-current] .fv-mark,
   transition:
     transform 0.16s ease,
     opacity 0.16s ease;
+}
+
+/* The sub-agent's latest narration line inside the chat card. One line only:
+   the full log lives in the side panel, so a talkative run can never stretch
+   the timeline. `dir=auto` on the element keeps mixed RTL/LTR text readable,
+   and `overflow-wrap` stops an unbroken URL from widening the card. */
+.explore-narration {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin: 0 12px 8px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 6%, transparent);
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+.explore-narration-mark {
+  flex: 0 0 auto;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.55;
+}
+
+.explore-narration-line {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .explore-card-open:hover .explore-card-arrow {

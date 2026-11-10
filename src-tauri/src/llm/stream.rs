@@ -602,6 +602,12 @@ pub(super) async fn stream_with_key(
     // "running". A provider that cannot flush HEADERS within this budget will
     // not answer either; the env override covers an exotic queued gateway.
     let header_wait = std::time::Duration::from_secs(header_wait_secs());
+    // Stamp the steer generation BEFORE waiting for headers: a steer that lands
+    // while a black-holed request is parked in `send()` must drop it at once.
+    // The wait below used to race only Stop and the header deadline, so a steer
+    // during a silent request sat on "Steering the running agent…" until the
+    // whole budget (60s by default) expired.
+    let steer_base = steer_interrupt.map(InterruptSignal::generation);
     let resp = loop {
         let send_body = retry_body.as_ref().unwrap_or(body);
         let mut req = client.post(&url).json(send_body);
@@ -620,6 +626,21 @@ pub(super) async fn stream_with_key(
         let resp = tokio::select! {
             biased;
             _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
+            _ = async {
+                match (steer_interrupt, steer_base) {
+                    (Some(sig), Some(base)) => sig.wait_for(base).await,
+                    _ => std::future::pending::<u64>().await,
+                }
+            } => {
+                // A steer landed before the provider flushed headers. This is
+                // NOT a provider failure: return an interrupted accumulator so
+                // the turn re-issues the step with the steer appended (see
+                // `run_turn`), instead of reporting a bogus HTTP error.
+                let mut acc = StreamAcc::default();
+                acc.interrupt_base = steer_base.unwrap_or_default();
+                acc.interrupted = true;
+                return Ok(acc);
+            }
             _ = tokio::time::sleep(header_wait) => {
                 return Err((
                     0u16,
@@ -662,12 +683,14 @@ pub(super) async fn stream_with_key(
     };
 
     let mut acc = StreamAcc::default();
-    // Stamp this request with the signal's current generation: only a raise that
+    // Stamp this request with the signal's generation: only a raise that
     // happens AFTER this point is meant for THIS stream. Without the stamp a
     // raise landing between two requests was consumed by the next one (or lost),
-    // which is why a mid-turn steer only went through sometimes.
-    if let Some(sig) = steer_interrupt {
-        acc.interrupt_base = sig.generation();
+    // which is why a mid-turn steer only went through sometimes. The stamp is
+    // the one captured BEFORE the header wait, so a raise that landed while the
+    // request was parked in `send()` still interrupts the first read.
+    if let Some(base) = steer_base {
+        acc.interrupt_base = base;
     }
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();

@@ -34,6 +34,80 @@ export function latestTodos(
 /** عرض ثابت پنل شناور قدیمی (px) — فقط برای clamp و مهاجرت موقعیت قدیمی. */
 const PANEL_W = 300;
 
+/* ── عرض پنل راست: یک منبع حقیقت ────────────────────────────────────────
+   قبلاً پنل فقط با `window.innerWidth` کلمپ می‌شد، پس سایدبار و ستون چت
+   را نادیده می‌گرفت و با پنل اسپلیت (viewer) هم هم‌اهنگ نبود؛ نتیجه: عرض
+   پنل با هر ری‌سایز پنجره بی‌سروصدا عوض می‌شد و روی چت می‌افتاد. حالا
+   سقف از عرض واقعی `.app-body` منهای سایدبار و منهای یک نوار قابل‌استفاده
+   برای چت حساب می‌شود. */
+
+/** کوچک‌ترین عرض پنل راست (px). */
+export const RIGHT_PANEL_MIN_WIDTH = 220;
+
+/** عرض پیش‌فرض پنل راست وقتی کاربر هنوز خودش درگ نکرده (px).
+ *  برابر با حداقل است: پنل همیشه در باریک‌ترین حالت مجاز سایت باز می‌شود. */
+export const RIGHT_PANEL_DEFAULT_WIDTH = RIGHT_PANEL_MIN_WIDTH;
+
+/** عرض *زندهٔ* پنل راست که رندر شده، برای اینکه پنل اسپلیت (viewer) آن را
+ *  از فضای خودش کم کند و دو پنل روی هم نیفتند. وقتی پنل راست باز نیست
+ *  صفر است. */
+export const rightPanelLiveWidth = { current: 0 };
+
+/** عرض فعلی پنل راست برای مصرف‌کننده‌های بیرونی (App/clampSplitWidth). */
+export function getRightPanelLiveWidth(): number {
+  return rightPanelLiveWidth.current;
+}
+
+/** نوار حداقلی که ستون چت باید کنار پنل راست نگه دارد (px) — هم‌خوان با
+ *  CHAT_MIN_WIDTH در lib/viewerTabs تا هر دو پنل یک قانون داشته باشند. */
+export const CHAT_KEEP_MIN_WIDTH = 320;
+
+/** عرض سایدبار از توکن CSS `--sidebar-w` (پیش‌فرض 264px طبق :root). */
+function sidebarWidth(): number {
+  if (typeof window === "undefined") return 264;
+  try {
+    const v = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--sidebar-w"),
+    );
+    return Number.isFinite(v) && v > 0 ? v : 264;
+  } catch {
+    return 264;
+  }
+}
+
+/** بزرگ‌ترین عرض مجاز پنل راست در یک عرض ظرف مشخص.
+ *  @param appBodyWidth عرض واقعی `.app-body` (کل پنجره منهای حاشیه‌ها)
+ *  @param reservedچپ      عرض اشغال‌شده در سمت چپ (سایدبار + ستون چت)
+ *
+ *  سقف = appBody − reservedچپ، و اگر چیزی برای آن نماند، عریض‌ترین
+ *  مقداری که هنوز هم ستون چت را زیر حد خودش نمی‌برد. حداقل همیشه
+ *  RIGHT_PANEL_MIN_WIDTH است تا پنل هرگز کوچک‌تر از خودش نشود. */
+export function rightPanelMaxWidth(appBodyWidth: number): number {
+  const body =
+    Number.isFinite(appBodyWidth) && appBodyWidth > 0
+      ? appBodyWidth
+      : typeof window !== "undefined"
+        ? window.innerWidth
+        : 1024;
+  const reserved = sidebarWidth() + CHAT_KEEP_MIN_WIDTH;
+  const max = body - reserved;
+  if (!Number.isFinite(max)) return RIGHT_PANEL_DEFAULT_WIDTH;
+  // وقتی پنجره خیلی باریک است، پنل را به‌جای صفر کردن قفل نمی‌کنیم
+  // (پنل باید همیشه بار باشد) اما هرگز از حداقل هم کوچک‌تر نمی‌شود.
+  return Math.max(RIGHT_PANEL_MIN_WIDTH, Math.round(max));
+}
+
+/** کلمپ عرض درخواستی بین حداقل پنل و سقفِ ظرف فعلی. */
+export function clampRightPanelWidth(
+  width: number,
+  appBodyWidth?: number,
+): number {
+  const body = appBodyWidth as number;
+  const max = rightPanelMaxWidth(body);
+  const n = Number.isFinite(width) ? width : RIGHT_PANEL_DEFAULT_WIDTH;
+  return Math.max(RIGHT_PANEL_MIN_WIDTH, Math.min(max, Math.round(n)));
+}
+
 /** وضعیت ذخیره‌شدهٔ پنل Todos (localStorage با کلید `coder:todoPanel`):
  *  حالت جمع‌شده و ارتفاع‌های per-chat. موقعیت (right/y) نسخهٔ شناور قدیمی
  *  است و فقط برای مهاجرت خوانده می‌شود — پنل جدید داک‌شده است و موقعیت ندارد. */
@@ -448,15 +522,13 @@ export function RightPanel() {
 }
 
 function RightPanelContent() {
-  // عرض پنل — با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و
-  // ذخیرهٔ محلی تا بین بازشدن‌ها حفظ شود.
-  const [width, setWidth] = useState(() => {
-    if (typeof window === "undefined") return 300;
-    const vw =
-      typeof window.innerWidth === "number" &&
-      Number.isFinite(window.innerWidth)
-        ? window.innerWidth
-        : 1024;
+  // دو لایهٔ عرض:
+  //  • `chosen` — چیزی که کاربر با درگ انتخاب کرده (در localStorage)؛ هرگز
+  //    با باریک‌شدن موقت پنجره بازنویسی نمی‌شود.
+  //  • `width`  — عرض واقعیِ رندرشده؛ بعد از بازشدن و با هر ری‌سایز واقعیِ
+  //    `.app-body` کلمپ می‌شود تا هیچ‌وقت روی چت/سایدبار نریزد.
+  const [chosen, setChosen] = useState<number>(() => {
+    if (typeof window === "undefined") return RIGHT_PANEL_DEFAULT_WIDTH;
     const saved = (() => {
       try {
         return parseInt(localStorage.getItem("coder:rightPanelWidth") ?? "", 10);
@@ -464,38 +536,87 @@ function RightPanelContent() {
         return NaN;
       }
     })();
-    const n = Number.isFinite(saved) ? saved : 300;
-    return Math.max(220, Math.min(Math.max(220, vw - 24), n));
+    // سقف پیش‌فرض: مقدار ذخیره‌شده فقط اگر از پیش‌فرض باریک‌تر باشد پذیرفته
+    // می‌شود؛ در غیر این‌صورت پنل به پیش‌فرض (حداقلِ سایت) برمی‌گردد.
+    return Number.isFinite(saved)
+      ? Math.min(saved, RIGHT_PANEL_DEFAULT_WIDTH)
+      : RIGHT_PANEL_DEFAULT_WIDTH;
   });
+  // عرض رندرشده هرگز از انتخاب کاربر بزرگ‌تر نمی‌شود؛ مقدار ذخیره‌شدهٔ قدیمی
+  // (مثلاً ۴۰۰) با پیش‌فرض جدید (۲۲۰) جایگزین می‌شود تا کاربری که یک‌بار درگ
+  // کرده برای همیشه پنل پهن نبیند. بالا بردن دستی همیشه ممکن است.
+  const [width, setWidth] = useState(() =>
+    Math.min(chosen, RIGHT_PANEL_DEFAULT_WIDTH),
+  );
+  const asideRef = useRef<HTMLElement>(null);
   const dragCleanup = useRef<(() => void) | null>(null);
+
+  // اندازهٔ ظرف واقعی: `.app-body` میزبان پنل است؛ عرضش = پنجره منهای
+  // حاشیه‌ها. از ResizeObserver استفاده می‌کنیم (همان الگوی App.tsx) نه
+  // window.innerWidth — تا تغییر عرض سایدبار هم حساب شود.
+  const appBodyWidth = () => {
+    const el = asideRef.current?.parentElement;
+    const w = el?.clientWidth ?? 0;
+    return w > 0 ? w : window.innerWidth;
+  };
+
+  const persist = (w: number) => {
+    try {
+      localStorage.setItem("coder:rightPanelWidth", String(w));
+    } catch {
+      /* حافظه در دسترس نیست — عرض فقط حفظ نمی‌شود */
+    }
+  };
+
+  useEffect(() => {
+    // اولین کلمپ: عرض ذخیره‌شده را در ظرف واقعی جا می‌دهیم.
+    setWidth(clampRightPanelWidth(chosen, appBodyWidth()));
+    const el = asideRef.current?.parentElement;
+    if (!el || typeof ResizeObserver === "undefined") {
+      // فالبک: بدون ResizeObserver فقط به ری‌سایز پنجره گوش می‌دهیم.
+      const onResize = () => setWidth(clampRightPanelWidth(chosen, appBodyWidth()));
+      window.addEventListener("resize", onResize);
+      return () => window.removeEventListener("resize", onResize);
+    }
+    const ro = new ResizeObserver(() => {
+      setWidth(clampRightPanelWidth(chosen, el.clientWidth));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+    // `chosen` عمداً خارج از deps: کلمپ با تغییر انتخاب کاربر (درگ) خودش
+    // مستقیم ست می‌شود؛ اگر داخل deps بیاید هر حرکت درگ یک Observer نو می‌سازد.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chosen]);
+
   useEffect(() => {
     return () => {
       dragCleanup.current?.();
       dragCleanup.current = null;
     };
   }, []);
+
+  // عرض زنده را برای پنل اسپلیت منتشر می‌کنیم و موقع بسته‌شدن صفرش می‌کنیم
+  // تا فضای پنل آزاد بماند.
   useEffect(() => {
-    const onResize = () => {
-      setWidth((w) => Math.max(220, Math.min(window.innerWidth - 24, w)));
+    rightPanelLiveWidth.current = width;
+    return () => {
+      rightPanelLiveWidth.current = 0;
     };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
+  }, [width]);
+
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startW = width;
+    const bodyLen = startW; // فقط برای وضوح؛ سقف از appBodyWidth خوانده می‌شود
+    void bodyLen;
     const onMove = (ev: MouseEvent) => {
-      const w = Math.max(
-        220,
-        Math.min(window.innerWidth - 24, startW - (ev.clientX - startX)),
-      );
+      const max = rightPanelMaxWidth(appBodyWidth());
+      const raw = startW - (ev.clientX - startX);
+      const w = Math.max(RIGHT_PANEL_MIN_WIDTH, Math.min(max, Math.round(raw)));
       setWidth(w);
-      try {
-        localStorage.setItem("coder:rightPanelWidth", String(w));
-      } catch {
-        /* حافظه در دسترس نیست — عرض فقط حفظ نمی‌شود */
-      }
+      setChosen(w);
+      persist(w);
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -509,6 +630,7 @@ function RightPanelContent() {
 
   return (
     <aside
+      ref={asideRef}
       className="right-panel"
       role="complementary"
       aria-label="Right panel"

@@ -46,6 +46,105 @@
     }
 
     #[test]
+    fn evaluate_accepts_the_argument_names_models_actually_send() {
+        // Traced: the call failed with "evaluate needs expression" while the
+        // model had sent a perfectly good `script`. Every spelling is a valid
+        // expression; rejecting one costs a full round-trip.
+        assert_eq!(
+            evaluate_script(&json!({"expression": "1+1"})),
+            Some("1+1")
+        );
+        assert_eq!(evaluate_script(&json!({"script": "document.title"})), Some("document.title"));
+        assert_eq!(evaluate_script(&json!({"code": " document.body.innerText "})), Some("document.body.innerText"));
+        assert_eq!(evaluate_script(&json!({"js": "location.href"})), Some("location.href"));
+        assert_eq!(evaluate_script(&json!({"expression": "   "})), None);
+        assert_eq!(evaluate_script(&json!({})), None);
+    }
+
+    #[test]
+    fn a_top_level_return_is_wrapped_instead_of_failing() {
+        // Traced: `SyntaxError: Illegal return statement`. Runtime.evaluate takes
+        // an expression, so a snippet shaped like a function body must run inside
+        // one.
+        let wrapped = wrap_top_level_return("const rows = [1, 2];\nreturn rows.length;");
+        assert!(wrapped.starts_with("(function(){"), "{wrapped}");
+        assert!(wrapped.ends_with("})()"), "{wrapped}");
+        assert!(wrapped.contains("return rows.length;"), "{wrapped}");
+        // A bare return (no value) is still a statement.
+        assert!(wrap_top_level_return("return;").starts_with("(function(){"));
+        // Awaiting snippets need an ASYNC body; the driver awaits the promise.
+        let awaited = wrap_top_level_return("const x = await foo();\nreturn x;");
+        assert!(awaited.starts_with("(async function(){"), "{awaited}");
+        // Plain expressions and already-wrapped snippets are untouched.
+        assert_eq!(wrap_top_level_return("document.title"), "document.title");
+        assert_eq!(
+            wrap_top_level_return("(function(){ return 1; })()"),
+            "(function(){ return 1; })()"
+        );
+        assert_eq!(wrap_top_level_return("(() => 1)()"), "(() => 1)()");
+        // A return inside a one-line callback is legal where it stands; wrapping
+        // is still safe, but the detector only looks at line starts.
+        assert_eq!(
+            wrap_top_level_return("[1].map(function(x){return x;})"),
+            "[1].map(function(x){return x;})"
+        );
+    }
+
+    #[test]
+    fn find_accepts_pattern_and_query_aliases() {
+        assert_eq!(find_needle(&json!({"text": "hello"})), Some("hello"));
+        assert_eq!(find_needle(&json!({"pattern": "hello"})), Some("hello"));
+        assert_eq!(find_needle(&json!({"query": "  hello  "})), Some("hello"));
+        assert_eq!(find_needle(&json!({"needle": "hello"})), Some("hello"));
+        assert_eq!(find_needle(&json!({"text": "  "})), None);
+        assert_eq!(find_needle(&json!({})), None);
+    }
+
+    #[test]
+    fn upload_paths_accept_a_string_a_json_string_and_an_array() {
+        // Traced: `file_upload needs paths` while the model had sent
+        // `"paths": "[\\"/tmp/a.png\\"]"` — a JSON array in a string.
+        assert_eq!(
+            upload_paths(&json!({"paths": "/tmp/a.png"})),
+            vec!["/tmp/a.png".to_string()]
+        );
+        assert_eq!(
+            upload_paths(&json!({"paths": "[\"/tmp/a.png\",\"/tmp/b.png\"]"})),
+            vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()]
+        );
+        assert_eq!(
+            upload_paths(&json!({"paths": ["/tmp/a.png", "  ", "/tmp/b.png"]})),
+            vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()]
+        );
+        assert!(upload_paths(&json!({})).is_empty());
+        assert!(upload_paths(&json!({"paths": []})).is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_answers_without_re_rendering_the_page() {
+        let snap = fixture_snapshot();
+        let short = unchanged_snapshot_text(&snap, 4, SNAPSHOT_SUMMARY_CHARS, false, false);
+        assert!(short.contains("unchanged since refs v4"), "{short}");
+        assert!(short.contains("still valid"), "{short}");
+        // The whole point: the page body and its entry list are NOT resent.
+        assert!(!short.contains("Unique main paragraph"), "{short}");
+        assert!(!short.contains("Main Button"), "{short}");
+        // The explicit re-read still renders the page (once per version).
+        let full = unchanged_snapshot_text(&snap, 4, SNAPSHOT_MAX_CHARS, true, false);
+        assert!(full.contains("Main Button"), "{full}");
+        assert!(full.contains("Unique main paragraph"), "{full}");
+        // Asking `full=true` again on the same unchanged version must not
+        // resend the page: traced runs repeated it 14 times.
+        let repeat = unchanged_snapshot_text(&snap, 4, SNAPSHOT_MAX_CHARS, true, true);
+        assert!(repeat.contains("already sent"), "{repeat}");
+        assert!(!repeat.contains("Main Button"), "{repeat}");
+        assert!(!repeat.contains("Unique main paragraph"), "{repeat}");
+        // A plain snapshot after a full render is still the short note.
+        let plain = unchanged_snapshot_text(&snap, 4, SNAPSHOT_SUMMARY_CHARS, false, true);
+        assert!(!plain.contains("Main Button"), "{plain}");
+    }
+
+    #[test]
     fn a_printed_ref_is_not_an_array_index() {
         // Regression: refs are monotonic across snapshots, so the FIRST ref of a
         // later snapshot is not `entries[0]`'s index. Reading the ref directly as
@@ -202,14 +301,18 @@
         let nav = run("navigate", &json!({"url": page}), &chat).expect("navigate");
         assert!(!nav.is_empty());
 
+        // The navigate result already carries the summary and its refs. A
+        // second plain snapshot on the unchanged page is the SHORT note now
+        // (refs still valid), so the button ref comes from `nav`.
         let snap = run("snapshot", &json!({}), &chat).expect("snapshot");
-        assert!(snap.contains("[1]"), "snapshot handed out no refs: {snap}");
+        assert!(snap.contains("unchanged"), "snapshot resent the page: {snap}");
+        assert!(nav.contains("[1]"), "navigate handed out no refs: {nav}");
 
         // The button's ref is the one whose line names the button. Match the
         // REF LINE specifically: the page URL is echoed above the list and also
         // contains the handler's source text, so a looser match picked the URL
         // line (which carries no ref) and failed the parse.
-        let button_ref = snap
+        let button_ref = nav
             .lines()
             .find(|l| l.starts_with("- [") && l.contains("button"))
             .and_then(|l| l.split('[').nth(1))
@@ -347,6 +450,50 @@
         assert_eq!(full_flat.matches("Unique main paragraph").count(), 1, "{full_flat}");
     }
 
+    #[test]
+    fn page_furniture_survives_a_content_heavy_page() {
+        // Traced on Instagram: the feed's 100+ main entries consumed the whole
+        // 6K summary, so the nav/header rows carrying the account/Profile link
+        // were never printed. The browser agent then clicked a feed AUTHOR and
+        // reported that stranger's profile as the logged-in account. The
+        // furniture must survive a long main list: it is how the model
+        // navigates (and identifies the session).
+        let mut entries: Vec<SnapEntry> = (0..80)
+            .map(|i| SnapEntry {
+                role: "button".into(),
+                name: format!("Feed action {i} with a deliberately long accessible name"),
+                region: "main".into(),
+                nth: 0,
+            })
+            .collect();
+        entries.push(SnapEntry {
+            role: "link".into(),
+            name: "Profile".into(),
+            region: "nav".into(),
+            nth: 0,
+        });
+        let mut display_order: Vec<usize> = (0..entries.len()).collect();
+        display_order.sort_by_key(|&i| region_rank(&entries[i].region));
+        let snap = Snapshot {
+            url: "https://fixture.test/feed".into(),
+            title: "Feed".into(),
+            entries,
+            display_order,
+            headings: vec![],
+            main_text: "A long feed of posts.".into(),
+            body_text: String::new(),
+            base_ref: 1,
+            sig: 0,
+        };
+        let text = render_snapshot(&snap, SNAPSHOT_SUMMARY_CHARS, false);
+        assert!(text.contains("Profile"), "nav link was dropped: {text}");
+        assert!(
+            text.contains("Feed action 0"),
+            "the summary still has to carry content: {text}"
+        );
+        assert!(text.len() <= SNAPSHOT_SUMMARY_CHARS + 120, "render blew its budget");
+    }
+
     /// The REAL-page gate (plan §1): a local HTTP fixture with nav before
     /// main, real Chromium, summary and full must agree on refs, clicking a
     /// summary ref must hit the intended element, and the main text must
@@ -395,8 +542,17 @@
         assert!(nav.contains("Main Button"), "navigate carried no summary: {nav}");
         assert!(nav.contains("Unique main paragraph"), "{nav}");
 
-        let summary = run("snapshot", &json!({}), &chat).expect("snapshot");
+        let summary = nav.clone();
+        // A plain snapshot of the unchanged page is now a short note, and the
+        // explicit `full=true` still re-renders for the comparison below.
+        let unchanged = run("snapshot", &json!({}), &chat).expect("snapshot");
+        assert!(unchanged.contains("unchanged"), "{unchanged}");
         let full = run("snapshot", &json!({"full": true}), &chat).expect("full snapshot");
+        // A second `full=true` on the same unchanged version is a short note,
+        // not another copy of the page.
+        let repeated = run("snapshot", &json!({"full": true}), &chat).expect("repeat full snapshot");
+        assert!(repeated.contains("already sent"), "{repeated}");
+        assert!(!repeated.contains("Main Button"), "{repeated}");
         let summary_map = ref_label_map(&summary);
         let full_map = ref_label_map(&full);
         assert!(!summary_map.is_empty(), "no refs in summary: {summary}");

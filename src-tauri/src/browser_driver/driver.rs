@@ -13,6 +13,10 @@ pub(super) struct Driver {
     pub(super) snapshots: Vec<(usize, Snapshot)>,
     /// Version of the newest snapshot.
     pub(super) current: Option<usize>,
+    /// Version whose full page render was already sent to the model. A repeated
+    /// `full=true` on the same unchanged version answers with a short note
+    /// instead of resending the whole page (traced: 14 full re-reads).
+    pub(super) full_sent_version: Option<usize>,
     pub(super) seq: usize,
 }
 
@@ -36,6 +40,7 @@ impl Driver {
             next_ref: 1,
             snapshots: Vec::new(),
             current: None,
+            full_sent_version: None,
             seq: 0,
         })
     }

@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { ToolActivity } from "../types";
 import { useStore } from "../lib/store";
 import { toolCallBody } from "../lib/toolActivity";
 import { exploreTitle, exploreToolCounts } from "./ExploreCard";
+import { subagentDisplayName } from "./ToolCallView";
 import { StatusIcon } from "./ToolCallView";
+import { useVimScroll } from "../lib/useVimScroll";
 
 /** One argument line ("path: src/a.ts") for a call row's body. */
 function argsText(activity: ToolActivity): string {
@@ -101,6 +103,10 @@ export function ExplorePanel({
     const msg = chat?.messages.find((m) => m.id === messageId);
     return msg?.toolActivity?.[index] ?? null;
   });
+  const subagentRows = useStore((s) => s.customSubagents);
+  // Shared vim scroll keys over the run (j/k, gg/G, Ctrl+D/U).
+  const rootRef = useRef<HTMLDivElement>(null);
+  useVimScroll(rootRef);
 
   if (!activity) {
     return (
@@ -112,10 +118,11 @@ export function ExplorePanel({
 
   const counts = exploreToolCounts(activity);
   const total = counts.reduce((n, c) => n + c.count, 0);
+  const agentName = subagentDisplayName(activity.tool, subagentRows);
   const kids = activity.children ?? [];
 
   return (
-    <div className="explore-panel">
+    <div ref={rootRef} className="explore-panel">
       <div className="explore-panel-head">
         <span
           className={`explore-card-status ${activity.status}`}
@@ -124,9 +131,9 @@ export function ExplorePanel({
         >
           <StatusIcon status={activity.status} />
         </span>
-        <span className="trace-pill trace-pill-sub">Explore</span>
+        <span className="trace-pill trace-pill-sub">{agentName}</span>
         <span className="explore-panel-title" dir="auto">
-          {exploreTitle(activity)}
+          {exploreTitle(activity, agentName)}
         </span>
         {total > 0 && <span className="explore-panel-count">{`${total} tool calls`}</span>}
       </div>
@@ -146,6 +153,14 @@ export function ExplorePanel({
       )}
       {activity.status === "running" && (
         <div className="explore-card-progress" aria-hidden="true" />
+      )}
+      {activity.narration?.trim() && (
+        <div className="explore-narration-log">
+          <div className="explore-narration-head">Sub-agent narration</div>
+          <div className="explore-narration-body" dir="auto">
+            {activity.narration}
+          </div>
+        </div>
       )}
       {activity.status === "running" && (
         <div className="explore-panel-running">

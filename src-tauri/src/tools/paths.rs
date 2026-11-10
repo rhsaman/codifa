@@ -298,16 +298,33 @@ pub(super) fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
-/// The user-level data folder (CODER_DATA_DIR or ~/.codifa) — readable AND
-/// writable without a permission prompt when `allow_coder` is set: plugins and
-/// skills LIVE here, so refusing writes burned a traced round on "path escapes
-/// project root" for every plugin/skill update.
+/// The user-level data folder — readable AND writable without a permission
+/// prompt when `allow_coder` is set: plugins and skills LIVE here, so refusing
+/// writes burned a traced round on "path escapes project root" for every
+/// plugin/skill update.
+///
+/// Resolution order: `CODER_DATA_DIR`, then the LIVE Settings → Data path
+/// (`state::current_data_root`), then `~/.codifa` as the default. The live root
+/// MUST win: it used to be hardcoded to `~/.codifa`, so after the user moved the
+/// folder in Settings the OLD path stayed silently writable (a grant nobody
+/// gave) while the new one asked for every write.
+///
+/// The result is canonicalized because `resolve_safe` compares it against
+/// `target_canon`: on macOS `/var` → `/private/var` would otherwise miss, and on
+/// Windows a substituted drive letter would not match the real target.
 pub(super) fn coder_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CODER_DATA_DIR") {
         if !dir.is_empty() {
             return fs::canonicalize(&dir).ok();
         }
     }
+    if let Some(live) = crate::state::current_data_root() {
+        // `current_data_root` may be set before the folder exists (first launch),
+        // so canonicalize when possible and fall back to the raw path.
+        return Some(fs::canonicalize(&live).unwrap_or(live));
+    }
+    // `dirs::home_dir()` is the per-OS home (USERPROFILE on Windows, $HOME on
+    // Unix) — the same source `state.rs` uses for its default.
     dirs::home_dir().map(|h| h.join(".codifa"))
 }
 

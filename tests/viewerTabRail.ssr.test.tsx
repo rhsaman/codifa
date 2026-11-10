@@ -232,10 +232,12 @@ console.log("4) the \"+\" menu opens ONLY the chat-owned pages; the dock owns th
   // The dock carries a FIXED icon per page (T3-Code-style launcher row).
   const dockHtml = renderToStaticMarkup(React.createElement(ViewerDockBar))
   const dockButtons = (dockHtml.match(/viewer-dock-btn/g) ?? []).length
-  check("the dock renders one button per page (7)", dockButtons === 7, dockHtml)
-  for (const title of ["Files", "Todos", "Git diff", "Artifacts", "Schedule", "Inbox", "Terminal"]) {
+  check("the dock renders one button per page (6)", dockButtons === 6, dockHtml)
+  for (const title of ["Panel", "Git diff", "Artifacts", "Schedule", "Inbox", "Terminal"]) {
     check(`the dock carries the ${title} page`, dockHtml.includes(`aria-label="${title}"`), title)
   }
+  // The explorer moved to the sidebar's Files view (see tests/sidebarView.test.ts).
+  check("the dock no longer carries Files", !dockHtml.includes('aria-label="Files"'), dockHtml)
   check("the dock announces itself as a toolbar", dockHtml.includes('aria-label="Pane pages"'))
 
   // Drive the real action behind the dock's terminal entry: it opens an

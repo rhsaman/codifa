@@ -69,7 +69,7 @@ console.log('2) the Ctrl+X SECOND key while the prefix is armed:')
 {
   setPrefixArmedForTest(true)
   try {
-    for (const key of ['j', 'u', 'r', 'c', 'v']) {
+    for (const key of ['j', 'k', 'u', 'r', 'c', 'v', 'p']) {
       const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
       check(`bare ${key} suppressed while armed`, isReservedTerminalChord(ev2))
     }
@@ -80,13 +80,33 @@ console.log('2) the Ctrl+X SECOND key while the prefix is armed:')
     check('bare [ suppressed while armed (Ctrl+X [ = prev terminal tab)', isReservedTerminalChord(ev({ key: '[', code: 'BracketLeft' })))
     check('bare ] suppressed while armed (Ctrl+X ] = next terminal tab)', isReservedTerminalChord(ev({ key: ']', code: 'BracketRight' })))
     check('a non-prefix letter stays shell input', !isReservedTerminalChord(ev({ key: 'a', code: 'KeyA' })))
-    for (const key of ['h', 'k', 'l']) {
+    // `k` IS a prefix key now (Ctrl+X K = leave the terminal for the chat), so
+    // once the prefix is armed it must be swallowed — the shell never sees it.
+    // `h`/`l` stay plain window-move letters and reach the shell untouched.
+    for (const key of ['h', 'l']) {
       const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
       check(`bare ${key} NOT a prefix key — reaches the shell while armed`, !isReservedTerminalChord(ev2))
     }
   } finally {
     setPrefixArmedForTest(false)
   }
+}
+
+console.log('2b) the second prefix key is reserved ONLY while armed:')
+{
+  // Ctrl+X J is a PARITY rule on the panel state (closed -> open, open ->
+  // close), not a double-tap timer. So `j` must be swallowed exactly while the
+  // prefix is armed and must be ordinary shell input the instant it is not —
+  // otherwise typing `j` in the shell dies.
+  setPrefixArmedForTest(false)
+  check('disarmed: bare j IS shell input', !isReservedTerminalChord(ev({ key: 'j', code: 'KeyJ' })))
+  setPrefixArmedForTest(true)
+  check('armed: bare j suppressed (the chord runs in App)', isReservedTerminalChord(ev({ key: 'j', code: 'KeyJ' })))
+  check('armed: bare k suppressed (Ctrl+X K leaves the terminal)', isReservedTerminalChord(ev({ key: 'k', code: 'KeyK' })))
+  check('armed: Shift+J still shell input', !isReservedTerminalChord(ev({ key: 'J', code: 'KeyJ', shiftKey: true })))
+  check('armed: Ctrl+J still reserved (newline chord)', isReservedTerminalChord(ev({ key: 'j', code: 'KeyJ', ctrlKey: true })))
+  setPrefixArmedForTest(false)
+  check('disarmed again: bare j is shell input', !isReservedTerminalChord(ev({ key: 'j', code: 'KeyJ' })))
 }
 
 console.log('3) the same letters are ORDINARY shell input once disarmed:')

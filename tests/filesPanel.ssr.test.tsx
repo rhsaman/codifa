@@ -51,8 +51,15 @@ const html = renderToString(<FilesPanel />)
 console.log('1) the panel chrome renders:')
 check('root panel class', html.includes('files-panel'), html.slice(0, 200))
 check('the panel is LTR (paths read left to right)', html.includes('dir="ltr"'))
-check('has a title', html.includes('files-panel-title') && html.includes('>Files<'))
-check('has a refresh action', html.includes('Refresh the file tree'))
+check(
+  'shares the chat list head: a filter box, no "Files" title',
+  html.includes('sidebar-head') &&
+    html.includes('sidebar-search-input') &&
+    html.includes('Filter files') &&
+    !html.includes('files-panel-title'),
+  html.slice(0, 400),
+)
+check('has no refresh button: the tree is live', !html.includes('Refresh the file tree'))
 check('does not render a tree with no workspace', !html.includes('files-list'))
 
 console.log('2) the no-workspace state explains itself:')
@@ -63,11 +70,11 @@ check(
   html.slice(0, 400),
 )
 
-console.log('3) the refresh action is inert without a workspace root:')
+console.log('3) the filter box is inert without a workspace root:')
 {
-  const refreshBtn = html.match(/<button[^>]*files-panel-action[^>]*>/)
-  check('the refresh button renders', refreshBtn !== null, html.slice(0, 400))
-  check('the refresh button starts disabled', refreshBtn?.[0].includes('disabled') === true, refreshBtn?.[0])
+  const box = html.match(/<input[^>]*sidebar-search-input[^>]*>/)
+  check('the filter box renders', box !== null, html.slice(0, 400))
+  check('the filter box starts disabled', box?.[0].includes('disabled') === true, box?.[0])
 }
 
 export {}

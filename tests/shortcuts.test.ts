@@ -4,7 +4,7 @@
 // اجرا: npx esbuild tests/shortcuts.test.ts --bundle --platform=node \
 //        --format=esm --outfile=tests/.tmp-shortcuts.mjs && node tests/.tmp-shortcuts.mjs
 
-import { navChord, panelToggleTarget, physicalKey, prefixMoveDir, isWindowMoveChord, shouldFocusSearch, PREFIX_KEY, PREFIX_SHORTCUTS } from "../src/lib/shortcuts"
+import { navChord, panelToggleTarget, physicalKey, prefixMoveDir, isWindowMoveChord, shouldFocusSearch, tabCycleChord, PREFIX_KEY, PREFIX_SHORTCUTS } from "../src/lib/shortcuts"
 import { PREFIX_SECOND_KEYS } from "../src/lib/terminalKeys"
 import { pickNeighborByRect } from "../src/lib/chatTree"
 import type { PrefixMoveDir } from "../src/lib/shortcuts"
@@ -67,6 +67,8 @@ console.log('۳) shouldFocusSearch — گارد Ctrl+K سایدبار:')
   check('Ctrl+K بلعیده‌شده (defaultPrevented) → false', shouldFocusSearch(key("k", { code: "KeyK", ctrl: true, prevented: true })) === false)
   check('حرف k بدون Ctrl → false', shouldFocusSearch(key("k", { code: "KeyK" })) === false)
   check('Ctrl+J → false (کورد ناوبری است، نه سرچ)', shouldFocusSearch(key("j", { code: "KeyJ", ctrl: true })) === false)
+  // چیدمان فارسی: e.key محلی‌شده است («ن»)؛ فقط e.code می‌تواند کورد را نجات دهد.
+  check('Ctrl+«ن» (code=KeyK) روی چیدمان فارسی → true', shouldFocusSearch(key("ن", { code: "KeyK", ctrl: true })) === true)
 }
 
 console.log('۴) panelToggleTarget — تفکیک سایدبار و پنل راست:')
@@ -125,17 +127,19 @@ console.log('۶) isWindowMoveChord — کورد مستقیم Cmd/Ctrl + H/J/K/L:
 console.log('۷) کلید دوم پیشوند — j=ترمینال، h/l=پرش سکشن، براکت‌ها=تب ترمینال:')
 {
   // حرکت بین پنجره‌های چت فقط با کورد مستقیم Ctrl+H/J/K/L است؛ در پیشوند،
-  // h/l پرش بین سه سکشن‌اند (سایدبار ↔ چت‌ها ↔ پنل راست) و j ترمینال را
-  // می‌زند. k هیچ کاری در پیشوند ندارد.
+  // h/l پرش بین سه سکشن‌اند (سایدبار ↔ چت‌ها ↔ پنل راست) و j به ترمینال
+  // پایین می‌رود و k از ترمینال بیرون می‌آید (به کامپوزر چت).
   check('j → terminal', PREFIX_SHORTCUTS['j']?.action === 'terminal')
-  check('k کلید دوم دستور نیست', PREFIX_SHORTCUTS['k'] === undefined)
+  check('k → خروج از ترمینال به چت', PREFIX_SHORTCUTS['k']?.action === 'terminal-leave')
   check('h → پرش سکشن چپ', PREFIX_SHORTCUTS['h']?.action === 'pane-left')
   check('l → پرش سکشن راست', PREFIX_SHORTCUTS['l']?.action === 'pane-right')
-  // ترمینال هم نباید h/k/l را به‌عنوان کلید دوم پیشوند بلعد؛ فقط j و براکت‌ها
+  check('p → صفحهٔ Panel', PREFIX_SHORTCUTS['p']?.action === 'panel')
+  // ترمینال نباید h/l را به‌عنوان کلید دوم پیشوند بلعد؛ فقط j و k و براکت‌ها
   // و کلیدهای صوتی/undo می‌مانند.
   const second: readonly string[] = PREFIX_SECOND_KEYS
   check('ترمینال: j کلید دوم پیشوند است', second.includes('j'))
-  check('ترمینال: h/k/l کلید دوم پیشوند نیستند', !second.includes('h') && !second.includes('k') && !second.includes('l'))
+  check('ترمینال: k کلید دوم پیشوند است (خروج به چت)', second.includes('k'))
+  check('ترمینال: h/l کلید دوم پیشوند نیستند', !second.includes('h') && !second.includes('l'))
 }
 
 console.log('۸) جهت هر کلید — همان جهت ویم، مستقل از چیدمان:')
@@ -200,9 +204,31 @@ console.log('۹) کلیدهای فیزیکی براکت — چرخه تب ترم
   const second: readonly string[] = PREFIX_SECOND_KEYS
   check('براکت‌ها کلید دوم پیشوند داخل ترمینال‌اند', second.includes('[') && second.includes(']'))
   // هر action باید در اپ وایر شده باشد — یک تایپو بی‌صدا کورد را می‌بلعد.
-  const known = new Set(['voice', 'live', 'terminal', 'pane-left', 'pane-right', 'terminal-focus', 'terminal-next', 'terminal-prev', 'files', 'git', 'artifacts', 'schedule'])
+  const known = new Set(['voice', 'live', 'terminal', 'terminal-leave', 'pane-left', 'pane-right', 'terminal-focus', 'terminal-next', 'terminal-prev', 'files', 'git', 'artifacts', 'schedule', 'panel', 'workspaces'])
   const unknown = Object.values(PREFIX_SHORTCUTS).filter((s) => s.action && !known.has(s.action))
   check('همهٔ actionها وایر شده‌اند', unknown.length === 0, unknown)
+}
+
+console.log('۶) tabCycleChord — Cmd+Shift+[ / ] مک، Ctrl+Shift+[ / ] ویندوز/لینوکس:')
+{
+  const bracket = (code: string, k: string, mods: { meta?: boolean; ctrl?: boolean; shift?: boolean; alt?: boolean }) => ({
+    key: k,
+    code,
+    ctrlKey: !!mods.ctrl,
+    metaKey: !!mods.meta,
+    shiftKey: !!mods.shift,
+    altKey: !!mods.alt,
+  })
+  check('مک: Cmd+Shift+[ → قبلی', tabCycleChord(bracket('BracketLeft', '{', { meta: true, shift: true }), true) === -1)
+  check('مک: Cmd+Shift+] → بعدی', tabCycleChord(bracket('BracketRight', '}', { meta: true, shift: true }), true) === 1)
+  check('ویندوز/لینوکس: Ctrl+Shift+[ → قبلی', tabCycleChord(bracket('BracketLeft', '{', { ctrl: true, shift: true }), false) === -1)
+  check('ویندوز/لینوکس: Ctrl+Shift+] → بعدی', tabCycleChord(bracket('BracketRight', '}', { ctrl: true, shift: true }), false) === 1)
+  check('بدون Shift کورد نیست', tabCycleChord(bracket('BracketLeft', '[', { meta: true }), true) === null)
+  check('مک با Ctrl (نه Cmd) کورد نیست', tabCycleChord(bracket('BracketLeft', '{', { ctrl: true, shift: true }), true) === null)
+  check('ویندوز با Meta (نه Ctrl) کورد نیست', tabCycleChord(bracket('BracketLeft', '{', { meta: true, shift: true }), false) === null)
+  check('Alt+Shift کورد نیست', tabCycleChord(bracket('BracketLeft', '{', { meta: true, shift: true, alt: true }), true) === null)
+  check('رویداد بدون code با کلید { هم می‌گیرد', tabCycleChord(bracket('', '{', { meta: true, shift: true }), true) === -1)
+  check('کلید دیگر کورد نیست', tabCycleChord(bracket('KeyP', 'P', { meta: true, shift: true }), true) === null)
 }
 
 if (failed > 0) {

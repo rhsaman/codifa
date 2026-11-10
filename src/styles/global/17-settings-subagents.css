@@ -1,0 +1,451 @@
+/* ════ Settings → Sub-agents ══════════════════════════════════════════════
+   The tab follows the Plugins page language: one compact header with a live
+   count, then a responsive grid of cards. Every card carries an avatar, a
+   name + origin line, a tool-count pill, a clamped description, a capped tool
+   strip and one footer row. Built-ins and plugin agents are read-only; custom
+   rows put Edit/Delete in the same footer position, so the three sections
+   scan identically instead of looking like three different pages. */
+
+.subagents-page {
+  padding-bottom: 8px;
+}
+
+.subagents-intro-field {
+  margin-bottom: 4px;
+}
+
+/* Buttons on this tab stay flat, like the provider toolbar's "+ Add provider":
+   the accent pill carries the action on its own. The global `.btn` hover bloom
+   and the tiny-button top highlight read as a shadow here. */
+.subagents-page .btn.tiny,
+.subagent-editor .btn.tiny {
+  box-shadow: none;
+}
+
+.subagents-page .btn:not(:disabled):hover,
+.subagent-editor .btn:not(:disabled):hover {
+  box-shadow: none;
+}
+
+/* ── Sections ───────────────────────────────────────────────────────────── */
+
+.subagents-section {
+  margin-top: 26px;
+}
+
+.subagents-section-head {
+  margin-bottom: 2px;
+}
+
+.subagents-section-head label {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.subagents-section-desc {
+  margin: 0 0 12px;
+}
+
+/* ── Agent cards ────────────────────────────────────────────────────────── */
+
+/* The Plugins card recipe, a column instead of a grid so the footer can pin
+   to the bottom and every card in a row ends on the same hairline. */
+.settings-modal .pm-card.subagent-card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 14px 15px;
+}
+
+.subagent-card .pm-card-head {
+  align-items: center;
+}
+
+.subagent-card .pm-card-title {
+  gap: 1px;
+}
+
+.subagent-card .pm-card-name {
+  font-size: 13.5px;
+}
+
+/* Origin is metadata, not a live status: quiet text and a neutral dot.
+   `settings-modal` outranks the green "Active" rule on plugin cards. */
+.settings-modal .subagent-card .pm-card-state {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.settings-modal .subagent-card .pm-card-state::before {
+  width: 5px;
+  height: 5px;
+  background: color-mix(in srgb, var(--text-dim) 55%, transparent);
+  box-shadow: none;
+}
+
+.subagent-card .pm-count {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  white-space: nowrap;
+}
+
+.subagent-card .pm-card-desc {
+  -webkit-line-clamp: 2;
+}
+
+/* A single capped strip of tool names: enough to see what the agent owns
+   without turning one card into a wall of code chips. */
+.subagent-tool-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 22px;
+  margin-top: 1px;
+}
+
+.subagent-tool-line code {
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--bg-input) 70%, transparent);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.subagent-tool-more {
+  align-self: center;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One footer row for every card: a note on read-only agents, the two actions
+   on a custom one. The hairline keeps rows aligned without another box. */
+.subagent-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+
+.subagent-foot-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+/* The main action of a custom card, using the Plugins card's footer
+   affordance: label left, hint + chevron pushed to the right. */
+.subagent-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.subagent-edit:hover {
+  color: var(--accent);
+}
+
+.subagent-edit-hint {
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  font-weight: 500;
+  opacity: 0.72;
+}
+
+.subagent-edit .pd-chevron {
+  font-size: 8px;
+  transition:
+    transform 0.15s ease,
+    color 0.15s ease;
+}
+
+.subagent-edit:hover .pd-chevron {
+  transform: translateX(2px);
+}
+
+/* ── One group per plugin bundle ────────────────────────────────────────── */
+
+.subagent-group {
+  margin-top: 10px;
+  border: 1px solid var(--set-card-border, var(--border));
+  border-radius: 14px;
+  background: var(--set-card-bg, var(--bg));
+  overflow: hidden;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.subagent-group + .subagent-group {
+  margin-top: 10px;
+}
+
+.subagent-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 13px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  transition: background 0.15s ease;
+}
+
+.subagent-group-head::-webkit-details-marker {
+  display: none;
+}
+
+.subagent-group-head:hover {
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.subagent-group-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.subagent-group-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.subagent-group-head .pm-count {
+  flex: 0 0 auto;
+  margin-inline-start: 0;
+  white-space: nowrap;
+}
+
+.subagent-group-chevron {
+  flex: 0 0 auto;
+  font-size: 9px;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+
+.subagent-group[open] .subagent-group-chevron {
+  transform: rotate(90deg);
+}
+
+.subagent-group-body {
+  padding: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  background: color-mix(in srgb, var(--bg) 98%, var(--text) 2%);
+}
+
+.subagent-group-body .settings-grid {
+  gap: 8px;
+}
+
+.subagents-search {
+  margin: 0 0 12px;
+}
+
+/* ── Editor form ────────────────────────────────────────────────────────── */
+
+.subagent-editor {
+  max-width: 860px;
+}
+
+.subagent-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.subagent-back:hover {
+  color: var(--accent);
+}
+
+/* The editor is a form, not a row: no hover lift, just the quiet card edge. */
+.settings-modal .subagent-editor-card {
+  padding: 18px;
+}
+
+.settings-modal .subagent-editor-card:hover {
+  transform: none;
+  border-color: var(--set-card-border, var(--border));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.subagent-editor-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.subagent-editor-title {
+  min-width: 0;
+}
+
+.subagent-editor-desc {
+  max-width: 76ch;
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.subagent-editor-desc b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.subagent-editor-desc code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+/* Fields are a single readable column: label, control, hint — never a label
+   squeezed beside a control whose width then depends on the panel. */
+.subagent-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.subagent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.subagent-label {
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+}
+
+.subagent-input,
+.subagent-textarea {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  border-radius: 10px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  outline: none;
+  transition:
+    border-color 0.14s ease,
+    box-shadow 0.14s ease;
+}
+
+.subagent-textarea {
+  min-height: 176px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.subagent-input:hover,
+.subagent-textarea:hover {
+  border-color: color-mix(in srgb, var(--border) 55%, var(--accent) 45%);
+}
+
+.subagent-input:focus,
+.subagent-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+.subagent-mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.subagent-hint {
+  max-width: 76ch;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.subagent-hint code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+.subagent-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+/* A pressed quick-add chip: the checked tools must be obvious at a glance. */
+.subagent-tools .btn.tiny[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-input));
+  color: var(--accent);
+}
+
+.subagent-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* A narrow settings pane lets the search fill the row instead of sitting in
+   a 360px box. */
+@media (max-width: 720px) {
+  .subagents-search {
+    max-width: none;
+  }
+}

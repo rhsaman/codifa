@@ -145,6 +145,31 @@ export interface ToolFallback {
   model: string
 }
 
+/** A user-created sub-agent (Settings → Sub-agents). Stored in settings.json —
+ *  no files. It carries a role prompt, optional tool narrowing and a tool-set
+ *  kind; the MODEL is never per-agent: every sub-agent runs on the single
+ *  Settings → Tools → "Sub-agent" row. */
+export interface CustomSubagent {
+  /** Stable id; the delegation tool is exposed as `agent__<id>`. */
+  id: string
+  name: string
+  /** WHEN to delegate to it — shown to the parent model. */
+  description?: string
+  /** The sub-agent's system prompt. A row without one is not delegable. */
+  prompt: string
+  /** Optional narrowing of the kind's tool set (empty = the kind's default).
+   *  A non-empty list is the EXACT set, so it can also add terminal/file tools
+   *  a read-only research agent would not have by default. */
+  tools?: string[]
+          /** Plugin slugs whose skills and connectors this sub-agent carries.
+           *  LEGACY: Settings no longer assigns plugins — every sub-agent has
+           *  `load_plugin` and the full catalog. Old rows keep their attached
+           *  bundles (inlined at startup) until edited. */
+  plugins?: string[]
+  /** Which tool set this sub-agent gets. Defaults to 'research'. */
+  kind?: 'research' | 'browser' | 'computer'
+}
+
 /** One image/video-generation fallback target: a settings.providers id plus the
  *  model id that target serves. Same shape as a tool fallback, kept as its own
  *  type because the media slots resolve keys per provider kind (OpenAI-compatible

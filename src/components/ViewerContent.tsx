@@ -25,7 +25,6 @@ const FileViewerPanel = lazy(() =>
 const TextViewerPanel = lazy(() =>
   import("./TextViewerPanel").then((m) => ({ default: m.TextViewerPanel })),
 );
-const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
 const ExplorePanel = lazy(() =>
   import("./ExplorePanel").then((m) => ({ default: m.ExplorePanel })),
 );
@@ -144,12 +143,6 @@ function ViewerContentInner() {
         index={active.exploreIndex ?? 0}
       />
     );
-  }
-
-  if (active.kind === "files") {
-    // The explorer's root follows this tab's chat, so a split pane showing a
-    // background chat lists THAT chat's workspace.
-    return <FilesPanel key={active.id} chatId={active.chatId ?? activeChatId} />;
   }
 
   if (active.kind === "review") {

@@ -107,6 +107,46 @@ action=screenshot takes a fresh one]"
     }
 }
 
+/// A cheap content digest of a captured file.
+///
+/// Used to detect a capture whose PIXELS did not change and to fold the
+/// picture into the round's no-progress digest. Hashing the encoded file is
+/// enough: the encoder is deterministic for identical pixels, and a file that
+/// cannot be read returns `None` so the caller falls back to sending it.
+pub(super) fn shot_file_digest(path: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
+/// The identity of one ACTION for the repeat ceiling.
+///
+/// `reason` is narration for the permission card, never an execution
+/// parameter. The traced desktop loop sent 56 `command+tab` calls whose ONLY
+/// difference was the sentence explaining why (plus a few rephrasings), so a
+/// raw-args key treated every spelling as a new action and the loop ran for
+/// 31 minutes. Ignoring `reason` catches the loop at the 6th/12th repeat
+/// (~1.5 and ~4.5 minutes in that trace). Every execution field still counts,
+/// so legitimate work — a different file, a different command, a new click
+/// target — stays distinct.
+pub(super) fn repeat_action_key(name: &str, raw_args: &str) -> String {
+    let mut key = name.to_string();
+    key.push('\u{1f}');
+    match serde_json::from_str::<Value>(raw_args) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("reason");
+            }
+            key.push_str(&v.to_string());
+        }
+        // Unparseable arguments are the model's own bytes; compare them as-is.
+        Err(_) => key.push_str(raw_args),
+    }
+    key
+}
+
 pub(super) fn shot_summary(shots: &[crate::computer::Shot]) -> String {
     let mut out = String::from("Screenshot taken:");
     for (i, s) in shots.iter().enumerate() {
@@ -286,6 +326,46 @@ pub(super) enum SubMsg {
     Done { id: String, name: String, args: Value, result: String, ok: bool },
 }
 
+/// Make ONE connector's deferred tools callable in this turn.
+///
+/// The tool array must stay byte-identical across the rounds of a turn or the
+/// prefix cache breaks, so a call cannot add schemas to the array it was made
+/// with; appending here makes the tools callable from the NEXT round, which is
+/// what both `use_mcp` and `load_plugin` rely on. Returns how many tools became
+/// callable (0 when the connector was already active or has no tools).
+fn activate_connector(
+    server: &str,
+    connectors: &[crate::mcp_index::ConnectorEntry],
+    deferred: &[Value],
+    activated: &mut std::collections::HashSet<String>,
+    advertised: &mut Vec<String>,
+    schemas: &mut Vec<Value>,
+) -> usize {
+    if !activated.insert(server.to_string()) {
+        return 0;
+    }
+    let fresh: Vec<Value> = deferred
+        .iter()
+        .filter(|s| {
+            s["function"]["name"]
+                .as_str()
+                .and_then(|n| crate::mcp_index::owner_of(connectors, n))
+                == Some(server)
+        })
+        .cloned()
+        .collect();
+    advertised.extend(
+        fresh
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str().map(str::to_string)),
+    );
+    advertised.sort();
+    advertised.dedup();
+    let count = fresh.len();
+    schemas.extend(fresh);
+    count
+}
+
 /// Run one full agent turn: stream the model, execute tool calls, repeat
 /// until the model answers without tool calls or MAX_STEPS is reached.
 /// Emits the same event protocol as the Python graph.
@@ -365,8 +445,9 @@ already approved with \"Always allow\".",
         );
     }
     // Skills: the system prompt carries a catalog of the installed skills and
-    // the model loads the ones it needs via `load_skill` (the Codex/Claude
-    // pattern). Only the skills the user attached are inlined whole.
+    // the model loads the plugin it needs via `load_plugin` (one unit: every
+    // skill body and every connector tool). Only attached plugins/skills are
+    // inlined whole.
     // The skill store lives in the DATA root, not the workspace. A caller that
     // omits `data_root` (e.g. a scheduled run) must still find the store, so
     // fall back to the native data root rather than the workspace — reading the
@@ -376,27 +457,78 @@ already approved with \"Always allow\".",
     } else {
         req.data_root.clone()
     };
+    // Automatic delegation, in the prompt as well as in the tool table: every
+    // reachable sub-agent (custom rows AND enabled bundle profiles) is listed
+    // by NAME with the matching rule — use the fewest that cover the request,
+    // never the whole list. A child turn gets no list (it cannot delegate).
+    if req.mode != "subagent" {
+        system.push_str(&delegation_prompt_hint(
+            std::path::Path::new(&skill_root),
+            &req.custom_subagents,
+            req.allow_browser,
+            req.allow_computer,
+        ));
+    }
     // Skills: the catalog ONLY. WHICH skill applies is the model's call through
-    // `load_skill` (the Codex/Claude pattern) — nothing is picked for it from
-    // the wording of the request. The explore sub-agent does NOT get the
-    // catalog: its work is read/grep/find_symbol, it can never attach a skill,
-    // and the catalog is ~5.8 KB of prompt re-sent on EVERY step of EVERY
-    // explore run — the largest single fixed cost in sub-agent tokens.
-    // `ATTACHED SKILLS` is empty for a sub-agent anyway (run_subagent hard-codes
-    // `skills: Vec::new()`), so nothing is lost here.
-    let missing_skills = if req.mode == "subagent" {
-        Vec::new()
-    } else {
-        // The catalog is the byte-stable part: it lives on the system prompt,
-        // so it must not depend on the current message — the router builds it
-        // from the skill store alone, and which skill applies is the model's
-        // call made from the catalog.
-        let skill_section = crate::skill_router::build_section(&skill_root, &req.skills);
+    // `load_plugin` (the Codex/Claude pattern) — nothing is picked for it from
+    // the wording of the request. A sub-agent gets the same catalog: it has
+    // `load_plugin` too, so it can use any installed toolbox without anything
+    // being assigned to it in Settings. Its own bundle / @mentions are inlined
+    // on top, budgeted by the router.
+    // The catalog is the byte-stable part: it lives on the system prompt,
+    // so it must not depend on the current message — the router builds it
+    // from the plugin store alone, and which plugin applies is the model's
+    // call made from the catalog.
+    //
+    // An attached PLUGIN is ONE unit: every skill it carries is a candidate
+    // with it, so `req.plugins` expands into its skill names here instead
+    // of the model having to load them one by one. A sub-agent then narrows
+    // that candidate list to its own role (a bundle can be a library).
+    let missing_skills = {
+        let mut attached = req.skills.clone();
+        for name in crate::plugins::bundle_skill_names(
+            std::path::Path::new(&skill_root),
+            &req.plugins,
+        ) {
+            if !attached.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                attached.push(name);
+            }
+        }
+        // A sub-agent gets the plugin CATALOG too: it has `load_plugin`, so it
+        // can discover and use ANY toolbox the user installed without anything
+        // being assigned to it in Settings → Sub-agents. Its own bundle /
+        // @mentions are inlined on top of that catalog, but budgeted — a bundle
+        // may carry dozens of skills, so the agent's own identity picks which
+        // ones are inlined and the rest are indexed by path.
+        let skill_section = if req.mode == "subagent" {
+            let focus = if req.subagent_focus.trim().is_empty() {
+                req.system_prompt.as_str()
+            } else {
+                req.subagent_focus.as_str()
+            };
+            crate::skill_router::build_subagent_section(&skill_root, &attached, focus)
+        } else {
+            crate::skill_router::build_section(&skill_root, &attached)
+        };
         if !skill_section.text.is_empty() {
             system.push_str(&skill_section.text);
         }
         skill_section.missing
     };
+    // A plugin-use turn must still feed the Todos panel. The CHECKLIST rule lives
+    // in `default_system_prompt` only; the app's own mode prompt (or a custom one)
+    // REPLACES that text, and an attached plugin inlines its own workflow on top —
+    // so the model followed the plugin's steps and never called `update_plan`,
+    // leaving the panel empty. Appended only when the prompt does not already
+    // mention the tool, so the default prompt's wording is never doubled.
+    if req.mode != "subagent" && !req.plugins.is_empty() && !system.contains("update_plan") {
+        system.push_str(
+            "\n\nCHECKLIST: a plugin workflow has several steps, so BEFORE the first action \
+call update_plan with the COMPLETE list (short imperative items in the user's language), \
+then keep it current: mark each item completed and the next one in_progress as you finish \
+it. Put update_plan in the SAME step as your other tool calls, never alone.",
+        );
+    }
     // Plugin hooks: the SAME resolved list is used at all four lifecycle points
     // below, read ONCE from the bundles that are enabled. A sub-agent never runs
     // them: hooks belong to the turn the user started, and a nested explore
@@ -595,6 +727,16 @@ already approved with \"Always allow\".",
                         "{text}\n\n=== IMAGE ANALYSIS (from the vision model) ===\n{desc}"
                     ),
                 })),
+                // A model KNOWN to be text-only never receives raw image blocks:
+                // when the Vision slot gave no description (out of the describe
+                // window, or every rung failed) the image is replaced by a note.
+                None if !main_can_vision => messages.push(json!({
+                    "role": role,
+                    "content": format!(
+                        "{text}\n\n[image omitted: this model cannot read images and the Vision \
+                         model (Settings → Tools → Vision) gave no description]"
+                    ),
+                })),
                 None => {
                     let mut blocks: Vec<Value> = Vec::new();
                     if !text.is_empty() {
@@ -644,7 +786,11 @@ already approved with \"Always allow\".",
         }
     }
     let mut inline_images: Vec<String> = req.images.clone();
-    if !main_can_vision {
+    // Only a turn that actually CARRIES images needs the pass: calling the slot
+    // with an empty list returns NotConfigured, and the old unguarded block then
+    // stamped "[image omitted …]" onto every text-only sub-agent prompt even
+    // when no image was attached.
+    if !main_can_vision && !req.images.is_empty() {
         match run_vision_slot(
             &client,
             req,
@@ -666,16 +812,31 @@ already approved with \"Always allow\".",
                 inline_images.clear();
             }
             VisionOutcome::Failed { model, error } => {
-                // The slot's model failed: fall back to sending the raw images to
-                // the main model rather than losing them entirely.
+                // The main model is known to be text-only, so the raw images are
+                // NEVER sent to it: they are dropped and the model is told why.
                 emit(&AgentEvent::Text {
                     content: format!(
                         "\n\n> The vision model ({model}) could not analyze the image ({error}); \
-                         sending it to the main model instead.\n"
+                         the image was skipped because this model cannot read images.\n"
                     ),
                 });
+                final_prompt = format!(
+                    "{}\n\n[image omitted: this model cannot read images and the Vision model \
+                     failed ({error})]",
+                    req.prompt
+                );
+                inline_images.clear();
             }
-            VisionOutcome::NotConfigured => {}
+            VisionOutcome::NotConfigured => {
+                // No Vision model is set (Settings → Tools → Vision): a text-only
+                // model still must not get image blocks it will reject.
+                final_prompt = format!(
+                    "{}\n\n[image omitted: this model cannot read images and no Vision model \
+                     is configured in Settings → Tools → Vision]",
+                    req.prompt
+                );
+                inline_images.clear();
+            }
         }
     }
 
@@ -739,16 +900,32 @@ already approved with \"Always allow\".",
             }
         }
     }
-    if !final_prompt.is_empty() || !inline_images.is_empty() {
+    // Composer FILE attachments arrive as paths and are unknown to the model
+    // until they are named in the message: without this block a turn whose
+    // prompt says "this file" reached the provider with no mention of the file
+    // at all, so the model answered that nothing was attached (traced).
+    let attachments: Vec<&str> = req
+        .attachments
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if !final_prompt.is_empty() || !inline_images.is_empty() || !attachments.is_empty() {
         // Images ride WITH the user text as neutral content blocks; llm.rs
         // translates each one to the provider's own shape (OpenAI image_url /
         // Anthropic base64 source / Gemini inlineData) right before sending.
-        if inline_images.is_empty() {
+        if inline_images.is_empty() && attachments.is_empty() {
             messages.push(json!({"role": "user", "content": final_prompt}));
         } else {
             let mut blocks: Vec<Value> = Vec::new();
             if !final_prompt.is_empty() {
                 blocks.push(json!({"type": "text", "text": final_prompt}));
+            }
+            if !attachments.is_empty() {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": format!("Attached files:\n{}", attachments.join("\n")),
+                }));
             }
             for url in &inline_images {
                 blocks
@@ -768,12 +945,36 @@ already approved with \"Always allow\".",
     if let Some(m) = plugin_context_message(&session_note) {
         messages.push(m);
     }
+    // The plugin the user attached (`/slug` / the open plugin-use session) is
+    // already a loaded toolbox: its skills are inlined and its connectors ride
+    // along, so the reminder must NOT ask the model to load it again (that was
+    // the traced redundant `load_skill` round).
+    if req.mode != "subagent" || !req.plugins.is_empty() {
+        if let Some(m) = active_plugin_context_message(&crate::plugins::active_plugin_note(
+            std::path::Path::new(&skill_root),
+            &req.plugins,
+        )) {
+            messages.push(m);
+        }
+    }
     // The last message gets a weak model's attention, so the duty to load a
-    // matching skill rides at the very tail, right under the request. MAIN AGENT
-    // ONLY: a sub-agent has no `load_skill` (research_schemas), so the reminder
-    // would be an instruction it cannot follow.
-    if req.mode != "subagent" {
-        messages.push(skills_context_message());
+    // matching plugin rides at the very tail, right under the request. Every
+    // turn gets it — a child is not exempt: the browser sub-agent is exactly
+    // who must find a live-UI skill's plugin when the main agent delegates the
+    // page work, and its own system-prompt catalog is easy to skim past. The
+    // reminder is byte-stable for a given attachment set, so it rides the tail
+    // without moving the cached prefix.
+    messages.push(skills_context_message(&req.skills, &req.plugins));
+    // Deterministic second door: if the request's own words name an installed
+    // skill, hand the model the owning plugin and the exact `slug`+`skill`
+    // call. This is what makes discovery automatic even when the user did not
+    // @mention anything and the catalog is long enough to skim. It is skipped
+    // when the user DID attach something — explicit intent wins — and it never
+    // inlines a skill body or bypasses the plugin.
+    if req.skills.is_empty() && req.plugins.is_empty() && final_prompt == req.prompt {
+        if let Some(hint) = crate::skill_router::auto_match_hint(&skill_root, &final_prompt) {
+            messages.push(json!({"role": "user", "content": hint}));
+        }
     }
     // The Plan-Execute protocol (always-on, main AND sub): the first tool reply
     // must be one `batch` with the whole step — the model-INDEPENDENT
@@ -805,15 +1006,136 @@ already approved with \"Always allow\".",
 
     // The explore sub-agent gets the full read/search set; the main agent
     // deliberately has NO search tools and must delegate via `explore`.
-    let mut schemas = if req.mode == "subagent" {
-        let mut research = research_schemas();
-        // A plugin profile may run a NARROWER sub-agent (a reviewer that only
-        // reads, a locator that only greps). The narrowing is applied here so
-        // the sub-turn never even sees the schema of a tool it may not call.
-        retain_subagent_tools(&mut research, &req.subagent_tools);
-        research
+    // A PROFILE (plugin `agents/*.md` or a Settings → Sub-agents row) may be
+    // granted more than research: when it declares tools, it starts from the
+    // whole sub-agent universe and the declaration narrows it. An undeclared
+    // profile keeps its kind's classic set, and the builtin `explore` is always
+    // read-only — its prompt promises research, never edits.
+    //
+    // OWNERSHIP: when a reachable Browser Navigator / Desktop Operator exists,
+    // that sub-agent OWNS its driver for the turn. The parent then keeps only
+    // `agent__<id>`; leaving the direct tools bound made the model choose the
+    // shorter path (a traced "open digikala" called `browser_navigate` and the
+    // profile never ran). The same id gates the dispatch arm, so a stale or
+    // hallucinated direct call is refused with the delegation name.
+    let browser_owner = if req.mode == "subagent" {
+        None
     } else {
-        let mut schemas = tool_schemas(req.allow_create, req.allow_browser);
+        reachable_subagent_id(
+            &req.custom_subagents,
+            "browser",
+            req.allow_browser,
+            req.allow_computer,
+        )
+    };
+    let computer_owner = if req.mode == "subagent" {
+        None
+    } else {
+        reachable_subagent_id(
+            &req.custom_subagents,
+            "computer",
+            req.allow_browser,
+            req.allow_computer,
+        )
+    };
+    // Repeat the ownership at the TAIL. The system-prompt list sits before a
+    // multi-kilobyte plugin catalog, and the traced failure was exactly a model
+    // ignoring it; the last message before the first call is what a weak model
+    // actually follows. The block is stable for the turn, so it churns nothing
+    // the previous round cached.
+    if browser_owner.is_some() || computer_owner.is_some() {
+        let mut duty = String::new();
+        if let Some(id) = browser_owner.as_deref() {
+            duty.push_str(&format!(
+                "- The browser is owned by the `{id}` sub-agent. Call `agent__{id}` for any page \
+                 work; direct `browser_*` tools are NOT bound and are refused.\n"
+            ));
+        }
+        if let Some(id) = computer_owner.as_deref() {
+            duty.push_str(&format!(
+                "- The desktop is owned by the `{id}` sub-agent. Call `agent__{id}` for desktop \
+                 work; the direct `computer` tool is NOT bound and is refused.\n"
+            ));
+        }
+        if let Some(m) = trailing_context_message(
+            "=== SUB-AGENT OWNERSHIP (NOT A NEW REQUEST) ===\n",
+            &duty,
+        ) {
+            messages.push(m);
+        }
+    }
+    let mut schemas = if req.mode == "subagent" {
+        let kind = req.subagent_kind.as_deref().unwrap_or("research");
+        // A `browser` or `computer` sub-agent additionally binds its driver's
+        // schemas. `allow_browser`/`allow_computer` were already gated in
+        // `run_subagent` (parent switch AND kind), so reading them here is the
+        // single source of truth: no switch-flip can widen a child.
+        let add_driver = |tools: &mut Vec<Value>| {
+            if kind == "browser" && req.allow_browser {
+                tools.extend(crate::browser_driver::actions::entries().into_iter().map(
+                    |(name, desc, params)| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": { "name": name, "description": desc, "parameters": params }
+                        })
+                    },
+                ));
+            }
+            if kind == "computer" && req.allow_computer {
+                tools.push(crate::computer::schema());
+                // The desktop is for apps that have NO command line. File
+                // creation, conversion and export (pptx/docx/xlsx/pdf, a deck
+                // built from data, a document converted to PDF) are ONE
+                // `run_terminal` call with python-pptx/soffice — the traced
+                // desktop run instead drove the PowerPoint UI for half an hour
+                // and shipped nothing. A child with only `computer` + read-only
+                // research tools could not even try the CLI: `run_terminal` was
+                // not bound, so its two attempts were refused as unknown tools.
+                // Bind it whenever the schema table does not already carry it;
+                // the parent's caps still gate what the command may do.
+                if !tools
+                    .iter()
+                    .any(|s| s["function"]["name"].as_str() == Some("run_terminal"))
+                {
+                    tools.extend(
+                        crate::agent::schemas::tool_schemas(false, false)
+                            .into_iter()
+                            .filter(|s| {
+                                s["function"]["name"].as_str() == Some("run_terminal")
+                            }),
+                    );
+                }
+            }
+        };
+        // What the builtin `explore` and an undeclared profile run on.
+        let mut default_tools = research_schemas();
+        add_driver(&mut default_tools);
+        let declared = req.subagent_profile && !req.subagent_tools.is_empty();
+        if declared {
+            // A profile that names tools starts from the WHOLE sub-agent
+            // universe, which is what lets a pack's `Bash`/`Edit`/`Write`
+            // survive; the declaration then narrows it.
+            let mut tools = subagent_schemas();
+            add_driver(&mut tools);
+            if retain_subagent_tools(&mut tools, &req.subagent_tools) {
+                tools
+            } else {
+                // The list names nothing this sub-agent can run (`Task`,
+                // `TodoWrite`, a typo). Keep the kind's default set: zero tools
+                // is useless, and the whole work universe would be more reach
+                // than the list asked for.
+                default_tools
+            }
+        } else {
+            default_tools
+        }
+    } else {
+        // `browser_owner.is_none()` so the direct driver is withheld exactly
+        // when the browser sub-agent owns it (see the ownership note above).
+        let mut schemas = tool_schemas(
+            req.allow_create,
+            req.allow_browser && browser_owner.is_none(),
+        );
         // Media generation rides ONLY on the main agent's turn: these tools
         // spend the user's provider credit and their results (an inline
         // markdown reference) are meant for the user's chat, not for a
@@ -823,7 +1145,12 @@ already approved with \"Always allow\".",
         // Every installed sub-agent PROFILE joins the same delegation list as
         // `explore`: one mechanism, so a bundle cannot invent a second kind of
         // sub-agent that misses the depth limit, the model slot or the caps.
-        schemas.extend(delegation_schemas(std::path::Path::new(&skill_root)));
+        schemas.extend(delegation_schemas(
+            std::path::Path::new(&skill_root),
+            &req.custom_subagents,
+            req.allow_browser,
+            req.allow_computer,
+        ));
         schemas
     };
     // What the tools may do this turn. A renderer that sends `cap` wins; without
@@ -847,16 +1174,22 @@ already approved with \"Always allow\".",
             )
         });
     }
-    // A read-only mode never sees the authoring enum: `allow_create` is sticky
-    // from the conversation history, so an Ask turn can carry it while the mode
-    // forbids saving a bundle — with the full enum the model then names
-    // `action=update` (the "updates the plugin instead of running it" report).
-    // The compact form keeps the door open for `list`/`run` only. The schedule
-    // tool narrows the same way (its full schema advertises create/update/
-    // toggle/delete, which a read-only turn refuses), and the authoring tools
-    // vanish outright — `denied_by_caps` already dropped them above.
-    if !caps.write_files {
-        compact_plugin_schema(&mut schemas);
+    // The plugin door is NOT narrowed by the mode either — same reasoning as
+    // `schedule` below. A bundle lives under `~/.codifa/plugins/`, outside the
+    // workspace, so `write_files` (the only thing that tells the modes apart)
+    // has nothing to say about it. What actually gates authoring is the REQUEST
+    // (`allow_create`, "the user asked for a bundle this turn"), already applied
+    // to the schema in `tool_schemas` and re-checked on every call in the loop.
+    // Narrowing by mode as well is what made an explicit "update the plugin"
+    // show only `list`/`run` in a read-only chat and then refuse the call.
+    // The authoring TOOLS still vanish outright in a read-only turn —
+    // `denied_by_caps` dropped them above.
+    // The schedule tool is NOT narrowed by the mode: its store is outside the
+    // workspace, so a read-only turn may still create/update/toggle/delete a
+    // task — "[Schedule: update …]" typed in Ask must work. Only an UNATTENDED
+    // run narrows to list (nobody to approve a change there); the in-loop
+    // backstop splits on the same flag.
+    if req.headless {
         compact_schedule_schema(&mut schemas);
     }
     // MCP connectors switched on in the composer become extra tools named
@@ -929,6 +1262,15 @@ already approved with \"Always allow\".",
         .filter(|s| connectors.iter().any(|c| &c.server == *s))
         .cloned()
         .collect();
+    // An ATTACHED plugin is already a loaded toolbox: its connectors come with
+    // its skills, so they are advertised from the FIRST request instead of
+    // waiting for `use_mcp`. The trailing ACTIVE PLUGIN note promises exactly
+    // that, and a deferred schema would make the promise false.
+    for name in crate::plugins::mcp_of(std::path::Path::new(&skill_root), &req.plugins).keys() {
+        if connectors.iter().any(|c| &c.server == name) {
+            activated.insert(name.clone());
+        }
+    }
     // Append the schemas of everything activated so far. `deferred` was filtered
     // once above, so this is a partition, not a second collision pass.
     if !activated.is_empty() {
@@ -950,7 +1292,7 @@ already approved with \"Always allow\".",
     // The name is checked first because this push happens AFTER the MCP filter:
     // a connector exposing a tool literally named `computer` would otherwise
     // collide and the model would see the same name on two rows.
-    if req.allow_computer && req.mode != "subagent" {
+    if req.allow_computer && req.mode != "subagent" && computer_owner.is_none() {
         let taken = schemas
             .iter()
             .any(|s| s["function"]["name"].as_str() == Some("computer"));
@@ -1020,15 +1362,11 @@ already approved with \"Always allow\".",
         ..Default::default()
     });
 
-    let max_steps = if req.mode == "subagent" {
-        SUBAGENT_MAX_STEPS
-    } else {
-        // No cap on the main agent: it must be able to finish the job it
-        // started. `usize::MAX` disables every budget nudge that keys off
-        // `max_steps` (see `main_wrapup_message`), which is exactly right —
-        // there is no budget to warn about.
-        usize::MAX
-    };
+    // No step cap for a sub-agent either: a hard budget cut traced browser
+    // runs off mid-list and handed the parent `[Tool budget exhausted]` dumps
+    // instead of an answer. The idle guard and the attempt ladder bound a
+    // genuinely wedged provider; a healthy run finishes its task first.
+    let max_steps = usize::MAX;
     // Lookups already executed in THIS turn. A repeat of the same read window
     // or grep is pure waste — the payload is already in the context above —
     // and the explore prompt forbids it, yet a traced run re-read three files
@@ -1117,9 +1455,50 @@ already approved with \"Always allow\".",
     // nothing real to show. Kept in order, one entry per round, so
     // `plans::plan_text` can pick the rounds that carry the plan.
     let mut prior_text: Vec<String> = Vec::new();
+    // A plan-mode turn that saved the plan as a markdown ARTIFACT: the body
+    // never appears in `prior_text` (it rides on the tool call), so without
+    // this the end-of-turn save kept only the closing summary as plan.md.
+    // Only a plan-named artifact qualifies (see plan_document_from_artifact).
+    let mut plan_artifact: Option<(String, String)> = None;
     // The main-agent wrap-up nudge is delivered once per turn (see
     // `main_wrapup_message`); the flag keeps a later step from re-sending it.
     let mut wrapup_delivered = false;
+    // Desktop control is approved per TASK, not per mouse action: the first
+    // direct `computer` call this turn asks (the card states the act), and an
+    // allow covers the rest of the turn. Delegated desktop work has its own
+    // gate at the delegation boundary in `run_subagent`, where the model
+    // supplies a real reason; this latch is never set by that path.
+    let mut desktop_approved = false;
+    // Wall-clock budget for a SUB-AGENT attempt (see
+    // `context::subagent_budget_secs`). The idle guard only catches silence;
+    // this bounds a child that is busy but making no progress. `None` for a
+    // normal turn — the user is present and can stop it.
+    let turn_started = std::time::Instant::now();
+    let sub_budget = (req.mode == "subagent")
+        .then(|| crate::agent::context::subagent_budget_secs(
+            req.subagent_kind.as_deref().unwrap_or("research"),
+        ));
+    let mut budget_nudged = false;
+    // Digest of the last DISTINCT screenshot the model was sent. A mutating
+    // computer action always captures the screen it changed, so a no-op action
+    // produced a byte-identical PNG that was re-encoded and re-billed on every
+    // following round. `None` until the first capture.
+    let mut last_shot_digest: Option<u64> = None;
+    // Digests of the last few rounds (tool calls + results + screenshot pixels).
+    // A repeated digest means the same calls returned the same bytes: the child
+    // is looping, not working. See the guard at the end of the loop.
+    let mut round_hashes: Vec<u64> = Vec::new();
+    let mut stall_nudges = 0usize;
+    // How many times ONE exact call (name + raw args) has been issued this turn.
+    // The round digest only catches a loop whose RESULT also repeats; a desktop
+    // loop like `command+tab` changes the screen every round, so it looked like
+    // progress. A per-action ceiling catches it regardless of the result.
+    let mut action_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut repeated_action_nudged: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Consecutive rounds whose EVERY call named a tool that does not exist.
+    let mut invalid_rounds = 0usize;
     for step in 0..max_steps {
         // Drain any mid-turn steer BEFORE this model call: the steer is appended
         // as an extra user message, so the model keeps the whole conversation
@@ -1142,25 +1521,31 @@ already approved with \"Always allow\".",
             emit(&AgentEvent::Done { aborted: true });
             return Ok(());
         }
-        // Budget nudge (explore only): make the sub-agent report while it
-        // still has calls left instead of running out silently.
-        if req.mode == "subagent" && step + 3 == max_steps {
-            messages.push(json!({
-                "role": "user",
-                "content": "Tool budget nearly exhausted — report your findings in your NEXT answer; only call a tool if it is essential."
-            }));
-        }
-        // Spent-budget nudge (explore only), placed where the prompt's own
-        // "fixed 3-step budget" runs out. It asks for ONE last batch plus the
-        // report, never for a stop: 15 of 63 traced runs still ended on a fetch
-        // call because something genuinely was missing, so a hard cut would
-        // trade report quality for tokens. Batching the remainder keeps the
-        // information while dropping the per-round conversation re-send.
-        if req.mode == "subagent" && step == EXPLORE_BUDGET_STEPS {
-            messages.push(json!({
-                "role": "user",
-                "content": "The 3-step budget is spent. Write the report NOW from what you already have. If a specific fact is still missing, fetch ALL of it in ONE batch of calls next to the report — do not keep fetching one thing per round."
-            }));
+        // Sub-agent wall-clock budget. The idle guard in `run_subagent` only
+        // fires on SILENCE; a child that keeps emitting events (the traced
+        // desktop run: 56× `command+tab`, 165 LLM calls, 1_851 s) never trips
+        // it. At the soft mark the child is told to stop exploring and report;
+        // at the hard mark the loop breaks and the end-of-turn path below asks
+        // for a final tools-off report, so the parent still receives the
+        // evidence instead of a dead card. This is not a step cap: a child that
+        // is genuinely progressing gets its full window.
+        if let Some((soft, hard)) = sub_budget {
+            let elapsed = turn_started.elapsed().as_secs();
+            if elapsed >= hard {
+                break;
+            }
+            if elapsed >= soft && !budget_nudged {
+                budget_nudged = true;
+                messages.push(json!({
+                    "role": "user",
+                    "content": format!(
+                        "=== TIME BUDGET ===\n{elapsed}s of this sub-agent's window are used. \
+Stop exploring and finish: use the results you already have and write the final report in \
+your next reply. Do not start another search or another GUI flow unless it is required to \
+answer the task."
+                    ),
+                }));
+            }
         }
         // Wrap-up nudge (main agent only), once, a few steps before the cap.
         // Traced Oct 29: three of twenty runs hit MAX_STEPS and were cut with
@@ -1677,7 +2062,7 @@ already approved with \"Always allow\".",
                         degrade_images_to_text(&client, req, &cfg, &mut messages).await;
                     if changed > 0 {
                         emit(&AgentEvent::Text {
-                            content: "\n\n> The main model rejected the image; retrying with \
+                            content: "\n\n> This model rejected the image; retrying with \
 the Vision model's description instead.\n"
                                 .to_string(),
                         });
@@ -1990,6 +2375,18 @@ the Vision model's description instead.\n"
             }
         }
 
+        // A round made ONLY of names that are not in the advertised table is a
+        // hallucination loop, not work. The unknown-tool reply already tells the
+        // model the valid names; three rounds in a row that ignore it will not
+        // recover on their own (a weak model keeps inventing the same family).
+        // Tracked here, acted on at the end of the round.
+        let round_all_invalid = !tool_calls.is_empty()
+            && tool_calls.iter().all(|(_, n, _)| {
+                !advertised.iter().any(|a| a == n)
+                    && !n.starts_with(crate::mcp::TOOL_PREFIX)
+                    && crate::mcp_index::owner_of(&connectors, n).is_none()
+            });
+
         if tool_calls.is_empty() {
             // Plan mode: persist the plan document to disk (native plans.rs,
             // same layout the Python sidecar used) and emit plan_card so the
@@ -2008,12 +2405,19 @@ the Vision model's description instead.\n"
                 let full = crate::plans::plan_text(&parts);
                 let data_root = native_data_root();
                 let ws = crate::plans::workspace_slug_for_root(&root);
-                let doc = extract_plan_body(&full);
+                // The artifact IS the plan when the turn saved one: the prose
+                // rounds then only carry the closing summary, which must not
+                // win over the document the planner actually wrote.
+                let from_artifact = plan_artifact.is_some();
+                let doc = plan_artifact
+                    .clone()
+                    .or_else(|| extract_plan_body(&full));
                 let has_plan = crate::plans::get_plan(&data_root, &ws, &req.chat_id).is_some();
-                let wrote_document = doc
-                    .as_ref()
-                    .map(|(_, body)| crate::plans::has_heading(body))
-                    .unwrap_or(false);
+                let wrote_document = from_artifact
+                    || doc
+                        .as_ref()
+                        .map(|(_, body)| crate::plans::has_heading(body))
+                        .unwrap_or(false);
                 // A plan-mode turn is not always a plan: the user asks a
                 // question, answers the planner's clarification, or says "keep
                 // the saved plan", and the turn then ends with a conversational
@@ -2132,6 +2536,10 @@ the Vision model's description instead.\n"
                 call
             })
             .collect();
+        // First message this round. The no-progress guard below reads
+        // `messages[round_msg_start..]` (this round's tool results) — the
+        // assistant message is excluded from the digest by its role.
+        let round_msg_start = messages.len();
         messages.push(json!({
             "role": "assistant",
             "content": if text.is_empty() { Value::Null } else { json!(text) },
@@ -2202,9 +2610,9 @@ the Vision model's description instead.\n"
             // grant, so the common case costs nothing. A sub-agent never
             // prompts: it reports back and the parent turn owns the question.
             if req.mode != "subagent" && !name.starts_with(crate::mcp::TOOL_PREFIX) {
-                if let Some(folder) = outside_target(name, &args, &root, permit.as_ref(), &caps) {
-                    if ask_outside_access(emit, &req.chat_id, cancel, name, &folder, req.headless).await {
-                        grant_folder(&mut permit, &folder);
+                if let Some(ask) = outside_target(name, &args, &root, permit.as_ref(), &caps) {
+                    if ask_outside_access(emit, &req.chat_id, cancel, name, &ask, req.headless).await {
+                        grant_folder(&mut permit, &ask.folder);
                     } else {
                         // The card must appear even when the call is refused:
                         // the renderer resolves it with the denial reason.
@@ -2213,7 +2621,7 @@ the Vision model's description instead.\n"
                             name: name.clone(),
                             args: args.clone(),
                         });
-                        denied.push((id.clone(), name.clone(), args, denied_outside(&folder)));
+                        denied.push((id.clone(), name.clone(), args, denied_outside(&ask.target)));
                         continue;
                     }
                 }
@@ -2350,7 +2758,7 @@ the Vision model's description instead.\n"
             let root_c = root.clone();
             let permit_c = permit.clone();
             // Skills live in the DATA root, not the workspace: dispatch must
-            // resolve `load_skill`/`create_skill` there, or every load answers
+            // resolve `load_plugin` there, or every load answers
             // "Available: (none)" while the catalog above lists the skill.
             let skill_root_c = skill_root.clone();
             // A scheduled turn may block for minutes on a paid script, so the
@@ -2474,11 +2882,15 @@ context; use what it showed, read a DIFFERENT window, or move on"
                 None,
             );
         }
-        // Explore sub-agents in one step run CONCURRENTLY (tokio::spawn +
-        // join): the model often fires several research questions at once and
-        // each takes seconds — sequential execution multiplies the wall time.
-        // Mutating tools stay sequential (ordering + cancel semantics).
-        let mut explore_batch: Vec<(String, String, Value, u64)> = Vec::new();
+        // Independent research sub-agents in one step run CONCURRENTLY
+        // (join): the model often fires several research questions at once
+        // and each takes seconds — sequential execution multiplies the wall
+        // time. Browser/desktop agents are the exception: they share ONE page
+        // / ONE desktop, so two of them in parallel would fight over the
+        // driver. Those run serially below, in the order the model called
+        // them. Mutating tools stay sequential too (ordering + cancel).
+        let mut parallel_batch: Vec<(String, String, Value, u64)> = Vec::new();
+        let mut serial_delegations: Vec<(String, String, Value, u64)> = Vec::new();
         let mut rest: Vec<(String, String, String)> = Vec::new();
         for call in sequential {
             if is_delegation(&call.1) {
@@ -2511,10 +2923,10 @@ context; use what it showed, read a DIFFERENT window, or move on"
                     serde_json::from_str(&call.2).unwrap_or_else(|_| json!({}));
                 emit(&AgentEvent::Status {
                     stage: "tool".into(),
-                    content: call.1.clone(),
+                    content: delegation_display_name(req, &call.1),
                 });
                 let branch = BRANCH_SEQ.fetch_add(1, Ordering::Relaxed);
-                // The card carries its branch id so the calls the explore
+                // The card carries its branch id so the calls the sub-agent
                 // makes (tagged with the same id) nest under it.
                 emit(&AgentEvent::Branch {
                     branch,
@@ -2527,9 +2939,9 @@ context; use what it showed, read a DIFFERENT window, or move on"
                 });
                 // The identical question already ran in THIS turn: its report is
                 // in the context above, so re-running it would buy the same
-                // findings twice (a full sub-agent: up to 12 rounds × 3 attempts).
+                // findings twice (a full sub-agent: many rounds × attempts).
                 // Answer with a pointer instead. The key is registered BEFORE the
-                // run, so two identical explores in the SAME step cannot both
+                // run, so two identical delegations in the SAME step cannot both
                 // start.
                 let key = lookup_key(&call.1, &args);
                 if key.is_some_and(|k| !seen_lookups.insert(k)) {
@@ -2540,7 +2952,7 @@ context; use what it showed, read a DIFFERENT window, or move on"
                         &call.0,
                         &call.1,
                         &args,
-                        "this exact explore ALREADY ran in this turn — its report is in \
+                        "this exact sub-agent task ALREADY ran in this turn — its report is in \
 your context above. Use that report, or ask a DIFFERENT, narrower question"
                             .into(),
                         true,
@@ -2548,23 +2960,34 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                         None,
                         None,
                     );
+                } else if matches!(
+                    delegation_kind(req, &call.1).as_str(),
+                    "browser" | "computer"
+                ) {
+                    // One shared page / desktop: never run two drivers at once.
+                    serial_delegations.push((call.0, call.1, args, branch));
                 } else {
-                    explore_batch.push((call.0, call.1, args, branch));
+                    parallel_batch.push((call.0, call.1, args, branch));
                 }
             } else {
                 rest.push(call);
             }
         }
-        if !explore_batch.is_empty() {
-            // Concurrent explores polled in THIS task via join_all — no
+        // A steer that lands while this step's tools run must stop the batch
+        // from STARTING more long work: the next step is where it is delivered.
+        // Delegations already running are cancelled by `SteerAwareCancel`;
+        // this stamp covers the calls that have not started yet.
+        let batch_steer_base = steer_flag.generation();
+        if !parallel_batch.is_empty() {
+            // Concurrent sub-agents polled in THIS task via join_all — no
             // tokio::spawn, so no Send bound and the turn still blocks until
-            // every report is back (explore stays synchronous by design).
+            // every report is back (delegation stays synchronous by design).
             // Structural events (tool cards/status/usage) flow through a
-            // channel to the parent stream so parallel explores stay VISIBLE
+            // channel to the parent stream so parallel sub-agents stay VISIBLE
             // in the chat while they work; Text/Error stay inside each
             // sub-agent's own report (never surfaced in the chat).
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubMsg>();
-            let futures: Vec<_> = explore_batch
+            let futures: Vec<_> = parallel_batch
                 .iter()
                 .map(|(id, name, args, branch)| {
                     let branch = *branch;
@@ -2574,16 +2997,33 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                     let name_c = name.clone();
                     let name_t = name.clone();
                     let cancel_c = std::sync::Arc::clone(cancel);
+                    let steer_c = steer_flag.clone();
                     let tx = tx.clone();
                     Box::pin(async move {
                         let tx_ev = tx.clone();
                         let mut sink = move |ev: &AgentEvent| {
                             let _ = tx_ev.send(SubMsg::Ev(ev.clone()));
                         };
+                        // A steer during this delegation must cut the child
+                        // short: the parent is blocked here, so without the
+                        // watcher the steer waits for the whole child run.
+                        let steer_guard = SteerAwareCancel::new(&cancel_c, &steer_c);
                         let (result, ok) = run_subagent(
-                            &req_c, &args_c, branch, &name_t, &mut sink, &cancel_c,
+                            &req_c,
+                            &args_c,
+                            branch,
+                            &name_t,
+                            &mut sink,
+                            &steer_guard.flag,
                         )
                         .await;
+                        let steered = steer_guard.steered() && steer_pending(&req_c.chat_id);
+                        drop(steer_guard);
+                        let result = if steered && !ok {
+                            steered_tool_result(result)
+                        } else {
+                            result
+                        };
                         // Each explore posts its OWN end marker, so the parent
                         // resolves this card the moment it lands — not after
                         // the slowest sibling in the batch finishes.
@@ -2645,6 +3085,85 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             };
             let (_reports, _) = tokio::join!(sub_all, forward);
         }
+        // Browser/desktop delegations run SERIALLY in the model's call order:
+        // the whole point of a page/desktop driver is that there is one, and
+        // two sub-agents in parallel would overwrite each other's page state.
+        // They still belong to this step: the main agent does not pay another
+        // model round-trip to run them.
+        for (id, name, args, branch) in serial_delegations {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if req.mode != "subagent" {
+                    eprintln!(
+                        "[turn-end] chat={} cancel flag set before serial delegation",
+                        req.chat_id
+                    );
+                }
+                drop_steers(&req.chat_id, emit);
+                emit(&AgentEvent::Done { aborted: true });
+                return Ok(());
+            }
+            if steer_flag.interrupted_since(batch_steer_base) && steer_pending(&req.chat_id) {
+                // The user already superseded this step: do not start another
+                // long delegation. Answer the call anyway — every `tool_calls`
+                // id needs a result or the next request is rejected.
+                finish_tool(
+                    &mut messages,
+                    emit,
+                    &trace,
+                    &id,
+                    &name,
+                    &args,
+                    steered_skip_result(),
+                    false,
+                    req.mode == "subagent",
+                    None,
+                    None,
+                );
+                continue;
+            }
+            let req_c = req.subagent_snapshot();
+            let mut sink = |ev: &AgentEvent| emit(ev);
+            // Same steer-aware cancel as the parallel arm: a browser/desktop
+            // delegation blocks the parent, so a steer must cut the child short
+            // instead of waiting for the whole run.
+            let steer_guard = SteerAwareCancel::new(cancel, &steer_flag);
+            // Boxed for the same reason the parallel arm is: run_turn calls
+            // run_subagent, whose child turn calls run_turn again. The Box is
+            // the indirection that keeps that cycle from being infinite-sized.
+            let (result, ok) = Box::pin(run_subagent(
+                &req_c,
+                &args,
+                branch,
+                &name,
+                &mut sink,
+                &steer_guard.flag,
+            ))
+            .await;
+            let steered = steer_guard.steered() && steer_pending(&req.chat_id);
+            drop(steer_guard);
+            let result = if steered && !ok {
+                steered_tool_result(result)
+            } else {
+                result
+            };
+            if !ok && req.headless {
+                let brief: String = result.chars().take(200).collect();
+                eprintln!("[tool] {name} failed: {brief}");
+            }
+            finish_tool(
+                &mut messages,
+                emit,
+                &trace,
+                &id,
+                &name,
+                &args,
+                result,
+                ok,
+                req.mode == "subagent",
+                None,
+                None,
+            );
+        }
         for (id, name, raw_args) in &rest {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 // Stop mid-batch: the remaining tools are skipped, so anything
@@ -2657,6 +3176,25 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                 return Ok(());
             }
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+            if steer_flag.interrupted_since(batch_steer_base) && steer_pending(&req.chat_id) {
+                // Same rule as the serial delegations above: answer the call
+                // without running it, so the steer is delivered at the next
+                // step instead of after more work the user superseded.
+                finish_tool(
+                    &mut messages,
+                    emit,
+                    &trace,
+                    &id,
+                    &name,
+                    &args,
+                    steered_skip_result(),
+                    false,
+                    req.mode == "subagent",
+                    None,
+                    None,
+                );
+                continue;
+            }
             // The call about to run may CHANGE the workspace (`write_file`,
             // `edit_file`, or a `run_terminal` that really writes), so every body
             // cached by the repeat-guard is now possibly a snapshot of a file
@@ -2897,16 +3435,16 @@ user to ask for it. Available this turn: `list` and `run`."
                         Err(e) => (e, false),
                     }
                 }
-            } else if name == "schedule" && !caps.write_files {
-                // The backstop next to the plugin gate: the schema is list-only
-                // in a read-only turn, so a create/update/toggle/delete that
-                // still arrives is a stale transcript or a hallucinated call —
-                // refuse it before anything reaches the schedule store. A
-                // sticky `allow_create` cannot arm this tool here (see
-                // `compact_schedule_schema`); listing stays possible so the
-                // model can still answer "what is scheduled".
+            } else if name == "schedule" && req.headless {
+                // The backstop next to the plugin gate, and the ONLY one left on
+                // `schedule`: a user-invoked turn authors schedules in every mode
+                // (the store is not the workspace, so `write_files` does not apply).
+                // An unattended run has nobody to approve a write to that store, so
+                // its schema is list-only (`compact_schedule_schema`) and any
+                // create/update/toggle/delete that still arrives is a stale
+                // transcript — refused before it reaches the store.
                 let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
-                match schedule_mode_refusal(&action, &caps) {
+                match schedule_mode_refusal(&action, true) {
                     Some(refusal) => (refusal, false),
                     None => {
                         let root_sb = root.clone();
@@ -3000,31 +3538,68 @@ user to ask for it. Available this turn: `list` and `run`."
                     Ok(r) => (r, true),
                     Err(e) => (e, false),
                 }
+            } else if name == "computer" && computer_owner.is_some() {
+                // Same ownership rule as the browser: the profile is the only
+                // door, so a direct call here is stale or hallucinated.
+                let owner = computer_owner.as_deref().unwrap_or_default();
+                (
+                    format!(
+                        "The desktop is owned by the `{owner}` sub-agent this turn. Do NOT call \
+`computer` directly: call `agent__{owner}` with a description and the task as `prompt`."
+                    ),
+                    false,
+                )
             } else if name == "computer" {
                 // Bound only when the user enabled Computer Use; the schema is
                 // withheld otherwise, so reaching here means it is allowed.
-                match crate::computer::run(&args) {
-                    Ok(o) => {
-                        // The capture must be HANDED to the model, not described
-                        // to it: the result used to be the path alone, so the
-                        // agent asked for a screenshot, received a filename and
-                        // clicked blind. The pixels are attached to the next
-                        // request instead (see `step_shots` after this phase).
-                        for shot in o.shots {
-                            emit(&AgentEvent::Tool {
-                                id: format!("{id}-shot"),
-                                name: "computer".into(),
-                                args: json!({"action": "screenshot", "path": shot.path}),
-                                result: shot.path.clone(),
-                                ok: true,
-                                results: None,
-                                engine: None,
-                            });
-                            step_shots.push(shot);
+                // The SWITCH says the user is willing to allow desktop work in
+                // principle — it is not a per-task grant, so the first action of
+                // a task asks, with the act as the reason. An allow covers the
+                // rest of THIS turn (a click, then a type, then a check is one
+                // task, not three popups). A child turn was already approved at
+                // the delegation boundary.
+                let allowed = if desktop_approved || req.mode == "subagent" {
+                    true
+                } else {
+                    let why = crate::computer::permission_reason(&args);
+                    let ok = ask_desktop_access(
+                        emit,
+                        &req.chat_id,
+                        cancel,
+                        "Control the desktop",
+                        &why,
+                        req.headless,
+                    )
+                    .await;
+                    desktop_approved = ok;
+                    ok
+                };
+                if !allowed {
+                    (denied_desktop(&crate::computer::permission_reason(&args)), false)
+                } else {
+                    match crate::computer::run(&args) {
+                        Ok(o) => {
+                            // The capture must be HANDED to the model, not described
+                            // to it: the result used to be the path alone, so the
+                            // agent asked for a screenshot, received a filename and
+                            // clicked blind. The pixels are attached to the next
+                            // request instead (see `step_shots` after this phase).
+                            for shot in o.shots {
+                                emit(&AgentEvent::Tool {
+                                    id: format!("{id}-shot"),
+                                    name: "computer".into(),
+                                    args: json!({"action": "screenshot", "path": shot.path}),
+                                    result: shot.path.clone(),
+                                    ok: true,
+                                    results: None,
+                                    engine: None,
+                                });
+                                step_shots.push(shot);
+                            }
+                            (o.text, true)
                         }
-                        (o.text, true)
+                        Err(e) => (e, false),
                     }
-                    Err(e) => (e, false),
                 }
             } else if crate::browser_driver::handles(name) {
                 // Native browser driver. This arm MUST precede the MCP arm: the
@@ -3032,12 +3607,22 @@ user to ask for it. Available this turn: `list` and `run`."
                 // tool this app advertises natively would otherwise be routed to
                 // the connector it replaced.
                 //
-                // Second gate (the schema filter is the first): a turn whose
-                // Browser switch is off must not start a browser even if the
-                // model emits the call anyway (stale transcript, hallucinated
-                // name, a connector echoing `browser_*`). Refusing HERE, before
-                // `run`, is what keeps Chromium from being launched at all.
-                if !req.allow_browser {
+                // OWNERSHIP gate: a turn with a reachable Browser Navigator has
+                // no browser_* schemas, so reaching here means a stale
+                // transcript or a hallucinated name. Refuse it and name the
+                // delegation tool instead of silently doing the work directly —
+                // that would leave the profile unused and the chat without the
+                // sub-agent's report.
+                if let Some(owner) = browser_owner.as_deref() {
+                    (
+                        format!(
+                            "The browser is owned by the `{owner}` sub-agent this turn. \
+Do NOT call browser_* directly: call `agent__{owner}` with a description and the task as \
+`prompt` — it drives the page and returns the result."
+                        ),
+                        false,
+                    )
+                } else if !req.allow_browser {
                     (
                         "The Browser is switched off for this turn (composer → MCP tools → Browser). \
                          Ask the user to enable it before browsing."
@@ -3059,6 +3644,159 @@ user to ask for it. Available this turn: `list` and `run`."
                         Ok(Err(e)) => (e, false),
                         Err(e) => (format!("browser task failed: {e}"), false),
                     }
+                }
+            } else if name == "load_plugin" {
+                // The plugin is ALWAYS the unit that gets loaded: `slug` alone
+                // returns every skill body and activates its connectors.
+                // `slug` + `skill` narrows to ONE body from INSIDE that plugin,
+                // which is how a 24-skill library is used without paying for
+                // all of it. A bare skill name never loads directly: it names
+                // its owning plugin and asks the model to load that plugin.
+                let store = std::path::Path::new(&skill_root);
+                let slug = args["slug"].as_str().unwrap_or("").trim();
+                let query = args["query"].as_str().unwrap_or("").trim();
+                let skill = args["skill"].as_str().unwrap_or("").trim();
+                let file = args["file"].as_str().unwrap_or("").trim();
+                // An identical load is pure waste: the toolbox / skill body is
+                // already in the context above (a full `instagram-api-less`
+                // toolbox is ~9K chars, and traced runs loaded it again inside
+                // a sub-agent). The key lives in `seen_lookups`, so a FOLD that
+                // elides the earlier result removes it too — the model can
+                // always re-read text it can no longer see. A `query` search is
+                // not keyed: it is a cheap lookup whose result may differ.
+                let load_key = lookup_key(name, &args);
+                if load_key
+                    .as_ref()
+                    .is_some_and(|key| seen_lookups.contains(key))
+                {
+                    let what = if !skill.is_empty() {
+                        "This skill text"
+                    } else {
+                        "This plugin/toolbox"
+                    };
+                    (
+                        format!(
+                            "{what} is ALREADY loaded in this turn — its text is in your context \
+                             above. Do not load it again: use that text, or ask for a specific \
+                             skill file you still need."
+                        ),
+                        true,
+                    )
+                } else {
+                    let outcome = if !file.is_empty() && skill.is_empty() {
+                        (
+                            "load_plugin needs `skill` with `file`: the extra file belongs to one \
+                             skill of the plugin."
+                                .to_string(),
+                            false,
+                        )
+                    } else if slug.is_empty() && !skill.is_empty() {
+                        // No bare-skill shortcut: name the OWNING plugin and
+                        // make the model load that plugin (optionally narrowed
+                        // to this skill). This keeps discovery plugin-first —
+                        // the catalog/search always lead to a plugin, and the
+                        // skill is used from inside the toolbox that carries it.
+                        match crate::plugins::plugin_of_skill(store, skill) {
+                            Some(owner) => (
+                                format!(
+                                    "load_plugin needs the plugin `slug`: {skill:?} lives inside \
+                                     {owner:?}. Call load_plugin with slug={owner} skill={skill} \
+                                     to read that one body, or slug={owner} for the whole \
+                                     toolbox (its connectors and every skill)."
+                                ),
+                                false,
+                            ),
+                            None => (
+                                format!(
+                                    "load_plugin needs the plugin `slug` — {skill:?} is not a \
+                                     skill of any enabled plugin. Call load_plugin with `query` \
+                                     to find the plugin that carries the skill you need."
+                                ),
+                                false,
+                            ),
+                        }
+                    } else if slug.is_empty() && !query.is_empty() {
+                        match crate::plugins::search_plugins(store, query) {
+                            Ok(found) => (found, true),
+                            Err(e) => (e, false),
+                        }
+                    } else if slug.is_empty() {
+                        (
+                            "load_plugin needs a plugin `slug` (or a `query` of the task's words \
+                             to search every installed plugin)."
+                                .to_string(),
+                            false,
+                        )
+                    } else if !skill.is_empty() {
+                        let read = if file.is_empty() {
+                            crate::plugins::plugin_skill_body(store, slug, skill)
+                        } else {
+                            crate::plugins::plugin_skill_file(store, slug, skill, file)
+                        };
+                        match read {
+                            Ok(body) => (body, true),
+                            Err(e) => (e, false),
+                        }
+                    } else {
+                        match crate::plugins::plugin_toolbox(store, slug) {
+                            Ok(toolbox) => {
+                                let mut loaded: Vec<String> = Vec::new();
+                                let mut missing: Vec<String> = Vec::new();
+                                for wanted in &toolbox.connectors {
+                                    match crate::mcp_index::resolve_server(&connectors, wanted) {
+                                        Some(server) => {
+                                            let count = activate_connector(
+                                                &server,
+                                                &connectors,
+                                                &deferred,
+                                                &mut activated,
+                                                &mut advertised,
+                                                &mut schemas,
+                                            );
+                                            loaded.push(if count == 0 {
+                                                format!("{server} (already loaded)")
+                                            } else {
+                                                format!("{server} ({count} tools)")
+                                            });
+                                        }
+                                        None => missing.push(wanted.clone()),
+                                    }
+                                }
+                                if !loaded.is_empty() {
+                                    let mut all: Vec<String> = activated.iter().cloned().collect();
+                                    all.sort();
+                                    emit(&AgentEvent::McpLoaded { servers: all });
+                                }
+                                let mut out = toolbox.text;
+                                if loaded.is_empty() {
+                                    out.push_str("\nConnectors: none switched on.");
+                                } else {
+                                    out.push_str(&format!(
+                                        "\nConnectors activated for your next step: {}.",
+                                        loaded.join(", ")
+                                    ));
+                                }
+                                if !missing.is_empty() {
+                                    out.push_str(&format!(
+                                        "\nConnectors that could not start: {} — tell the user to \
+                                         check them in Settings → MCP.",
+                                        missing.join(", ")
+                                    ));
+                                }
+                                (out, true)
+                            }
+                            Err(e) => (e, false),
+                        }
+                    };
+                    // Only a SUCCESS joins the guard: a bad slug must keep its
+                    // real error, and a retry after a transient failure must
+                    // still reach the store.
+                    if outcome.1 {
+                        if let Some(key) = load_key {
+                            seen_lookups.insert(key);
+                        }
+                    }
+                    outcome
                 }
             } else if name == "use_mcp" {
                 // Connectors are OFFERED as an index and loaded on demand: the
@@ -3093,32 +3831,14 @@ user to ask for it. Available this turn: `list` and `run`."
                             true,
                         )
                     } else {
-                        activated.insert(server.clone());
-                        // The tool array is re-read on every round (the call site
-                        // borrows `schemas`, it does not snapshot it), so appending
-                        // HERE makes the connector's tools callable on the very
-                        // NEXT round of this turn. Only the already-borrowed round
-                        // keeps the old shape, which is what the byte-stability
-                        // guard (`tool_schemas_serialize_byte_identically`) is about.
-                        let fresh: Vec<Value> = deferred
-                            .iter()
-                            .filter(|s| {
-                                s["function"]["name"]
-                                    .as_str()
-                                    .and_then(|n| crate::mcp_index::owner_of(&connectors, n))
-                                    == Some(server.as_str())
-                            })
-                            .cloned()
-                            .collect();
-                        advertised.extend(
-                            fresh
-                                .iter()
-                                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string)),
+                        let fresh_count = activate_connector(
+                            &server,
+                            &connectors,
+                            &deferred,
+                            &mut activated,
+                            &mut advertised,
+                            &mut schemas,
                         );
-                        advertised.sort();
-                        advertised.dedup();
-                        let fresh_count = fresh.len();
-                        schemas.extend(fresh);
                         let tools = connectors
                             .iter()
                             .find(|c| c.server == server)
@@ -3783,6 +4503,28 @@ call fetch_url again with offset={next} for the rest]",
                         let create = action == "create";
                         match crate::artifacts::save(store, chat_id, &args, create) {
                             Ok(saved) => {
+                                // Plan mode may save the plan as a markdown
+                                // artifact instead of writing it in prose.
+                                if req.mode == "plan" && saved["kind"].as_str() == Some("md") {
+                                    let title =
+                                        saved["title"].as_str().unwrap_or_default();
+                                    let content =
+                                        saved["content"].as_str().unwrap_or_default();
+                                    if let Some(doc) =
+                                        plan_document_from_artifact(title, content)
+                                    {
+                                        // A plan is a Plan-tab document, not an
+                                        // artifact: tag it so the Artifacts page
+                                        // stops listing it. The transcript card
+                                        // still opens it from the chat.
+                                        let _ = crate::artifacts::mark_plan(
+                                            store,
+                                            chat_id,
+                                            saved["id"].as_str().unwrap_or_default(),
+                                        );
+                                        plan_artifact = Some(doc);
+                                    }
+                                }
                                 // Only an update pins the editor badge: a fresh
                                 // create announces itself once and is done.
                                 if !create {
@@ -3839,15 +4581,8 @@ call fetch_url again with offset={next} for the rest]",
                     ),
                 }
             } else {
-                // Skills and connectors are updated through the generic dispatch
-                // (their handlers live in tools.rs and return only a string), so
-                // the edit badge is decided HERE: does the target exist before
-                // the call (an EDIT, not a create)? The event goes out only when
-                // the save succeeds.
-                let was_update = edit_target_of(name, &args, std::path::Path::new(&skill_root));
-                // Same worker protection as the plugin arm above: generic
-                // sequential handlers (terminal-capable skills, connectors)
-                // block too, so they run on the blocking pool.
+                // Generic sequential handlers (terminal-capable skills,
+                // connectors) block too, so they run on the blocking pool.
                 //
                 // Live output: the blocking task streams its command's tail
                 // through a channel while it runs (only `run_terminal` sends);
@@ -3884,17 +4619,7 @@ call fetch_url again with offset={next} for the rest]",
                     .await
                     .unwrap_or(Err("tool task failed".into()))
                 {
-                    Ok(r) => {
-                        if let Some((target, pin_name, pin_path)) = was_update {
-                            emit(&AgentEvent::EditTarget {
-                                target,
-                                action: "update".into(),
-                                name: pin_name,
-                                path: pin_path,
-                            });
-                        }
-                        (r, true)
-                    }
+                    Ok(r) => (r, true),
                     Err(e) => (e, false),
                 }
             };
@@ -4102,7 +4827,31 @@ call fetch_url again with offset={next} for the rest]",
         // a screenshot rides into the next request as an image block on a user
         // message — the same shape the composer's own attachments use, which
         // `llm.rs` already translates per provider.
-        if !step_shots.is_empty() || !step_read_images.is_empty() {
+        //
+        // Drop a capture whose PIXELS are identical to the previous one first.
+        // Every mutating computer action captures the screen it changed, so an
+        // action that did nothing (a `command+tab` swallowed by the window
+        // manager, a click on a dead control) produced a byte-identical PNG
+        // that was re-encoded and re-billed as vision tokens on that step and
+        // every following one. The previous picture is still in history; a
+        // one-line note is all the model needs.
+        let mut unchanged_shots = 0usize;
+        if !step_shots.is_empty() {
+            let mut kept = Vec::with_capacity(step_shots.len());
+            for shot in step_shots.drain(..) {
+                match shot_file_digest(&shot.path) {
+                    Some(d) if last_shot_digest == Some(d) => unchanged_shots += 1,
+                    Some(d) => {
+                        last_shot_digest = Some(d);
+                        kept.push(shot);
+                    }
+                    // Unreadable: let the encoder report it as before.
+                    None => kept.push(shot),
+                }
+            }
+            step_shots = kept;
+        }
+        if !step_shots.is_empty() || !step_read_images.is_empty() || unchanged_shots > 0 {
             // One encoder, one cap, per provider: `image_data_url_for` picks the
             // largest edge this provider's vision pass actually reads, so a 5K
             // capture is not re-uploaded at full size on every following turn.
@@ -4113,7 +4862,93 @@ call fetch_url again with offset={next} for the rest]",
                 .filter_map(|p| crate::commands::image_data_url_for(p, &cfg.provider))
                 .collect();
             let mut blocks: Vec<Value> = Vec::new();
-            if urls.is_empty() {
+            if unchanged_shots > 0 {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "{} capture(s) were pixel-identical to the previous screen — image \
+                         omitted because nothing changed. If the action was supposed to change \
+                         the screen, it did not take effect; try a different action instead of \
+                         repeating it.",
+                        unchanged_shots
+                    ),
+                }));
+            }
+            // A text-only model (main agent OR a sub-agent — sub-agents run this
+            // same loop with their own model) must never get the raw screenshot:
+            // the Vision slot describes it and only the description is sent.
+            //
+            // `Some(true)` = the model reads images: send them inline.
+            // `Some(false)` = text-only: the Vision slot is mandatory.
+            // `None` = unknown. A MAIN turn keeps the historical "try the model
+            // first" behavior (a configured slot must not preempt a flagship
+            // model), but a SUB-AGENT runs unattended: sending raw bytes to a
+            // gateway that silently drops them left the traced desktop agent
+            // blind for 30 minutes. So an unknown sub-agent capability asks the
+            // configured Vision slot first; when the slot is not configured the
+            // raw blocks still go through (the model may see them after all).
+            let mut urls = urls;
+            let mut described = false;
+            let vision = model_supports_vision(&req.providers, &req.provider_id, &cfg.model);
+            let try_slot =
+                vision == Some(false) || (vision.is_none() && req.mode == "subagent");
+            if !urls.is_empty() && try_slot {
+                let summary = if step_shots.is_empty() {
+                    "Image(s) read by the agent.".to_string()
+                } else {
+                    shot_summary(&step_shots)
+                };
+                let vclient = crate::llm::http_client();
+                match run_vision_slot(
+                    &vclient,
+                    req,
+                    &cfg.model,
+                    &cfg.provider,
+                    &cfg.base_url,
+                    &cfg.api_keys,
+                    &summary,
+                    &urls,
+                )
+                .await
+                {
+                    VisionOutcome::Ok(desc) => {
+                        let note = format!(
+                            "{summary}\n\n=== IMAGE ANALYSIS (from the vision model) ===\n{desc}"
+                        );
+                        blocks.push(json!({"type": "text", "text": note}));
+                        urls.clear();
+                        described = true;
+                    }
+                    VisionOutcome::NotConfigured if vision == Some(false) => {
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": format!(
+                                "{summary}\n\n[image omitted: this model cannot read images and no \
+                                 Vision model is configured in Settings → Tools]"
+                            ),
+                        }));
+                        urls.clear();
+                        described = true;
+                    }
+                    VisionOutcome::Failed { .. } if vision == Some(false) => {
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": format!(
+                                "{summary}\n\n[image omitted: this model cannot read images and the \
+                                 Vision model (Settings → Tools → Vision) gave no description]"
+                            ),
+                        }));
+                        urls.clear();
+                        described = true;
+                    }
+                    // Unknown capability and no usable slot: keep the raw
+                    // blocks and let the model try.
+                    _ => {}
+                }
+            }
+            if described {
+                // The description already carries the image content.
+            } else if urls.is_empty() && unchanged_shots == 0 {
                 // Unreadable file or a format the encoder refused: tell the
                 // model the capture failed instead of leaving it to guess.
                 blocks.push(json!({
@@ -4148,11 +4983,189 @@ call fetch_url again with offset={next} for the rest]",
             // MAX_HISTORY_SHOTS captures in the conversation (see the const).
             elide_stale_screenshots(&mut messages, MAX_HISTORY_SHOTS);
         }
+
+        // --- No-progress and hallucinated-tool guards -----------------------
+        // A digest of EVERYTHING this round produced: the calls (name + raw
+        // args), the text of every tool result (already capped by
+        // `finish_tool`, so the digest is consistent) and the PIXELS of this
+        // round's captures. Equal digests across rounds mean the same calls
+        // returned the same bytes: the child is looping, not working. Kept
+        // cheap on purpose — the point is to save far more than it costs.
+        let round_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for (_, n, a) in &tool_calls {
+                // Same identity as the repeat ceiling: a reworded `reason`
+                // must not make a repeated no-op look like new work.
+                repeat_action_key(n, a).hash(&mut h);
+            }
+            for m in &messages[round_msg_start..] {
+                if m["role"].as_str() == Some("tool") {
+                    // A batching hint is APPENDED to the tool result after the
+                    // call (and stripped again before the next request). It is
+                    // harness text, not a new result: hashing it made two
+                    // identical no-op rounds look different because the hint's
+                    // round counter changed.
+                    let content = m["content"].as_str().unwrap_or_default();
+                    content
+                        .split("\n\n[hint]")
+                        .next()
+                        .unwrap_or(content)
+                        .hash(&mut h);
+                }
+            }
+            for s in &step_shots {
+                shot_file_digest(&s.path).hash(&mut h);
+            }
+            h.finish()
+        };
+        let repeats = round_hashes
+            .iter()
+            .rev()
+            .take(5)
+            .filter(|h| **h == round_hash)
+            .count();
+        round_hashes.push(round_hash);
+        if round_hashes.len() > 8 {
+            round_hashes.remove(0);
+        }
+        // One earlier occurrence = the same state reached twice: a nudge that
+        // NAMES the loop. Two or more (the same round-state reached a THIRD
+        // time within five rounds) = the child cannot get out; stop it and let
+        // the end-of-turn report carry the evidence to the parent. Main turns
+        // are only nudged: the user is present and can decide.
+        if repeats >= 1 && req.mode == "subagent" {
+            if repeats == 1 && stall_nudges == 0 {
+                stall_nudges += 1;
+                messages.push(json!({
+                    "role": "user",
+                    "content": "=== NO PROGRESS ===\nThe last rounds repeated the same tool \
+calls and returned the same results (the screen did not change either). Repeating them \
+cannot change the outcome. If the task is not finished, CHANGE approach — a different \
+action or tool, or a different window/element — otherwise write the final report now with \
+what you already have.",
+                }));
+            } else if repeats >= 2 {
+                break;
+            }
+        }
+        // A repeated ACTION, independent of its result. The traced desktop loop
+        // pressed `command+tab` 56 times: every round produced a DIFFERENT
+        // screenshot, so neither the idle guard nor the digest below saw a
+        // stall. Six identical calls earn a nudge; twelve end the attempt with
+        // the forced report. Legitimate work varies its arguments (a different
+        // file, a different line window, the next command), so this only fires
+        // on a genuine loop.
+        let mut too_many_repeats = false;
+        if req.mode == "subagent" {
+            for (_, n, a) in &tool_calls {
+                let key = repeat_action_key(n, a);
+                let count = action_counts.entry(key.clone()).or_insert(0);
+                *count += 1;
+                if *count == 6 && repeated_action_nudged.insert(key.clone()) {
+                    let shown: String = a.chars().take(180).collect();
+                    messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "=== REPEATED ACTION ===\n`{n}` has now been called {count} times \
+with the exact same arguments ({shown}). Even if its result keeps changing, the task is not \
+progressing. Stop repeating it: use a different action or a different target, or write the \
+final report with what you already have."
+                        ),
+                    }));
+                } else if *count >= 12 {
+                    too_many_repeats = true;
+                }
+            }
+        }
+        if too_many_repeats {
+            break;
+        }
+        // A round whose EVERY call named a tool that does not exist is a
+        // hallucination loop: the unknown-tool reply already lists the valid
+        // names, and a model that ignores it for three rounds in a row will not
+        // recover on its own.
+        if round_all_invalid {
+            invalid_rounds += 1;
+        } else {
+            invalid_rounds = 0;
+        }
+        if invalid_rounds >= 3 {
+            if req.mode == "subagent" {
+                break;
+            }
+            emit(&AgentEvent::Warn {
+                content: "The model kept calling tools that do not exist, so the turn was \
+stopped instead of spending more rounds on the same mistakes. Check the selected model's \
+tool-call support."
+                    .into(),
+            });
+            run_stop_hooks(&hooks, emit);
+            emit(&AgentEvent::Done { aborted: false });
+            return Ok(());
+        }
     }
 
-    // Budget exhausted. The explore sub-agent must still hand the parent its
-    // findings: fold the tool results it already gathered into a report —
-    // no forced extra model call (the data is already in context).
+    // Budget exhausted. A sub-agent must still hand the parent a REPORT, not a
+    // dump of raw tool results. The old fallback folded the newest tool outputs
+    // into `[Tool budget exhausted] Findings gathered so far:` and returned
+    // them; traced browser runs then handed the parent 11K of page text that
+    // answered nothing, and the parent re-delegated the same question. Ask the
+    // SAME model once more with tools omitted: a tools-off turn cannot spend
+    // another step, and it turns the data already in context into the answer the
+    // parent can act on. If the provider fails or returns nothing, the bounded
+    // raw findings below remain the last resort.
+    if req.mode == "subagent" {
+        messages.push(json!({
+            "role": "user",
+            "content": "The work window is over. Do NOT call any tools. Write your \
+final report now from the tool results above: what you saw, what you did, and what you \
+could not verify. Be concise and factual, and answer the task as it was given."
+        }));
+        let mut forced = String::new();
+        let mut sink = |sig: StreamSignal| {
+            if let StreamSignal::Text(delta) = sig {
+                if !delta.is_empty() {
+                    // Forward the deltas to the turn's own stream: this closure
+                    // is a LOCAL accumulator, not the turn sink above, so
+                    // without this the forced report never reached `emit` —
+                    // the parent ladder folded nothing and reported the raw
+                    // tool entries instead of the answer that was just written.
+                    forced.push_str(&delta);
+                    emit(&AgentEvent::Text {
+                        content: delta.to_string(),
+                    });
+                }
+            }
+        };
+        let forced_res = stream_chat(
+            &client,
+            &cfg,
+            &messages,
+            None,
+            &mut sink,
+            Some(cancel),
+            Some(steer_flag.as_ref()),
+        )
+        .await;
+        if let Ok(acc) = forced_res {
+            // The sink above already emitted the deltas; only emit the
+            // accumulator when a provider (unusually) did not delta at all.
+            if forced.trim().is_empty() && !acc.text.trim().is_empty() {
+                forced = acc.text;
+                emit(&AgentEvent::Text {
+                    content: forced.clone(),
+                });
+            }
+        }
+        // Even a partial forced report beats a raw tool dump; only an empty one
+        // falls through to the bounded-findings fallback below.
+        if !forced.trim().is_empty() {
+            run_stop_hooks(&hooks, emit);
+            emit(&AgentEvent::Done { aborted: false });
+            return Ok(());
+        }
+    }
     if req.mode == "subagent" {
         let mut report =
             String::from("[Tool budget exhausted] Findings gathered so far:\n");

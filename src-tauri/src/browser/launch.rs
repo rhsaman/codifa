@@ -49,6 +49,13 @@ pub(super) fn launch_args(
         "--no-default-browser-check".to_string(),
         "--disable-blink-features=AutomationControlled".to_string(),
         "--window-size=1280,800".to_string(),
+        // The panel is shown on a Retina display, and `Page.startScreencast`
+        // captures at the browser's device scale. Without this flag the frame
+        // is 1x CSS pixels and the webview upscales it 2x — every page looked
+        // soft no matter how high the emulated viewport was. The emulated CSS
+        // viewport stays 1x (`deviceScaleFactor: 1`), so page layout and input
+        // coordinates are unchanged; only rasterization gets the extra pixels.
+        "--force-device-scale-factor=2".to_string(),
     ];
     if let Some(ua) = ua {
         args.push(format!("--user-agent={ua}"));

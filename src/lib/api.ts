@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, ProviderHeader, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
+import type { AgentMode, CustomSubagent, McpServerConfig, ModeCapabilities, ProviderConfig, ProviderHeader, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 import { retryBackoffMs } from './retry'
@@ -207,6 +207,11 @@ export interface ModelsResult {
    *  `/models` payload or the models.dev catalog. A key that is ABSENT means no
    *  source described the model; `[]` means it has no thinking mode. */
   thinkingLevels: Record<string, ThinkingLevel[]>
+  /** Per-model image-input capability from the provider payload (OpenRouter
+   *  `architecture.input_modalities`) or models.dev (`modalities.input`). A key
+   *  that is ABSENT means UNKNOWN — the turn keeps sending images to the model;
+   *  `false` routes captures through the Vision slot instead. */
+  vision: Record<string, boolean>
 }
 
 /** Ordered keys for a provider (top = tried first). Sent as api_keys. */
@@ -454,12 +459,18 @@ export function splitTtsSentences(text: string, maxLen = 160): string[] {
     if (t) parts.push(t)
     cur = ''
   }
-  for (const ch of clean) {
+  const chars = Array.from(clean)
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]
     if (ch === '\n') {
       flush()
       continue
     }
     cur += ch
+    // A dot glued to the next letter/digit is part of a name or number
+    // (bundle.rs, v1.2, 3.5), not a sentence end — splitting there produced
+    // fragments like "bundle." + "rs:105" that the TTS turned into noise.
+    if (ch === '.' && /[\p{L}\p{N}]/u.test(chars[i + 1] ?? '')) continue
     if (SENTENCE_END_RE.test(ch) || (ch === '،' && cur.trim().length >= COMMA_SPLIT_MIN_CHARS)) {
       flush()
     }
@@ -648,6 +659,7 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
         pricing?: ModelPricing | null
         reasoning?: boolean | null
         thinking_levels?: string[] | null
+        vision?: boolean | null
       }>
     }
     const models: string[] = []
@@ -655,6 +667,7 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
     const pricing: Record<string, ModelPricing> = {}
     const reasoning: Record<string, boolean> = {}
     const thinkingLevels: Record<string, ThinkingLevel[]> = {}
+    const vision: Record<string, boolean> = {}
     for (const m of data.models ?? []) {
       models.push(m.id)
       if (m.context) context[m.id] = m.context
@@ -665,8 +678,12 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
       if (Array.isArray(m.thinking_levels)) {
         thinkingLevels[m.id] = m.thinking_levels as ThinkingLevel[]
       }
+      // `null` = no source described this model's image input. Keeping the key
+      // absent is what makes the turn try the model first instead of routing
+      // every capture away from a model that may well read images.
+      if (typeof m.vision === 'boolean') vision[m.id] = m.vision
     }
-    return { models, context, pricing, reasoning, thinkingLevels }
+    return { models, context, pricing, reasoning, thinkingLevels, vision }
   })()
   modelsInFlight.set(sig, p)
   // Clear the cache entry once the request settles, but keep a short "fresh"
@@ -866,8 +883,14 @@ export interface StreamParams {
   webSearchAutoFetch?: number
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
-  /** Allow the agent to create skills / MCP connectors through its internal
-   *  `create_skill` / `create_mcp` tools (there is no standalone command). */
+  /** Slugs of PLUGINS attached for this turn. A plugin is ONE unit: the
+   *  backend inlines every skill body inside it, keeps its connectors switched
+   *  on, and tells the model the toolbox is already loaded — no separate
+   *  per-skill loading. */
+  plugins?: string[]
+  /** Allow the agent to create or edit a plugin through the authoring actions
+   *  of its internal `plugin` tool (there is no standalone skill/connector
+   *  authoring tool and no `/plugin create` command outside this gate). */
   allowCreate?: boolean
   /** Per-mode tool capabilities sent to the backend for tool gating. */
   cap?: ModeCapabilities
@@ -884,6 +907,10 @@ export interface StreamParams {
   allowBrowser?: boolean
   /** Per-subagent model overrides (explore, vision, compact). */
   subagentModels?: Record<string, string>
+  /** User-created sub-agents (Settings → Sub-agents): prompt + optional tool
+   *  narrowing + `kind`. Advertised to the model as `agent__<id>` delegation
+   *  tools; they all run on the `explore` slot's model (`subagentModels.explore`). */
+  customSubagents?: CustomSubagent[]
   /** Per-tool reasoning-effort overrides, keyed by the same slot names as
    *  `subagentModels`. A missing key means "inherit the main model's level". */
   subagentThinking?: Record<string, string>
@@ -1091,6 +1118,7 @@ export async function streamChat(
           search_plugins: params.searchPlugins ?? [],
           web_search_auto_fetch: params.webSearchAutoFetch ?? 5,
           skills: params.skills ?? [],
+          plugins: params.plugins ?? [],
           allow_create: params.allowCreate ?? false,
           // Omitted as `null` (not `{}`) when the caller sends nothing: the
           // backend then derives the table from `mode`, whereas an empty object
@@ -1101,6 +1129,7 @@ export async function streamChat(
           allow_computer: params.allowComputer ?? false,
           allow_browser: params.allowBrowser ?? false,
           subagent_models: params.subagentModels ?? {},
+          custom_subagents: params.customSubagents ?? [],
           subagent_thinking: params.subagentThinking ?? {},
           tool_fallbacks: params.toolFallbacks ?? {},
           providers: params.providers ?? {},
@@ -1456,8 +1485,9 @@ export async function triggerCompact(params: {
 }
 
 /** Deliver a message to a RUNNING agent for this chat (no abort, injected at
- *  the next tool call). Returns false if the sidecar is unreachable or the
- *  chat_id/prompt are invalid. */
+ *  the next tool call). `prompt` may be empty when `images`/`attachments`
+ *  carry the message (a picture-only mid-turn steer). Returns false if the
+ *  sidecar is unreachable or no turn is running / nothing was sendable. */
 export async function steerChat(
   chatId: string,
   id: string,
@@ -1644,8 +1674,8 @@ export async function requestChatTitle(params: {
 /** Read a document for the file viewer. format: "text" (default) | "html"
  *  (styled Word/Excel view) | "pages" (PDF pages as JPEG data URLs).
  *  `sheet` selects one Excel sheet, `pages` selects PDF pages like "1-3,7".
- *  `maxChars` overrides the backend's text cap (0/default = the 24k
- *  agent-context cap; the viewer passes a much larger one).
+ *  `maxChars` overrides the backend's text cap (0/default = the whole file;
+ *  the viewer passes its own page size).
  *  Results are mtime-cached backend-side, so repeated calls are cheap. */
 export async function readDocumentText(
   root: string,
@@ -1703,12 +1733,21 @@ export interface SubagentJob {
 }
 
 
-/** Answer a pending outside-workspace permission / confirm_action request from the agent. */
+/** Answer a pending outside-workspace permission / confirm_action request from the agent.
+ *  `note`, when present, is delivered to the turn as the user's next steer. */
 export async function respondPermission(
   id: string,
   allowed: boolean,
+  note?: string,
+  chatId?: string,
 ): Promise<boolean> {
-  return postAnswer('/permission/respond', { id, allowed })
+  const body: Record<string, unknown> = { id, allowed }
+  const trimmed = note?.trim()
+  if (trimmed) {
+    body.note = trimmed
+    if (chatId) body.chatId = chatId
+  }
+  return postAnswer('/permission/respond', body)
 }
 
 /**

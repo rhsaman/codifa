@@ -98,13 +98,14 @@ const OPEN_TARGETS: Array<{
  *  legacy/text docs (doc/csv/md) as plain text — so binary Excel never hits
  *  the "Binary file" fallback. Results are mtime-cached backend-side and
  *  the panel re-fetches only when docRev bumps (no polling). */
-const DOC_EXTS = new Set(["pdf", "docx", "doc", "xlsx", "xlsm", "xls", "csv", "md"]);
+const DOC_EXTS = new Set(["pdf", "docx", "doc", "pptx", "xlsx", "xlsm", "xls", "csv", "md"]);
 /** Excel extensions that render as an HTML grid and accept a sheet name. */
 const SHEET_EXTS = new Set(["xlsx", "xlsm", "xls"]);
 /** Grid extensions rendered as an Excel-like table (Excel + CSV). CSV has no sheets. */
 const GRID_EXTS = new Set(["xlsx", "xlsm", "xls", "csv"]);
-/** Extensions read as plain text via /doc/read (no styled HTML available). */
-const DOC_TEXT_EXTS = new Set(["doc", "md"]);
+/** Extensions read as plain text via /doc/read (no styled HTML available).
+ *  PPTX has no HTML renderer either — its slides come back as plain text. */
+const DOC_TEXT_EXTS = new Set(["doc", "pptx", "md"]);
 /** Viewer reads bypass the agent's 24k context cap — a repo README outgrows
  *  it and the panel shows the text to the user, not to a model. 2M chars is
  *  far past any real document while still sparing the markdown renderer. */
@@ -1033,8 +1034,9 @@ export function FileViewerPanel({
       <div className="file-viewer-head" dir="ltr" style={{ direction: "ltr" }}>
         <FileIcon path={filePath} size={20} />
         {/* The name doubles as "show me this in the explorer": it activates the
-            chat's Files tab, opens the file's folder chain and highlights the
-            row — the reverse trip of opening a file from the tree. */}
+            sidebar's Files view, opens the file's folder chain and hands the
+            caret to the row — the reverse trip of opening a file from the
+            tree, so j/k continue from that file. */}
         <button
           type="button"
           className="file-viewer-name file-viewer-name-btn"
@@ -1042,7 +1044,7 @@ export function FileViewerPanel({
           onClick={() =>
             useViewerTabs
               .getState()
-              .revealFile(toWorkspacePath(fileRoot, filePath) || filePath)
+              .revealFile(toWorkspacePath(fileRoot, filePath) || filePath, true)
           }
         >
           {fileBasename(filePath)}

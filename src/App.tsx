@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState, Suspense, lazy } from 'react'
-import { useStore } from './lib/store'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, Suspense, lazy } from 'react'
+import { useStore, workspaceKey } from './lib/store'
 import { ChatWindows } from './components/ChatWindows'
 
 /** Tab row visible only in single-window mode. Multi-window hides the row:
@@ -12,22 +12,69 @@ function ChatTabsRow() {
     </div>
   )
 }
+
+/** The chat column body. Each workspace owns its own window/tab view, so an
+ *  empty workspace (or one whose tabs were all closed) shows a focused empty
+ *  state with a single New chat action instead of a blank pane. */
+function ChatArea() {
+  const activeWorkspaceKey = useStore((s) => s.activeWorkspaceKey)
+  const hasWindows = useStore((s) =>
+    s.chatTree ? collectChatIds(s.chatTree).length > 0 : s.visibleChatIds.length > 0,
+  )
+  const hasChats = useStore((s) =>
+    s.chats.some((c) => workspaceKey(c.root ?? '') === activeWorkspaceKey),
+  )
+  if (hasWindows) return <ChatWindows />
+  return (
+    <div className="chat-empty-state" role="status">
+      <div className="chat-empty-icon" aria-hidden="true">
+        <svg
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.4 9.4 0 0 1-3.3-.6L3 21l1.7-5a8.2 8.2 0 0 1-.7-3.4 8.4 8.4 0 0 1 8.5-8.3 8.4 8.4 0 0 1 8.5 8.2Z" />
+          <path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01" />
+        </svg>
+      </div>
+      <h2>{hasChats ? 'No chat open' : 'No chats in this workspace'}</h2>
+      <p>
+        {hasChats
+          ? 'Open one from the sidebar, or start a new conversation in this workspace.'
+          : 'Start a conversation — it will be saved in this workspace.'}
+      </p>
+      <button className="chat-empty-new" onClick={() => useStore.getState().newChat()}>
+        New chat
+      </button>
+    </div>
+  )
+}
 import { Sidebar } from './components/Sidebar'
 import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerWindows } from './components/ViewerWindows'
-import { clampSplitWidth, cycleTerminalTabs, loadSplitWidth, persistSplitWidth, useViewerTabs } from './lib/viewerTabs'
+import { FALLBACK_VIEWER_KIND, clampSplitWidth, cycleTerminalTabs, loadSplitWidth, shownViewerTabId, useViewerTabs, viewerScopeForChat, viewerTabRows, activeTerminalTabId, visibleTabs } from './lib/viewerTabs'
+import { clampPaneWidth, loadPaneWidths, paneWidthFor, savePaneWidth } from './lib/paneWidths'
+import { getRightPanelLiveWidth } from './components/TodosPanel'
+import { cycleId } from './lib/tabCycle'
 import { ViewerAddButton, ViewerDockBar, ViewerPaneFullscreenButton, ViewerPaneToggleButton, ViewerTabListButton } from './components/ViewerTabBar'
 import { ChatTabListButton } from './components/ChatTabBar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isWindowMoveChord, isApplePlatform } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isWindowMoveChord, isApplePlatform, tabCycleChord } from './lib/shortcuts'
+import { useSidebarView } from './lib/sidebarView'
 import { resolveChatClose } from './lib/chatClose'
 import { collectChatIds, pickNeighborByRect, type WindowNavDir, type WindowRect } from './lib/chatTree'
 import { focusChatInput } from './lib/chatFocus'
-import { activePane, focusAppPane } from './lib/paneFocus'
+import { activePane, focusAppPane, terminalTabHost } from './lib/paneFocus'
+import { terminalCloseChord, terminalHostFor, type TerminalHost } from './lib/terminalClose'
 import { cyclePane } from './lib/paneCycle'
 import { paneOwner, snapshotIntent } from './lib/panePointer'
 import { applyInputSuppression } from './lib/inputSuppress'
@@ -98,14 +145,105 @@ function isWindowMoveBlocked(t: HTMLElement | null | undefined, dir?: WindowNavD
  * closes it directly — dispatching the panel event for it did nothing at all,
  * which is why Ctrl+W in the pane terminal was a no-op.
  */
-function closeFocusedTerminal(): void {
-  if (document.activeElement?.closest?.('.terminal-panel')) {
+function closeFocusedTerminal(host: TerminalHost = 'bottom'): void {
+  if (host === 'bottom') {
     window.dispatchEvent(new CustomEvent('coder:close-terminal-tab'))
     return
   }
+  // Right-pane terminal: close THAT tab (and only if the pane is really
+  // showing it — a terminal tab that is not the active one is not what the
+  // caret's shell is drawn in).
   const tabs = useViewerTabs.getState()
   const active = tabs.tabs.find((t) => t.id === tabs.activeId)
   if (active?.kind === 'terminal') tabs.closeViewer(active.id)
+}
+
+/** Cmd/Ctrl+Shift+[ / ]: step to the previous/next TAB of the pane that holds
+ *  the caret, like VS Code — chat tabs in the chat column, the strip's tabs in
+ *  the right pane (a terminal tab shown there included), the shells of the
+ *  BOTTOM terminal panel.
+ *
+ *  A focused TERMINAL never disturbs another pane's strip: it steps only the
+ *  tab strip of its OWN host (the panel's shells, or the right pane's tabs).
+ *  The caret is put back into the newly shown terminal afterwards, otherwise
+ *  the next chord would read the pane as `<body>`/viewer and start stepping a
+ *  different strip.
+ *
+ *  The sidebar has no tabs, so the chord is not ours there (returns false and
+ *  nothing is swallowed). */
+function cycleFocusedTabs(dir: 1 | -1): boolean {
+  const st = useStore.getState()
+  // Terminal FIRST, ahead of `activePane()`'s verdict, and routed by HOST: the
+  // pane id is shared by the bottom panel and a right-pane terminal tab, but
+  // their strips are not. Sending both to the bottom panel's own cycle made the
+  // chord change the PANEL's shells while the user was typing in the right-pane
+  // terminal. Each host now steps only its own strip.
+  const termHost = terminalTabHost()
+  if (termHost === 'bottom') {
+    window.dispatchEvent(new CustomEvent('coder:cycle-terminal', { detail: dir }))
+    return true
+  }
+  if (termHost === 'pane') return cycleViewerTabs(st.activeChatId || undefined, dir, 'terminal')
+  const pane = activePane()
+  if (pane === 'chat') {
+    const next = cycleId(st.openChatIds, st.activeChatId, dir)
+    if (next && next !== st.activeChatId) {
+      st.openChat(next)
+      requestAnimationFrame(() => focusChatInput(next))
+    }
+    return true
+  }
+  if (pane === 'terminal') {
+    // Only a right-pane terminal TAB reaches here (the bottom panel returned
+    // above): it is an ordinary strip tab of the viewer.
+    return cycleViewerTabs(st.activeChatId || undefined, dir)
+  }
+  if (pane === 'viewer') return cycleViewerTabs(st.activeChatId || undefined, dir)
+  return false
+}
+
+/** Step the right pane's strip and put the caret where the pane lands: the
+ *  xterm of a terminal tab, the page body of everything else.
+ *
+ *  `only: 'terminal'` restricts the step to the pane's TERMINAL tabs (the strip
+ *  the right-pane terminal itself draws): the chord fired from inside a shell
+ *  must not walk off into a neighbouring file tab. Focus is re-requested AFTER
+ *  the store update so the caret ends up in the xterm the step REVEALED —
+ *  otherwise the next press reads `<body>` and drifts to another strip. */
+function cycleViewerTabs(
+  chatId: string | undefined,
+  dir: 1 | -1,
+  only?: 'terminal',
+): boolean {
+  const vt = useViewerTabs.getState()
+  const scope = viewerScopeForChat(chatId)
+  // A TERMINAL-ONLY step must NOT start from `viewerTabRows`: that list is the
+  // pane's top strip, which deliberately EXCLUDES dock pages — terminals among
+  // them (`TAB_STRIP_KINDS`). Filtering it for terminals therefore always
+  // yielded an empty strip, `cycleId` returned nothing and the chord looked
+  // dead in a right-pane terminal. Terminals live in `visibleTabs`, the full
+  // per-chat set, which is also the order the terminal strip itself paints.
+  const rows = only === 'terminal'
+    ? visibleTabs(vt.tabs, scope)
+    : viewerTabRows(vt.tabs, scope, vt.activeId)
+  const strip = only === 'terminal' ? rows.filter((t) => t.kind === 'terminal') : rows
+  // Which tab the strip is ON: see `activeTerminalTabId` — `shownViewerTabId`
+  // cannot answer for a terminal (not a TAB_STRIP_KIND), and its `null` made
+  // every step land on the FIRST terminal, so the chord looked dead.
+  const shown = shownViewerTabId(vt.tabs, vt.activeId, scope)
+  const current = strip.some((t) => t.id === shown)
+    ? shown
+    : activeTerminalTabId(vt.tabs, scope, vt.activeId)
+  const next = cycleId(
+    strip.map((t) => t.id),
+    current,
+    dir,
+  )
+  // A different tab than the active one switches; the SAME id (a strip of one)
+  // is a no-op — but the caret still goes back into that terminal.
+  if (next && next !== vt.activeId) vt.setActiveViewer(next)
+  requestAnimationFrame(() => focusAppPane('viewer'))
+  return true
 }
 
 /** Pick the app bar's compact level from its REAL overflow (no magic widths:
@@ -123,6 +261,9 @@ function fitTitlebar(el: HTMLElement) {
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
+  // Dep only: opening/closing the docked right panel changes the space the
+  // split pane may use, so the clamp below must re-run on that toggle.
+  const rightPanelOpen = useStore((s) => s.rightPanelOpen)
   const load = useStore((s) => s.load)
   const activeChatRoot = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
@@ -137,6 +278,22 @@ export default function App() {
   )
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
+  // The pane's width is PER-PAGE: the Todos page is a narrow checklist and
+  // opens at the site minimum, while every other page (files, review, browser,
+  // terminals) keeps the user's own split width. Derived from the tab the pane
+  // body is actually showing (same rule as ViewerContent/ViewerTabBar) so a
+  // switch to/from Todos resizes the pane immediately, with no extra state.
+  const viewerTabsState = useViewerTabs((s) => s.tabs)
+  const viewerActiveId = useViewerTabs((s) => s.activeId)
+  const viewerScope = viewerScopeForChat(useStore((s) => s.activeChatId))
+  // Animated open/close for the right pane — same shape as the sidebar: the
+  const shownTabId = shownViewerTabId(viewerTabsState, viewerActiveId, viewerScope)
+  const shownTab = viewerTabsState.find((t) => t.id === shownTabId)
+  // The page the pane is showing right now — the key its width is stored under.
+  // With no tab shown the BODY paints the Panel page (ViewerContent's
+  // `<TodosPage />` fallback), so that is the page whose width applies — not
+  // the legacy split width.
+  const paneKind = shownTab?.kind ?? FALLBACK_VIEWER_KIND
   const chatFull = useStore((s) => s.chatFullscreen)
   // Animated open/close for the right pane — same shape as the sidebar: the
   // section itself STAYS MOUNTED (a fresh node would skip its first transition,
@@ -155,28 +312,68 @@ export default function App() {
   }, [paneOpen])
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
-  // VSCode-style split between chat group and viewer group. Default half
-  // viewport, resizable via the dock handle, persisted in localStorage.
+  // PER-PAGE pane width: each page remembers the width the user dragged it to,
+  // so widening Review never touches Todos. An unsaved page falls back to the
+  // legacy global split width; Todos has its own narrow minimum.
   const [splitW, setSplitW] = useState(() => loadSplitWidth(0.5))
+  const [paneWidths, setPaneWidths] = useState(loadPaneWidths)
+  const paneWidthsRef = useRef(paneWidths)
+  paneWidthsRef.current = paneWidths
+
   const splitDrag = useRef<{ startX: number; startW: number } | null>(null)
+  const editorAreaRef = useRef<HTMLDivElement>(null)
   const viewerContentRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const onResize = () => setSplitW((w) => clampSplitWidth(w))
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
+  // The viewer pane shares its flex row with the chat column INSIDE
+  // `.editor-area`; the sidebar sits outside it. Clamping the pane against
+  // `window.innerWidth` ignored the sidebar: widening it shrank the editor
+  // area while the pane kept its pixel width, so the pane spilled past the
+  // app's right edge (and its header actions became unreachable). Observe the
+  // REAL container and keep enough room for the chat strip. The editor area
+  // only mounts once the store finishes loading, hence the `loaded` dep: the
+  // first App render is the loading screen and has no ref to observe yet.
+  // Width actually painted by the pane: the shown page's own saved width, else
+  // the Todos minimum, else the legacy split width. Clamped to the real
+  // container so a narrow window can never push the pane over the chat strip.
+  const paneW = clampPaneWidth(
+    paneWidthFor(paneWidths, paneKind, splitW),
+    editorAreaRef.current?.clientWidth ?? window.innerWidth,
+    getRightPanelLiveWidth(),
+  )
+
+  useLayoutEffect(() => {
+    const el = editorAreaRef.current
+    if (!el) return
+    const clampToArea = () => {
+      const area = el.clientWidth
+      // The docked right panel (Todos/Tools/Terminals) occupies pixels on the
+      // right of the SAME flex row. Leaving it out let the viewer pane and the
+      // right panel overflow each other and the app's right edge.
+      if (area > 0)
+        setSplitW((w) => clampSplitWidth(w, area, getRightPanelLiveWidth()))
+    }
+    clampToArea()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(clampToArea)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [loaded, rightPanelOpen])
 
   const startSplitResize = (e: React.MouseEvent) => {
     e.preventDefault()
-    splitDrag.current = { startX: e.clientX, startW: splitW }
+    splitDrag.current = { startX: e.clientX, startW: paneW }
     // 1:1 tracking: the pane's open/close width transition must not ease the
     // per-move steps (the class is stripped again in onUp).
     document.body.classList.add('coder-resizing')
     const onMove = (ev: MouseEvent) => {
       if (!splitDrag.current) return
-      const w = clampSplitWidth(splitDrag.current.startW - (ev.clientX - splitDrag.current.startX))
-      setSplitW(w)
-      persistSplitWidth(w)
+      const area = editorAreaRef.current?.clientWidth ?? window.innerWidth
+      const w = clampPaneWidth(
+        splitDrag.current.startW - (ev.clientX - splitDrag.current.startX),
+        area,
+        getRightPanelLiveWidth(),
+      )
+      // Saved under THIS page's key only — every other page keeps its width.
+      setPaneWidths(savePaneWidth(paneWidthsRef.current, paneKind, w))
     }
     const onUp = () => {
       splitDrag.current = null
@@ -232,6 +429,11 @@ export default function App() {
   // tmux-style prefix sequence (Ctrl+X then u/r/c/x). The flag lives in a ref
   // so the window listener reads the latest state without re-subscribing.
   const prefixActiveRef = useRef(false)
+  // Whether the `Ctrl+X` that armed the current chord landed INSIDE the bottom
+  // terminal panel. Ctrl+X J closes that panel only when BOTH keys were typed
+  // there, so a chord begun in the chat can never hide it — even if the panel's
+  // focus-retry chain steals the caret between the two keys.
+  const prefixArmedInTerminalRef = useRef(false)
   const prefixTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
@@ -367,6 +569,8 @@ export default function App() {
       } else {
         opened = !st.sidebarOpen
         st.setSidebarOpen(opened)
+        // Revealing the sidebar by keyboard lands on the active workspace row.
+        if (opened) st.requestSidebarFocus()
       }
       requestAnimationFrame(() =>
         focusAppPane(opened ? (target === 'right' ? 'viewer' : 'sidebar') : 'chat'),
@@ -444,8 +648,70 @@ export default function App() {
             // Ctrl+X then V: toggle the realtime voice session.
             window.dispatchEvent(new CustomEvent('coder:toggle-live'))
           } else if (sc.action === 'terminal') {
-            // Ctrl+X then J: toggle the bottom terminal panel.
-            useStore.getState().toggleTerminalPanel()
+            // Ctrl+X then J: JUMP INTO the bottom terminal panel — never a
+            // blind toggle. Closed → open it and land in the active shell;
+            // already open (even with the caret already in it) → just put the
+            // caret back in the shell. A toggle used to CLOSE the panel when
+            // the caret was inside it, so the one way BACK to the shell you
+            // had just left read as "Ctrl+X J did nothing".
+            const st = useStore.getState()
+            // Ctrl+X J is a plain rule on the panel's STATE — no double-tap
+            // timer. A timing pair made the result depend on how fast you
+            // pressed the two taps, which is exactly the "sometimes it works,
+            // sometimes I press it several times" bug: a slow second tap fell
+            // outside the window and was swallowed as a no-op.
+            //
+            //   caret INSIDE the bottom shell -> close it, back to the chat
+            //   anything else                  -> open it and focus the shell
+            //
+            // The CARET decides, not just the open flag. Closing on any open
+            // panel hijacked the jump: with the panel open but the caret in the
+            // chat (or a right-pane terminal), Ctrl+X J was meant to come back
+            // to the shell and instead hid the panel. And the caret must be in
+            // the BOTTOM host specifically — a right-pane terminal tab shares
+            // the chord range but has its own strip, and closing the bottom
+            // panel from there would be news to no one.
+            //
+            // BOTH keys of the chord must land in the bottom panel. Deciding on
+            // the second key alone was not enough: a chord STARTED in the chat
+            // could still hide the panel, because the panel's focus-retry chain
+            // (it keeps re-focusing the xterm for ~0.5s while the shell mounts,
+            // and after a programmatic focus) can pull the caret back into the
+            // hidden helper textarea BETWEEN the `x` and the `j`. The `j` then
+            // targets the xterm and the chord read "the caret is in the shell"
+            // although the user never moved it there.
+            //
+            // `insideTerminalHost` is deliberately NOT used: its
+            // `document.activeElement` fallback is exactly what a stolen caret
+            // looks like. The arming `x` is recorded on its own event target
+            // (see the prefix-arm branch) and both must agree.
+            const target = e.target as HTMLElement | null
+            const jInShell = !!target?.closest?.('.terminal-panel')
+            const caretInBottomShell = jInShell && prefixArmedInTerminalRef.current
+            if (st.terminalPanelOpen && caretInBottomShell) {
+              // Drop any in-flight focus retry before hiding, or the chain pulls
+              // the caret back into the shell a tick later.
+              window.dispatchEvent(new CustomEvent('coder:blur-terminal-focus'))
+              st.setTerminalPanelOpen(false)
+              focusAppPane('chat')
+              const id = useStore.getState().activeChatId
+              if (id) requestAnimationFrame(() => focusChatInput(id))
+            } else {
+              focusAppPane('terminal', { ring: true })
+            }
+          } else if (sc.action === 'terminal-leave') {
+            // Ctrl+X then K: leave the bottom terminal for the CHAT — the
+            // composer of the centered chat window. The panel keeps running;
+            // only the caret goes back.
+            //
+            // Tell the panel to drop any in-flight focus retry FIRST: Ctrl+X J
+            // starts a ~0.5s retry chain while the xterm mounts, and a K fired
+            // inside that window would otherwise be undone a tick later by the
+            // stale chain pulling the caret back into the shell.
+            window.dispatchEvent(new CustomEvent('coder:blur-terminal-focus'))
+            focusAppPane('chat')
+            const id = useStore.getState().activeChatId
+            if (id) requestAnimationFrame(() => focusChatInput(id))
           } else if (sc.action === 'pane-right' || sc.action === 'pane-left') {
             // Ctrl+X then L/H: the ONLY way focus crosses the three sections —
             // the direct Ctrl+L/H chord never leaves the chat windows. A closed
@@ -469,10 +735,52 @@ export default function App() {
             // its own chords: Ctrl+X then J toggles it.
             useViewerTabs.getState().openTerminal({ cwd: useStore.getState().root ?? undefined })
             focusAppPane('viewer', { ring: true })
+          } else if (sc.action === 'workspaces') {
+            // Ctrl+X then W: reveal + focus the sidebar's WORKSPACE LIST —
+            // the projects list, never the workspace the user had drilled
+            // into. The store counter lets the Sidebar clear its Files view
+            // and the drill-in, then land the caret on the active row.
+            // Pressed again while the sidebar is already showing that list
+            // with the caret anywhere inside it (row, header or search box),
+            // it closes the sidebar — one chord toggles. The old guard also
+            // demanded `.sidebar-ws-list`, so from the opened workspace's
+            // header/search the chord could never close the sidebar.
+            const st = useStore.getState()
+            const caret = document.activeElement as HTMLElement | null
+            const atWorkspaceList =
+              st.sidebarOpen &&
+              useSidebarView.getState().view === 'chats' &&
+              !!caret?.closest?.('.sidebar')
+            if (atWorkspaceList) {
+              st.setSidebarOpen(false)
+              requestAnimationFrame(() => focusAppPane('chat'))
+              return
+            }
+            // Reveal the list HERE, not from the sidebar's focus effect: the
+            // effect is replayed on remount (and after a hot reload), and it
+            // must never yank a freshly revealed Files view back to Chats.
+            useSidebarView.getState().setView('chats')
+            if (!st.sidebarOpen) st.setSidebarOpen(true)
+            st.requestWorkspaceListFocus()
           } else if (sc.action === 'files') {
-            // Ctrl+X then E: the file explorer tab (opens the pane) with its
-            // filter box focused. This used to sit on Ctrl/Cmd+F; that chord
-            // now belongs to the chat transcript's find bar.
+            // Ctrl+X then E: the file explorer (the sidebar's Files view,
+            // opening the sidebar if needed). From an OPEN FILE it reveals and
+            // focuses that file's own row, so j/k continue from where the user
+            // already is; otherwise it focuses the name filter. This used to
+            // sit on Ctrl/Cmd+F; that chord now belongs to the chat
+            // transcript's find bar. Pressed again while the explorer already
+            // holds the caret, it closes the sidebar (toggle).
+            const st = useStore.getState()
+            const caret = document.activeElement as HTMLElement | null
+            const inExplorer =
+              st.sidebarOpen &&
+              useSidebarView.getState().view === 'files' &&
+              !!caret?.closest?.('.sidebar-files-view')
+            if (inExplorer) {
+              st.setSidebarOpen(false)
+              requestAnimationFrame(() => focusAppPane('chat'))
+              return
+            }
             useViewerTabs.getState().focusFilesFilter()
           } else if (sc.action === 'git') {
             // Ctrl+X then G: the focused chat's git diff page.
@@ -483,6 +791,10 @@ export default function App() {
           } else if (sc.action === 'schedule') {
             // Ctrl+X then S: the schedule page.
             useViewerTabs.getState().openSchedule()
+          } else if (sc.action === 'panel') {
+            // Ctrl+X then P: the Panel page — turn usage + background
+            // terminals + the agent plan, scoped to the focused chat.
+            useViewerTabs.getState().openTodos(useStore.getState().activeChatId ?? undefined)
           } else if (sc.action === 'terminal-next' || sc.action === 'terminal-prev') {
             // Ctrl+X then ] / [: cycle the TERMINAL tabs — right-pane terminal
             // tabs (revealing the pane if closed), falling back to the bottom
@@ -506,6 +818,11 @@ export default function App() {
       ) {
         e.preventDefault()
         prefixActiveRef.current = true
+        // Remember WHERE the chord was started (see the `terminal` branch: a
+        // Ctrl+X J only closes the panel when both keys were typed in it).
+        prefixArmedInTerminalRef.current = !!(e.target as HTMLElement | null)?.closest?.(
+          '.terminal-panel',
+        )
         window.dispatchEvent(new CustomEvent('coder:prefix', { detail: true }))
         prefixTimerRef.current = window.setTimeout(cancelPrefix, 2000)
         return
@@ -518,6 +835,18 @@ export default function App() {
       // event reaches here, and inside dialogs/overlay the pickers keep the
       // keys. The terminal keeps its shell chords too (xterm sends ^H/^K/^L),
       // so a blocked chord falls through instead of returning.
+      // Cmd/Ctrl+Shift+[ / ]: previous/next tab of the focused pane. Dialogs and
+      // overlays keep their own keys.
+      const cycleDir = e.defaultPrevented ? null : tabCycleChord(e)
+      if (
+        cycleDir &&
+        !(e.target as HTMLElement | null)?.closest?.('[role="dialog"], .settings-modal, .search-overlay') &&
+        cycleFocusedTabs(cycleDir)
+      ) {
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
       const winDir = e.defaultPrevented ? null : isWindowMoveChord(e)
       if (winDir && !isWindowMoveBlocked(e.target as HTMLElement | null, winDir)) {
         if (moveChatWindow(winDir)) {
@@ -542,10 +871,36 @@ export default function App() {
       // its chord closes the terminal tab). Multi-window chat windows are
       // exempt: their draft survives in the sidebar, so the close chord there
       // always closes that window.
-      if (k === 'w' && !e.shiftKey && !e.altKey) {
+      if (k === 'w' && !e.altKey) {
         const isClosePlatformChord = isApplePlatform() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey
         const t = e.target as HTMLElement | null
-        const inTerminal = isInsideTerminal(t)
+        const termHost = terminalHostFor(t, document.activeElement)
+        const inTerminal = termHost !== null
+        // INSIDE a terminal, `closeFocusedTerminal` decides — per host and per
+        // modifier (see src/lib/terminalClose.ts). Two bugs lived here: the
+        // right-pane host was invisible to `isInsideTerminal` (the caret is in
+        // the tab's `.terminal-tab-panel`, not the bottom `.terminal-panel`),
+        // so Ctrl+W closed the WHOLE pane instead of that one tab; and the
+        // chord ignored Shift, so Ctrl+Shift+W had no meaning in a pane
+        // terminal even though plain Ctrl+W IS shell input there (^W).
+        if (inTerminal && termHost && terminalCloseChord(termHost, e, isApplePlatform())) {
+          e.preventDefault()
+          e.stopPropagation()
+          closeFocusedTerminal(termHost)
+          return
+        }
+        if (inTerminal) {
+          // Not a close: a right-pane terminal hands Ctrl+W to its shell
+          // (^W delete-word) and lets Shift variants through untouched; the
+          // bottom panel is an app surface, so it still swallows the chord
+          // rather than leaking it to the shell.
+          if (termHost === 'bottom') {
+            e.preventDefault()
+            e.stopPropagation()
+          }
+          return
+        }
+        if (e.shiftKey) return
         if (!isClosePlatformChord) {
           // Not the close half: outside a terminal it is swallowed so the
           // host window never closes; inside one it is ordinary shell input
@@ -753,7 +1108,7 @@ export default function App() {
       >
         <ErrorBoundary>
           <Sidebar />
-          <div className={
+          <div ref={editorAreaRef} className={
             "editor-area" +
             (viewerFull && !chatFull ? " viewer-full" : "") +
             (chatFull ? " chat-full" : "")
@@ -820,7 +1175,7 @@ export default function App() {
                 {/* Each visible chat mounts its own ChatPanel (independent
                   scroll/draft/composer); single window = one panel, same as
                   before. No key remount: panels reset per-chat state by id. */}
-                <ChatWindows />
+                <ChatArea />
               </main>
             </section>
             {!chatFull && (
@@ -850,9 +1205,9 @@ export default function App() {
                              max-width cap would otherwise clamp the first
                              ~40% of the close transition into a visible
                              plateau (width stuck, then a sudden drop). */
-                          flexBasis: paneOpen ? splitW : 0,
-                          width: paneOpen ? splitW : 0,
-                          maxWidth: paneOpen ? splitW : undefined,
+                          flexBasis: paneOpen ? paneW : 0,
+                          width: paneOpen ? paneW : 0,
+                          maxWidth: paneOpen ? paneW : undefined,
                           display: "flex",
                           flexDirection: "column",
                           minHeight: 0,
@@ -875,7 +1230,11 @@ export default function App() {
                       {/* The single tab entry point: its menu opens only the
                           chat-owned pages (Browser/Trace) as ordinary tabs. */}
                       <ViewerAddButton />
-                      <span className="viewer-pane-spacer" aria-hidden="true" />
+                      {/* The empty stretch of the pane header is part of the app
+                          bar: it carries the window drag region too, so a
+                          double-click here maximizes/restores the window just
+                          like on the chat column's bar. */}
+                      <span className="viewer-pane-spacer" data-tauri-drag-region="deep" aria-hidden="true" />
                       <div className="viewer-pane-actions">
                         <ViewerPaneFullscreenButton />
                         <ViewerPaneToggleButton />
@@ -904,11 +1263,16 @@ export default function App() {
                       // textarea, but the click TARGET is the canvas, so the
                       // target-based editable probe below can never see it —
                       // excluding `.xterm` here is what keeps a pane-terminal
-                      // click from having its caret stolen right back.
+                      // click from having its caret stolen right back. The
+                      // browser stage is the same story: it forwards keys to
+                      // the virtual page and focuses ITSELF on mousedown, but
+                      // the click lands on the page <img>, so without this
+                      // exclusion the pane host stole the caret right after
+                      // and every keystroke went nowhere.
                       onMouseDown={(e) => {
                         const t = e.target as HTMLElement | null
                         if (t?.closest?.(
-                          'input, textarea, select, button, a, [contenteditable="true" i], [tabindex]:not([tabindex="-1"]), .xterm',
+                          'input, textarea, select, button, a, [contenteditable="true" i], [tabindex]:not([tabindex="-1"]), .xterm, .browser-stage',
                         )) return
                         viewerContentRef.current?.focus({ preventScroll: true })
                       }}

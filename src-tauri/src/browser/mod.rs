@@ -37,8 +37,15 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// Viewport a fresh tab starts with (mirrors browser_session.DEFAULT_VIEWPORT).
 const DEFAULT_VIEWPORT: (u32, u32) = (1280, 800);
-/// JPEG quality for the panel's frames (mirrors the Python `quality=60`).
-const SCREENSHOT_QUALITY: u32 = 60;
+/// JPEG quality for the panel's frames. 60 was visibly soft on text even before
+/// the Retina upscale; 80 costs ~35% more bytes over loopback and removes most
+/// of the ringing that made the page look out of focus.
+const SCREENSHOT_QUALITY: u32 = 80;
+/// Screencast frames are captured at the browser's forced device scale (2x,
+/// see `launch_args`), capped to this many physical pixels. 5120 covers a
+/// 2560pt pane at 2x — the common full-width case on a Retina display — while
+/// still bounding a 4K emulated viewport (7680px source) to a sane frame size.
+const SCREENCAST_MAX: u32 = 5120;
 /// How long to wait for Chromium's debugging port to answer.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-CDP-command timeout.

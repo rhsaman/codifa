@@ -19,11 +19,24 @@ import { findOpenRunTarget } from '../lib/nvimEdit'
 import { TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE, registerTerminalScreen, xtermTheme } from '../lib/xtermTheme'
 import { isReservedTerminalChord } from '../lib/terminalKeys'
 import { ownedPtyIds } from '../lib/terminalSessions'
+import {
+  currentTerminalWorkspace,
+  loadBottomTerminalTabs,
+  normalizeTerminalTitle,
+  saveBottomTerminalTabs,
+  terminalTabLabel,
+  workspaceCwdForNewTerminal,
+  type PersistedTerminalTab,
+} from '../lib/bottomTerminalTabs'
 
 interface TerminalTab {
   id: string
   shell: string
   cwd: string
+  /** User-typed name (double-click rename); empty = show `shell`. */
+  title?: string
+  /** Workspace this tab was opened in — its shells start there. */
+  wsKey?: string
   /** Command line for the tab tooltip (`nvim +42 /w/a.ts`). */
   program?: string
   /** The REQUESTED argv of a run target (`["nvim","+42","/w/a.ts"]`), kept for
@@ -103,11 +116,21 @@ export function TerminalPanel() {
   const theme = useStore((s) => s.theme)
   const [tabs, setTabs] = useState<TerminalTab[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
+  // Tab key currently being renamed inline (double-click a chip); null = no.
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  // The WORKSPACE this strip belongs to. Each workspace keeps its own tabs (and
+  // its own saved list), so switching projects swaps the strip instead of
+  // showing the previous project's shells.
+  const wsKey = useStore((s) => currentTerminalWorkspace(s))
   // Height lives in the store (persisted) so a fresh render restores the size.
   const height = useStore((s) => s.terminalHeight)
   // Reason a program could not be started. Shown in the panel instead of
   // failing silently.
   const [spawnError, setSpawnError] = useState<string | null>(null)
+  // One-frame "no slide" flag for a KEYBOARD jump into the panel (Ctrl+X J).
+  // The reveal keeps its (short) animation for a click; a caret move must not
+  // wait on it. See the `coder:focus-terminal` listener below.
+  const [instantOpen, setInstantOpen] = useState(false)
 
   // Once the panel has been opened in this session it stays mounted (hidden
   // via CSS) so the xterm buffers and the shells behind it survive toggling.
@@ -158,14 +181,94 @@ export function TerminalPanel() {
   // A `coder:focus-terminal` request asks the panel to take the caret: the
   // panel is opened by the caller, this only focuses the ACTIVE session's
   // xterm, which is where typing has to land.
+  //
+  // RETRIED across a few frames because the panel is often being REVEALED in
+  // the same gesture (`focusAppPane('terminal')` sets the open flag first, and
+  // the height transition passes through a 0-size frame). xterm refuses
+  // `focus()` on a hidden screen, and the WebKit caret then settles on
+  // `<body>` — which `activePane()` reads as "no pane", so the very next tab
+  // chord stepped some OTHER strip. Each try re-checks that the caret really
+  // landed inside this screen before stopping.
+  // A `coder:focus-terminal` request asks the panel to take the caret: the
+  // panel is opened by the caller, this only focuses the ACTIVE session's
+  // xterm, which is where typing has to land.
+  //
+  // RETRIED across a few frames because the panel is often being REVEALED in
+  // the same gesture (`focusAppPane('terminal')` sets the open flag first, and
+  // the shell's xterm only exists once React has committed the reveal).
+  //
+  // An EMPTY panel (no tab at all — booted open with nothing in it, or every
+  // tab was closed) used to swallow the request: there was no `activeIdRef` to
+  // focus, so Ctrl+X J left the caret on <body> and looked like a no-op. Spawn
+  // a shell first, then land in it.
   useEffect(() => {
-    const onFocusRequest = () => {
+    let tries = 0
+    let timer = 0
+    let spawned = false
+    // A focus request is a RETRY CHAIN over ~0.5s (the xterm exists only after
+    // React commits the reveal). Ctrl+X K fired inside that window used to LOSE:
+    // the pending retry ran one tick later and pulled the caret straight back
+    // into the shell the user had just left. Every chain captures the current
+    // generation; leaving the terminal bumps it, so a stale chain aborts.
+    let generation = 0
+    const land = (myGen: number) => {
+      if (myGen !== generation) return
       const id = activeIdRef.current
-      const term = id ? entries.current.get(id)?.term : null
-      term?.focus()
+      const entry = id ? entries.current.get(id) : null
+      // Nothing to focus AND no tab at all: start a shell (once), then keep
+      // probing for its xterm. Judged by the real tab list, not by
+      // `activeIdRef`: during a reveal that ref is briefly empty while the
+      // shells are still mounting, and spawning on that would add a second
+      // shell every time Ctrl+X J was pressed on a panel that already had
+      // tabs.
+      if (!id && !spawned && tabsRef.current.length === 0) {
+        spawned = true
+        tries = 0
+        void newSessionRef.current?.()
+        timer = window.setTimeout(() => land(myGen), 40)
+        return
+      }
+      entry?.term.focus()
+      const input = entry?.el?.querySelector?.('.xterm-helper-textarea') as HTMLElement | null
+      if (input && document.activeElement === input) return
+      if (tries++ < 12) timer = window.setTimeout(() => land(myGen), 40)
+    }
+    const onFocusRequest = (e: Event) => {
+      // A jump INTO a collapsed panel must not slide: stamp the instant flag so
+      // the transition is dropped for this reveal, then clear it once the caret
+      // landed (a later click-driven reveal animates normally). The REVEAL is
+      // decided by the caller (paneFocus reads it before flipping the open
+      // flag); by the time this event fires the store already says open, so
+      // re-checking it here would always read false. The animation is only
+      // ~70ms now, so the flag clears quickly instead of being held for 400ms.
+      if ((e as CustomEvent<{ instant?: boolean }>).detail?.instant) {
+        setInstantOpen(true)
+        window.setTimeout(() => setInstantOpen(false), 120)
+      }
+      tries = 0
+      spawned = false
+      window.clearTimeout(timer)
+      const myGen = ++generation
+      land(myGen)
+    }
+    // Ctrl+X K: abandon any in-flight focus chain so nothing drags the caret
+    // back into the xterm after the user asked to leave it. Also stop the
+    // "spawn a shell because the panel was empty" branch: a K that lands while
+    // the shell is still mounting must not be answered by spawning AND
+    // focusing it. The generation bump is checked here too, not only in the
+    // retry timer, because `land` may already be mid-await on the spawn.
+    const onLeave = () => {
+      generation++
+      tries = 0
+      window.clearTimeout(timer)
     }
     window.addEventListener('coder:focus-terminal', onFocusRequest)
-    return () => window.removeEventListener('coder:focus-terminal', onFocusRequest)
+    window.addEventListener('coder:blur-terminal-focus', onLeave)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('coder:focus-terminal', onFocusRequest)
+      window.removeEventListener('coder:blur-terminal-focus', onLeave)
+    }
   }, [])
 
   // A `coder:new-terminal` request is Ctrl+T fired while the BOTTOM panel holds
@@ -192,6 +295,13 @@ export function TerminalPanel() {
       const i = list.findIndex((t) => t.id === activeIdRef.current)
       const j = i === -1 ? 0 : (i + dir + list.length) % list.length
       setActiveId(list[j].id)
+      // The chord is fired from INSIDE this panel, so the caret has to come
+      // back into the shell it just revealed: a freshly shown xterm is not
+      // focusable in the same tick as the state update, hence the (retried)
+      // request. Without it the caret drops to `<body>` and the next chord
+      // would step a DIFFERENT strip — the "the pane's tabs changed while I
+      // was typing in the terminal" bug.
+      window.dispatchEvent(new CustomEvent('coder:focus-terminal'))
     }
     window.addEventListener('coder:cycle-terminal', onCycleRequest)
     return () => window.removeEventListener('coder:cycle-terminal', onCycleRequest)
@@ -254,13 +364,16 @@ export function TerminalPanel() {
     }, 16)
   }, [activeId, fitActive])
 
-  const spawnSession = useCallback(async (cwd?: string, program?: string, args?: string[]) => {
+  const spawnSession = useCallback(
+    async (cwd?: string, program?: string, args?: string[], restore?: PersistedTerminalTab) => {
     if (!hasTerminalApi()) return
     // Reuse a run target that is already open instead of starting a second one.
     // A run target can be heavy — the user's own Neovim with its LSP plugins
     // measured ~600 MB for ONE instance — so asking for the same file again must
     // focus that editor rather than pay for another whole process tree.
-    if (program) {
+    // A RESTORE never reuses: it is bringing back a tab the user closed the app
+    // with, not requesting the same target twice.
+    if (program && !restore) {
       const open = findOpenRunTarget(tabsRef.current, [program, ...(args ?? [])])
       if (open) {
         setSpawnError(null)
@@ -271,11 +384,11 @@ export function TerminalPanel() {
     // Default to the focused chat's workspace, resolved at call time — a
     // workspace switched while the panel was open must still apply to the
     // next new shell. Empty root falls back to home in the main process.
-    const dir =
-      cwd ??
-      useStore.getState().chats.find((c) => c.id === useStore.getState().activeChatId)?.root ??
-      useStore.getState().root ??
-      ''
+    const dir = cwd ?? workspaceCwdForNewTerminal(useStore.getState())
+    // The workspace this shell BELONGS to: the chat open at creation time. It
+    // pins the tab (and its persisted record) to that project, so a restart in
+    // another workspace does not drag it there.
+    const wsKey = restore?.wsKey ?? currentTerminalWorkspace(useStore.getState())
     try {
       const requested = program ? [program, ...(args ?? [])] : undefined
       const info = await window.coder.terminalCreate(dir || '', program, args)
@@ -283,7 +396,10 @@ export function TerminalPanel() {
       // or a create that found no shell) must not push a null tab: the render
       // below reads `tab.id` and a null entry would crash the whole tree.
       if (!info || typeof info.id !== 'string') return
-      setTabs((prev) => [...prev, requested ? { ...info, argv: requested } : info])
+      setTabs((prev) => [
+        ...prev,
+        { ...info, wsKey, ...(requested ? { argv: requested } : {}), ...(restore?.title ? { title: restore.title } : {}) },
+      ])
       setActiveId(info.id)
       setSpawnError(null)
     } catch (err) {
@@ -295,8 +411,38 @@ export function TerminalPanel() {
     }
   }, [])
 
-  // Adopt sessions from a previous renderer (dev reload) on first open, or
-  // spawn the initial shell in the current workspace.
+  // Persist the tab list (cwd/title/shell per tab, never pty ids) whenever it
+  // changes, so a restart reopens the same chips with the same names. Runs on
+  // first render too, which is why an empty `tabs` right after boot cannot
+  // wipe the saved list: the restore effect below refills it synchronously.
+  const restoredRef = useRef(false)
+  useEffect(() => {
+    if (tabs.length === 0) return
+    // Split by workspace: only THIS workspace's strip is rewritten, so the
+    // tabs of a project the user is not in survive untouched.
+    const byWs = new Map<string, PersistedTerminalTab[]>()
+    for (const t of tabs) {
+      // The tab's OWN workspace wins. An unstamped row (adopted from a pty the
+      // bridge reported without a workspace) is saved under the strip it is on
+      // — `wsKey` — instead of immediately being written to every workspace.
+      const k = t.wsKey || wsKey
+      const row: PersistedTerminalTab = {
+        key: t.id,
+        title: t.title,
+        shell: t.shell,
+        cwd: t.cwd,
+        wsKey: k,
+        ...(t.program ? { program: t.program } : {}),
+        ...(t.argv ? { argv: t.argv } : {}),
+        ...(t.id === activeId ? { active: true } : {}),
+      }
+      ;(byWs.get(k) ?? byWs.set(k, []).get(k)!).push(row)
+    }
+    for (const [k, rows] of byWs) saveBottomTerminalTabs(k, rows)
+  }, [tabs, activeId, wsKey])
+
+  // Adopt sessions from a previous renderer (dev reload) on first open, else
+  // BRING BACK the saved tabs, else spawn one shell in the current workspace.
   useEffect(() => {
     if (!open || bootstrappedRef.current) return
     bootstrappedRef.current = true
@@ -306,8 +452,12 @@ export function TerminalPanel() {
     void (async () => {
       // `?? []`: the bridge may RESOLVE null instead of rejecting (web build,
       // or a stubbed bridge), and `.catch` alone would let that null through to
-      // `.filter` below.
-      const live = (await window.coder.terminalList().catch(() => [])) ?? []
+      // `.filter` below. `?.` as well: `terminalList` is NOT part of the older
+      // preload contract, so a build whose bridge only has terminalCreate would
+      // throw a TypeError right here — outside the promise chain — and the panel
+      // opened EMPTY, with no shell and no error ("Ctrl+X J did nothing").
+      // No listing ability ⇒ nothing to adopt; the spawn branch below still runs.
+      const live = (await window.coder?.terminalList?.().catch(() => [])) ?? []
       if (cancelled) return
       const known = new Set(tabsRef.current.map((t) => t.id))
       // RIGHT-PANE sessions are NOT ours to adopt: `terminalList` returns every
@@ -319,16 +469,82 @@ export function TerminalPanel() {
       // real id can become a tab (the render reads `tab.id`).
       const adopt = live.filter((s) => !!s && typeof s.id === 'string' && !known.has(s.id) && !paneOwned.has(s.id))
       if (adopt.length > 0) {
-        setTabs((prev) => [...prev, ...adopt])
+        // An adopted pty carries no workspace: it is a shell THIS renderer left
+        // running (dev reload), so it belongs to the workspace on screen now.
+        // Without the stamp it saved under `__none__` and reappeared in every
+        // workspace's strip.
+        setTabs((prev) => [...prev, ...adopt.map((s) => ({ ...s, wsKey }))])
         setActiveId((cur) => cur ?? adopt[0].id)
       } else if (shouldSpawnShell(tabsRef.current.length)) {
-        await spawnSession()
+        // A dev reload keeps the pty, a REAL restart does not: the pty ids in
+        // storage are dead, so each saved record spawns a fresh shell in its own
+        // cwd and gets the user's name back. Only THIS workspace's records are
+        // used — another project's shells must not appear here. Nothing saved in
+        // this workspace → one plain shell.
+        const saved = restoredRef.current ? [] : loadBottomTerminalTabs(wsKey)
+        restoredRef.current = true
+        if (saved.length > 0) {
+          const wantActive = saved.find((t) => t.active) ?? saved[saved.length - 1]
+          for (const rec of saved) {
+            if (cancelled) return
+            await spawnSession(rec.cwd, rec.program, rec.argv, { ...rec, wsKey })
+          }
+          // `spawnSession` activates each new tab; put the caret back where the
+          // user left it once they all exist.
+          const back = tabsRef.current.find((t) => t.title === wantActive.title && t.cwd === wantActive.cwd)
+          if (back) setActiveId(back.id)
+        } else {
+          await spawnSession()
+        }
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [open, spawnSession])
+  }, [open, spawnSession, wsKey])
+
+  // WORKSPACE SWITCH: the strip belongs to one workspace at a time. Leaving a
+  // workspace closes its shells (their cwd pointed at the old project anyway),
+  // then the destination's saved tabs are respawned. Tabs are already saved per
+  // workspace by the effect above, so nothing is lost on the way out.
+  //
+  // `closeSession` is declared further down (it needs the screen helpers), so it
+  // is reached through a ref — the same indirection `newSessionRef` uses.
+  const closeSessionRef = useRef<(id: string) => void>(() => {})
+  const prevWsKeyRef = useRef(wsKey)
+  useEffect(() => {
+    if (prevWsKeyRef.current === wsKey) return
+    const leaving = prevWsKeyRef.current
+    prevWsKeyRef.current = wsKey
+    // A tab belongs to the workspace in ITS OWN `wsKey`. Falling back to the
+    // DESTINATION key (as this used to) made every unstamped tab look like it
+    // already lived in the workspace being entered, so the previous project's
+    // shells stayed on the strip. Untagged rows fall back to the workspace we
+    // are LEAVING — they were on screen there.
+    const owner = (t: TerminalTab) => t.wsKey || leaving
+    // Close every shell of the workspace we just left, then respawn the
+    // destination's saved tabs. Both halves come from ONE snapshot so the
+    // filter below and the loop above can never disagree.
+    const stale = tabsRef.current.filter((t) => owner(t) !== wsKey)
+    const have = tabsRef.current.filter((t) => owner(t) === wsKey)
+    for (const t of stale) closeSessionRef.current(t.id)
+    setTabs(have)
+    // Nothing of the destination is live → rebuild it from this workspace's
+    // saved list. Non-empty means a dev reload kept it, so it is left alone.
+    if (have.length > 0 || !hasTerminalApi()) return
+    const saved = loadBottomTerminalTabs(wsKey)
+    if (saved.length === 0) return
+    let cancelled = false
+    void (async () => {
+      for (const rec of saved) {
+        if (cancelled) return
+        await spawnSession(rec.cwd, rec.program, rec.argv, { ...rec, wsKey })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [wsKey, spawnSession])
 
   // pty output → the matching xterm; exit → drop the tab (and hide the panel
   // when the last one dies, like VSCode).
@@ -448,7 +664,7 @@ export function TerminalPanel() {
     [scheduleFit],
   )
 
-  const closeSession = useCallback((id: string) => {
+  const closeSession = useCallback((id: string, opts?: { hidePanelWhenEmpty?: boolean }) => {
     const entry = entries.current.get(id)
     if (entry) {
       entry.offFont()
@@ -463,8 +679,15 @@ export function TerminalPanel() {
     setTabs(next)
     setActiveId((cur) => (cur === id ? (next[next.length - 1]?.id ?? null) : cur))
     void window.coder.terminalKill(id).catch(() => {})
-    if (next.length === 0) useStore.getState().setTerminalPanelOpen(false)
+    // A WORKSPACE SWITCH closes shells on its way to another project and must not
+    // hide the panel on the way (the destination restores its own tabs).
+    if (next.length === 0 && opts?.hidePanelWhenEmpty !== false)
+      useStore.getState().setTerminalPanelOpen(false)
   }, [])
+  // The workspace-switch effect above runs before this callback exists.
+  useEffect(() => {
+    closeSessionRef.current = (id) => closeSession(id, { hidePanelWhenEmpty: false })
+  }, [closeSession])
 
   const newSession = useCallback(() => {
     useStore.getState().setTerminalPanelOpen(true)
@@ -692,6 +915,10 @@ export function TerminalPanel() {
   return (
     <section
       className={'terminal-panel' + (fullscreen ? ' terminal-full' : '')}
+      // `data-instant` is stamped while a KEYBOARD jump is in flight (see the
+      // listener above): the caret is about to land in the shell, so the reveal
+      // must not slide under it. A click or a drag keeps the short animation.
+      data-instant={instantOpen ? 'true' : undefined}
       data-open={open}
       data-fullscreen={fullscreen}
       dir="ltr"
@@ -711,7 +938,39 @@ export function TerminalPanel() {
       <header className="terminal-tabbar">
         <span className="terminal-title">Terminal</span>
         <div className="terminal-tabs" role="tablist">
-          {tabs.map((tab) => (
+          {tabs.map((tab) =>
+            renamingId === tab.id ? (
+              <div key={tab.id} className="terminal-tab terminal-tab-active terminal-tab-renaming">
+                <input
+                  className="terminal-tab-rename"
+                  aria-label={`Rename ${terminalTabLabel(tab)}`}
+                  defaultValue={terminalTabLabel(tab)}
+                  autoFocus
+                  onFocus={(e) => e.currentTarget.select()}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    // Keep the chord handlers and the xterm out of a plain text
+                    // field: otherwise Enter/Escape would also reach the app.
+                    e.stopPropagation()
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      const title = normalizeTerminalTitle(e.currentTarget.value)
+                      setTabs((prev) => prev.map((t) => (t.id === tab.id ? { ...t, title } : t)))
+                      setRenamingId(null)
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault()
+                      setRenamingId(null)
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // Clicking away commits, like the right pane's strip.
+                    const title = normalizeTerminalTitle(e.currentTarget.value)
+                    setTabs((prev) => prev.map((t) => (t.id === tab.id ? { ...t, title } : t)))
+                    setRenamingId(null)
+                  }}
+                />
+              </div>
+            ) : (
             <div
               key={tab.id}
               role="tab"
@@ -720,14 +979,15 @@ export function TerminalPanel() {
               className={
                 'terminal-tab' + (tab.id === activeId ? ' terminal-tab-active' : '')
               }
-              title={tab.program}
+              title={`${terminalTabLabel(tab)}${tab.program ? ` — ${tab.program}` : ''} — double-click to rename`}
               onClick={() => activate(tab.id)}
+              onDoubleClick={() => setRenamingId(tab.id)}
             >
-              <span className="terminal-tab-shell">{tab.shell}</span>
+              <span className="terminal-tab-shell">{terminalTabLabel(tab)}</span>
               <span className="terminal-tab-cwd">{cwdBasename(tab.cwd)}</span>
               <button
                 className="terminal-tab-close"
-                aria-label={`Close ${tab.shell} terminal`}
+                aria-label={`Close ${terminalTabLabel(tab)} terminal`}
                 title="Close terminal"
                 onClick={(e) => {
                   e.stopPropagation()
@@ -739,7 +999,8 @@ export function TerminalPanel() {
                 </svg>
               </button>
             </div>
-          ))}
+            )
+          )}
         </div>
         <div className="terminal-actions">
           <button

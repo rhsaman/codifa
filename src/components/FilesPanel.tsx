@@ -1,5 +1,5 @@
 /**
- * File explorer for the right side pane: a lazy workspace tree.
+ * File explorer for the sidebar (its Files view): a lazy workspace tree.
  *
  * Only ONE directory level is read at a time (`api.fsList(root, rel)`), so a
  * huge repository costs nothing until a folder is actually opened. The
@@ -10,7 +10,7 @@
  * row dragged onto a folder moves into it. Every mutation goes through the
  * same path — run it, then re-read the tree from disk, never guess.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import { api, workspaceFiles } from "../lib/fs";
@@ -20,6 +20,9 @@ import { useViewerTabs } from "../lib/viewerTabs";
 import { ChatRenameInput } from "./ChatRenameInput";
 import { menuLeft, menuTop } from "../lib/tabBar";
 import { physicalKey } from "../lib/shortcuts";
+import { focusChatInput } from "../lib/chatFocus";
+import { focusAppPane } from "../lib/paneFocus";
+import { onGitChange } from "../lib/liveEvents";
 import {
   copyName,
   flattenTree,
@@ -32,7 +35,6 @@ import {
   toggleExpanded,
   ancestorDirs,
   filterRows,
-  nextFilterIndex,
   type TreeCache,
 } from "../lib/fileTree";
 
@@ -130,6 +132,14 @@ function errText(err: unknown): string {
  *  so a chat with nothing open never re-renders on every store write. */
 const EMPTY_DIRS: readonly string[] = [];
 
+/** Last filter / reveal signal values this module has acted on. The explorer
+ *  unmounts whenever the sidebar shows the chats or is collapsed, while the
+ *  viewer store keeps its counters: without these, every switch back to Files
+ *  would replay an old request (the filter box popping open, a file being
+ *  revealed again). Each signal is served exactly once. */
+let servedFilterAt = 0;
+let servedRevealAt = 0;
+
 export function FilesPanel({ chatId }: { chatId?: string }) {
   // The explorer belongs to a chat: its root follows the owning chat so split
   // panes showing two chats never mirror each other's tree.
@@ -181,6 +191,7 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
   const [filter, setFilter] = useState<string | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const filterOpen = filter !== null;
+  const listRef = useRef<HTMLDivElement>(null);
   // The full workspace path list (`fs_walk`), used by the filter so a deep
   // folder/file the lazy tree never loaded is still findable by name.
   const [walked, setWalked] = useState<readonly string[]>([]);
@@ -190,6 +201,8 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
   // Keyboard-highlighted row while the filter is active (Ctrl+K/J navigation).
   const [filterIdx, setFilterIdx] = useState(0);
   const filterRowRef = useRef<HTMLButtonElement>(null);
+  // First `g` of `gg` (Neovim: jump to the first row).
+  const gAt = useRef(0);
   // The row the file header asked to reveal; scrolled into view once.
   const revealRowRef = useRef<HTMLButtonElement>(null);
   // Reading the cache from a menu/mutation callback must not go through a
@@ -285,6 +298,32 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
     void Promise.all(dirs.map((d) => loadDir(d, gen, true)));
   }, [loadDir]);
 
+  // LIVE: the tree follows the disk without a refresh button. The backend
+  // pushes workspace changes (the same /ws/events beat the git badge uses), and
+  // a window focus covers edits made while the app was in the background. Each
+  // loaded level is re-read IN PLACE (the cache is kept, unlike `refreshTree`),
+  // so rows never blink out while the agent is writing files.
+  useEffect(() => {
+    if (!root) return;
+    let timer: number | undefined;
+    const sync = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        const gen = genRef.current;
+        for (const dir of Object.keys(cacheRef.current)) void loadDir(dir, gen, true);
+      }, 250);
+    };
+    const off = onGitChange(root, (evRoot) => {
+      if (evRoot === root) sync();
+    });
+    window.addEventListener("focus", sync);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", sync);
+      off();
+    };
+  }, [root, loadDir]);
+
   /** Run one filesystem mutation and re-read the tree afterwards. Every
    *  failure is surfaced as the panel's action strip instead of an unhandled
    *  rejection: a refused move (destination exists, folder into itself) is a
@@ -352,13 +391,14 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
     if (filterOpen) filterRef.current?.focus();
   }, [filterOpen]);
 
-  // Ctrl/Cmd+F routed through the viewer store: the app-wide handler activates
-  // the explorer tab (an open file, Git or todos may have been showing) and
-  // bumps `filesFilterFocusAt`. Consuming the counter here is what opens AND
-  // focuses the box, so the shortcut works no matter which rail tab was up.
+  // Ctrl+X E routed through the viewer store: it shows the explorer (the
+  // sidebar may have been listing chats, or collapsed) and bumps
+  // `filesFilterFocusAt`. Consuming the counter here — once per value — is what
+  // opens AND focuses the box.
   const filterFocusAt = useViewerTabs((s) => s.filesFilterFocusAt);
   useEffect(() => {
-    if (filterFocusAt === 0) return;
+    if (filterFocusAt === 0 || filterFocusAt === servedFilterAt) return;
+    servedFilterAt = filterFocusAt;
     setFilter((prev) => (prev === null ? "" : prev));
     // The input mounts on the render this schedule, so focus after the commit.
     requestAnimationFrame(() => filterRef.current?.focus());
@@ -470,10 +510,160 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
     setFilterIdx((prev) => (prev < rows.length ? prev : 0));
   }, [query, rows.length]);
 
-  // Keep the Ctrl+K/J-highlighted row in view while the filter navigates.
+  // Keep the filter's highlighted row in view as the keyboard walks the tree
+  // (j/k on a row also advances filterIdx).
   useEffect(() => {
     if (filterOpen) filterRowRef.current?.scrollIntoView({ block: "nearest" });
   }, [filterOpen, filterIdx]);
+
+  /** Hand the caret from the filter box to the FIRST tree row — the explorer
+   *  counterpart of Ctrl/Cmd+J in the workspace search. */
+  const focusFirstFileRow = () => {
+    if (rows.length === 0) return;
+    setFilterIdx(0);
+    requestAnimationFrame(() => focusRowAt(0));
+  };
+
+  /** Open a file from the tree and hand the caret to the VIEWER, so its bare
+   *  vim scroll keys (h/j/k/l) work immediately — the user asked to open a
+   *  file, not to keep walking the tree. The tab mounts a commit later;
+   *  focusAppPane retries until the page body exists and marks it as the vim
+   *  region. */
+  const openFileAndFocus = (path: string) => {
+    useViewerTabs.getState().openFile(path, undefined, root, ownerChatId);
+    requestAnimationFrame(() => focusAppPane("viewer"));
+  };
+
+  /** Focus one visible row by index (used by click, j/k and Ctrl+J). */
+  const focusRowAt = (idx: number) => {
+    const row = rows[Math.max(0, Math.min(rows.length - 1, idx))];
+    if (!row) return;
+    const el = listRef.current?.querySelector<HTMLButtonElement>(
+      `[data-file-path="${CSS.escape(row.path)}"]`,
+    );
+    el?.focus({ preventScroll: true });
+    el?.scrollIntoView({ block: "nearest" });
+  };
+
+  /** Rows covered by Ctrl+D / Ctrl+U: half a screenful, measured from a real
+   *  row so the list's own spacing is included. */
+  const halfPageRows = () => {
+    const host = listRef.current;
+    const row = host?.querySelector<HTMLElement>("button.files-row");
+    const rowH = Math.max(1, row?.getBoundingClientRect().height || 31);
+    return Math.max(1, Math.floor((host?.clientHeight ?? 320) / rowH / 2));
+  };
+
+  /** A mouse click has to leave the caret on a ROW: WebKit (Tauri's webview)
+   *  does not move focus to a `<button>` on click, so after clicking a folder
+   *  the list never received j/k. Focusing it here is what makes the keyboard
+   *  contract work after a pointer interaction. Fields (the rename input, the
+   *  filter) own their clicks untouched. */
+  const onFilesMouseDown = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const t = e.target as HTMLElement | null;
+    if (t?.closest("input, textarea, select, [contenteditable='true']")) return;
+    const row = t?.closest<HTMLButtonElement>("button.files-row");
+    if (row) {
+      const idx = rows.findIndex((r) => r.path === row.dataset.filePath);
+      if (idx >= 0) setFilterIdx(idx);
+      row.focus({ preventScroll: true });
+      return;
+    }
+    // Empty space past the rows: focus the list itself so j/k still enter the
+    // tree at the highlighted row instead of leaking to the chat.
+    listRef.current?.focus({ preventScroll: true });
+  };
+
+  /** Row keyboard navigation — the SAME contract as the workspace list:
+   *  plain j/k (or the arrows) walk the visible rows up/down, gg/G jump to the
+   *  first/last row, Ctrl+D / Ctrl+U move half a screenful, Ctrl/Cmd+K returns
+   *  to the filter box, Esc hands the caret back to the chat, and Enter
+   *  opens/toggles the row natively as the focused <button>. Modified J/K
+   *  never move rows (j/k alone do), so Ctrl+J stays the "enter the list from
+   *  the filter" chord and Ctrl+K the "leave it" chord. */
+  const onFilesListKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement | null;
+    // The rename input (and any future field inside a row) owns its keys.
+    if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
+    const k =
+      (e.code || "").replace(/^Key/, "").toLowerCase() || e.key.toLowerCase();
+    const modifier = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+    const rowEl = target?.closest<HTMLButtonElement>("button.files-row");
+    const currentIdx = () => {
+      if (rowEl) return rows.findIndex((r) => r.path === rowEl.dataset.filePath);
+      return Math.max(0, Math.min(rows.length - 1, filterIdx));
+    };
+    if (modifier && k === "k") {
+      e.preventDefault();
+      e.stopPropagation();
+      filterRef.current?.focus({ preventScroll: true });
+      filterRef.current?.select?.();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      const chatId = useStore.getState().activeChatId;
+      if (chatId) requestAnimationFrame(() => focusChatInput(chatId));
+      return;
+    }
+    // Neovim jumps / half-page steps over the SAME row focus as j/k.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && k === "g") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        // G: last row.
+        gAt.current = 0;
+        if (rows.length > 0) {
+          setFilterIdx(rows.length - 1);
+          focusRowAt(rows.length - 1);
+        }
+        return;
+      }
+      const now = Date.now();
+      if (now - gAt.current <= 800) {
+        gAt.current = 0;
+        if (rows.length > 0) {
+          setFilterIdx(0);
+          focusRowAt(0);
+        }
+        return;
+      }
+      gAt.current = now;
+      return;
+    }
+    // Any other key ends a pending `gg` (Neovim's timeout_leave).
+    gAt.current = 0;
+    if (modifier && (k === "d" || k === "u")) {
+      e.preventDefault();
+      if (rows.length === 0) return;
+      const cur = currentIdx();
+      if (cur < 0) return;
+      const step = halfPageRows() * (k === "d" ? 1 : -1);
+      const next = Math.max(0, Math.min(rows.length - 1, cur + step));
+      setFilterIdx(next);
+      focusRowAt(next);
+      return;
+    }
+    const down = e.key === "ArrowDown" || (plain && k === "j");
+    const up = e.key === "ArrowUp" || (plain && k === "k");
+    if (!down && !up) return;
+    if (!rowEl) {
+      // The caret is on the list itself (a click past the rows): the first
+      // j/k lands on the highlighted row instead of starting one step past it.
+      e.preventDefault();
+      if (rows.length > 0) focusRowAt(filterIdx);
+      return;
+    }
+    const idx = rows.findIndex((r) => r.path === rowEl.dataset.filePath);
+    if (idx < 0) return;
+    const next = Math.max(0, Math.min(rows.length - 1, idx + (down ? 1 : -1)));
+    e.preventDefault();
+    if (next === idx) return;
+    // Keep the filter's own highlight in sync so Ctrl+K → Enter reopens the
+    // row the user last walked to.
+    setFilterIdx(next);
+    requestAnimationFrame(() => focusRowAt(next));
+  };
 
   // Reveal request from a file header: open every ancestor folder (loading the
   // levels that were never read) and highlight the file's own row.
@@ -483,6 +673,8 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
     // Only the chat that owns the request reveals it: a split pane in another
     // chat must not jump its tree to a file it never asked about.
     if (revealAt.chatId && revealAt.chatId !== (ownerChatId ?? useStore.getState().activeChatId)) return;
+    if (revealAt.at === servedRevealAt) return;
+    servedRevealAt = revealAt.at;
     const rel = revealAt.path;
     const chain = ancestorDirs(rel);
     // Snapshot of the open folders: a fold made by the user while this file is
@@ -500,6 +692,25 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
     const gen = genRef.current;
     for (const d of next) if (!isLoaded(cacheRef.current, d)) void loadDir(d, gen, true);
     setRevealed(rel);
+    if (revealAt.focus) {
+      // Ctrl+X E from the file viewer: the file's OWN row is the destination.
+      // An active name filter could hide that row, so close the box first;
+      // then probe until the folder chain above has loaded and the row mounts.
+      closeFilter();
+      let tries = 0;
+      const land = () => {
+        const el = listRef.current?.querySelector<HTMLButtonElement>(
+          `[data-file-path="${CSS.escape(rel)}"]`,
+        );
+        if (el) {
+          el.focus({ preventScroll: true });
+          el.scrollIntoView({ block: "nearest" });
+          return;
+        }
+        if (tries++ < 30) requestAnimationFrame(land);
+      };
+      requestAnimationFrame(land);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [revealAt, root, treeChatId, setExpandedDirs, loadDir]);
 
@@ -511,23 +722,37 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
 
   return (
     <div className="files-panel" dir="ltr">
-      <div className="files-panel-head">
-        {filterOpen ? (
-          <div className="files-filter" role="search">
-            <input
+      {/* Same head as the chat list (the search box), so the
+          two sidebar views line up under the switch. The box is always there:
+          focusing or typing opens the filter, clearing/Esc closes it. */}
+      <div className="files-panel-head sidebar-head">
+        <div className="sidebar-search-box" role="search">
+          <span className="sidebar-search-icon" aria-hidden="true">
+            <SearchIcon />
+          </span>
+          <input
               ref={filterRef}
-              className="files-filter-input"
+              className="sidebar-search-input"
               dir="auto"
               type="text"
-              placeholder="Filter by name…"
+              placeholder="Filter files…"
               value={filter ?? ""}
               spellCheck={false}
+              disabled={!root}
               aria-label="Filter the file tree by name"
+              onFocus={() => setFilter((prev) => (prev === null ? "" : prev))}
               onChange={(e) => setFilter(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Escape") {
                   e.stopPropagation();
-                  closeFilter();
+                  // First Esc clears the query; an already-empty box hands the
+                  // caret back to the chat, like the workspace search.
+                  if (filter) {
+                    closeFilter();
+                    return;
+                  }
+                  const chatId = useStore.getState().activeChatId;
+                  if (chatId) requestAnimationFrame(() => focusChatInput(chatId));
                 } else if (e.key === "Enter") {
                   // Open the highlighted hit — a file directly, a folder by
                   // loading it (its level joins the cached tree the filter
@@ -536,58 +761,36 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
                   if (!hit) return;
                   if (hit.kind === "dir") toggleDir(hit.path);
                   else {
-                    void useViewerTabs.getState().openFile(hit.path, undefined, root, ownerChatId);
+                    openFileAndFocus(hit.path);
                     closeFilter();
                   }
                 } else if (
                   (e.ctrlKey || e.metaKey) &&
                   !e.shiftKey &&
                   !e.altKey &&
-                  (physicalKey(e) === "k" || physicalKey(e) === "j")
+                  physicalKey(e) === "j"
                 ) {
-                  // Neovim-style Ctrl+K (up) / Ctrl+J (down) over the matches,
-                  // wrapping at both ends.
+                  // Same contract as the workspace search: plain j/k stay
+                  // filter text; Ctrl/Cmd+J enters the tree at its first row
+                  // and Ctrl/Cmd+K comes back here from any row.
                   e.preventDefault();
                   e.stopPropagation();
-                  const delta = physicalKey(e) === "k" ? -1 : 1;
-                  setFilterIdx((prev) => nextFilterIndex(prev, delta, rows.length));
+                  focusFirstFileRow();
                 }
               }}
             />
+          {filterOpen && filter ? (
             <button
               type="button"
-              className="files-panel-action"
+              className="sidebar-search-clear"
               title="Clear filter (Esc)"
               aria-label="Clear the filter"
               onClick={closeFilter}
             >
               <CloseIcon />
             </button>
-          </div>
-        ) : (
-          <span className="files-panel-title">Files</span>
-        )}
-        <button
-          className="files-panel-action"
-          title="Filter files (Ctrl+F / Cmd+F)"
-          aria-label="Filter files by name"
-          aria-pressed={filterOpen}
-          disabled={!root}
-          onClick={() => setFilter((prev) => (prev === null ? "" : null))}
-        >
-          <SearchIcon />
-        </button>
-        <button
-          className="files-panel-action"
-          title="Refresh"
-          aria-label="Refresh the file tree"
-          disabled={!root}
-          onClick={refreshTree}
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" />
-          </svg>
-        </button>
+          ) : null}
+        </div>
       </div>
 
       {actionError ? (
@@ -613,7 +816,11 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
         )
       ) : (
         <div
+          ref={listRef}
           className="files-list"
+          tabIndex={-1}
+          onKeyDown={onFilesListKeyDown}
+          onMouseDown={onFilesMouseDown}
           // The empty space past the rows drops into the workspace root.
           onDragOver={(e) => {
             if (!dragPath || moveTarget(dragPath, "") === null) return;
@@ -672,6 +879,7 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
               <button
                 key={row.path}
                 ref={filterActive ? filterRowRef : revealActive ? revealRowRef : undefined}
+                data-file-path={row.path}
                 className={
                   "files-row" +
                   (isDir ? " files-row-dir" : "") +
@@ -702,7 +910,7 @@ export function FilesPanel({ chatId }: { chatId?: string }) {
                   }
                   // Explicit root + chatId: the tab must belong to THIS chat's
                   // tree, not to whichever chat happens to be focused.
-                  useViewerTabs.getState().openFile(row.path, undefined, root, ownerChatId);
+                  openFileAndFocus(row.path);
                 }}
                 onDragStart={(e) => {
                   e.dataTransfer.effectAllowed = "move";

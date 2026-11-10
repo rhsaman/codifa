@@ -21,38 +21,50 @@ pub(super) enum Window {
         /// Lines in the WHOLE file, so the header can say "of N" — see
         /// [`numbered_window`].
         total: usize,
+        /// The bytes were not valid UTF-8 and are shown with replacement chars.
+        lossy: bool,
     },
     Empty(String),
 }
 
-/// Read one window of a file (1-indexed offset, line count) with the same
-/// truncation rules as tools.py: 2MB byte cap, 2000-char line cap.
+/// Shown above a lossily-decoded window: the text is readable, but a writer
+/// must not round-trip it through a `String` (it would rewrite the bad bytes).
+pub(super) const UTF8_VIEW_NOTE: &str =
+    "[note] this file is not valid UTF-8; invalid sequences are shown replaced. Do not edit it \
+     with `edit_file` — its bytes would be rewritten; use `run_terminal` for a byte-exact change.";
+
+/// Read one window of a file (1-indexed offset, line count). Per-line
+/// truncation still applies (`MAX_LINE_LENGTH`); the file itself has no cap.
 pub(super) fn file_window(abs: &Path, offset: usize, limit: usize) -> Result<Window, String> {
     file_window_upto(abs, offset, limit, None)
 }
 
-/// `file_window`, allowed to stretch the window to the END of the file.
+/// Extensions the native document reader (`docs.rs`) parses.
 ///
-/// A short file read as a 400-line window ends a few lines before EOF, and the
-/// model then spends a WHOLE round trip asking for the remainder — the single
-/// largest source of extra round trips in the traced corpus: 78 of 80 reads in
-/// one run stopped before EOF with a median of 7_951 unused chars left in the
-/// result budget, and 106 rounds were a read chained onto another read of the
-/// same file. Serving the tail NOW costs those same bytes once (they fit the
-/// budget the result already has) and removes the follow-up round — the turn
-/// gets shorter and cheaper without withholding a single line.
-///
-/// The stretch is deliberately conservative: only when the remainder is no
-/// larger than the window the caller asked for AND the numbered rendering of the
-/// whole thing still fits `budget`. Anything bigger keeps today's behaviour, so
-/// a 20k-line file never turns one read into an unbounded payload.
+/// A `.docx`/`.pptx`/`.xlsx` is a ZIP and a `.pdf` is compressed, so reading
+/// their raw bytes as UTF-8 returned binary noise — which is exactly what pushed
+/// the agent into `unzip … | sed …` / `pdftotext` in the shell, where a read-only
+/// turn then refused it. The native reader is the same one the right-hand viewer
+/// uses, so `read` can answer a document directly. The legacy `.doc`/`.ppt`
+/// entries route to the reader's "re-save as .docx/.pptx" message instead of
+/// ZIP/binary noise.
+const DOCUMENT_EXTENSIONS: [&str; 8] =
+    [".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".xls", ".doc", ".ppt"];
+
+fn is_document_path(abs: &Path) -> bool {
+    abs.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .is_some_and(|e| DOCUMENT_EXTENSIONS.contains(&e.as_str()))
+}
+
 pub(super) fn file_window_upto(
     abs: &Path,
     offset: usize,
     limit: usize,
     budget: Option<usize>,
 ) -> Result<Window, String> {
-    let meta = fs::metadata(abs).map_err(|e| {
+    fs::metadata(abs).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             // A guessed filename returning a bare ENOENT made the model retry
             // blind (traced: 2 rounds on a typo'd/guessed path). Name the
@@ -68,20 +80,62 @@ pub(super) fn file_window_upto(
             format!("file not found: {e}")
         }
     })?;
-    if meta.len() as usize > MAX_READ_BYTES {
-        return Err(format!(
-            "file too large to read in one call ({} bytes > {MAX_READ_BYTES}); use offset/limit windows",
-            meta.len()
-        ));
+    let start = offset.saturating_sub(1);
+    // NO file-size refusal: the window is streamed from disk, and collection
+    // stops once the block can no longer fit the result budget (the renderer
+    // then states the exact resume offset) while the scan continues only to
+    // count lines. A multi-GB log or a 500-page PDF is therefore readable in
+    // windows instead of being refused with "too large in one call".
+    let mut lines: Vec<String> = Vec::new();
+    let mut chars = 0usize;
+    let mut lossy = false;
+    let mut total = 0usize;
+    if is_document_path(abs) {
+        // A document is bounded by its EXTRACTED text, not its container: the
+        // native reader has no character/page cap, so `offset` continues
+        // straight through a long PDF/DOCX/PPTX.
+        let content = crate::docs::read_document(&abs.to_string_lossy(), "", "", 0)?;
+        for line in content.lines() {
+            total += 1;
+            if total <= start || lines.len() >= limit {
+                continue;
+            }
+            if budget.is_some_and(|cap| !lines.is_empty() && chars >= cap) {
+                continue;
+            }
+            let line = truncated_line(line);
+            chars += line.chars().count();
+            lines.push(line);
+        }
+    } else {
+        let file = fs::File::open(abs)
+            .map_err(|e| format!("cannot read {}: {e}", abs.display()))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            raw.clear();
+            let n = std::io::BufRead::read_until(&mut reader, b'\n', &mut raw)
+                .map_err(|e| format!("cannot read {}: {e}", abs.display()))?;
+            if n == 0 {
+                break;
+            }
+            total += 1;
+            if total <= start || lines.len() >= limit {
+                continue;
+            }
+            if budget.is_some_and(|cap| !lines.is_empty() && chars >= cap) {
+                continue;
+            }
+            if std::str::from_utf8(&raw).is_err() {
+                lossy = true;
+            }
+            let text = String::from_utf8_lossy(&raw);
+            let text = text.trim_end_matches('\n').trim_end_matches('\r');
+            let line = truncated_line(text);
+            chars += line.chars().count();
+            lines.push(line);
+        }
     }
-    let content = read_viewable_text(abs)?;
-    let total = content.lines().count();
-    let mut lines: Vec<String> = content
-        .lines()
-        .skip(offset.saturating_sub(1))
-        .take(limit)
-        .map(truncated_line)
-        .collect();
     if lines.is_empty() {
         // An empty window is never data: say WHY it is empty, otherwise the
         // caller burns another round guessing (a traced run read offset=100000
@@ -95,49 +149,16 @@ pub(super) fn file_window_upto(
             )
         }));
     }
-    // Stretch to EOF when the tail is small enough to ride along for free (see
-    // `file_window_upto`): the model would otherwise spend a whole round trip
-    // asking for exactly these lines.
-    let mut extended = false;
-    if let Some(budget) = budget {
-        let served_to = offset.saturating_sub(1) + lines.len();
-        let rest_count = total.saturating_sub(served_to);
-        if rest_count > 0 && rest_count <= limit {
-            let rest: Vec<String> = content
-                .lines()
-                .skip(served_to)
-                .map(truncated_line)
-                .collect();
-            if rest.len() == rest_count {
-                let asked_cost = numbered_cost(offset.max(1), lines.iter().map(|l| l.len()).sum(), lines.len());
-                let rest_cost = numbered_cost(served_to + 1, rest.iter().map(|l| l.len()).sum(), rest.len());
-                if asked_cost + rest_cost + READ_TRUNCATION_RESERVE <= budget {
-                    lines.extend(rest);
-                    extended = true;
-                }
-            }
-        }
-    }
+    // Reaching EOF is a FACT of the window; whether it is announced as an
+    // "extended" read is the caller's choice (`read_window_block_capped` only
+    // marks default reads, which are the ones that stretch to the budget).
+    let extended = start + lines.len() >= total;
     Ok(Window::Lines {
         lines,
         extended,
         total,
+        lossy,
     })
-}
-
-/// Char cost of rendering `count` numbered lines that begin at line `first` and
-/// carry `sum_len` chars of text in total.
-///
-/// An estimate on purpose: it only decides whether a tail RIDES ALONG, and
-/// `numbered_window_capped` remains the hard bound afterwards — so being a few
-/// chars optimistic never breaks the budget, it just lets a window grow by one
-/// line before the cut.
-pub(super) fn numbered_cost(first: usize, sum_len: usize, count: usize) -> usize {
-    if count == 0 {
-        return 0;
-    }
-    let width = (first + count - 1).to_string().len();
-    sum_len + count * (width + 2) + 40
 }
 
 /// Bare window text (no line numbers) — the shape non-agent callers expect.
@@ -146,8 +167,12 @@ pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, St
         return list_dir(abs, offset, limit);
     }
     match file_window(abs, offset, limit)? {
-        Window::Lines { lines, .. } => {
+        Window::Lines { lines, lossy, .. } => {
             let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+            if lossy {
+                out.push_str(UTF8_VIEW_NOTE);
+                out.push('\n');
+            }
             for line in lines {
                 out.push_str(&line);
                 out.push('\n');
@@ -172,11 +197,15 @@ pub fn read_window_block(abs: &Path, label: &str, offset: usize, limit: usize) -
 /// disprove — so a batch that cannot afford a real window says so instead.
 pub(super) const READ_BLOCK_MIN: usize = 1_200;
 
-/// Default window of a `read` that names no offset/limit. One definition, used
-/// by the dispatch arm AND by the repeat-guard's coverage check, so the two can
-/// never disagree about which lines a call actually asked for.
+/// Default window of a `read` that names no offset/limit: ALL remaining lines.
+/// The result budget is the real bound — `numbered_window_capped_of` cuts at
+/// `MODEL_RESULT_CAP` and states the exact resume offset, so no arbitrary
+/// 400-line ceiling hides the rest of a file the user asked to read.
 pub(crate) const DEFAULT_READ_OFFSET: usize = 1;
-pub(crate) const DEFAULT_READ_LIMIT: usize = 400;
+pub(crate) const DEFAULT_READ_LIMIT: usize = usize::MAX;
+/// Directory listings keep a page: entries are not file content, and a huge
+/// directory read as "content" would be tail-cut with no resume marker.
+pub(crate) const DIR_LIST_LIMIT: usize = 400;
 
 /// The (file, offset, limit) entries a `read` call asks for, with the same
 /// defaults the dispatch arm applies.
@@ -291,7 +320,7 @@ pub(super) fn merge_read_targets(targets: Vec<(String, usize, usize, bool)>) -> 
                 // A union is only stretchable when EVERY window in it was the
                 // default one: a deliberate narrow `limit` must never be widened
                 // behind the model's back.
-                Some(last) if start <= last.1 + GAP => {
+                Some(last) if start <= last.1.saturating_add(GAP) => {
                     last.1 = last.1.max(end);
                     last.2 &= extend;
                 }
@@ -325,16 +354,17 @@ pub fn read_window_block_capped(
     extend_to_eof: bool,
 ) -> Result<String, String> {
     if abs.is_dir() {
-        return read_window(abs, offset, limit);
+        return read_window(abs, offset, limit.min(DIR_LIST_LIMIT));
     }
     // An unbounded call (`usize::MAX` budget) is the programmatic shape other
     // callers rely on: they asked for THAT window, so it is served exactly.
     let budget = Some(budget).filter(|b| *b != usize::MAX);
-    match file_window_upto(abs, offset, limit, budget.filter(|_| extend_to_eof))? {
+    match file_window_upto(abs, offset, limit, budget)? {
         Window::Lines {
             lines,
             extended,
             total,
+            lossy,
         } => {
             let first = offset.max(1);
             let mut out = numbered_window_capped_of(
@@ -344,7 +374,10 @@ pub fn read_window_block_capped(
                 budget.unwrap_or(usize::MAX),
                 total,
             );
-            if extended {
+            if lossy {
+                out = format!("{UTF8_VIEW_NOTE}\n{out}");
+            }
+            if extended && extend_to_eof {
                 // The stretch that saved the follow-up round must be VISIBLE, or
                 // the model cannot tell a short window from the end of the file
                 // and re-reads the tail anyway. The marker is also what the
@@ -748,33 +781,6 @@ pub fn parse_ranges(ranges: &[String], single_target: &str) -> (Vec<(String, usi
 // ---------------------------------------------------------------------------
 // grep
 // ---------------------------------------------------------------------------
-
-/// could otherwise use, and the marker keeps the substitution honest.
-
-/// Read a file for VIEWING: a real I/O cause is named, and invalid UTF-8 is
-/// shown lossily with a marker instead of refused.
-///
-/// Same defect as `read_editable_text`: the old one-liner collapsed EACCES, a
-/// directory, an I/O error and a genuine encoding mismatch into "binary file",
-/// which told the model nothing and cost it a retry round. A read never rewrites
-/// the file, so a lossy view is safe — refusing it threw away content the model
-
-pub(super) fn read_viewable_text(target: &Path) -> Result<String, String> {
-    let bytes = fs::read(target)
-        .map_err(|e| format!("cannot read {}: {e}", target.display()))?;
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(text),
-        Err(e) => {
-            let at = e.utf8_error().valid_up_to();
-            let text = String::from_utf8_lossy(e.as_bytes()).into_owned();
-            Ok(format!(
-                "[note] this file is not valid UTF-8 (first bad byte at offset {at}); the text below \
-                 is shown with invalid sequences replaced. Do not edit it with `edit_file` — its \
-                 bytes would be rewritten; use `run_terminal` for a byte-exact change.\n{text}"
-            ))
-        }
-    }
-}
 
 /// Read a file's current text for an edit, naming the REAL cause when it fails.
 ///

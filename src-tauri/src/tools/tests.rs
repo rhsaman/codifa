@@ -1,121 +1,5 @@
     use super::*;
 
-    /// Absolute path of the sanitized skill-search fixture store
-    /// (`tests/fixtures/skill-store/`): 12 bundles whose descriptions are the
-    /// real store's own text, bodies replaced. The five traced queries and
-    /// their expectations below pin the ranking rules.
-    fn fixture_store() -> String {
-        format!("{}/tests/fixtures/skill-store", env!("CARGO_MANIFEST_DIR"))
-    }
-
-    #[test]
-    fn search_returns_the_test_ui_body_on_the_first_call() {
-        // Traced (`mvyy1qf7`): this query listed Test UI beside three skills
-        // that matched one filler word, and the model spent a SECOND call
-        // naming it. The confident-match rule (IDF + field weights) answers
-        // with the body instead.
-        let out = search_skills(&fixture_store(), "Test UI live browser harness renderer")
-            .unwrap();
-        assert!(out.contains("===== SKILL: Test UI ====="), "{out}");
-    }
-
-    #[test]
-    fn search_sends_a_browser_ask_to_browser_automation() {
-        // "open website in browser instagram": the old contains-count ranked
-        // alpha-cutout first (its description merely mentions a browser).
-        // Field weights put the NAME hit on top, and nothing else is close.
-        let out = search_skills(&fixture_store(), "open website in browser instagram")
-            .unwrap();
-        assert!(out.contains("===== SKILL: Browser Automation ====="), "{out}");
-    }
-
-    #[test]
-    fn search_sends_a_tradingview_question_to_the_datafeed_skill() {
-        // "tradingview charting library AI agent": the old scorer matched
-        // "agent" (a word in half the store) and ranked agent-discussion
-        // first. IDF collapses that word and lifts "tradingview"/"charting".
-        let out = search_skills(&fixture_store(), "tradingview charting library AI agent")
-            .unwrap();
-        assert!(out.contains("===== SKILL: charting-library-datafeed ====="), "{out}");
-    }
-
-    /// The authoring ask must rank skill-creator near the top and NOT let the
-    /// academy-guide keyword soup (skills/plugins/connectors/MCP in one line)
-    /// take the first candidate slot. Answered identically on every repeat.
-    #[test]
-    fn a_plugin_authoring_ask_ranks_the_creator_above_the_keyword_soup() {
-        for q in [
-            "create plugin bundle skills MCP connectors runnable scripts from URL",
-            "plugin create bundle skills scripts mcp connector",
-        ] {
-            for i in 0..3 {
-                let out = search_skills(&fixture_store(), q).unwrap();
-                if out.starts_with("=====") {
-                    // A confident hit IS acceptable — but then it must be the
-                    // creator itself.
-                    assert!(
-                        out.contains("===== SKILL: skill-creator ====="),
-                        "run {i} of {q:?} answered with the wrong skill: {out}"
-                    );
-                    continue;
-                }
-                let creator = out
-                    .lines()
-                    .position(|l| l.contains("skill-creator"))
-                    .unwrap_or_else(|| panic!("run {i} of {q:?} omitted skill-creator: {out}"));
-                assert!(creator <= 3, "run {i} of {q:?}: creator not in top 3: {out}");
-                // The keyword soup (skills/plugins/connectors/MCP in one
-                // description line) must not take the first candidate slot —
-                // whoever does outrank it (the plan only pins "not top 1")
-                // is fine, as long as the creator sits in the top 3.
-                let first_candidate = out.lines().nth(1).unwrap_or_default();
-                assert!(
-                    !first_candidate.contains("academy-guide"),
-                    "run {i} of {q:?}: academy-guide took the top slot: {out}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_bundle_drill_down_lists_its_skills() {
-        // load_skill bundle=<slug>: the catalog cap can leave a whole bundle
-        // unnamed; this is the way in, one `- name: description` per skill.
-        let root = fixture_store();
-        let out = search_skills(&root, "definitely-no-such-word-xyz").unwrap_err();
-        assert!(out.contains("Available:"), "{out}");
-
-        let out = crate::tools::dispatch_with_data_root(
-            &root,
-            "load_skill",
-            &json!({"bundle": "builtin-plugin"}),
-            None,
-            Some(&root),
-        )
-        .unwrap();
-        assert!(out.contains("- Test UI:"), "{out}");
-        assert!(out.contains("- Browser Automation:"), "{out}");
-        assert!(!out.contains("Fixture body"), "a listing must not inline bodies: {out}");
-
-        let err = crate::tools::dispatch_with_data_root(
-            &root,
-            "load_skill",
-            &json!({"bundle": "no-such-bundle"}),
-            None,
-            Some(&root),
-        )
-        .unwrap_err();
-        assert!(err.contains("no skills"), "{err}");
-    }
-
-    #[test]
-    fn stopwords_and_the_store_itself_cannot_be_scored() {
-        // Function words alone must not rank anything, and an empty store
-        // answers with a plain error rather than a panic.
-        let err = search_skills(&fixture_store(), "the a an and or of to in on").unwrap_err();
-        assert!(err.contains("no word to search"), "{err}");
-    }
-
     #[test]
     fn plugin_list_answers_one_line_per_bundle_and_slug_drills_in() {
         // "what plugins exist" used to pay every bundle's whole manifest
@@ -183,28 +67,6 @@
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn load_skill_names_loads_every_body_in_one_call() {
-        // ONE round-trip for the whole skill set: names=[...] resolves each
-        // name/slug and returns every body together; a name that matches
-        // nothing is listed at the end instead of failing the batch.
-        let root = fixture_store();
-        let out = dispatch_with_data_root(
-            &root,
-            "load_skill",
-            &json!({"names": ["Test UI", "browser-automation", "no-such-skill"]}),
-            None,
-            Some(&root),
-        )
-        .unwrap();
-        assert!(out.contains("===== SKILL: Test UI ====="), "{out}");
-        assert!(out.contains("Fixture body for Test UI"), "{out}");
-        assert!(out.contains("===== SKILL: Browser Automation ====="), "{out}");
-        assert!(out.contains("not found: no-such-skill"), "{out}");
-        assert!(out.contains("Available:"), "{out}");
-        // A body is not truncated away by the multi form.
-        assert!(!out.contains("elided"), "{out}");
-    }
 
     #[test]
     fn batch_runs_every_op_in_order_with_full_results() {
@@ -302,6 +164,7 @@
             &json!({
                 "action": "create",
                 "name": "Bare Bundle",
+                "description": "A bundle with a single skill",
                 "skills": [{"name": "Bare Skill", "content": "BODY"}]
             }),
             None,
@@ -956,6 +819,105 @@
     }
 
     #[test]
+    fn a_multi_megabyte_text_file_reads_in_windows_instead_of_refusing() {
+        // A 2 MB byte gate refused `read` on exactly the files the user wanted
+        // read (a log, a dump, a big export) and named no way through. The
+        // window is streamed from disk now: the first call serves up to the
+        // result budget and states the exact resume offset, so successive calls
+        // reach the whole file.
+        let dir = std::env::temp_dir().join(format!("codifa-readhuge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.log");
+        let body: String = (1..=70_000)
+            .map(|i| format!("line {i:06}: the payload for this row\n"))
+            .collect();
+        fs::write(&path, &body).unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().len() > MAX_READ_BYTES as u64,
+            "fixture must exceed the old 2 MB refusal"
+        );
+
+        let root = dir.to_str().unwrap().to_string();
+        let first = dispatch(&root, "read", &json!({"filePath": "big.log"}), None).unwrap();
+        assert!(!first.contains("too large"), "{first}");
+        assert!(
+            first.contains("of 70000"),
+            "the header must state the real length: {first}"
+        );
+        assert!(first.contains("line 000001:"), "{first}");
+        // The WINDOW obeys the result budget. A large file's one-per-turn
+        // outline rides AFTER the window, so it is not part of this bound.
+        let window = first.split(READ_OUTLINE_MARK).next().unwrap_or(&first);
+        assert!(
+            window.chars().count() <= crate::agent::MODEL_RESULT_CAP,
+            "the block must stay inside the result cap: {} chars",
+            window.chars().count()
+        );
+        let rest = first
+            .split_once("Read the rest with offset=")
+            .expect("a cut window names its resume offset")
+            .1;
+        let resume: usize = rest
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|d| d.parse().ok())
+            .expect("resume offset is a number");
+        assert!(resume > 1, "{first}");
+
+        // The named offset continues exactly at the cut — the whole file is
+        // reachable call by call, nothing hides behind a "too large" gate.
+        let second = dispatch(
+            &root,
+            "read",
+            &json!({"filePath": "big.log", "offset": resume, "limit": 3}),
+            None,
+        )
+        .unwrap();
+        assert!(
+            second.contains(&format!("line {resume:06}:")),
+            "offset {resume} must resume at that line: {second}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pptx_read_returns_slide_text_not_zip_bytes() {
+        // `.pptx` is a ZIP: reading its bytes as text returned binary noise,
+        // which pushed the model into shell unzip tricks that a read-only turn
+        // refuses. `read` now dispatches to the native slide reader.
+        let dir = std::env::temp_dir().join(format!("codifa-readpptx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deck.pptx");
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (n, text) in [(1, "Quarterly numbers"), (2, "Next steps")] {
+            zip.start_file(
+                format!("ppt/slides/slide{n}.xml"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            let xml = format!(
+                r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p><a:p><a:r><a:t>bullet</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            );
+            std::io::Write::write_all(&mut zip, xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let root = dir.to_str().unwrap().to_string();
+        let out = dispatch(&root, "read", &json!({"filePath": "deck.pptx"}), None).unwrap();
+        assert!(out.contains("PPTX: 2 slide(s)"), "{out}");
+        assert!(
+            out.contains("Quarterly numbers") && out.contains("Next steps"),
+            "both slides' text must be present: {out}"
+        );
+        assert!(!out.contains("PK\u{3}\u{4}"), "raw zip bytes leaked: {out}");
+        assert!(!out.contains('\u{FFFD}'), "binary noise leaked: {out}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn overlapping_windows_of_one_file_merge_into_their_union() {
         // Traced on the real corpus: 42 batches carried overlapping windows of
         // the SAME file (6_928 lines ~ 381K chars delivered twice inside one
@@ -1234,6 +1196,35 @@
             assert!(!plain.contains("1: "), "{plain}");
 
             let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_docx_read_returns_extracted_text_not_zip_bytes() {
+        // MEASURED (mw94lr47): a read-only turn could not read a `.docx` at
+        // all — its bytes are a ZIP, so the model fell back to
+        // `unzip -p … | sed …`, and the write gate refused that over a `>`
+        // inside the sed regex. `read` now extracts the document text with the
+        // same native reader the right-hand viewer uses.
+        let dir = std::env::temp_dir().join(format!("codifa-docx-read-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let docx = dir.join("report.docx");
+        let file = fs::File::create(&docx).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("word/document.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Quarterly report</w:t></w:r></w:p><w:p><w:r><w:t>Revenue grew 12%</w:t></w:r></w:p></w:body></w:document>"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let block = read_window_block(&docx, "report.docx", 1, 20).unwrap();
+        assert!(block.contains("Quarterly report"), "{block}");
+        assert!(block.contains("Revenue grew 12%"), "{block}");
+        assert!(!block.contains("PK\u{3}"), "raw zip bytes leaked: {block}");
+        let _ = fs::remove_dir_all(&dir);
         }
 
         #[test]

@@ -13,6 +13,39 @@ import { markVimRegion, paneOwner } from './panePointer'
 import { flashPaneFocus } from './paneFlash'
 import type { AppPane } from './paneCycle'
 
+/** The bottom terminal's host element — its shell tab strip lives inside it. */
+const BOTTOM_TERMINAL = '.terminal-panel'
+/** A terminal tab open in the RIGHT pane — its own strip, inside the viewer. */
+const PANE_TERMINAL = '.terminal-tab-panel'
+
+/** Which terminal STRIP the tab chord must step while the caret is in a
+ *  terminal — `null` when the caret is not in one.
+ *
+ *  The two hosts are NOT interchangeable, even though `activePane()` reports
+ *  'terminal' for both: the bottom panel has its own shells and its own strip,
+ *  while a right-pane terminal tab shares the VIEWER's strip with the files
+ *  around it. Sending both to `coder:cycle-terminal` is exactly the bug where
+ *  typing in the right-pane terminal changed the BOTTOM panel's shells instead
+ *  of the terminal tabs the user was looking at. Order matters:
+ *
+ *   - an idle caret (`<body>`, the stale WebKit focus) falls back to the last
+ *     pointer intent, so a press on either host still reads as that host;
+ *   - `activePane()`'s 'terminal' verdict, used when neither reads as one, is
+ *     the pane terminal unless the bottom host is the one on screen and
+ *     carrying the caret.
+ *
+ *  Pure DOM reads, no store, so a unit test can fake the caret. */
+export function terminalTabHost(): 'bottom' | 'pane' | null {
+  if (typeof document === 'undefined') return null
+  const el = document.activeElement as HTMLElement | null
+  const idle = !el || el === document.body || el === document.documentElement
+  const host = idle ? paneOwner() : el
+  if (host?.closest?.(PANE_TERMINAL)) return 'pane'
+  if (host?.closest?.(BOTTOM_TERMINAL)) return 'bottom'
+  if (activePane() !== 'terminal') return null
+  return 'pane'
+}
+
 /**
  * Focus the sidebar's search box, falling back to the sidebar itself. The box
  * is the natural landing spot but is not always mounted (a narrow window hides
@@ -59,7 +92,7 @@ export function activePane(): AppPane {
     if (!vt.paneOpen) return 'chat'
     const kind = vt.activeId?.split(':')[0]
     if (kind === 'terminal') return 'terminal'
-    return kind && kind !== 'files' ? 'viewer' : 'chat'
+    return kind ? 'viewer' : 'chat'
   }
   if (el.closest('.sidebar')) return 'sidebar'
   // Two hosts run a pty: the bottom panel and a right-pane terminal TAB.
@@ -84,6 +117,11 @@ export function focusAppPane(pane: AppPane, opts?: { ring?: boolean }): void {
   if (typeof document === 'undefined') return
   const ring = opts?.ring === true
   if (pane === 'terminal') {
+    // Ctrl+X J is "put the caret in the bottom terminal", NOT a reveal to
+    // watch: if the panel is already open we just refocus the live xterm, and
+    // if it is closed we open it and land the caret at once. Either way the
+    // caller gets the caret back, never a toggle that closes the panel.
+    const alreadyOpen = useStore.getState().terminalPanelOpen
     useStore.getState().setTerminalPanelOpen(true)
     // Flash the BOTTOM panel once it mounts. The commit can land a frame or
     // two after `setTerminalPanelOpen` (concurrent rendering), so probe
@@ -97,7 +135,9 @@ export function focusAppPane(pane: AppPane, opts?: { ring?: boolean }): void {
       }
       requestAnimationFrame(ringWhenMounted)
     }
-    window.dispatchEvent(new CustomEvent('coder:focus-terminal'))
+    window.dispatchEvent(
+      new CustomEvent('coder:focus-terminal', { detail: { instant: !alreadyOpen } }),
+    )
     return
   }
   if (pane === 'viewer') {
@@ -178,6 +218,23 @@ export function focusAppPane(pane: AppPane, opts?: { ring?: boolean }): void {
   }
   const chatId = useStore.getState().activeChatId
   if (chatId) focusChatInput(chatId)
+  // A chat with NO composer on screen (a window that is still mounting, a chat
+  // column in an empty state) used to leave the caret exactly where it was —
+  // inside the terminal we were asked to LEAVE. Since Ctrl+X K exists only to
+  // get out of the shell, the fallback must actually move the caret: drop it
+  // from the terminal onto the chat column, then onto <body> if there is not
+  // even a column yet. Without this, "leave the terminal" kept the next keys
+  // going to the pty.
+  if (!document.activeElement?.closest?.('.composer-input, [data-chat-window], .chat-group')) {
+    const chatHost =
+      document.querySelector<HTMLElement>('.chat-group, [data-chat-window]') ||
+      document.body
+    if (chatHost === document.body) (document.activeElement as HTMLElement | null)?.blur?.()
+    else {
+      if (!chatHost.hasAttribute('tabindex')) chatHost.setAttribute('tabindex', '-1')
+      chatHost.focus({ preventScroll: true })
+    }
+  }
   // The window wrap (`.chat-window`) rings, not the composer: the ring must
   // show "this chat is active", and wrap the transcript too.
   if (ring && chatId) {

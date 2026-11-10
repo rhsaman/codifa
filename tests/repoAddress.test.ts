@@ -52,9 +52,18 @@ console.log('4) the composer routes a bare plugin name to create, not install:')
   // standalone `/skill` and `/mcp` commands were removed, so the same trap can
   // no longer exist there.
   const src = readFileSync('src/components/Chat.tsx', 'utf8')
+  const branch = src.slice(
+    src.indexOf('if (sub === "install" && arg) {'),
+    src.indexOf('if (sub === "update" && arg) {'),
+  )
   check(
     'the plugin install branch consults the heuristic',
-    /if \(sub === "install" && arg\) \{[\s\S]{0,700}?if \(!looksLikeRepoAddress\(arg\)\)/.test(src),
+    branch.includes('looksLikeRepoAddress(arg)'),
+  )
+  check(
+    'a scoped plugin@marketplace is resolved BEFORE the create fallback',
+    branch.indexOf('parsePluginInstallSpec(arg)') !== -1 &&
+      branch.indexOf('parsePluginInstallSpec(arg)') < branch.indexOf('looksLikeRepoAddress(arg)'),
   )
   check(
     'a bare name sends a CREATE prompt instead of a doomed install',

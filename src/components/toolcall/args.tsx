@@ -40,6 +40,7 @@ export function fmtArgValue(v: unknown): string {
  *  name). Scoped per tool so e.g. `create_skill` keeps showing its `name`. */
 export const REDUNDANT_ARG_KEYS: Record<string, Set<string>> = {
   load_skill: new Set(["name", "file", "query"]),
+  load_plugin: new Set(["slug", "skill", "file", "query"]),
 };
 
 /** Remaining args rendered as clean `key: value` chips inside the card head —
@@ -101,11 +102,20 @@ export function argsTextFor(activity: ToolActivity): string {
     .join("\n");
 }
 
-/** One-line row detail: the skill name for `load_skill` (its backend summary is
+/** One-line row detail: the plugin/skill a load names (its backend summary is
  *  only the tool name, which the label already shows), else the backend
  *  summary, else whatever the args say. */
 export function rowDetail(activity: ToolActivity): string {
-  if (canonicalTool(activity.tool) === "load_skill") {
+  const tool = canonicalTool(activity.tool);
+  if (tool === "load_plugin") {
+    const what = [activity.args?.slug, activity.args?.skill]
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+      .join(" / ");
+    if (what) return shortArg(what, 60);
+    const q = String(activity.args?.query ?? "");
+    return q ? shortArg(q, 48) : "";
+  }
+  if (tool === "load_skill") {
     const name = String(activity.args?.name ?? activity.args?.file ?? "");
     if (name) return shortArg(name, 60);
   }

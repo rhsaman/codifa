@@ -1,8 +1,8 @@
 //! Native model-catalog endpoint: `GET /models`.
 //!
-//! Ported from `backend/providers.py::list_models`. The renderer needs five
+//! Ported from `backend/providers.py::list_models`. The renderer needs six
 //! things per model — `id`, `context`, `pricing`, `reasoning`,
-//! `thinking_levels` — and the two
+//! `thinking_levels`, `vision` — and the two
 //! authoritative sources are the provider's own `/models` payload and the
 //! community-maintained models.dev catalog (used to fill the gaps, and as the
 //! PRIMARY source for gateways that under-report their context window).
@@ -407,6 +407,56 @@ fn entry_reasoning(entry: &Value) -> Option<bool> {
     )
 }
 
+/// Whether a model accepts image input, from one `/models` entry.
+///
+/// `None` means the payload is SILENT — "unknown" must stay distinct from
+/// "text-only", because routing images away from a vision-capable model costs a
+/// description call on every capture. Accepted shapes, in order:
+///
+///   * OpenRouter: `architecture.input_modalities: ["text", "image"]`
+///   * models.dev / generic: `modalities.input: ["text", "image"]`
+///   * flat provider payloads: `input_modalities: [...]`
+///   * explicit flags: `supports_vision`, `supports_image_input`, `vision`
+///
+/// A `modality` string (`"text+image->text"`) is the older OpenRouter shape and
+/// is read for `image` too.
+fn entry_vision(entry: &Value) -> Option<bool> {
+    let modalities = |value: Option<&Value>| -> Option<bool> {
+        let list = value?.as_array()?;
+        Some(list.iter().any(|m| {
+            m.as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("image") || s.starts_with("image/"))
+        }))
+    };
+    if let Some(v) = modalities(entry.get("architecture").and_then(|a| a.get("input_modalities"))) {
+        return Some(v);
+    }
+    if let Some(v) = modalities(entry.get("modalities").and_then(|m| m.get("input"))) {
+        return Some(v);
+    }
+    if let Some(v) = modalities(entry.get("input_modalities")) {
+        return Some(v);
+    }
+    if let Some(v) = modalities(
+        entry
+            .get("capabilities")
+            .and_then(|c| c.get("input_modalities")),
+    ) {
+        return Some(v);
+    }
+    if let Some(modality) = entry
+        .get("architecture")
+        .and_then(|a| a.get("modality"))
+        .and_then(Value::as_str)
+    {
+        return Some(modality.to_ascii_lowercase().contains("image"));
+    }
+    first_bool(
+        entry,
+        &["supports_vision", "supports_image_input", "vision"],
+    )
+}
+
 // ---------- per-model thinking LEVELS ----------
 
 /// Canonical UI thinking levels, lowest → highest (mirrors `ThinkingLevel` in
@@ -749,6 +799,14 @@ fn models_dev_reasoning(catalog: &Value, keys: &[String], model_id: &str) -> Opt
         .and_then(Value::as_bool)
 }
 
+/// models.dev's `modalities.input` describes image support for models whose
+/// gateway payload is silent (Gemini, Claude, most router catalogs).
+fn models_dev_vision(catalog: &Value, keys: &[String], model_id: &str) -> Option<bool> {
+    let entry = models_dev_entry(catalog, keys, model_id)?;
+    entry_vision(&entry)
+}
+
+
 /// models.dev's `cost.*` is already USD per million tokens (no conversion).
 fn models_dev_pricing(catalog: &Value, keys: &[String], model_id: &str) -> Option<Value> {
     let entry = models_dev_entry(catalog, keys, model_id)?;
@@ -828,6 +886,9 @@ struct Row {
     /// the model (the composer keeps its full list), `[]` when it has no
     /// thinking mode at all, otherwise the exact levels to offer.
     thinking_levels: Option<Vec<String>>,
+    /// Image-input capability: `null` means no source described the model (the
+    /// turn may still send images), `false` routes captures to the Vision slot.
+    vision: Option<bool>,
 }
 
 impl Row {
@@ -839,6 +900,7 @@ impl Row {
             "pricing": self.pricing,
             "reasoning": self.reasoning,
             "thinking_levels": self.thinking_levels,
+            "vision": self.vision,
         })
     }
 }
@@ -891,6 +953,11 @@ fn apply_models_dev(row: &mut Row, catalog: &Value, provider: &str, base_url: &s
     }
     if row.thinking_levels.is_none() {
         row.thinking_levels = models_dev_thinking_levels(catalog, &dev_keys, &dev_id, provider);
+    }
+    // Image input is a gap-fill: a gateway that reports its own modalities is
+    // authoritative; the catalog covers the silent ones (Gemini/Claude/etc.).
+    if row.vision.is_none() {
+        row.vision = models_dev_vision(catalog, &dev_keys, &dev_id);
     }
 }
 
@@ -1069,6 +1136,7 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
                 pricing: None,
                 reasoning: None,
                 thinking_levels: None,
+                vision: None,
             });
         }
     } else {
@@ -1090,6 +1158,7 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
                 pricing: entry_pricing(entry),
                 reasoning: entry_reasoning(entry),
                 thinking_levels: entry_thinking_levels(entry, &provider),
+                vision: entry_vision(entry),
             });
         }
         // Capacity rule for the context window: **models.dev → the provider's

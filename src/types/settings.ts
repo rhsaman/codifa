@@ -1,7 +1,7 @@
 import type { Chat } from './chat.ts'
 import type { MarketplaceSource } from './market.ts'
 import type { McpServerConfig, SearchConsoleConfig, SearchPluginConfig } from './mcp.ts'
-import type { AgentModeDef, MediaFallback, ProviderConfig, RecentModel, SttFallback, ThinkingLevel, ToolFallback, TtsFallback } from './providers.ts'
+import type { AgentModeDef, CustomSubagent, MediaFallback, ProviderConfig, RecentModel, SttFallback, ThinkingLevel, ToolFallback, TtsFallback } from './providers.ts'
 
 
 export interface Settings {
@@ -123,6 +123,10 @@ export interface Settings {
    *  the tool's own model, and a fallback never overrides the tool's reasoning
    *  level. */
   toolFallbacks?: Record<string, ToolFallback[]>
+  /** User-created sub-agents (Settings → Sub-agents). Advertised to the model as
+   *  delegation tools alongside plugin agents; every one of them runs on the
+   *  same Settings → Tools → "Sub-agent" model row. */
+  customSubagents?: CustomSubagent[]
   /** Single auto-compaction threshold as a percentage of the RAW context window.
    *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`.
    *  The reserved headroom is implicit: `(100 - compactAtPercent)%` of the window

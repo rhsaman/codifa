@@ -55,6 +55,83 @@
     }
 
     #[test]
+    fn vision_reads_openrouter_and_models_dev_shapes() {
+        // OpenRouter's live payload.
+        let openrouter = json!({
+            "architecture": { "input_modalities": ["text", "image"] }
+        });
+        assert_eq!(entry_vision(&openrouter), Some(true));
+        // The same model without image input is explicitly text-only.
+        let text_only = json!({
+            "architecture": { "input_modalities": ["text"] }
+        });
+        assert_eq!(entry_vision(&text_only), Some(false));
+        // models.dev's catalog shape.
+        let dev = json!({ "modalities": { "input": ["text", "image", "pdf"] } });
+        assert_eq!(entry_vision(&dev), Some(true));
+        // Old OpenRouter modality string.
+        let legacy = json!({ "architecture": { "modality": "text+image->text" } });
+        assert_eq!(entry_vision(&legacy), Some(true));
+        // A silent payload is UNKNOWN, not text-only.
+        assert_eq!(entry_vision(&json!({ "id": "mystery" })), None);
+        // Explicit boolean flags.
+        assert_eq!(entry_vision(&json!({ "supports_vision": true })), Some(true));
+        assert_eq!(entry_vision(&json!({ "vision": false })), Some(false));
+    }
+
+    #[test]
+    fn models_dev_vision_fills_a_silent_provider_payload() {
+        let catalog = json!({
+            "openrouter": {
+                "models": {
+                    "nvidia/nemotron-3-super-120b-a12b": {
+                        "modalities": { "input": ["text"], "output": ["text"] }
+                    },
+                    "google/gemini-3.6-flash": {
+                        "modalities": { "input": ["text", "image"], "output": ["text"] }
+                    }
+                }
+            }
+        });
+        let mut text_only = Row {
+            id: "nvidia/nemotron-3-super-120b-a12b".into(),
+            context: None,
+            max_output: None,
+            pricing: None,
+            reasoning: None,
+            thinking_levels: None,
+            vision: None,
+        };
+        apply_models_dev(&mut text_only, &catalog, "openrouter", "");
+        assert_eq!(text_only.vision, Some(false));
+
+        let mut vision = Row {
+            id: "google/gemini-3.6-flash".into(),
+            context: None,
+            max_output: None,
+            pricing: None,
+            reasoning: None,
+            thinking_levels: None,
+            vision: None,
+        };
+        apply_models_dev(&mut vision, &catalog, "openrouter", "");
+        assert_eq!(vision.vision, Some(true));
+
+        // A provider that already said `true` is never downgraded by the gap-fill.
+        let mut provider_wins = Row {
+            id: "nvidia/nemotron-3-super-120b-a12b".into(),
+            context: None,
+            max_output: None,
+            pricing: None,
+            reasoning: None,
+            thinking_levels: None,
+            vision: Some(true),
+        };
+        apply_models_dev(&mut provider_wins, &catalog, "openrouter", "");
+        assert_eq!(provider_wins.vision, Some(true));
+    }
+
+    #[test]
     fn multi_vendor_detection_counts_prefixes() {
         let rows = vec![
             row("nvidia/llama"),
@@ -156,6 +233,7 @@
             pricing: None,
             reasoning: None,
             thinking_levels: None,
+            vision: None,
         };
         apply_models_dev(&mut provider_says_4k, &catalog, "openai", "");
         assert_eq!(
@@ -174,6 +252,7 @@
             pricing: None,
             reasoning: None,
             thinking_levels: None,
+            vision: None,
         };
         apply_models_dev(&mut provider_says_nothing, &catalog, "openai", "");
         assert_eq!(provider_says_nothing.context, Some(128_000));
@@ -187,6 +266,7 @@
             pricing: None,
             reasoning: None,
             thinking_levels: None,
+            vision: None,
         };
         apply_models_dev(&mut unknown_to_catalog, &catalog, "openai", "");
         assert_eq!(
@@ -213,6 +293,7 @@
             pricing: None,
             reasoning: None,
             thinking_levels: None,
+            vision: None,
         };
         apply_models_dev(&mut row, &catalog, "nvidia", "https://integrate.api.nvidia.com/v1");
         assert_eq!(

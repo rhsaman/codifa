@@ -3,7 +3,10 @@
 //! A plugin ships `agents/<name>.md` with YAML frontmatter (`name`,
 //! `description`, `tools`) plus the prompt body. Codifa renders each one as a
 //! delegable sub-agent: the prompt body becomes the sub-agent's system prompt
-//! and `tools` narrows what it may call.
+//! and `tools` is the exact set it may call — `Bash`/`Edit`/`Write` included
+//! (canonicalized to Codifa's `run_terminal`/`edit_file`/`write_file`). The
+//! owning plugin rides along, so the bundle's skills and connectors are active
+//! for its agent.
 //!
 //! The MODEL is deliberately NOT taken from the file. Every plugin sub-agent
 //! runs on the same slot the built-in `explore` agent uses — the "Explore" row of
@@ -17,6 +20,26 @@ use serde_json::{json, Value};
 
 /// Folder inside a plugin holding its sub-agent profiles.
 pub(crate) const AGENTS: &str = "agents";
+
+/// Stable tool-name slug of a sub-agent profile name.
+///
+/// The delegation tool is `agent__<slug>`, so this is the ONE spelling both the
+/// schema builder and the dispatcher must agree on: a profile named
+/// "Code Reviewer" is advertised as `agent__code_reviewer`, and resolving that
+/// call must find the same profile. Lowercase, ASCII alphanumerics/`_`/`-` kept,
+/// whitespace becomes `_`, everything else is dropped.
+pub(crate) fn agent_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c.to_ascii_lowercase());
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
+    }
+    out
+}
+
 /// Cap on the sub-agents one bundle may ship, so a runaway repo cannot flood the
 /// tool list the main agent sees on every round.
 pub(crate) const MAX_AGENTS: usize = 16;
@@ -152,11 +175,19 @@ pub fn read_agents(plugin_dir: &Path) -> Vec<Value> {
 }
 
 /// One profile by name (case-insensitive), from a plugin folder.
+///
+/// The caller passes the SLUG the model called (`agent__<slug>` → `<slug>`), so
+/// matching uses the same [`agent_slug`] the schema was built from — a profile
+/// named "Code Reviewer" resolves from `code_reviewer`. Exact name matching
+/// stays as a fallback for non-ASCII names, whose slug is empty.
 pub fn find_agent(plugin_dir: &Path, name: &str) -> Option<Value> {
     let want = name.trim().to_lowercase();
-    read_agents(plugin_dir)
-        .into_iter()
-        .find(|row| row["name"].as_str().unwrap_or("").to_lowercase() == want)
+    let want_slug = agent_slug(name);
+    read_agents(plugin_dir).into_iter().find(|row| {
+        let row_name = row["name"].as_str().unwrap_or("");
+        row_name.to_lowercase() == want
+            || (!want_slug.is_empty() && agent_slug(row_name) == want_slug)
+    })
 }
 
 #[cfg(test)]

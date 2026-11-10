@@ -20,6 +20,7 @@ import {
   resetAvailableSkillsCacheForTest,
   setAvailableSkillsFetcher,
   pluginCommands,
+  mentionCatalog,
   type SkillMention,
 } from '../src/lib/skills.ts'
 import type { SkillRow } from '../src/lib/api.ts'
@@ -116,6 +117,41 @@ console.log('5) کامند پلاگین (<plugin> <skill>) و کش دومی:')
   invalidateAvailableSkills()
   await new Promise((r) => setTimeout(r, 10))
   check('بعد از خاموش‌کردن پلاگین کامندی نمی‌ماند', pluginCommands(getAvailableSkills()).length === 0, getAvailableSkills())
+}
+
+console.log('6) منشن فقط از کاتالوگ کامل می‌خواند (نه لیست تنظیمات):')
+{
+  resetSkillsCacheForTest()
+  resetAvailableSkillsCacheForTest()
+  backendList = [{ name: 'Store Only', slug: 'store-only' }]
+  availableList = [
+    {
+      name: 'Ponytail',
+      slug: 'ponytail',
+      description: 'lazy senior dev',
+      plugin: 'Ponytail',
+      plugin_slug: 'ponytail',
+    },
+  ]
+  check('کاتالوگ منشن ابتدا خالی است', mentionCatalog().length === 0, mentionCatalog())
+
+  // The Settings list must NOT populate the mention source: it is deliberately
+  // narrower and used to make a typed @mention stay unmatched.
+  await ensureSkillsList()
+  check(
+    'لیست تنظیمات به کاتالوگ منشن نشت نمی‌کند',
+    mentionCatalog().length === 0,
+    mentionCatalog(),
+  )
+
+  const rows = await ensureAvailableSkills()
+  check('کاتالوگ کامل منبع منشن است', mentionCatalog().length === rows.length, mentionCatalog())
+  const { skills } = extractMentionSkills('@ponytail را بررسی کن', mentionCatalog())
+  check(
+    'منشن اسکیل پلاگین با کاتالوگ کامل کار می‌کند',
+    skills.length === 1 && skills[0] === 'Ponytail',
+    skills,
+  )
 }
 
 if (failed > 0) {

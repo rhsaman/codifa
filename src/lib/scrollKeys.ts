@@ -69,6 +69,29 @@ export function canScrollFrom(
   return owner.contains(el) || focusIsIdle
 }
 
+/** Half a viewport — Neovim's Ctrl+D / Ctrl+U. Rounded so a 1px offset does
+ *  not make the step depend on a scrollbar's fractional height. */
+export function halfPageDelta(
+  dir: 'down' | 'up',
+  viewportHeight: number,
+): ScrollDelta {
+  const step = Math.max(1, Math.round(Math.abs(viewportHeight) / 2))
+  return { dx: 0, dy: dir === 'down' ? step : -step }
+}
+
+/** `gg` (top) / `G` (bottom): the delta that pins the viewport to an edge.
+ *  Pure so the math is testable without a DOM. */
+export function edgeDelta(
+  edge: 'top' | 'bottom',
+  view: { scrollTop: number; scrollHeight: number; clientHeight: number },
+): ScrollDelta {
+  if (edge === 'top') return { dx: 0, dy: -Math.max(0, view.scrollTop) }
+  return {
+    dx: 0,
+    dy: Math.max(0, view.scrollHeight - view.clientHeight - Math.max(0, view.scrollTop)),
+  }
+}
+
 /**
  * Smooth-scroll tuning: each animation frame covers this fraction of the
  * remaining distance (ease-out glide), and the glide snaps onto its target

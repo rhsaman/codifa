@@ -1,7 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useStore } from "../lib/store";
-import { useViewerTabs, viewerTabTitle } from "../lib/viewerTabs";
+import { useViewerScope, useViewerTabs, viewerTabTitle, visibleViewerTree } from "../lib/viewerTabs";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
 import { buildFromList, collectChatIds, findNodeById, flexWeights, leafCount } from "../lib/chatTree";
 import { SchedulePage, TodosPage } from "./ViewerPages";
@@ -35,7 +35,6 @@ const ArtifactsPanel = lazy(() =>
 const ArtifactPanel = lazy(() =>
   import("./ArtifactPanel").then((m) => ({ default: m.ArtifactPanel })),
 );
-const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
 const ExplorePanel = lazy(() =>
   import("./ExplorePanel").then((m) => ({ default: m.ExplorePanel })),
 );
@@ -158,9 +157,6 @@ function ViewerLeafBody({ tabId }: { tabId: string }) {
         initialUrl={tab.browserUrl ?? ""}
       />
     );
-  }
-  if (tab.kind === "files") {
-    return <FilesPanel key={tab.id} chatId={tab.chatId} />;
   }
   // Explore was missing from this dispatcher: a split pane holding an explore
   // tab used to fall through to the schedule inbox. Same panel, this leaf's tab.
@@ -433,6 +429,12 @@ export function ViewerWindows() {
   const focusedId = useViewerTabs((s) => s.focusedViewerId);
   const activeId = useViewerTabs((s) => s.activeId);
   const tabs = useViewerTabs((s) => s.tabs);
+  // The split tree is ONE global layout, but every leaf is a tab and tabs are
+  // scoped: chat A's Plan/Artifact/Browser pane must not keep painting after a
+  // switch to chat B. Render only the leaves visible in the focused scope; the
+  // stored tree keeps the hidden ones so switching back restores the layout.
+  const scope = useViewerScope();
+  const scopedTree = visibleViewerTree(tree, tabs, scope);
   const [dragId, setDragId] = useState<string | null>(null);
   const [drop, setDrop] = useState<DropMark>(null);
   const stackRef = useRef<HTMLDivElement>(null);
@@ -509,9 +511,18 @@ export function ViewerWindows() {
     [],
   );
 
-  const leaves = tree ? leafCount(tree) : 0;
+  // Leaves the panes paint in THIS scope. A hidden leaf is not a pane: when
+  // only one survives (or none), the classic single-tab body takes over.
+  const paneIds = scopedTree ? collectChatIds(scopedTree) : [];
+  const leaves = paneIds.length;
+  const scopedFocusedId =
+    focusedId && paneIds.includes(focusedId)
+      ? focusedId
+      : activeId && paneIds.includes(activeId)
+        ? activeId
+        : null;
   // Single pane (or no tree yet): classic behavior with chat filtering.
-  if (!tree || leaves <= 1) {
+  if (!scopedTree || leaves <= 1) {
     return <ViewerContent />;
   }
 
@@ -524,7 +535,7 @@ export function ViewerWindows() {
 
   return (
     <div ref={stackRef} className="viewer-windows multi tree" data-testid="viewer-windows">
-      <ViewerSplitView node={tree} focusedId={focusedId ?? activeId} multi drag={drag} startResize={startResize} />
+      <ViewerSplitView node={scopedTree} focusedId={scopedFocusedId} multi drag={drag} startResize={startResize} />
     </div>
   );
 }

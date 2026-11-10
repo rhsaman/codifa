@@ -133,7 +133,11 @@ console.log('3) a terminal tab is NEVER persisted (a pty cannot be restored):')
   vt().openTerminal({ chatId: 'c1', cwd: '/w' })
   const raw = memStore.get('coder:viewerTabs') ?? ''
   check('something was persisted (the file tab)', raw.includes('a.ts'), raw.slice(0, 200))
-  check('the terminal tab is not in storage', !raw.includes('terminal'), raw.slice(0, 400))
+  // Terminals DO persist now (they used to be EPHEMERAL and vanished on
+  // restart). The tab keeps cwd/shell so it can reopen; the pty id is not the
+  // tab id, so nothing live is stored.
+  check('the terminal tab IS in storage (survives a restart)', raw.includes('terminal'), raw.slice(0, 400))
+  check('its cwd is kept so it reopens in place', raw.includes('/w'), raw.slice(0, 400))
 }
 
 console.log('4) the rail can tell two terminal tabs apart:')

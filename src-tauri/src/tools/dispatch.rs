@@ -197,9 +197,10 @@ into one union — those lines are all above; do NOT re-read them]"
                 );
             }
             let offset = args["offset"].as_u64().unwrap_or(DEFAULT_READ_OFFSET as u64) as usize;
-            // Windowed-read discipline: a whole-file read floods the context
-            // and slows the agent down. Cap the default window; larger reads
-            // must be explicit (offset/limit).
+            // The default window is "as much as the result budget allows" — the
+            // block renderer cuts at `MODEL_RESULT_CAP` and names the exact
+            // resume offset, so a whole-file ask is never silently truncated by
+            // an arbitrary 400-line ceiling.
             let limit = args["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
             let abs = resolve_safe(root, &path, true, permit)?;
             // A read of a file that is not there is the classic detour into a
@@ -697,7 +698,7 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 // was one read away. Answer it here instead, and name the one
                 // call that DOES outline a file so the next round is exact.
                 Ok(abs) if abs.is_dir() => {
-                    let listing = list_dir(&abs, DEFAULT_READ_OFFSET, DEFAULT_READ_LIMIT)?;
+                    let listing = list_dir(&abs, DEFAULT_READ_OFFSET, DIR_LIST_LIMIT)?;
                     let files: Vec<&str> = listing
                         .lines()
                         .filter(|e| !e.ends_with('/') && !e.starts_with('('))
@@ -752,134 +753,59 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 Ok(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
             }
         }
-        // Create or update a skill from a command (the Codex/Claude
-        // `create_skill` flow).
-        "create_skill" => {
-            // A repo is an alternative SOURCE for the whole skill: read it first,
-            // then hand it to `sync_skill` exactly like a model-written body, so
-            // the frontmatter, slug and extra-file rules stay in one place
-            // (the same trick `plugins::apply_parts` uses).
-            let repo_spec = args["repo"].as_str().unwrap_or("").trim().to_string();
-            let from_repo = if repo_spec.is_empty() {
-                None
-            } else {
-                Some(crate::repo::read_skill(
-                    &repo_spec,
-                    args["repo_path"].as_str().unwrap_or(""),
-                    args["repo_ref"].as_str().unwrap_or(""),
-                    &s("name"),
-                )?)
-            };
-            let name = if !s("name").trim().is_empty() {
-                s("name")
-            } else {
-                from_repo
-                    .as_ref()
-                    .and_then(|r| r["name"].as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            if name.trim().is_empty() {
-                return Err("create_skill requires name (or a repo that names the skill)".into());
+        // The plugin is the ONLY unit the agent loads: one call returns every
+        // skill body, the connector inventory and the script/command list.
+        // The TURN handler intercepts this tool so it can also activate the
+        // plugin's connectors; this arm serves every other caller (tests, the
+        // tools API) with the same text and the same unit rule.
+        "load_plugin" => {
+            let store_base_lp = data_root.ok_or("load_plugin needs a data root")?;
+            let store = Path::new(store_base_lp);
+            let slug = s("slug");
+            let query = s("query");
+            let skill = s("skill");
+            let file = s("file");
+            if !file.is_empty() && skill.is_empty() {
+                return Err(
+                    "load_plugin needs `skill` with `file`: the extra file belongs to one skill \
+                     of the plugin"
+                        .into(),
+                );
             }
-            // An empty body is allowed on purpose: `sync_skill` keeps the
-            // stored body when one exists and fails only when a NEW skill would
-            // be written with nothing in it. A delete, a rename, or a call that
-            // only touches an extra file must not have to resend the whole
-            // markdown — the old guard rejected exactly those calls.
-            let mut content = s("content");
-            if content.trim().is_empty() {
-                if let Some(r) = &from_repo {
-                    content = r["content"].as_str().unwrap_or("").to_string();
-                }
+            if slug.is_empty() && !skill.is_empty() {
+                let owner = crate::plugins::plugin_of_skill(store, &skill).ok_or_else(|| {
+                    format!(
+                        "load_plugin needs the plugin `slug` — {skill:?} is not a skill of any \
+                         enabled plugin. Call load_plugin with `query` to find the plugin that \
+                         carries it."
+                    )
+                })?;
+                // Plugin-first: a bare skill name never loads directly. The
+                // error names the owning plugin so the next call is one round.
+                return Err(format!(
+                    "load_plugin needs the plugin `slug`: {skill:?} lives inside {owner:?}. Call \
+                     load_plugin with slug={owner} skill={skill} to read that one body, or \
+                     slug={owner} for the whole toolbox."
+                ));
             }
-            let mut body = json!({
-                "name": name,
-                "previous_name": s("previous_name"),
-                "content": content,
-                "description": args["description"].clone(),
-            });
-            if let Some(r) = &from_repo {
-                // The repo fills only what the call left out.
-                if body["description"].is_null() {
-                    body["description"] = r["description"].clone();
-                }
-                if let Some(files) = r["extra_files"].as_object() {
-                    if !files.is_empty() {
-                        body["extra_files"] = json!(files);
-                    }
-                }
+            if slug.is_empty() && !query.is_empty() {
+                return crate::plugins::search_plugins(store, &query);
             }
-            if args["delete"].as_bool().unwrap_or(false) {
-                body["delete"] = json!(true);
+            if slug.is_empty() {
+                return Err(
+                    "load_plugin needs a plugin `slug` (or a `query` of the task's words to \
+                     search every installed plugin)."
+                        .into(),
+                );
             }
-            if let Some(extra) = args["extra_files"].as_object() {
-                // Explicit files win over the ones that came with the repo.
-                let mut merged = body["extra_files"].as_object().cloned().unwrap_or_default();
-                for (k, v) in extra {
-                    merged.insert(k.clone(), v.clone());
-                }
-                body["extra_files"] = json!(merged);
+            if !skill.is_empty() {
+                return if file.is_empty() {
+                    crate::plugins::plugin_skill_body(store, &slug, &skill)
+                } else {
+                    crate::plugins::plugin_skill_file(store, &slug, &skill, &file)
+                };
             }
-            if let Some(del) = args["deleted_files"].as_array() {
-                body["deleted_files"] = json!(del);
-            }
-            // A delete is answered by the bundle writer: the skill's folder is
-            // removed, and a bundle that held ONLY that skill goes with it.
-            if body["delete"].as_bool().unwrap_or(false) {
-                return crate::plugins::delete_bundle_skill(Path::new(store_base), &name)
-                    .map(|_| format!("Skill deleted: {name}"));
-            }
-            let res = crate::plugins::save_bundle_skill(Path::new(store_base), body.clone())?;
-            let name_out = body["name"].as_str().unwrap_or(&name).to_string();
-            // A skill the model just wrote is the USER's text: mark it so the
-            // startup seeder cannot revert it behind their back.
-            if let Some(dir) = crate::plugins::skill_dir_for(Path::new(store_base), &name_out) {
-                crate::skills::mark_user_edit(&dir);
-            }
-            Ok(format!(
-                "Skill saved: {name_out} (bundle: {})\nThe catalog in the system prompt now lists \
-                 it, so it can be loaded on demand in later turns.",
-                res["slug"].as_str().unwrap_or("")
-            ))
-        }
-        // Create or update an MCP connector from a command (`/plugin create`
-        // with a connector part). A connector is either a stdio server (command + args) or an
-        // HTTP one (url), so both shapes are accepted and stored verbatim.
-        // Editing an existing connector works two ways: pass the SAME name to
-        // overwrite it in place, or pass previous_name to rename it (the old
-        // file is removed so no stale duplicate is left behind).
-        "create_mcp" => {
-            let name = s("name");
-            if name.trim().is_empty() {
-                return Err("create_mcp requires name".into());
-            }
-            let mut cfg = serde_json::Map::new();
-            let command = s("command");
-            let url = s("url");
-            if !command.trim().is_empty() {
-                cfg.insert("command".into(), json!(command));
-                if let Some(args) = args["args"].as_array() {
-                    cfg.insert("args".into(), json!(args));
-                }
-            } else if !url.trim().is_empty() {
-                cfg.insert("url".into(), json!(url));
-            } else {
-                return Err("create_mcp requires either command (stdio) or url (http)".into());
-            }
-            if let Some(env) = args["env"].as_object() {
-                cfg.insert("env".into(), json!(env));
-            }
-            let prev = s("previous_name");
-            let res = crate::plugins::save_bundle_connector(
-                Path::new(store_base),
-                &json!({"name": name, "previous_name": prev, "cfg": Value::Object(cfg)}),
-            )?;
-            Ok(format!(
-                "Connector saved: {} (bundle: {})\nIt reaches the agent while that bundle is on.",
-                name,
-                res["slug"].as_str().unwrap_or("")
-            ))
+            crate::plugins::plugin_toolbox(store, &slug).map(|toolbox| toolbox.text)
         }
         // Plugins: one folder bundling skills + MCP connectors behind a single
         // on/off switch (see plugins.rs for the layout). Kept as ONE tool with
@@ -1020,104 +946,6 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 )),
             }
         }
-        // Load one stored skill's body on demand: the prompt lists only a slice
-        // of the installed skills, so a body costs one tool call instead of
-        // carrying all of them in the prompt. `file` reads an extra file of it;
-        // `query` searches the WHOLE store, which is what keeps a store with
-        // hundreds of skills reachable from a prompt that cannot list them.
-        "load_skill" => {
-            // ONE call, SEVERAL skills: `names=[...]` returns every body
-            // together, labeled — the whole skill set the task needs costs ONE
-            // round-trip instead of one per skill. Resolution is the same as
-            // the single form (name or slug, case-insensitive); a name that
-            // matches nothing is listed at the end instead of failing the
-            // batch, so one typo cannot lose the bodies that did resolve.
-            let names_list: Vec<String> = args["names"]
-                .as_array()
-                .map(|list| {
-                    list.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|n| !n.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !names_list.is_empty() {
-                let all = crate::skill_router::load_skills(store_base);
-                let resolve = |wanted: &str| {
-                    all.iter().find(|sk| {
-                        let n = sk["name"].as_str().unwrap_or_default().trim().to_lowercase();
-                        let slug = sk["slug"].as_str().unwrap_or_default().trim().to_lowercase();
-                        n == wanted.to_lowercase() || slug == wanted.to_lowercase()
-                    })
-                };
-                let mut out = String::new();
-                let mut missing: Vec<String> = Vec::new();
-                for wanted in &names_list {
-                    match resolve(wanted) {
-                        Some(sk) => out.push_str(&skill_body(sk)),
-                        None => missing.push(wanted.clone()),
-                    }
-                }
-                if !missing.is_empty() {
-                    out.push_str(&format!(
-                        "not found: {} — Available: {}",
-                        missing.join(", "),
-                        available_hint(&all)
-                    ));
-                }
-                return Ok(out);
-            }
-            let name = s("name");
-            if name.trim().is_empty() {
-                // bundle=<slug> drills into one plugin bundle: the catalog cap
-                // can leave a whole bundle unnamed, and this is how its skills
-                // stay reachable. Checked before `query` so a call carrying
-                // both does the cheaper, more specific thing.
-                let bundle = s("bundle");
-                if !bundle.trim().is_empty() {
-                    return list_bundle_skills(store_base, bundle.trim());
-                }
-                let query = s("query");
-                if query.trim().is_empty() {
-                    return Err(
-                        "load_skill requires name, or query to search the installed skills".into(),
-                    );
-                }
-                return search_skills(store_base, &query);
-            }
-            let file = s("file");
-            if !file.trim().is_empty() {
-                // A skill lives either in the standalone store or inside an
-                // ENABLED plugin folder, and only this branch needs the plugin
-                // dir — so it is resolved here instead of on every call.
-                let store = Path::new(store_base);
-                let plugin_dir = crate::plugins::plugin_of_skill(store, &name)
-                    .and_then(|slug| crate::plugins::find_skill_dir(store, &slug, &name));
-                let read = match &plugin_dir {
-                    Some(dir) => crate::skills::read_extra_file(dir, &name, &file),
-                    None => crate::skills::read_skill_file(store, &name, &file),
-                };
-                return Ok(read?["content"].as_str().unwrap_or_default().to_string());
-            }
-            // Same list the catalog is built from (`skill_router::load_skills`),
-            // so the NOT-FOUND hint names exactly what the model was shown.
-            let all = crate::skill_router::load_skills(store_base);
-            let wanted = name.trim().to_lowercase();
-            let hit = all.iter().find(|sk| {
-                let n = sk["name"].as_str().unwrap_or_default().trim().to_lowercase();
-                let slug = sk["slug"].as_str().unwrap_or_default().trim().to_lowercase();
-                n == wanted || slug == wanted
-            });
-            match hit {
-                Some(sk) => Ok(skill_body(sk)),
-                None => Err(format!(
-                    "skill not found: {name}. Available: {}",
-                    available_hint(&all)
-                )),
-            }
-        }
         // The ROUND-ELIMINATION executor: ONE call carries up to `BATCH_MAX_OPS`
         // tool calls, run IN ORDER, every sub-result the FULL output of the same
         // tool (nothing reduced), labeled per op. A whole step — the lookups,
@@ -1161,10 +989,16 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                     continue;
                 }
                 if !BATCH_TOOLS.contains(&tool.as_str()) {
-                    out.push_str(&format!(
-                        "\n=== {label} → REFUSED ===\n{tool:?} is not a batch tool. Batchable: {}\n",
-                        BATCH_TOOLS.join(", ")
-                    ));
+                    let reason = if tool == "load_plugin" {
+                        "`load_plugin` changes the tool set for the next round, so it cannot run inside a batch — call it directly in your next reply.".to_string()
+                    } else if crate::browser_driver::handles(&tool) {
+                        "browser tools drive one shared page in order and their next call depends on the previous result — call it directly in your next reply.".to_string()
+                    } else if tool.starts_with(crate::mcp::TOOL_PREFIX) {
+                        "MCP connector tools are not batchable — call it directly in your next reply.".to_string()
+                    } else {
+                        format!("{tool:?} is not a batch tool. Batchable: {}", BATCH_TOOLS.join(", "))
+                    };
+                    out.push_str(&format!("\n=== {label} → REFUSED ===\n{reason}\n"));
                     continue;
                 }
                 let sub_args = op.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -1182,18 +1016,40 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
     }
 }
 
+/// Warn when a bundle's scripts hard-code absolute `$HOME` paths outside the
+/// bundle folder.
+///
+/// A bundle must resolve its own files relative to itself (the runner starts a
+/// script with the bundle as its working directory): a literal stops being true
+/// when the bundle is installed elsewhere, and any other `$HOME` path is outside
+/// every root a scheduled run may touch, which stalls the run on a permission
+/// gate nobody can answer.
+pub(super) fn plugin_detached_path_warning(store: &Path, view: &Value) -> String {
+    let Some(slug) = view["slug"].as_str() else {
+        return String::new();
+    };
+    let paths = crate::plugins::script_outside_paths(store, slug);
+    if paths.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nWARNING: these absolute $HOME paths are hard-coded in the bundle's scripts but sit \
+         OUTSIDE the bundle folder: {}. Rewrite them with action=update.",
+        paths.join(", ")
+    )
+}
+
 /// Batchable tools for the `batch` executor — the read-only search family plus
-/// the writers, the terminal and the planning controls (skill load, plan
-/// update), so a WHOLE step (lookups → edits → verify) rides one round-trip.
-/// The DELEGATION tools stay out: their results are turn-shaping decisions the
-/// model should make on its own round.
+/// the writers, the terminal and the plan update, so a WHOLE step
+/// (lookups → edits → verify) rides one round-trip.
+/// `load_plugin` stays OUT: it activates connector tools for the next round, so
+/// the tool array would change mid-batch. Browser and MCP tools stay out for the
+/// same reason (one shared page / a wire round-trip per call). The DELEGATION
+/// tools stay out: their results are turn-shaping decisions the model should
+/// make on its own round.
 pub(super) const BATCH_TOOLS: &[&str] = &[
     "read",
     "grep",
-    // The skill load and the plan update ride the batch too: the model should
-    // issue them IN THE SAME ROUND as the lookups (user request — a solo
-    // load_skill/update_plan round is a wasted round-trip).
-    "load_skill",
     "update_plan",
     "glob",
     "find_symbol",

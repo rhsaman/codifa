@@ -26,13 +26,13 @@ pub(super) fn classify_subagent_attempt(res: &Result<(), String>, report: &str, 
     }
     let err = sub_error.trim();
     if !err.is_empty() {
-        return Err(format!("explore failed: {err}"));
+        return Err(format!("sub-agent failed: {err}"));
     }
     if report.trim().is_empty() {
         // The turn "succeeded" but produced no output — the parent must not
         // treat an empty report as data.
         return Err(
-            "explore returned no findings: the sub-agent produced no output (empty model response)"
+            "sub-agent returned no findings: it produced no output (empty model response)"
                 .to_string(),
         );
     }
@@ -41,7 +41,7 @@ pub(super) fn classify_subagent_attempt(res: &Result<(), String>, report: &str, 
         // of leaked call markup (`analysis激光 </rfl:parameter>`). That is not a
         // report: treat it as a failed attempt so the ladder moves on at once.
         return Err(
-            "explore returned malformed output (broken tool-call markup)".to_string(),
+            "sub-agent returned malformed output (broken tool-call markup)".to_string(),
         );
     }
     Ok(())
@@ -65,6 +65,161 @@ pub(super) fn report_is_garbled(report: &str) -> bool {
         "antml:",
     ];
     MARKERS.iter().any(|m| t.contains(m))
+}
+
+/// How much of a previous attempt's progress is carried into the next model.
+/// Enough to continue a browser/research run without re-sending the whole
+/// transcript; a `load_plugin` toolbox keeps its full body because re-loading
+/// it costs the same round-trip and the same ~9K chars again.
+const SUBAGENT_CONTINUATION_MAX_CHARS: usize = 12_000;
+const SUBAGENT_PROGRESS_ENTRY_CHARS: usize = 600;
+const SUBAGENT_TOOLBOX_ENTRY_CHARS: usize = 9_000;
+const SUBAGENT_PROGRESS_ENTRIES: usize = 40;
+
+/// A compact one-line description of a tool call's arguments, for the
+/// continuation block. It deliberately names the fields that matter to a
+/// browser/research task and drops the rest: the point is "what did the
+/// previous attempt already do", not a full replay of every argument.
+pub(super) fn progress_args(args: &Value) -> String {
+    const KEYS: [&str; 14] = [
+        "url",
+        "selector",
+        "ref",
+        "text",
+        "path",
+        "command",
+        "query",
+        "description",
+        "slug",
+        "skill",
+        "expression",
+        "pattern",
+        "action",
+        "paths",
+    ];
+    let mut out = String::new();
+    for key in KEYS {
+        let Some(value) = args.get(key) else { continue };
+        let text = match value {
+            Value::String(s) => s.trim().to_string(),
+            Value::Null => continue,
+            other => other.to_string(),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let text: String = text.chars().take(180).collect();
+        out.push_str(&format!("{key}={text:?} "));
+    }
+    out.trim().to_string()
+}
+
+fn clip_chars(text: &str, cap: usize) -> String {
+    let mut out: String = text.chars().take(cap).collect();
+    if out.chars().count() < text.chars().count() {
+        out.push('…');
+    }
+    out
+}
+
+/// Keep the continuation window bounded: newest entries win, and a single
+/// `load_plugin` body gets a much larger budget than a normal tool result.
+pub(super) fn trim_progress(progress: &mut Vec<String>) {
+    if progress.len() > SUBAGENT_PROGRESS_ENTRIES {
+        let drop = progress.len() - SUBAGENT_PROGRESS_ENTRIES;
+        progress.drain(0..drop);
+    }
+    let mut total: usize = progress.iter().map(|line| line.chars().count() + 1).sum();
+    while total > SUBAGENT_CONTINUATION_MAX_CHARS && progress.len() > 1 {
+        let removed = progress.remove(0);
+        total = total.saturating_sub(removed.chars().count() + 1);
+    }
+    if total > SUBAGENT_CONTINUATION_MAX_CHARS {
+        if let Some(last) = progress.last_mut() {
+            // Leave room for the ellipsis `clip_chars` appends, so the joined
+            // block never exceeds the budget by one char.
+            *last = clip_chars(last, SUBAGENT_CONTINUATION_MAX_CHARS.saturating_sub(1));
+        }
+    }
+}
+
+/// The prompt prefix for a retried attempt that already did real work.
+///
+/// A sub-agent runs its own loop, so restarting it from scratch after a provider
+/// hiccup repeats every side effect: traced live, a browser attempt published an
+/// Instagram post, hung on the verification step, and the next model was handed
+/// the original prompt — so it opened the composer and tried to publish again.
+/// The block below is the generic fix: keep the task, carry the completed steps,
+/// and make "verify before repeating an irreversible action" explicit.
+pub(super) fn continuation_block(progress: &[String]) -> String {
+    if progress.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n=== CONTINUATION — A PREVIOUS ATTEMPT WAS CUT OFF (NOT A NEW REQUEST) ===\n\
+The task above is unchanged. A previous attempt made the progress below, then stopped \
+(provider error or hang). Continue from that point instead of starting over.\n\
+- Do NOT repeat an action that already completed.\n\
+- The progress log is EVIDENCE, not live session state: a toolbox/connector listed as loaded \
+may need `load_plugin` once in THIS attempt before its tools are callable (re-loading a toolbox \
+is safe and is NOT an irreversible action).\n\
+- Before repeating an IRREVERSIBLE action (publish, send, upload, delete, pay), VERIFY the \
+resulting state and whether it already happened.\n\
+- If the previous attempt stopped while a tool was running, that tool MAY have completed — \
+check the page/state before calling it again.\n\
+- If the work is already done, report the evidence (counts, URLs, text) and finish.\n\n\
+PROGRESS FROM THE PREVIOUS ATTEMPT:\n{}\n=== END CONTINUATION ===",
+        progress.join("\n")
+    )
+}
+
+/// The tool result when the ladder gives up AFTER real work. `None` means the
+/// attempt produced neither progress nor text, so the normal failure reason is
+/// the whole truth.
+///
+/// This must never be "no findings": the parent decides its next step from this
+/// result, and an empty answer invites it to repeat a side effect the child
+/// already performed (the traced duplicate Instagram publish).
+pub(super) fn partial_subagent_report(
+    progress: &[String],
+    best_partial: &str,
+    reason: &str,
+) -> Option<String> {
+    if progress.is_empty() && best_partial.trim().is_empty() {
+        return None;
+    }
+    let mut partial = String::from(
+        "SUB-AGENT STOPPED BEFORE FINISHING. Do not treat this as \"nothing happened\": \
+         the attempt below performed real work before it failed. Use the evidence, and \
+         VERIFY the current state before repeating any action — especially anything \
+         irreversible (publish, send, upload, delete).\n",
+    );
+    if !progress.is_empty() {
+        partial.push_str("\nPROGRESS THAT ALREADY HAPPENED:\n");
+        partial.push_str(&progress.join("\n"));
+    }
+    if !best_partial.trim().is_empty() {
+        partial.push_str("\n\nLAST MODEL OUTPUT BEFORE THE FAILURE:\n");
+        partial.push_str(best_partial.trim());
+    }
+    partial.push_str("\n\nSTOP REASON: ");
+    partial.push_str(reason);
+    Some(partial)
+}
+
+/// A clean attempt that performed real tool work but wrote no closing text.
+///
+/// The report buffer is cleared by every tool start, so a model that ends right
+/// after a tool call leaves it empty. Retrying such an attempt is how a finished
+/// publish got attempted a second time; the evidence below is a usable result,
+/// so the ladder hands it to the parent instead of replaying the job.
+pub(super) fn finished_with_evidence_but_no_report(
+    res: &Result<(), String>,
+    sub_error: &str,
+    report: &str,
+    entries: &[String],
+) -> bool {
+    res.is_ok() && sub_error.trim().is_empty() && report.trim().is_empty() && !entries.is_empty()
 }
 
 pub(super) fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEvent) {
@@ -94,7 +249,7 @@ pub(super) fn fold_subagent_event(report: &mut String, sub_error: &mut String, e
 /// cached lookup body must be forgotten after one of them runs (see the `rest`
 /// loop). A stale pointer would hand the model a file as it was before its own
 /// edit: a silent quality loss that no token saving justifies.
-pub(super) const READONLY_NATIVE_TOOLS: [&str; 13] = [
+pub(super) const READONLY_NATIVE_TOOLS: [&str; 12] = [
     "read",
     "grep",
     "glob",
@@ -102,7 +257,6 @@ pub(super) const READONLY_NATIVE_TOOLS: [&str; 13] = [
     "current_time",
     "system_stats",
     "search_memory",
-    "load_skill",
     "lsp_definition",
     "lsp_references",
     "lsp_hover",
@@ -124,23 +278,118 @@ pub(crate) const DELEGATION_PREFIX: &str = "agent__";
 
 /// The tool name a profile is advertised under (its frontmatter name, folded to
 /// the charset providers accept).
+///
+/// Uses the SAME slug as `plugins::find_agent` resolution — a profile named
+/// "Code Reviewer" is advertised as `agent__code_reviewer` and found again from
+/// that exact key, instead of silently falling back to the builtin explore run.
 pub(super) fn delegation_tool_name(profile: &str) -> String {
-    let mut out = String::with_capacity(profile.len() + DELEGATION_PREFIX.len());
-    out.push_str(DELEGATION_PREFIX);
-    for c in profile.trim().chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            out.push(c.to_ascii_lowercase());
-        } else if c.is_whitespace() {
-            out.push('_');
-        }
-    }
-    out
+    format!(
+        "{DELEGATION_PREFIX}{}",
+        crate::subagents::agent_slug(profile)
+    )
 }
 
 /// True for any tool that runs a sub-agent: the builtin `explore`, or a plugin
 /// profile advertised under [`DELEGATION_PREFIX`].
 pub(super) fn is_delegation(name: &str) -> bool {
     name == "explore" || name.starts_with(DELEGATION_PREFIX)
+}
+
+/// Resolve the profile behind one delegation tool. The user's own Settings row
+/// wins a name collision with a plugin profile, matching both the advertised
+/// description and the dispatcher below.
+pub(super) fn resolve_delegation_profile(parent: &AgentRequest, tool: &str) -> Option<Value> {
+    if tool == "explore" {
+        return None;
+    }
+    let key = tool.strip_prefix(DELEGATION_PREFIX).unwrap_or(tool).trim();
+    parent
+        .custom_subagents
+        .iter()
+        .find(|row| row["id"].as_str().map(str::trim) == Some(key))
+        .cloned()
+        .or_else(|| {
+            crate::plugins::find_plugin_agent(std::path::Path::new(&parent.data_root), key)
+        })
+}
+
+/// The capability a profile runs as. An explicit `kind` (Settings rows) wins;
+/// otherwise the declared TOOLS decide, the same rule Settings applies on save:
+/// `computer` → desktop, any `browser_*` → browser, everything else research.
+/// A plugin profile has no kind field, so its declared tools are the only
+/// signal it has — without this a bundle agent that ships `browser_*` tools
+/// silently ran as a research agent and never received them.
+pub(super) fn profile_kind(profile: Option<&Value>) -> String {
+    let Some(row) = profile else {
+        return "research".to_string();
+    };
+    if let Some(kind) = row["kind"]
+        .as_str()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    {
+        return kind.to_ascii_lowercase();
+    }
+    let tools: Vec<String> = row["tools"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(|tool| tool.trim().to_ascii_lowercase().replace([' ', '-'], "_"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if tools.iter().any(|tool| tool == "computer") {
+        "computer".to_string()
+    } else if tools.iter().any(|tool| tool.starts_with("browser_")) {
+        "browser".to_string()
+    } else {
+        "research".to_string()
+    }
+}
+
+/// Capability of the agent a delegation tool starts, used to schedule the step:
+/// browser/desktop agents share one page/desktop and must run serially, while
+/// independent research agents can run together.
+pub(super) fn delegation_kind(parent: &AgentRequest, tool: &str) -> String {
+    let profile = resolve_delegation_profile(parent, tool);
+    profile_kind(profile.as_ref())
+}
+
+/// Human name of a delegation tool, for the chat's Working pill and cards.
+///
+/// The model calls `agent__<id>`; the user should see the profile's own name
+/// ("Browser Navigator"), never the raw tool id. A custom row wins, then a
+/// bundle profile, then a readable form of the id. `explore` stays "Explore".
+pub(super) fn delegation_display_name(parent: &AgentRequest, tool: &str) -> String {
+    if tool == "explore" {
+        return "Explore".to_string();
+    }
+    let key = tool.strip_prefix(DELEGATION_PREFIX).unwrap_or(tool).trim();
+    if let Some(name) = resolve_delegation_profile(parent, tool)
+        .and_then(|row| row["name"].as_str().map(str::to_string))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    {
+        return name;
+    }
+    let pretty = key
+        .split(['_', '-'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if pretty.is_empty() {
+        "Sub-agent".to_string()
+    } else {
+        pretty
+    }
 }
 
 /// True when this call can WRITE to the workspace — the only thing that makes a
@@ -150,7 +399,7 @@ pub(super) fn is_delegation(name: &str) -> bool {
 /// the whole lookup cache 247 times, and 60 of those wipes came from calls that
 /// cannot put a byte in a workspace file — `explore`(27), `web_search`(11),
 /// `system_stats`(7), `fetch_url`(5), `save_memory`(4), `ask_user`(3),
-/// `load_skill`(2), `confirm_action`(1) — plus every read-only `run_terminal`
+/// `load_plugin`(2), `confirm_action`(1) — plus every read-only `run_terminal`
 /// (`ls`, `git status`, builds) on top. Each wipe threw away the read coverage
 /// recorded one call earlier, which is why the coverage guard fired 6 times in a
 /// corpus that re-asked 137 already-served windows.
@@ -183,9 +432,9 @@ pub(super) fn mutates_workspace(name: &str, _args: &Value) -> bool {
         // the memory tools write the MEMORY store, and ask/plan/skill-load merely
         // report. These were 60 of the 247 measured wipes.
         "explore" | "web_search" | "fetch_url" | "search_memory" | "save_memory"
-        | "delete_memory" | "load_skill" | "ask_user" | "confirm_action"
+        | "delete_memory" | "load_plugin" | "ask_user" | "confirm_action"
         | "request_permission" | "current_time" | "system_stats" => false,
-        // Everything else (create_skill, create_mcp, plugin, schedule, the
+        // Everything else (plugin authoring, schedule, the
         // browser_* driver) counts as a writer: an unknown reach is not worth
         // handing the model a pointer to a file it can no longer trust.
         _ => !is_readonly_native(name),
@@ -473,14 +722,33 @@ pub(super) fn lookup_key(name: &str, args: &Value) -> Option<String> {
                 args["max_results"].as_u64().unwrap_or(100)
             ))
         }
+        // One loaded toolbox / skill body is enough for a turn. The key lives
+        // in the SAME guard the fold consults, so when a fold elides the text
+        // the key is forgotten and the model may re-read it.
+        "load_plugin" => {
+            let slug = s("slug");
+            let skill = s("skill");
+            let file = s("file");
+            if !slug.is_empty() {
+                Some(format!("load_plugin|{slug}|{skill}|{file}"))
+            } else if !skill.is_empty() {
+                Some(format!("load_plugin|skill|{skill}|{file}"))
+            } else {
+                // A `query` search is cheap and its result may change with the
+                // store; no repeat-guard.
+                None
+            }
+        }
         // The SAME research question must never run twice in one turn: a second
-        // explore costs a whole sub-agent (up to SUBAGENT_MAX_STEPS rounds ×
-        // SUBAGENT_MAX_ATTEMPTS attempts), while the first report is already in
-        // the context above. Keyed on the normalized PROMPT (the description is
-        // only a UI label, so it must not split one identical question into two
-        // keys). Whitespace and case are normalized so a re-worded-but-identical
-        // prompt is caught too.
-        "explore" => {
+        // delegation costs a whole sub-agent (many rounds × SUBAGENT_MAX_ATTEMPTS
+        // attempts), while the first report is already in the context above.
+        // Keyed on the normalized PROMPT (the description is only a UI label, so
+        // it must not split one identical question into two keys). Whitespace
+        // and case are normalized so a re-worded-but-identical prompt is caught
+        // too. The TOOL name stays in the key: two different agents may
+        // legitimately answer the same question, and the builtin `explore` key
+        // keeps its historical form.
+        _ if is_delegation(name) => {
             let prompt = s("prompt");
             let norm = prompt
                 .split_whitespace()
@@ -490,7 +758,7 @@ pub(super) fn lookup_key(name: &str, args: &Value) -> Option<String> {
             if norm.is_empty() {
                 return None;
             }
-            Some(format!("explore|{norm}"))
+            Some(format!("{name}|{norm}"))
         }
         _ => None,
     }
@@ -632,20 +900,48 @@ pub(super) fn single_call_hint(
         return None;
     }
     if mode == "subagent" {
+        let name = calls[0].1.as_str();
+        // Browser/desktop calls are SERIAL: every action returns the page or
+        // screen it produced, so "batch the next calls" is impossible advice.
+        // The waste in a traced browser run was different: it re-snapshotted
+        // after every navigate (the navigate result already carried the page),
+        // then burned the budget probing the same post with `browser_evaluate`
+        // long after the caption was in the result above. Point at the data
+        // instead of at batching.
+        if name.starts_with("browser_") {
+            if name == "browser_evaluate" {
+                return Some(Cow::Borrowed(
+                    "[hint] If this evaluate returned null/[] or a value you already had, do NOT repeat the probe: the page text above is the source. Use browser_find, or report that the page does not expose what was asked for.",
+                ));
+            }
+            if lone_rounds <= 1 {
+                return Some(Cow::Borrowed(
+                    "[hint] The result above already carries the page summary and fresh refs — read it before calling anything else; do NOT re-snapshot the same page. For a list or grid, collect the item hrefs with ONE browser_evaluate, then navigate to the exact URLs you still need instead of clicking tiles one by one.",
+                ));
+            }
+            return Some(Cow::Borrowed(
+                "[hint] Several lone browser calls in a row: stop re-reading the same page. Take the text from the result you already have, open only the URLs still missing by direct navigation, and after two empty evaluates stop probing and report what the page exposes.",
+            ));
+        }
+        if name == "computer" {
+            return Some(Cow::Borrowed(
+                "[hint] Desktop actions are serial: act on the screen you already have, and do not screenshot again immediately after an action that returned the new screen. Finish the smallest sequence, then report.",
+            ));
+        }
         return Some(Cow::Borrowed(
             "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
         ));
     }
     let name = calls[0].1.as_str();
-    if name == "explore" {
+    if is_delegation(name) {
         return Some(Cow::Borrowed(
-            "[hint] That step had ONE explore. Explores of one step run CONCURRENTLY and cost a single round-trip, while one broad explore is slow and returns a shallow report: when the task spans several areas, fire 2-4 focused explores (one per area/file group) IN THE SAME STEP.",
+            "[hint] That step had ONE sub-agent. Independent sub-agents called in the SAME step run CONCURRENTLY and cost a single round-trip: when the request genuinely splits into independent pieces that need different agents, fire them together. Never call two agents for the same piece, and browser/desktop agents still run one at a time over their shared page/desktop.",
         ));
     }
     // Read-only natives are the ONE group that really does run concurrently, so
     // they get the parallelism wording instead of the ordering one. In the last
     // traced corpus 6 lone `read`, 1 lone `fetch_url` (65_694 uncached tokens on
-    // its own) and 1 lone `load_skill` round sat outside the whitelist, i.e. the
+    // its own) and 1 lone `load_plugin` round sat outside the whitelist, i.e. the
     // hint could not fire on any of them. `find_symbol` and `lsp_symbols` joined
     // the MAIN set for the same reason they belong here: both answer "where does
     // this live" WITHOUT a follow-up read, so a lone one is exactly a round that
@@ -660,7 +956,6 @@ pub(super) fn single_call_hint(
             | "grep"
             | "glob"
             | "fetch_url"
-            | "load_skill"
             | "find_symbol"
             | "lsp_symbols"
             | "lsp_definition"
@@ -722,7 +1017,7 @@ pub(super) fn single_call_hint(
 ///   - a file write (`edit_file` / `write_file` / `artifact`) — independent
 ///     siblings run IN ORDER in one step;
 ///   - a read-only native lookup (`read`, `grep`, `glob`, `find_symbol`, the five
-///     `lsp_*` lookups, `fetch_url`, `load_skill`) — these run CONCURRENTLY, so a
+///     `lsp_*` lookups, `fetch_url`) — these run CONCURRENTLY, so a
 ///     lone one is the most common wasted round (measured: 54 of 65 rounds in
 ///     trace `mvy0ausq`, 91% of that turn's wire tokens).
 ///
@@ -762,7 +1057,6 @@ pub(super) fn single_call_is_serial(mode: &str, calls: &[(String, String, String
             | "lsp_hover"
             | "lsp_diagnostics"
             | "fetch_url"
-            | "load_skill"
     )
 }
 
@@ -875,12 +1169,17 @@ pub(super) const PLAN_CONTEXT_HEAD: &str =
 /// Wire-only like the plan context: the renderer never stores it, so it must not
 /// count toward the fold instruction (see `plan_context_keep`).
 pub(super) const SKILLS_CONTEXT_HEAD: &str =
-    "=== REMINDER: load a matching skill first (NOT a new request) ===";
+    "=== REMINDER: load a matching plugin first (NOT a new request) ===";
 
 /// Opening line of the trailing plugin-context message (a hook's SessionStart
 /// output: the guidance a bundle wants present for the whole conversation).
 pub(super) const PLUGIN_CONTEXT_HEAD: &str =
     "=== CONTEXT: from an installed plugin (NOT a new request) ===";
+
+/// Opening line of the trailing ACTIVE PLUGIN message: the plugin the user
+/// attached (`/slug`) is already loaded as one toolbox.
+pub(super) const ACTIVE_PLUGIN_CONTEXT_HEAD: &str =
+    "=== CONTEXT: active plugin, already loaded as one unit (NOT a new request) ===";
 
 /// Opening line of the trailing Plan-Execute protocol message: the model's
 /// FIRST tool-carrying reply of the turn must be ONE `batch` with the whole
@@ -896,7 +1195,9 @@ pub(super) const BATCH_PROTOCOL_HEAD: &str =
 pub(super) fn is_wire_only_context(content: &str) -> bool {
     content.starts_with(PLAN_CONTEXT_HEAD)
         || content.starts_with(SKILLS_CONTEXT_HEAD)
+        || content.starts_with(crate::skill_router::AUTO_MATCH_HEAD)
         || content.starts_with(PLUGIN_CONTEXT_HEAD)
+        || content.starts_with(ACTIVE_PLUGIN_CONTEXT_HEAD)
         || content.starts_with(BATCH_PROTOCOL_HEAD)
 }
 
@@ -920,30 +1221,60 @@ pub(super) fn plugin_context_message(section: &str) -> Option<Value> {
     trailing_context_message(PLUGIN_CONTEXT_HEAD, section)
 }
 
-/// The per-turn skills reminder, pushed at the TAIL of the request.
+pub(super) fn active_plugin_context_message(section: &str) -> Option<Value> {
+    trailing_context_message(ACTIVE_PLUGIN_CONTEXT_HEAD, section)
+}
+
+/// The per-turn plugin reminder, pushed at the TAIL of the request.
 ///
 /// The catalog cannot move out of the system prompt without re-billing the whole
 /// cached prefix, and it is not the catalog the model is missing — it is the
-/// DUTY. Real traces: an 11 KB catalog in `messages[0]`, 2 `load_skill` calls in
-/// ~250 steps. Restating the duty immediately under the request is what makes a
-/// weak model act, and the text is constant so it churns nothing it sits next
-/// to. It never names a skill: picking one from the wording of the request was
-/// removed on purpose (see `skill_router::build_section`).
-pub(super) fn skills_context_message() -> Value {
+/// DUTY. Restating it immediately under the request is what makes a weak model
+/// act. The text is constant for a given turn so it churns nothing it sits next
+/// to. It never names a plugin from the wording of the request: picking one is
+/// the model's call, made from the catalog.
+///
+/// `attached` and `plugins` are what the user already attached. Naming them
+/// explicitly is the fix for the traced bug where the reminder told the model to
+/// call `load_plugin` for a plugin the `/plugin` command had ALREADY inlined — the
+/// model obeyed the tail and spent a round on a redundant load.
+pub(super) fn skills_context_message(attached: &[String], plugins: &[String]) -> Value {
+    let already = if !plugins.is_empty() {
+        format!(
+            "The plugin(s) {} are ALREADY attached as one toolbox: their skills are available \
+             now (inlined, or indexed by path in a large bundle) and their connector tools are \
+             switched on. Do NOT call `load_plugin` for them again unless you need to re-read \
+             one body. ",
+            plugins.join(", ")
+        )
+    } else if !attached.is_empty() {
+        format!(
+            "These skills are ATTACHED to this turn and MANDATORY: follow each one's steps and \
+             run the verification it requires before reporting done — do NOT substitute your \
+             own approach: {}. Their bodies are already in your system prompt, so do NOT call \
+             `load_plugin` for them. ",
+            attached.join(", ")
+        )
+    } else {
+        String::new()
+    };
     json!({
         "role": "user",
         "content": format!(
             "{SKILLS_CONTEXT_HEAD}\n\
-             The `=== AVAILABLE SKILLS ===` catalog is in your system prompt. Before \
-             your first tool call of this turn, check it: if the request falls under \
-             one of those skills — a request in any language matches on the \
-             description — call `load_skill` for those skills IN THE SAME STEP as \
-             your other tool calls (never as a solo round) and follow their \
-             instructions for the rest of the turn. If the catalog has no entry for \
-             the task, do not read that as `no skill exists`: a large store cannot \
-             all fit there, so call `load_skill` with a `query` of the task's words \
-             and it searches every installed skill. Do not answer from memory when a \
-             skill covers the task, and do not load a skill that does not apply.\n\
+             {already}The `=== AVAILABLE PLUGINS ===` catalog is in your system prompt. The user \
+             does NOT have to @mention a skill: finding the plugin that carries it is YOUR \
+             responsibility. Before your first tool call of this turn, check it: if the request \
+             falls under one of those plugins — match its description OR one of its skill names, \
+             in any language — call `load_plugin` with that plugin's `slug` IN THE SAME STEP as \
+             your other tool calls (never as a solo round). Add `skill=<name>` when you need ONE \
+             skill body from it; load just the `slug` for the whole toolbox (every skill body \
+             and every connector tool). Never load a bare skill name — always name the plugin \
+             that owns it. If the catalog has no entry for the task, do not read that as \
+             `nothing exists`: a large store cannot all fit there, so call `load_plugin` with a \
+             `query` of the task's words and it searches every installed plugin AND skill, then \
+             names the owning plugin. Do not answer from memory when a plugin covers the task, \
+             and do not load one that does not apply.\n\
              --- end of reminder ---"
         ),
     })
@@ -970,7 +1301,10 @@ pub(super) fn batch_protocol_message() -> Value {
              ops:[{{\"tool\":\"grep\",\"args\":{{...}}}},…] (max 10). Every result comes back \
              together in one round-trip; a dependent second wave (calls that needed a \
              result you just got) goes in your NEXT reply. A reply with a single \
-             independent tool call wastes a whole round-trip — never send one."
+             independent tool call wastes a whole round-trip — never send one. \
+             `load_plugin`, the `browser_*` tools and MCP connector tools are NOT \
+             batchable: they change the tool set or act on one shared page in order, so \
+             call them directly in your next reply."
         ),
     })
 }
@@ -1110,15 +1444,20 @@ view of a name find_symbol could not resolve.\n\
 directory/include with 2-3 alternative keywords (a|b|c) — several such greps for \
 different directories go in the same step; then continue from step 2 or 3 on what \
 it found.\n\
-5. If an lsp_* tool says the language server is unavailable, stop using LSP for \
+5. The question is EXTERNAL — docs, a package, an API, or anything current — or the \
+layout has nothing to search: use web_search. It already fetches the top results; \
+use fetch_url only for one specific URL those results did not cover. Cite the URLs \
+you used. Never answer external facts from memory, and never use the web as a \
+substitute for reading the workspace when the question is about this codebase.\n\
+6. If an lsp_* tool says the language server is unavailable, stop using LSP for \
 that language and use grep + read.\n\
-6. Before each step, for every call ask: which exact question does it answer, and \
+7. Before each step, for every call ask: which exact question does it answer, and \
 what will I do differently depending on the result? Drop any call that cannot \
 change your next action. Grep shows only a few lines around each hit — read the \
 window you need, but never re-read what a result already showed and never repeat \
-a search with the same pattern. Every search goes through `grep`/`find_symbol`/\
-`glob`/`lsp_*` — you have no shell, and a search written as a shell line is not \
-yours to make.\n\n\
+a search with the same pattern. Every workspace search goes through `grep`/\
+`find_symbol`/`glob`/`lsp_*` — you have no shell, and a search written as a shell \
+line is not yours to make. Web lookups go through `web_search`/`fetch_url`.\n\n\
 FINAL REPORT (your only text output — write nothing between tool calls): the \
 main agent edits files with exact-match strings and only re-reads the narrow \
 windows you point at, so precision \
@@ -1300,6 +1639,65 @@ pub(super) fn subagent_error_is_fatal(err: &str) -> bool {
     crate::llm::should_fall_back(err)
 }
 
+/// Capabilities a sub-agent inherits from the turn that delegated to it.
+///
+/// The renderer usually sends the table, but a request without it (scheduler,
+/// legacy client) still has a MODE, so the row is derived instead of falling
+/// through to the permissive default in `caps_for_mode("subagent")`. That
+/// fallback is what let a read-only Ask turn hand write access to a child.
+pub(super) fn inherited_caps(parent: &AgentRequest) -> ToolCaps {
+    parent
+        .cap
+        .clone()
+        .unwrap_or_else(|| caps_for_mode(&parent.mode))
+}
+
+fn push_plugin_slug(out: &mut Vec<String>, raw: &str) {
+    let slug = raw.trim();
+    if !slug.is_empty() && !out.iter().any(|s| s == slug) {
+        out.push(slug.to_string());
+    }
+}
+
+/// Plugin slugs a sub-agent PROFILE carries.
+///
+/// A bundle agent ALWAYS carries its owning bundle (`plugin_slug` is stamped by
+/// `find_plugin_agent`), because the pack's skills are what make it useful at
+/// all; a legacy custom row may still carry checked bundles. These are INLINED
+/// at startup — but they are no longer the only toolbox: every sub-agent has
+/// `load_plugin` and the full plugin catalog, so it can load anything the user
+/// installed on its own (Settings → Sub-agents no longer assigns plugins).
+pub(super) fn attached_plugin_slugs(profile: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(profile) = profile else {
+        return out;
+    };
+    if let Some(slug) = profile["plugin_slug"].as_str() {
+        push_plugin_slug(&mut out, slug);
+    }
+    for slug in profile["plugins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        push_plugin_slug(&mut out, slug);
+    }
+    out
+}
+
+/// Skills a sub-agent inherits from the parent turn.
+///
+/// The user's `@` attachment is a statement about the WHOLE task, not only the
+/// main agent's half of it. A browser child does the actual page work on a
+/// live-UI request, so dropping the attached harness here meant the parent was
+/// told to follow Test UI while the delegation ran without it. Inherited skills
+/// ride through the child's own router, which budgets/inlines them exactly like
+/// a bundle's skills (and keeps the child's context bounded).
+pub(super) fn inherited_skills(parent: &AgentRequest) -> Vec<String> {
+    parent.skills.clone()
+}
+
 pub(super) async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
@@ -1316,19 +1714,74 @@ pub(super) async fn run_subagent(
     if prompt.is_empty() {
         return (format!("{tool} requires a non-empty prompt"), false);
     }
-    // A plugin sub-agent PROFILE supplies its own system prompt and narrows the
-    // tool set; a name `explore` keeps the builtin research prompt. The MODEL is
-    // deliberately NOT taken from the profile: every sub-agent — builtin or
-    // installed — runs on the `explore` slot of Settings → Tools, so one row
+    // The task is fixed for the whole ladder; only the continuation prefix
+    // below changes between attempts.
+    let original_prompt = prompt.clone();
+    // What the last attempt already did. On a retry this becomes part of the
+    // child's task, so a provider hiccup can never replay a completed action
+    // (the traced duplicate Instagram post). It is also the fallback report if
+    // every model fails after real work: a parent must never receive "no
+    // findings" when the child already changed the world.
+    let mut progress: Vec<String> = Vec::new();
+    let mut best_partial = String::new();
+    // A sub-agent PROFILE supplies its own system prompt and narrows the tool
+    // set. Two sources: a plugin bundle's `agents/*.md`, and a custom profile
+    // from Settings → Sub-agents (settings.json). A bare `explore` keeps the
+    // builtin research prompt. The MODEL is deliberately NOT taken from the
+    // profile: every sub-agent — builtin, plugin or custom — runs on the
+    // `explore` slot of Settings → Tools (labelled "Sub-agent"), so one row
     // controls what they all cost. A profile that names its own model is ignored.
-    let profile = if tool == "explore" {
-        None
-    } else {
-        crate::plugins::find_plugin_agent(
-            std::path::Path::new(&parent.data_root),
-            tool.strip_prefix(DELEGATION_PREFIX).unwrap_or(tool),
+    let profile = resolve_delegation_profile(parent, tool);
+    // Which tool set this sub-agent gets. An explicit `kind` wins; a plugin
+    // profile derives it from the tools it declared. The kind is the REQUEST,
+    // not the grant: `allow_browser`/`allow_computer` below still require the
+    // parent turn's own switch to be on.
+    let kind = profile_kind(profile.as_ref());
+
+    // Name this run for the user: the chat's Working pill and the sub-agent
+    // card say WHO is working ("Browser Navigator"), not the raw `agent__id`
+    // the model called. The pill is emitted below, before the first model
+    // round, and the ladder's own retry lines keep naming it.
+    let display_name = profile
+        .as_ref()
+        .and_then(|p| p["name"].as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| delegation_display_name(parent, tool));
+
+    // DESKTOP GATE: a delegation to a `computer` profile is still desktop
+    // control, and the composer switch alone does not approve it. Ask BEFORE
+    // the child starts, and carry the model's OWN `reason` (the delegation
+    // schema requires it) so the popup says why the desktop is needed. An
+    // approved child then runs its whole task without re-prompting: its
+    // `allow_computer` below is set, and `req.mode == "subagent"` skips the
+    // per-action gate in `turn.rs`.
+    if kind == "computer" && parent.allow_computer {
+        let reason = args["reason"]
+            .as_str()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| prompt.chars().take(300).collect());
+        let action = if description.trim().is_empty() {
+            format!("Use the desktop via {display_name}")
+        } else {
+            description.trim().to_string()
+        };
+        if !ask_desktop_access(
+            emit,
+            &parent.chat_id,
+            cancel,
+            &action,
+            &reason,
+            parent.headless,
         )
-    };
+        .await
+        {
+            return (denied_desktop(&reason), false);
+        }
+    }
 
     // Every retry event of this ladder is stamped with ITS branch id. Parallel
     // explore calls share one stream, so without it the renderer cannot tell
@@ -1394,9 +1847,23 @@ pub(super) async fn run_subagent(
         _ => emit_raw(ev),
     };
 
+    // The chore rides in the footer's Working pill. It must NAME the
+    // sub-agent (user request: the chat says which sub-agent is working) and
+    // may append the model's own short task label — the description alone
+    // used to replace the name, so the pill never showed WHO was running.
+    let status_label = {
+        let desc = description.trim();
+        if desc.is_empty() {
+            display_name.clone()
+        } else if desc.contains(display_name.as_str()) {
+            desc.to_string()
+        } else {
+            format!("{display_name} — {desc}")
+        }
+    };
     emit(&AgentEvent::Status {
         stage: "subagent".into(),
-        content: description.clone(),
+        content: status_label,
     });
 
     // Read-only sub-request: research-only system prompt. The model comes
@@ -1431,6 +1898,36 @@ pub(super) async fn run_subagent(
         .unwrap_or_default();
     let sub_provider_kind =
         crate::backend_light::resolve_slot_kind(&slot_entry, &parent.provider, &parent.providers);
+    // Plugins this sub-agent carries. A bundle agent ALWAYS gets its own
+    // bundle (the pack's skills are what make it useful at all), and a legacy
+    // custom row may name additional bundles. These are inlined, but they are
+    // not the only door: `load_plugin` + the catalog let the sub-agent load any
+    // enabled toolbox on its own.
+    let attached_plugins = attached_plugin_slugs(profile.as_ref());
+    // Identity for skill matching. A bundle may carry a LIBRARY of skills (82
+    // in the trading pack, ~820 KB); a sub-agent gets only the ones that name
+    // its own role inlined, and the rest as a path index it can `read` on
+    // demand. Name first, then the description, then the prompt head — that is
+    // the order in which a skill would name the same job.
+    let focus = profile
+        .as_ref()
+        .map(|p| {
+            let head: String = p["prompt"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .take(3_000)
+                .collect();
+            format!(
+                "{} {} {}",
+                p["name"].as_str().unwrap_or_default(),
+                p["description"].as_str().unwrap_or_default(),
+                head
+            )
+        })
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
+
     let mut sub_req = AgentRequest {
         provider: sub_provider_kind,
         provider_id: sub_provider_id,
@@ -1448,10 +1945,22 @@ pub(super) async fn run_subagent(
         },
         // A sub-agent is read, not heard: never apply the live-voice rules.
         system_suffix: String::new(),
-        skills: Vec::new(),
-        // The profile's declared tools, intersected with the research set inside
-        // the sub-turn (`retain_subagent_tools`): a profile can only NARROW what
-        // its own sub-agent may call, never widen it.
+        // A skill the user attached to this turn is MANDATORY for the work,
+        // including the part a child does. Dropping it here (the request used
+        // to pass `Vec::new()`) let a browser child run a live-UI task without
+        // the Test UI harness the parent was told to follow: the body stayed in
+        // the parent's context while the actual page work happened in the
+        // child. The child's router budgets/inlines it like its own bundle.
+        skills: inherited_skills(parent),
+        // The profile's attached bundles: a bundle agent always carries its
+        // own plugin, a legacy custom row may carry the bundles it was saved
+        // with. Their skills are inlined and their connectors activated by
+        // `turn.rs`. This is NOT a limit: `load_plugin` + the catalog let the
+        // child load any other enabled toolbox on its own.
+        plugins: attached_plugins,
+        // The profile's declared tools. When present, `turn.rs` starts from the
+        // full sub-agent universe so a pack's `Bash`/`Edit`/`Write` survive;
+        // when empty, the kind's default set applies.
         subagent_tools: profile
             .as_ref()
             .and_then(|p| p["tools"].as_array())
@@ -1462,19 +1971,37 @@ pub(super) async fn run_subagent(
                     .collect()
             })
             .unwrap_or_default(),
+        // Marks this child as a PROFILE, so `turn.rs` can start it from the
+        // full sub-agent universe when it declares tools. The builtin
+        // `explore` has no profile and keeps the read-only research set.
+        subagent_profile: profile.is_some(),
+        // What the skill selector compares bundle skills against. Empty for
+        // `explore`, which has no attached bundles anyway.
+        subagent_focus: focus,
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
         mcp_servers: Value::Null,
-        // A sub-agent runs the research tool set (read/grep/find_symbol): it has
-        // no connectors at all, so nothing is ever activated for it.
+        // No pre-activated connectors: the child starts from its attached
+        // bundles (activated by `turn.rs` from `plugins` above) and can load
+        // any other enabled plugin with `load_plugin`, which activates that
+        // bundle's connectors in the child's own schema list.
         mcp_active: Vec::new(),
         data_root: parent.data_root.clone(),
         subagent_models: parent.subagent_models.clone(),
         providers: parent.providers.clone(),
-        // Sub-agents are research-only: desktop control is never delegated.
-        allow_computer: false,
-        // A research sub-agent has no business driving a page either.
-        allow_browser: false,
+        // The custom sub-agent list rides along so a nested delegation from the
+        // child can still resolve a custom profile by id.
+        custom_subagents: parent.custom_subagents.clone(),
+        // The chosen kind is what `turn.rs` binds the tool set from. It is a
+        // REQUEST only: the two grants below still gate it on the parent turn.
+        subagent_kind: Some(kind.clone()),
+        // Desktop control is delegated ONLY to a `computer` sub-agent, and ONLY
+        // while the user's own Computer Use switch is on for this turn. Off ⇒
+        // the sub-agent degrades to research: same run, narrower reach.
+        allow_computer: parent.allow_computer && kind == "computer",
+        // Likewise the browser: a `browser` sub-agent drives a page only when
+        // the parent turn already has Browser Use on.
+        allow_browser: parent.allow_browser && kind == "browser",
         // Authoring tools are never delegated either.
         allow_create: false,
         // A read grant is inherited: the user widened THIS TURN's reach, and a
@@ -1521,6 +2048,9 @@ pub(super) async fn run_subagent(
         tool_fallbacks: parent.tool_fallbacks.clone(),
         // A research sub-agent is text-only — images belong to the parent turn.
         images: Vec::new(),
+        // …and so do the composer's file attachments: the child's prompt already
+        // names any file it must open.
+        attachments: Vec::new(),
         // A sub-agent inherits the parent's auto-fetch count.
         web_search_auto_fetch: parent.web_search_auto_fetch,
         // …and the headless contract: a scheduled run's explore must also
@@ -1529,7 +2059,7 @@ pub(super) async fn run_subagent(
         headless: parent.headless,
         // …and its capabilities: a read-only parent must not become writable
         // just because it handed the work to a sub-agent.
-        cap: parent.cap.clone(),
+        cap: Some(inherited_caps(parent)),
     };
 
     // Attempt ladder. A sub-agent runs INSIDE the parent turn, so the
@@ -1622,6 +2152,17 @@ pub(super) async fn run_subagent(
         attempt_started_ms.store(crate::state::now_ms() as u64, Ordering::Relaxed);
         let mut report = String::new();
         let mut sub_error = String::new();
+        // Per-attempt progress feeds the NEXT attempt's continuation. Text is
+        // buffered until the next tool call: streamed chunks are narration, not
+        // a report, and logging every token would make the continuation huge.
+        let mut attempt_entries: Vec<String> = Vec::new();
+        let mut pending_text = String::new();
+        let mut active_tool: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        // Re-state the task around the accumulated progress. A first attempt
+        // sees the user's prompt byte-for-byte; a retry sees the same task plus
+        // what already happened.
+        sub_req.prompt = format!("{original_prompt}{}", continuation_block(&progress));
         // Re-resolve the slot BEFORE every attempt. The user fixing the
         // sub-agent model while it retries expects the NEXT attempt to use it,
         // not the next turn — before this the ladder kept hammering the very
@@ -1683,28 +2224,93 @@ pub(super) async fn run_subagent(
         // model.
         let pulse = std::sync::Arc::new(AtomicU64::new(1));
         let pulse_sink = std::sync::Arc::clone(&pulse);
+        // SUBSTANTIVE progress (text or a tool call), distinct from status
+        // pings. The global LSP heartbeat may extend a cold start only while
+        // this is still zero: once the sub-agent has actually done something,
+        // unrelated LSP work must not mask a wedge.
+        let progress_pulse = std::sync::Arc::new(AtomicU64::new(0));
+        let progress_sink = std::sync::Arc::clone(&progress_pulse);
         let (res, was_nudged) = {
             let mut sink = |ev: &AgentEvent| {
                 pulse_sink.fetch_add(1, Ordering::Relaxed);
+                if matches!(
+                    ev,
+                    AgentEvent::Text { .. }
+                        | AgentEvent::ToolStart { .. }
+                        | AgentEvent::Tool { .. }
+                ) {
+                    progress_sink.fetch_add(1, Ordering::Relaxed);
+                }
                 fold_subagent_event(&mut report, &mut sub_error, ev);
-                // Forward only structural sub-agent events (status/tool/usage/
-                // thinking) to the parent stream so its tool calls stay visible
-                // in the chat while explore works — the sub-agent's narration
-                // (Text) and errors must never surface in the user's chat: the
-                // report goes to the PARENT agent as the tool result only.
+                // Progress for the NEXT attempt. Tool results are kept short
+                // (only a load_plugin toolbox keeps its body), because this is
+                // a "what happened" log, not a second copy of the transcript.
                 match ev {
-                    // The sub-run's own Done must not reach the parent stream
-                    // (it would read as the PARENT turn finishing).
-                    AgentEvent::Text { .. } | AgentEvent::Error { .. } | AgentEvent::Done { .. } => {}
-                    // Tool calls are tagged with this explore's branch so they
-                    // nest under its card instead of floating in the chat.
-                    AgentEvent::ToolStart { .. } | AgentEvent::Tool { .. } => {
-                        emit(&AgentEvent::Branch {
-                            branch,
-                            sub: true,
-                            inner: Box::new(ev.clone()),
-                        })
+                    AgentEvent::Text { content } => {
+                        if pending_text.chars().count() < 2_000 {
+                            pending_text.push_str(content);
+                        }
                     }
+                    AgentEvent::ToolStart { id, name, args, .. } => {
+                        if !pending_text.trim().is_empty() {
+                            attempt_entries.push(format!(
+                                "said: {}",
+                                clip_chars(pending_text.trim(), SUBAGENT_PROGRESS_ENTRY_CHARS)
+                            ));
+                            pending_text.clear();
+                        }
+                        active_tool.insert(id.clone(), (name.clone(), progress_args(args)));
+                    }
+                    AgentEvent::Tool {
+                        id,
+                        name,
+                        args,
+                        result,
+                        ok,
+                        ..
+                    } => {
+                        // Parallel calls in one step each keep their own slot:
+                        // a sibling finishing is not "this call may have run".
+                        active_tool.remove(id);
+                        let args_text = progress_args(args);
+                        let cap = if name == "load_plugin" {
+                            SUBAGENT_TOOLBOX_ENTRY_CHARS
+                        } else {
+                            SUBAGENT_PROGRESS_ENTRY_CHARS
+                        };
+                        let result_text = clip_chars(result, cap);
+                        attempt_entries.push(format!(
+                            "{name}({args_text}) -> {}{}",
+                            if *ok { "ok" } else { "FAILED" },
+                            if result_text.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {result_text}")
+                            }
+                        ));
+                    }
+                    _ => {}
+                }
+                // Forward structural events AND narration, but tag narration as
+                // a sub-agent branch so the renderer can show it INSIDE the
+                // explore card. It never enters the parent's model history, so
+                // a chatty child cannot cause a parent round-trip.
+                match ev {
+                    // The sub-run's own Done/Error must not reach the parent
+                    // stream (Done would read as the PARENT turn finishing).
+                    AgentEvent::Error { .. } | AgentEvent::Done { .. } => {}
+                    // Text is the child's own narration ("now opening the
+                    // profile…"). The renderer attaches it to this branch's
+                    // card; it is UI-only.
+                    AgentEvent::Text { .. }
+                    | AgentEvent::ToolStart { .. }
+                    | AgentEvent::Tool { .. } => emit(&AgentEvent::Branch {
+                        branch,
+                        sub: true,
+                        inner: Box::new(ev.clone()),
+                    }),
+                    // Retry/usage/thinking/status stay top-level so the Working
+                    // pill and token meter keep seeing them.
                     _ => emit(ev),
                 }
             };
@@ -1715,6 +2321,7 @@ pub(super) async fn run_subagent(
             // any other failure — instead of the turn freezing behind a
             // "tool running" pill until the user hits Stop.
             let guard_pulse = std::sync::Arc::clone(&pulse);
+            let guard_progress = std::sync::Arc::clone(&progress_pulse);
             let guard = async move {
                 let mut seen = guard_pulse.load(Ordering::Relaxed);
                 // LSP has its own heartbeat: a cold language server says nothing
@@ -1723,27 +2330,40 @@ pub(super) async fn run_subagent(
                 let mut seen_lsp = crate::lsp::activity();
                 let mut silent_since = std::time::Instant::now();
                 let started = std::time::Instant::now();
-                // …but the heartbeat is GLOBAL, so LSP work that has nothing to
-                // do with this attempt (another turn, a background pre-warm, a
-                // wedged call from an earlier tool) resets the silence clock
-                // forever and no amount of silence ever trips the guard. That is
-                // how an explore attempt sat "Contacting model" for 11 minutes
-                // while the retry banner counted up. So the heartbeat may only
-                // EXTEND the attempt up to a hard ceiling; past it the attempt is
-                // declared hung no matter how much unrelated LSP traffic there is.
-                let cap = std::time::Duration::from_secs(subagent_idle_secs() + 120);
+                // An attempt's OWN events are real progress: a browser agent
+                // working a multi-minute flow emits tool starts/results steadily,
+                // and an absolute cap killed healthy runs at four minutes (the
+                // traced Instagram verification). Only SILENCE may trip the
+                // guard; a busy attempt is never aged out.
+                let mut substantive = false;
+                // The LSP heartbeat is GLOBAL, so unrelated work could otherwise
+                // keep a wedged cold start alive forever. It may only extend the
+                // pre-first-progress window, and only up to this ceiling.
+                let cold_start_cap =
+                    std::time::Duration::from_secs(subagent_idle_secs() + 120);
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    if started.elapsed() >= cap {
+                    let now = guard_pulse.load(Ordering::Relaxed);
+                    if now != seen {
+                        seen = now;
+                        silent_since = std::time::Instant::now();
+                    }
+                    if !substantive && guard_progress.load(Ordering::Relaxed) > 0 {
+                        substantive = true;
+                    }
+                    // The cold-start allowance has a hard end: past it, even a
+                    // heartbeating (but unrelated) LSP call no longer buys time.
+                    if !substantive && started.elapsed() >= cold_start_cap {
                         return;
                     }
-                    let now = guard_pulse.load(Ordering::Relaxed);
                     let now_lsp = crate::lsp::activity();
-                    if now != seen || now_lsp != seen_lsp {
-                        seen = now;
+                    if !substantive && now_lsp != seen_lsp {
                         seen_lsp = now_lsp;
-                        silent_since = std::time::Instant::now();
-                    } else if silent_since.elapsed()
+                        if started.elapsed() < cold_start_cap {
+                            silent_since = std::time::Instant::now();
+                        }
+                    }
+                    if silent_since.elapsed()
                         >= std::time::Duration::from_secs(subagent_idle_secs())
                     {
                         return;
@@ -1791,6 +2411,45 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             };
             (res, was_nudged)
         };
+        // Fold this attempt's work into the running progress BEFORE the ladder
+        // decides what to do next. A nudged attempt is included too: the user
+        // asked for a restart, not a replay, so whatever already happened must
+        // still be carried forward. An interrupted tool is called out as
+        // "may have completed" because the future was dropped mid-call and the
+        // side effect may already be on the page/disk. Active calls are keyed
+        // by tool id, so parallel siblings are all captured — and a completed
+        // sibling was already removed above.
+        for (_, (name, args_text)) in active_tool.drain() {
+            attempt_entries.push(format!(
+                "{name}({args_text}) was still running when the attempt stopped — it MAY have \
+                 completed; verify the current state before repeating it."
+            ));
+        }
+        if !pending_text.trim().is_empty() {
+            attempt_entries.push(format!(
+                "said: {}",
+                clip_chars(pending_text.trim(), SUBAGENT_PROGRESS_ENTRY_CHARS)
+            ));
+        }
+        if !report.trim().is_empty() {
+            best_partial = report.clone();
+        }
+        // A clean run that did work but wrote no closing text is FINISHED, not
+        // empty: retrying it can repeat the side effect it just performed. Hand
+        // the evidence to the parent and stop.
+        if finished_with_evidence_but_no_report(&res, &sub_error, &report, &attempt_entries) {
+            let summary = format!(
+                "Sub-agent finished its tool work but wrote no closing summary. The actions it \
+                 performed are listed below — use them as the result, and verify the current \
+                 state before repeating anything.\n\n{}",
+                attempt_entries.join("\n")
+            );
+            return (summary, true);
+        }
+        if !attempt_entries.is_empty() {
+            progress.extend(attempt_entries);
+            trim_progress(&mut progress);
+        }
         // The user asked for this attempt to be REDONE. Nothing failed — we
         // simply stopped waiting — so retry immediately with no backoff, and
         // deliberately leave `last` untouched: if the ladder later gives up it
@@ -1825,7 +2484,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                 max_attempts,
                 delay_secs: 0,
                 reason: "retrying now (requested)".into(),
-                agent: "explore subagent".into(),
+                agent: format!("{display_name} subagent"),
                 tool: tool.to_string(),
                 model: sub_req.model.clone(),
                 provider_id: sub_req.provider_id.clone(),
@@ -1913,7 +2572,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                     max_attempts,
                     delay_secs: 0,
                     reason: format!("{} — trying the next model", last.0),
-                    agent: "explore subagent".into(),
+                    agent: format!("{display_name} subagent"),
                     tool: tool.to_string(),
                     model: sub_req.model.clone(),
                     provider_id: sub_req.provider_id.clone(),
@@ -1942,7 +2601,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             max_attempts,
             delay_secs: SUBAGENT_RETRY_BACKOFF_MS / 1000,
             reason: reason.clone(),
-            agent: "explore subagent".into(),
+            agent: format!("{display_name} subagent"),
             tool: tool.to_string(),
             model: sub_req.model.clone(),
             provider_id: sub_req.provider_id.clone(),
@@ -1978,7 +2637,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                 max_attempts,
                 delay_secs: 0,
                 reason: "retrying now (requested)".into(),
-                agent: "explore subagent".into(),
+                agent: format!("{display_name} subagent"),
                 tool: tool.to_string(),
                 model: sub_req.model.clone(),
                 provider_id: sub_req.provider_id.clone(),
@@ -1995,12 +2654,23 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             attempt: max_attempts,
             max_attempts,
             reason: last.0.clone(),
-            agent: "explore subagent".into(),
+            agent: format!("{display_name} subagent"),
             tool: tool.to_string(),
             model: sub_req.model.clone(),
             provider_id: sub_req.provider_id.clone(),
             fallback: using_fallback,
         });
+    }
+    // Giving up after real work must NOT read as "no findings". The parent is
+    // about to decide the next step from this result: it needs the evidence the
+    // child already produced (and a warning that an interrupted call may have
+    // landed), otherwise it repeats the side effect — the traced duplicate
+    // Instagram publish. The give-up banner keeps the short failure reason
+    // above; only the tool result becomes the partial report.
+    if !last.1 {
+        if let Some(partial) = partial_subagent_report(&progress, &best_partial, &last.0) {
+            return (partial, false);
+        }
     }
     last
 }

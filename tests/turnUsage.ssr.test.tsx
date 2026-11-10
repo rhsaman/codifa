@@ -130,6 +130,38 @@ console.log("3b) the foreign `skill` name counts as a load:");
   check("the `skill` alias marks the attached skill used", turnUsage(msgs).skills[0].used === true, turnUsage(msgs).skills)
 }
 
+console.log("3c) load_plugin with `skill` marks that exact skill (never its `file`):");
+{
+  const msgs = [
+    user("u2", { skills: ["pptx"] }),
+    assistant("a2", {
+      toolActivity: [
+        {
+          tool: "load_plugin",
+          args: { slug: "skills", skill: "pptx", file: "reference.md" },
+          status: "done",
+        },
+      ],
+    }),
+  ]
+  const u = turnUsage(msgs)
+  check("the plugin-narrowed skill is marked used", u.skills[0].used === true, u.skills)
+  check(
+    "the extra reference file is not a skill row",
+    !u.skills.some((s) => s.name.includes("reference")),
+    u.skills,
+  )
+  const failed = turnUsage([
+    user("u2"),
+    assistant("a2", {
+      toolActivity: [
+        { tool: "load_plugin", args: { slug: "skills", skill: "pptx" }, status: "error" },
+      ],
+    }),
+  ])
+  check("a failed load is not usage", failed.skills.length === 0, failed.skills)
+}
+
 console.log("4) a skill the agent loaded on its own is listed:");
 {
   const msgs = [
@@ -233,6 +265,7 @@ console.log("6) skillOwner + usagePlugins map names back to plugins:");
         { name: "github", used: true },
         { name: "other", used: false },
       ],
+      plugins: [],
     },
     catalog,
     plugins,
@@ -240,6 +273,65 @@ console.log("6) skillOwner + usagePlugins map names back to plugins:");
   check("skill owner is included", owners.includes("Dev Kit"), owners)
   check("connector owner is included", owners.includes("Git Tools"), owners)
   check("an unowned connector adds nothing", owners.length === 2, owners)
+}
+
+console.log("6b) a loaded plugin is usage even without a skill/connector row:");
+{
+  const plugins = [
+    { name: "Instagram API-less", slug: "instagram-api-less", enabled: true },
+  ] as any
+  const msgs = [
+    user("u1"),
+    assistant("a1", {
+      toolActivity: [
+        { tool: "load_plugin", args: { slug: "instagram-api-less" }, status: "done" },
+      ],
+    }),
+  ]
+  const u = turnUsage(msgs)
+  check("load_plugin is collected as a used plugin", u.plugins.length === 1 && u.plugins[0].name === "instagram-api-less" && u.plugins[0].used, u.plugins)
+  const owners = usagePlugins(u, [], plugins)
+  check("the slug resolves to the display name", owners.includes("Instagram API-less"), owners)
+  check("a failed load is not usage", turnUsage([
+    user("u1"),
+    assistant("a1", {
+      toolActivity: [
+        { tool: "load_plugin", args: { slug: "instagram-api-less" }, status: "error" },
+      ],
+    }),
+  ]).plugins.length === 0)
+  const nested = turnUsage([
+    user("u1"),
+    assistant("a1", {
+      toolActivity: [
+        {
+          tool: "explore",
+          status: "done",
+          children: [
+            { tool: "load_plugin", args: { slug: "nested-plugin" }, status: "done" },
+          ],
+        },
+      ],
+    }),
+  ])
+  check("a plugin loaded by a sub-agent is still this turn's", nested.plugins.some((p) => p.name === "nested-plugin"), nested.plugins)
+  const run = turnUsage([
+    user("u1"),
+    assistant("a1", {
+      toolActivity: [
+        { tool: "plugin", args: { action: "run", slug: "runner" }, status: "done" },
+      ],
+    }),
+  ])
+  check("plugin run counts as usage", run.plugins.some((p) => p.name === "runner"), run.plugins)
+  check("a plain plugin list is not usage", turnUsage([
+    user("u1"),
+    assistant("a1", {
+      toolActivity: [
+        { tool: "plugin", args: { action: "list" }, status: "done" },
+      ],
+    }),
+  ]).plugins.length === 0)
 }
 
 console.log("7) a re-spelled name is the same skill, not a second row:");

@@ -1,11 +1,29 @@
 use super::*;
 
 /// One queued mid-turn steer: the renderer's user-message id (so the bubble can
-/// be moved inline) plus the prompt text to inject.
+/// be moved inline), the prompt text to inject, and the files/images the user
+/// attached alongside that text.
 #[derive(Clone, Debug)]
 pub struct SteerMessage {
     pub id: String,
     pub prompt: String,
+    /// Absolute paths of composer FILE attachments. They ride into the turn as
+    /// a short text note (the model reads them with the normal file tools).
+    pub attachments: Vec<String>,
+    /// Composer images already resolved to inline `data:` URLs at queue time,
+    /// so a temp file vanishing before delivery cannot lose the picture.
+    pub images: Vec<String>,
+}
+
+impl SteerMessage {
+    /// Whether the model can receive anything from this steer. A blank prompt
+    /// with no files/images is un-deliverable and must not be reported back to
+    /// the renderer (it would ask for an empty turn).
+    fn is_deliverable(&self) -> bool {
+        !self.prompt.trim().is_empty()
+            || !self.attachments.is_empty()
+            || !self.images.is_empty()
+    }
 }
 
 /// Chats with a turn currently running. `/chat/steer` consults it to answer
@@ -172,9 +190,33 @@ pub(super) async fn await_answer(
 /// Queue a message to inject into the running turn for `chat_id`.
 /// Returns false when no turn is running — the caller should tell the renderer
 /// so it re-sends the message as a normal next turn.
+///
+/// `images` arrives as the renderer's loose entries (path string or
+/// `{path, dataUrl}`) and is resolved HERE so the inline copy wins and a temp
+/// file that disappears before the next step cannot lose the picture.
 #[must_use]
-pub fn push_steer(chat_id: &str, id: &str, prompt: &str) -> bool {
+pub fn push_steer(
+    chat_id: &str,
+    id: &str,
+    prompt: &str,
+    attachments: Vec<String>,
+    images: Vec<Value>,
+) -> bool {
     if chat_id.trim().is_empty() || !running_turns().lock().unwrap().contains(chat_id) {
+        return false;
+    }
+    let attachments: Vec<String> = attachments
+        .into_iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+    let steer = SteerMessage {
+        id: id.to_string(),
+        prompt: prompt.to_string(),
+        attachments,
+        images: resolve_image_entries(images),
+    };
+    if !steer.is_deliverable() {
         return false;
     }
     steer_inbox()
@@ -182,7 +224,7 @@ pub fn push_steer(chat_id: &str, id: &str, prompt: &str) -> bool {
         .unwrap()
         .entry(chat_id.to_string())
         .or_default()
-        .push(SteerMessage { id: id.to_string(), prompt: prompt.to_string() });
+        .push(steer);
     // Wake the in-flight stream: it drops the current request and re-issues it
     // with this steer appended, instead of letting the model finish first.
     if let Some(signal) = steer_flags().lock().unwrap().get(chat_id) {
@@ -207,6 +249,20 @@ pub(super) fn drain_steers(chat_id: &str) -> Vec<SteerMessage> {
         .unwrap_or_default()
 }
 
+/// Is a steer still waiting to be delivered for this chat?
+///
+/// The steer SIGNAL stays raised after `cancel_steer` (a generation counter is
+/// monotonic), so a cancelled steer must be distinguished from a live one
+/// before telling the model "read the user's new message".
+pub(super) fn steer_pending(chat_id: &str) -> bool {
+    steer_inbox()
+        .lock()
+        .unwrap()
+        .get(chat_id)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Move every queued steer into the running conversation and tell the renderer.
 /// Returns how many steers were delivered.
 ///
@@ -226,10 +282,31 @@ pub(super) fn deliver_steers(
     }
     let mut ids: Vec<String> = Vec::with_capacity(steers.len());
     for steer in steers {
-        if steer.prompt.trim().is_empty() {
+        if !steer.is_deliverable() {
             continue;
         }
-        messages.push(json!({"role": "user", "content": steer.prompt}));
+        // Text-only steers keep the original wire shape (a plain string), so
+        // the provider's prompt prefix stays byte-identical to before.
+        if steer.attachments.is_empty() && steer.images.is_empty() {
+            messages.push(json!({"role": "user", "content": steer.prompt}));
+        } else {
+            // Same neutral content-block shape a normal turn uses for images
+            // (see run_turn); llm.rs translates it per provider.
+            let mut blocks: Vec<Value> = Vec::new();
+            if !steer.prompt.trim().is_empty() {
+                blocks.push(json!({"type": "text", "text": steer.prompt}));
+            }
+            if !steer.attachments.is_empty() {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": format!("Attached files:\n{}", steer.attachments.join("\n")),
+                }));
+            }
+            for url in &steer.images {
+                blocks.push(json!({"type": crate::llm::IMAGE_BLOCK_TYPE, "data_url": url}));
+            }
+            messages.push(json!({"role": "user", "content": blocks}));
+        }
         ids.push(steer.id);
     }
     let n = ids.len();
@@ -256,9 +333,9 @@ pub(super) fn drop_steers(chat_id: &str, emit: &mut (dyn FnMut(&AgentEvent) + Se
     }
     let ids: Vec<String> = drain_steers(chat_id)
         .into_iter()
-        // A steer with no text was never deliverable; do not ask the renderer
-        // to re-send it.
-        .filter(|s| !s.prompt.trim().is_empty())
+        // A steer with no text and no files/images was never deliverable; do
+        // not ask the renderer to re-send it.
+        .filter(SteerMessage::is_deliverable)
         .map(|s| s.id)
         .collect();
     if ids.is_empty() {
@@ -314,4 +391,106 @@ impl Drop for SteerGuard {
         // A steer nobody consumed must not leak into the next turn of this chat.
         steer_inbox().lock().unwrap().remove(&self.chat_id);
     }
+}
+
+/// Child cancel flag for a delegation that ALSO trips when the parent turn is
+/// steered.
+///
+/// `run_subagent` blocks the parent until the child returns, and the child's
+/// own `SteerGuard` is inert (it must not unregister the parent), so the child
+/// never sees the parent's steer signal. A steer typed during a long
+/// explore/browser delegation therefore waited for the whole child run — the
+/// stuck "Steering the running agent…" bubble. A watcher turns a parent steer
+/// into a child cancel, so the delegation unwinds and the parent delivers the
+/// steer at the top of its next step.
+pub(super) struct SteerAwareCancel {
+    /// The flag handed to `run_subagent` and on to the child turn.
+    pub(super) flag: CancelFlag,
+    /// Generation of the parent steer signal when this delegation started.
+    base: u64,
+    /// The parent signal, kept for `steered()` after the child returns.
+    parent: Arc<InterruptSignal>,
+    /// Aborted on Drop so a finished delegation leaves no watcher behind.
+    watcher: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SteerAwareCancel {
+    pub(super) fn new(parent_cancel: &CancelFlag, parent_steer: &Arc<InterruptSignal>) -> Self {
+        let flag: CancelFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let base = parent_steer.generation();
+        let watch_flag = flag.clone();
+        let watch_stop = parent_cancel.clone();
+        let watch_steer = parent_steer.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                // Stop reaches the child exactly as it did before this helper
+                // existed; only the steer leg is new.
+                if watch_stop.load(Ordering::Relaxed) {
+                    watch_flag.store(true, Ordering::Relaxed);
+                    return;
+                }
+                tokio::select! {
+                    // `wait_for` registers interest before re-checking the
+                    // counter, so a steer landing between the check above and
+                    // this wait is still seen.
+                    _ = watch_steer.wait_for(base) => {
+                        watch_flag.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    // Stop has no event of its own; the same 200 ms tick the
+                    // model stream uses keeps it responsive without a spin.
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                }
+            }
+        });
+        SteerAwareCancel {
+            flag,
+            base,
+            parent: parent_steer.clone(),
+            watcher: Some(watcher),
+        }
+    }
+
+    /// Did a steer land since this delegation started? Read AFTER the child
+    /// returns, so the parent can tell the model why the report was cut short
+    /// instead of letting it retry work the user already superseded.
+    pub(super) fn steered(&self) -> bool {
+        self.parent.interrupted_since(self.base)
+    }
+}
+
+impl Drop for SteerAwareCancel {
+    fn drop(&mut self) {
+        if let Some(w) = self.watcher.take() {
+            w.abort();
+        }
+    }
+}
+
+/// Prefix a delegation result that a mid-turn steer cut short.
+///
+/// Without this the model sees an empty/failed child report and may retry the
+/// very work the user just replaced. The steer itself is appended as the next
+/// user message by `deliver_steers`, so the note only has to stop the retry.
+pub(super) fn steered_tool_result(result: String) -> String {
+    const NOTE: &str = "Stopped because the user sent a new instruction while this ran. \
+Do NOT retry this delegation: read the user's new message and follow it instead.";
+    if result.trim().is_empty() {
+        NOTE.to_string()
+    } else {
+        format!("{NOTE}\n\n{result}")
+    }
+}
+
+/// Result for a tool call that was never STARTED because a steer landed while
+/// an earlier call in the same step was still running.
+///
+/// The call must still be answered: its id is in the assistant message's
+/// `tool_calls`, and a request that omits a result for one is rejected by every
+/// provider. The note also stops the model from replaying work the user just
+/// superseded.
+pub(super) fn steered_skip_result() -> String {
+    "Skipped because the user sent a new instruction while this step was running. \
+Do NOT retry this call: read the user's new message and follow it instead."
+        .to_string()
 }

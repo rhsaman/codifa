@@ -1854,6 +1854,40 @@ select:focus-visible {
   padding: 3px 10px;
 }
 
+/* Full narration log in the side panel. It is a bounded, scrollable block so
+   a long browser run stays inspectable without pushing the tool list off
+   screen; every line wraps, and pre-wrap preserves the agent's own breaks. */
+.explore-narration-log {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.explore-narration-head {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+.explore-narration-body {
+  max-height: 32vh;
+  overflow: auto;
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 2.5%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  opacity: 0.88;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .explore-call-list {
   gap: 6px;
 }
@@ -1889,7 +1923,8 @@ select:focus-visible {
 .sidebar-panel.usage-docked,
 .sidebar-panel.terminals-docked,
 .sidebar-panel.todos-docked {
-  border-radius: 16px;
+  /* Panel mode owns the surface (right-panel.css); no rounding inside it. */
+  border-radius: 0;
 }
 
 .sidebar-panel.usage-docked .sidebar-panel-head,

@@ -57,7 +57,7 @@ pub(super) fn cache_read_tuple(acc: &StreamAcc) -> u64 {
 /// Kept as a prompt asset instead of a shipped skill: `include_str!` compiles
 /// `src-tauri/prompts/coding-rules.md` into the binary, so the file stays the
 /// single source and the prompt cannot drift from it. A skill would only apply
-/// when the model chose to spend a `load_skill` call, and a rule that is never
+/// when the model chose to spend a `load_plugin` call, and a rule that is never
 /// read is not a rule.
 ///
 /// Read only by the writable branch of `default_system_prompt`: a read-only
@@ -97,7 +97,13 @@ pub(super) fn default_system_prompt(mode: &str, root: &str) -> String {
         // and never reaches the model — and without it a one-line fix came back
         // wrapped in pasted file contents and a multi-paragraph write-up.
         format!(
-            "{coding_rules}You may write and edit files here. The edit_file/write_file call IS the \
+            "CHECKLIST: for multi-step work — and ALWAYS for a plugin workflow with more than \
+one step — call update_plan BEFORE the first action with the COMPLETE list, items short and \
+imperative in the user's language, then keep it current (mark each item completed and the \
+next in_progress as you finish it, and pass \"progress\" 0-100 on a long step). Never send \
+update_plan alone while more work follows — put it in the SAME step as your next tool calls. \
+Skip it only for a trivial single-step change.\n\
+{coding_rules}You may write and edit files here. The edit_file/write_file call IS the \
 artifact: never paste whole files or large code blocks into your reply — after the edits, \
 say concisely what changed (file, function, short diff-level description) and stop. Scale \
 the report to the size of the change: a one-line fix gets one line, not a write-up. If the \

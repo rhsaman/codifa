@@ -1,5 +1,12 @@
     use super::*;
 
+    /// Serializes tests that override `CODIFA_HEADER_WAIT_SECS`: the env is
+    /// process-global and the lib test binary runs tests on parallel threads.
+    fn header_wait_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// A black-holed streaming connection must FAIL AFTER THE HEADER BUDGET,
     /// not park the caller forever: `req.send()` never resolves and reports
     /// no error while TCP keeps retransmitting, and the SSE idle guard only
@@ -8,6 +15,7 @@
     /// select arm fires; before the fix this request simply hung.
     #[test]
     fn a_stream_that_never_sends_headers_errors_within_the_header_budget() {
+        let _env = header_wait_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // A server that accepts the connection and then sends NOTHING.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
@@ -58,6 +66,78 @@
         assert!(
             err.1.contains("no response headers"),
             "unexpected error: {err:?}"
+        );
+    }
+
+    /// A steer typed while a provider is parked BEFORE its response headers
+    /// must drop the request at once, exactly like one typed mid-stream.
+    ///
+    /// The header wait used to race only Stop and the 60s deadline, so a steer
+    /// during a black-holed request sat on "Steering the running agent…" until
+    /// the whole budget expired. The stream must return an INTERRUPTED
+    /// accumulator (not an Err), because the turn re-issues the step with the
+    /// steer appended rather than reporting a provider failure.
+    #[test]
+    fn a_steer_landing_while_waiting_for_headers_drops_the_request() {
+        let _env = header_wait_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // A server that accepts the connection and then sends NOTHING.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (_s, _keep) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let c = cfg("custom", &format!("http://127.0.0.1:{port}"), &["k"]);
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        // Long enough that ONLY the steer can end the wait quickly.
+        let prev = std::env::var("CODIFA_HEADER_WAIT_SECS").ok();
+        std::env::set_var("CODIFA_HEADER_WAIT_SECS", "30");
+        // Build the runtime BEFORE starting the raiser: the thread is only a
+        // clock, and the generation stamp must be captured before it fires.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sig = std::sync::Arc::new(InterruptSignal::new());
+        let raiser = {
+            let sig = sig.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                sig.raise();
+            })
+        };
+        let mut silent = |_sig: StreamSignal<'_>| {};
+        let mut sink: SignalSink<'_> = &mut silent;
+        let started = std::time::Instant::now();
+        let acc = rt
+            .block_on(async {
+                stream_chat(
+                    &http_client(),
+                    &c,
+                    &msgs,
+                    None,
+                    &mut sink,
+                    None,
+                    Some(sig.as_ref()),
+                )
+                .await
+            })
+            .expect("a steer is not a provider failure");
+        rt.shutdown_timeout(std::time::Duration::from_millis(200));
+        raiser.join().unwrap();
+        match prev {
+            Some(v) => std::env::set_var("CODIFA_HEADER_WAIT_SECS", v),
+            None => std::env::remove_var("CODIFA_HEADER_WAIT_SECS"),
+        }
+        assert!(acc.interrupted, "the steer must mark the stream interrupted");
+        assert_eq!(
+            acc.interrupt_base, 0,
+            "the pre-header generation must be stamped so the re-issued step ignores this raise"
+        );
+        // The steer, not the 30s budget, released us.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the steer must end the header wait immediately"
         );
     }
 

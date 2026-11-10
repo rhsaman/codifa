@@ -26,12 +26,54 @@
         // Drag, the screenshot targeting arguments and the mouse-button
         // arguments must be describable, or the model has no way to issue them.
         let props = &schema()["function"]["parameters"]["properties"];
-        for expected in ["to_x", "to_y", "display", "window", "button", "clicks"] {
+        for expected in ["to_x", "to_y", "display", "window", "button", "clicks", "reason"] {
             assert!(
                 props[expected].is_object(),
                 "the schema must declare `{expected}`: a model cannot pass an argument it was never told about"
             );
         }
+    }
+
+    #[test]
+    fn permission_reason_names_the_act_and_its_target() {
+        // The permission card must answer "allow WHAT?", not repeat the tool
+        // name. Each action states its own act and, when it has one, target.
+        assert_eq!(
+            permission_reason(
+                &json!({"action": "screenshot", "reason": "The user asked me to read the crash dialog"})
+            ),
+            "The user asked me to read the crash dialog"
+        );
+        assert_eq!(
+            permission_reason(&json!({"action": "screenshot", "window": "Chrome"})),
+            "Take a screenshot of the `Chrome` window."
+        );
+        assert_eq!(
+            permission_reason(&json!({"action": "click", "x": 10, "y": 20})),
+            "Click the desktop at (10, 20)."
+        );
+        assert_eq!(
+            permission_reason(&json!({"action": "click", "x": 10, "y": 20, "button": "right"})),
+            "Right-click the desktop at (10, 20)."
+        );
+        assert_eq!(
+            permission_reason(&json!({"action": "type", "text": "hello"})),
+            "Type \"hello\" into an app."
+        );
+        assert_eq!(
+            permission_reason(&json!({"action": "key", "key": "return"})),
+            "Press the `return` key on the desktop."
+        );
+        assert_eq!(
+            permission_reason(
+                &json!({"action": "drag", "x": 1, "y": 2, "to_x": 3, "to_y": 4})
+            ),
+            "Drag the mouse from (1, 2) to (3, 4)."
+        );
+        assert_eq!(
+            permission_reason(&json!({"action": "screenshot"})),
+            "Take a screenshot of the desktop."
+        );
     }
 
     #[test]

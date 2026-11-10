@@ -178,11 +178,18 @@ pub enum AgentEvent {
         options: Value,
         sections: Value,
     },
-    /// The agent is waiting for permission to run a destructive /
-    /// out-of-workspace action (POST /permission/respond).
+    /// The agent is waiting for the user to allow a destructive /
+    /// out-of-workspace / SSH / DESKTOP action (POST /permission/respond).
+    /// `scope` says which gate asked: `confirm`, `outside`, `ssh` or
+    /// `computer`. A desktop grant is per TASK — it ends with the turn and is
+    /// never persisted; the composer switch is the standing willingness.
     Permission {
         id: String,
         action: String,
+        /// The exact file / folder / command target the call names — what the
+        /// card shows. Separate from `folder` below, which is what "Always
+        /// allow" widens: the gate used to put the parent folder here, so a
+        /// write to /etc/hosts was shown as /etc.
         path: String,
         reason: String,
         scope: String,

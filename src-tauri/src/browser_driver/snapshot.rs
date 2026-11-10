@@ -283,9 +283,23 @@ pub(super) fn render_snapshot(snap: &Snapshot, budget: usize, full: bool) -> Str
         )
         .len();
         room = room.saturating_sub(head_max + note_max);
-        let mut list = String::new();
-        let mut shown = 0usize;
-        for &i in &snap.display_order {
+        // RESERVE room for page furniture (nav/header/footer). On a content-
+        // heavy page — Instagram's feed is the traced case — the main list is
+        // hundreds of entries long and used to consume the whole budget before
+        // the nav ever printed. The model then could not see the account /
+        // Profile link and "go to the logged-in account's profile"; one run
+        // clicked the first feed AUTHOR instead and reported that stranger's
+        // profile as the logged-in account. The furniture is not decoration:
+        // it is how the model navigates and identifies the session. Reserve a
+        // third of the interactive room for it (capped), then let the main
+        // list use the rest. Very tight renders keep the old behaviour: there
+        // is not enough room to give both, and the caller asked for a summary.
+        let nav_budget = if !full && budget >= 1_500 {
+            (room / 3).min(2_000)
+        } else {
+            0
+        };
+        let entry_line = |i: usize| -> String {
             let e = &snap.entries[i];
             let label = if e.name.is_empty() {
                 e.role.clone()
@@ -297,13 +311,41 @@ pub(super) fn render_snapshot(snap: &Snapshot, budget: usize, full: bool) -> Str
             } else {
                 format!(" ({})", e.region)
             };
-            let line = format!("- [{}] {label}{tag}\n", snap.base_ref + i);
-            if list.len() + line.len() > room {
+            format!("- [{}] {label}{tag}\n", snap.base_ref + i)
+        };
+        let mut list = String::new();
+        let mut shown = 0usize;
+        let main_room = room.saturating_sub(nav_budget);
+        for &i in &snap.display_order {
+            let e = &snap.entries[i];
+            if region_rank(&e.region) >= 2 {
+                continue;
+            }
+            let line = entry_line(i);
+            if list.len() + line.len() > main_room {
                 break;
             }
             list.push_str(&line);
             shown += 1;
         }
+        // Page furniture last, in its original display order, with whatever
+        // the main list did not need. This is what keeps the account/Profile
+        // control visible on a long feed.
+        let nav_room = room.saturating_sub(list.len());
+        let mut nav = String::new();
+        for &i in &snap.display_order {
+            let e = &snap.entries[i];
+            if region_rank(&e.region) < 2 {
+                continue;
+            }
+            let line = entry_line(i);
+            if nav.len() + line.len() > nav_room {
+                break;
+            }
+            nav.push_str(&line);
+            shown += 1;
+        }
+        list.push_str(&nav);
         if shown > 0 {
             let head = if shown < total {
                 format!("\nInteractive ({shown} of {total} shown; main/dialog first):\n")

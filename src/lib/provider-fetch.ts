@@ -31,6 +31,9 @@ export interface StoreLike {
   ) => void
   setProviderReasoningMap: (id: string, data: Record<string, boolean>) => void
   setProviderThinkingLevelsMap: (id: string, data: Record<string, ThinkingLevel[]>) => void
+  /** Per-model image-input capability: absent key = unknown, `false` = the
+   *  Vision slot describes captures instead of sending raw bytes. */
+  setProviderVisionMap: (id: string, data: Record<string, boolean>) => void
   setProviderModels: (id: string, models: string[]) => void
   healStaleModels: (id: string, validModels: string[]) => void
   updateProvider: (id: string, patch: Partial<ProviderConfig>) => void
@@ -200,6 +203,68 @@ export function mergeContextMap(
 }
 
 /**
+ * Build the per-model image-input map persisted with a provider's catalog.
+ *
+ * Same prune rule as `mergeContextMap`: only models in the CURRENT catalog (or
+ * user-added ones) keep an entry, so a renamed/removed model cannot leave a
+ * stale `true`/`false` behind forever. Unlike context, an ABSENT key is
+ * meaningful: it means "no source described this model", and the turn keeps
+ * sending images to it (the provider may read them natively). Only a real
+ * boolean from `/models` or models.dev is written.
+ */
+export function mergeVisionMap(
+  p: ProviderConfig,
+  fetched: string[],
+  reported: Record<string, boolean>,
+  previous: Record<string, boolean> | undefined,
+): Record<string, boolean> {
+  if (fetched.length === 0) return { ...(previous ?? {}) }
+
+  const removedSet = new Set((p.removedModels ?? []).map((m) => bareModelId(p, m)))
+  const keptBare = new Set<string>()
+  for (const m of fetched) {
+    const bare = bareModelId(p, m)
+    if (!removedSet.has(bare) && !isForeignModelId(p, bare)) keptBare.add(bare)
+  }
+  for (const m of p.addedModels ?? []) {
+    const bare = bareModelId(p, m)
+    if (!removedSet.has(bare) && !isForeignModelId(p, bare)) keptBare.add(bare)
+  }
+
+  const out: Record<string, boolean> = {}
+  const prefix = `${p.id}/`
+  // Seed with what we already knew, but only for models still in the catalog.
+  // A key the provider no longer serves is pruned instead of surviving.
+  for (const [key, value] of Object.entries(previous ?? {})) {
+    if (typeof value !== 'boolean') continue
+    const bare = key.startsWith(prefix) ? key.slice(prefix.length) : key
+    if (keptBare.has(bare)) out[key] = value
+  }
+
+  const reportedFor = (m: string): boolean | null => {
+    const bare = bareModelId(p, m)
+    for (const key of [m, bare, `${p.id}/${bare}`]) {
+      const v = reported?.[key]
+      if (typeof v === 'boolean') return v
+    }
+    return null
+  }
+
+  for (const m of fetched) {
+    const bare = bareModelId(p, m)
+    if (!keptBare.has(bare)) continue
+    const capability = reportedFor(m)
+    if (capability === null) continue
+    // Both key spellings: the renderer stores the bare id, while the backend
+    // also looks up `<provider_id>/<model>` for gateway-namespaced ids.
+    out[m] = capability
+    out[bare] = capability
+    out[`${p.id}/${bare}`] = capability
+  }
+  return out
+}
+
+/**
  * Fetch a provider's live `/models` list and write the result into the
  * store. Returns a small result envelope so callers can log or count
  * outcomes without throwing — exceptions from `fetchFn` are caught
@@ -229,6 +294,10 @@ export async function fetchAndPersist(
     store.setProviderPricingMap(p.id, res.pricing)
     store.setProviderReasoningMap(p.id, res.reasoning)
     store.setProviderThinkingLevelsMap(p.id, res.thinkingLevels)
+    store.setProviderVisionMap(
+      p.id,
+      mergeVisionMap(p, res.models, res.vision, fresh?.visionMap),
+    )
 
     if (res.models.length === 0) return { ok: true, count: 0 }
 

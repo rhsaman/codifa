@@ -479,16 +479,55 @@ pub(super) type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 /// scan starts right after the operator, so the token that follows is the
 /// target either way.
 pub(super) fn redirects_to_a_file(s: &str) -> bool {
-    let mut rest = s;
-    while let Some(idx) = rest.find('>') {
-        let after = &rest[idx + 1..];
+    // Quote-aware scan. MEASURED on a live read-only turn: `unzip -p x.docx
+    // word/document.xml | sed 's/<[^>]*>//g'` — the normal way to read a Word
+    // body — was refused as a workspace WRITE because the `>` inside the sed
+    // REGEX was read as a redirect. A `>` in a quoted argument is text the
+    // command interprets, never the shell's redirection.
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        // A backslash escapes the next character outside single quotes (a
+        // quoted regex keeps its own backslashes, matching shell rules).
+        if c == '\\' && quote != Some('\'') {
+            i += 2;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                i += 1;
+                continue;
+            }
+            None => {}
+        }
+        if c != '>' {
+            i += 1;
+            continue;
+        }
         // `>>` appends and `>|` overrides noclobber; the target follows both.
-        let target = after.trim_start_matches(['>', '|']).trim_start();
-        let word = target
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_matches(['"', '\'']);
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j] == '>' || chars[j] == '|') {
+            j += 1;
+        }
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        let start = j;
+        while j < chars.len() && !chars[j].is_whitespace() {
+            j += 1;
+        }
+        let word: String = chars[start..j].iter().collect();
+        let word = word.trim_matches(['"', '\'']);
         // An empty target is a dangling operator; `&` is a descriptor move; a
         // `/dev/*` node absorbs the stream without touching the workspace.
         if !word.is_empty()
@@ -498,7 +537,7 @@ pub(super) fn redirects_to_a_file(s: &str) -> bool {
         {
             return true;
         }
-        rest = after;
+        i = j;
     }
     false
 }

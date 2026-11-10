@@ -1,10 +1,11 @@
-import { useMemo, useEffect, useState } from "react";
+import { useMemo, useEffect, useRef, useState } from "react";
 import { APP_DIR, useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { isPlanDoc, latestPlanDoc } from "../lib/planDoc";
 import { fetchPlan } from "../lib/api";
 import { prepareContent } from "../lib/bidi";
 import { MarkdownProse } from "./ChatMessage";
+import { useVimScroll } from "../lib/useVimScroll";
 
 /** Docked Plan viewer tab (opened by the chat Plan card's "View full plan").
  *  Shows the owner chat's latest implementation plan document as markdown.
@@ -15,6 +16,9 @@ import { MarkdownProse } from "./ChatMessage";
 export function PlanPanel({ chatId }: { chatId?: string } = {}) {
   const storeActiveChatId = useStore((s) => s.activeChatId);
   const activeChatId = chatId ?? storeActiveChatId;
+  // Shared vim scroll keys over the plan body (j/k, gg/G, Ctrl+D/U).
+  const rootRef = useRef<HTMLElement>(null);
+  useVimScroll(rootRef);
   // Subscribe to just the active chat's record instead of the whole `chats`
   // array: that array now holds lightweight index rows, and every rename or
   // unread tick used to rebuild this panel.
@@ -52,6 +56,7 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
 
   return (
     <aside
+      ref={rootRef}
       className="review-panel review-docked-panel plan-panel"
       dir="ltr"
       aria-label="Implementation plan"

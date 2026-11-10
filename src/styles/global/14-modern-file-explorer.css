@@ -2,10 +2,13 @@
 
 /* ── Modern file explorer ── */
 .files-panel .files-panel-head {
-  min-height: 42px;
-  padding: 0 10px 0 14px;
-  gap: 4px;
-  border-bottom: 1px solid var(--hairline);
+  /* geometry comes from .sidebar-head, shared with the chat list */
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 10px 8px;
+  border-bottom: none;
 }
 
 .files-panel .files-panel-title {
@@ -111,4 +114,136 @@
   text-align: center;
   font-size: 12.5px;
   color: var(--text-dim);
+}
+
+/* ── Sidebar view switch (Chats ⇄ Files) ──
+   A segmented control at the top of the sidebar. The thumb is ONE element that
+   slides between the two segments (data-view on the container drives it), so
+   the active state glides instead of popping. */
+.sidebar-switch {
+  position: relative;
+  isolation: isolate;
+  flex: 0 0 auto;
+  /* Same width, margins, radius and fill as the search box under it, so the
+     switch and the field read as one column of controls. */
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin: 12px 10px 0;
+  padding: 3px;
+  direction: ltr;
+  border-radius: 10px;
+  background: var(--bg-input);
+}
+
+.sidebar-switch-thumb {
+  position: absolute;
+  z-index: 0;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / 2);
+  border-radius: 8px;
+  /* flat: a tinted fill and nothing else — no drop shadow, no glow */
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  box-shadow: none;
+  transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.sidebar-switch[data-view="files"] .sidebar-switch-thumb {
+  transform: translateX(100%);
+}
+
+.sidebar-switch-btn {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+.sidebar-switch-btn svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  transition:
+    color 0.2s ease,
+    transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.sidebar-switch-btn:hover,
+.sidebar-switch-btn.active {
+  color: var(--text);
+}
+
+.sidebar-switch-btn.active svg {
+  color: var(--accent);
+}
+
+.sidebar-switch-btn:focus-visible {
+  outline: 1.5px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -2px;
+}
+
+/* Attention dot on the Chats segment while the Files view hides the chat list. */
+.sidebar-switch-dot {
+  position: absolute;
+  top: 5px;
+  left: calc(50% + 6px);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: sidebar-switch-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes sidebar-switch-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* The explorer inside the sidebar: fills what is left under the switch and
+   fades in when the view changes. */
+.sidebar-files-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  animation: sidebar-view-in 0.22s ease both;
+}
+
+@keyframes sidebar-view-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-switch-thumb,
+  .sidebar-switch-btn,
+  .sidebar-switch-btn svg {
+    transition: none;
+  }
+  .sidebar-switch-dot,
+  .sidebar-files-view {
+    animation: none;
+  }
 }

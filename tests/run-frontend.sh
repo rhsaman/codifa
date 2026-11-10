@@ -50,6 +50,7 @@ fi
 bundle="$WORK_LOG/$id.mjs"
 # shellcheck disable=SC2086 — the flag string must word-split into args
 if ! "$ESBUILD" "$entry" --bundle --platform=node --format=esm $flags \
+     --loader:.png=dataurl \
      --outfile="$bundle" >"$WORK_LOG/$id.build" 2>&1; then
   echo FAIL >"$WORK_LOG/$id.status"
   exit 0
@@ -120,6 +121,8 @@ chatLeaks|tests/chatLeaks.test.ts|--packages=external --external:electron
 compactDedupe|tests/compactDedupe.test.ts|--packages=external --external:electron
 chatBodyPaging|tests/chatBodyPaging.test.ts|--packages=external --external:electron
 sidebar|tests/sidebar.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:src/lib/store=./src/lib/store --external:electron
+workspaceViews|tests/workspaceViews.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+moveWorkspace|tests/moveWorkspace.test.ts|--packages=external --external:electron
 usage|tests/usage.test.ts|-
 bidi|tests/bidi.test.ts|-
 ltrIslands|tests/ltrIslands.test.ts|-
@@ -148,6 +151,7 @@ watchdog|tests/watchdog.test.ts|-
 fetchAndPersist|tests/fetchAndPersist.test.ts|--packages=external --external:electron
 providerBaseUrl|tests/providerBaseUrl.test.ts|--packages=external --external:electron
 contextCapacityPersist|tests/contextCapacityPersist.test.ts|--packages=external --external:electron
+providerMapsPrune|tests/providerMapsPrune.test.ts|--packages=external --external:electron
 usageChip|tests/usageChip.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 traceNarration|tests/traceNarration.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 planApproval|tests/planApproval.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
@@ -217,6 +221,7 @@ terminalTheme|tests/terminalTheme.test.ts|-
 fileTree|tests/fileTree.test.ts|--packages=external --external:electron
 fileActions|tests/fileActions.test.ts|--packages=external --external:electron
 viewerFilesKind|tests/viewerFilesKind.test.ts|--packages=external --external:electron
+sidebarView|tests/sidebarView.test.ts|--packages=external --external:electron
 viewerPages|tests/viewerPages.test.ts|--packages=external --external:electron
 toolSlots|tests/toolSlots.test.ts|
 filesPanel|tests/filesPanel.ssr.test.tsx|--jsx=automatic --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
@@ -224,14 +229,22 @@ chatNormalMode|tests/chatNormalMode.test.ts|-
 artifactPanel|tests/artifactPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 artifactsPage|tests/artifactsPage.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 tabOrder|tests/tabOrder.test.ts|-
+tabCycle|tests/tabCycle.test.ts|--inject:tests/tabCycleFocus.stub.ts
+tabCycleFocus|tests/tabCycleFocus.test.ts|--inject:tests/tabCycleFocus.stub.ts
+terminalTabCycle|tests/terminalTabCycle.test.ts|--inject:tests/tabCycleFocus.stub.ts
+terminalClose|tests/terminalClose.test.ts|--inject:tests/tabCycleFocus.stub.ts
+terminalPersist|tests/terminalPersist.test.ts|--inject:tests/tabCycleFocus.stub.ts
+bottomTerminalTabs|tests/bottomTerminalTabs.test.ts|--inject:tests/tabCycleFocus.stub.ts
 stt|tests/stt.test.ts|
 localLive|tests/localLive.test.ts|
+singleFlight|tests/singleFlight.test.ts|
 mediaUrl|tests/mediaUrl.test.ts|
 liveSession|tests/liveSession.test.ts|
 livePrompt|tests/livePrompt.test.ts|
 paging|tests/paging.test.ts|-
 fuzzy|tests/fuzzy.test.ts|-
 paneCycle|tests/paneCycle.test.ts|
+paneWidths|tests/paneWidths.test.ts|--packages=external --external:electron
 prefixState|tests/prefixState.test.ts|
 panePointer|tests/panePointer.test.ts|
 chatFind|tests/chatFind.test.ts|
@@ -244,6 +257,7 @@ api|tests/api.test.ts|--packages=external --external:electron
 arrowDir|tests/arrowDir.test.ts|--packages=external --external:electron
 realtimeLive|tests/realtimeLive.test.ts|--packages=external --external:electron
 retryScheduler|tests/retryScheduler.test.ts|--packages=external --external:electron
+sidebarChordKeys|tests/sidebarChordKeys.test.ts|
 storeDedupe|tests/store.dedupe.test.ts|--packages=external --external:electron
 storeSeen|tests/store.seen.test.ts|--packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolActivityDedupe|tests/toolActivity.dedupe.test.ts|--packages=external --external:electron

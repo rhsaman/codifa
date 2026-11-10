@@ -5,12 +5,13 @@ import type { PluginCommand } from './skills'
 /** What a `/`-plugin command expands to for ONE turn.
  *
  *  A plugin is a BUNDLE the user installed as a unit: naming it must load the
- *  bundle, not one skill out of it. Every skill it holds is attached (the
- *  backend's `skills` filter is a whitelist, so an empty list means "all"), and
- *  its MCP connectors come along with their schemas. A bundle the user has to
- *  take apart by hand is the bundle failing at its one job. */
+ *  bundle, not one skill out of it. The turn carries the plugin SLUG, so the
+ *  backend inlines every skill body and keeps its MCP connectors switched on;
+ *  the skill list here is the inventory used for narrowed turns and for the
+ *  transcript line. A bundle the user has to take apart by hand is the bundle
+ *  failing at its one job. */
 export interface PluginTurn {
-  /** Every skill in the bundle, by the display name the backend attaches by. */
+  /** Every skill in the bundle — attached whole unless the turn is narrowed. */
   skills: string[]
   /** The bundle's own connectors, as the per-turn `mcpServers` override. */
   mcpServers?: Record<string, McpServerConfig>

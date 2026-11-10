@@ -220,7 +220,7 @@ export const TerminalResultText = function TerminalResultText({
  *  آیتم‌های این ابزارها فیلد `url` ندارند، پس نباید از WebResultLinks (مخصوص
  *  web_search/fetch_url) استفاده شوند؛ وگرنه به‌جای مسیر فایل فقط آیکون 🔗
  *  نمایش داده می‌شد. */
-/** File rows a card may render. A `load_skill` card NEVER lists files: its
+/** File rows a card may render. A plugin/skill load card NEVER lists files: its
  *  result is the skill's markdown body (a filename scan once turned every path
  *  it mentions into a chip), and transcripts saved before that fix still carry
  *  those bogus rows — the body is the real payload, so drop them here as well

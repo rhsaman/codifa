@@ -1,7 +1,8 @@
-import type { ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import { ScheduleSection } from "./SchedulePanel";
 import { TerminalsSection, TodosPageEmptyHint, TodosSection } from "./TodosPanel";
 import { TurnUsagePanel } from "./TurnUsagePanel";
+import { useVimScroll } from "../lib/useVimScroll";
 
 /** Scroll shell shared by every full pane page (todos, schedule). One place
  *  owns the scroll box and the reading-width cap, so a page never re-derives
@@ -9,10 +10,14 @@ import { TurnUsagePanel } from "./TurnUsagePanel";
  *
  *  `.panel-pane` (global.css) supplies the scroll box and the outer padding;
  *  `.panel-page-inner` caps the width so a wide pane does not stretch a card
- *  edge to edge. */
+ *  edge to edge. It also carries the shared vim scroll keys (j/k, gg/G,
+ *  Ctrl+D/U) like every other scrollable pane. */
 export function ViewerPage({ children }: { children: ReactNode }) {
+  const pageRef = useRef<HTMLDivElement>(null);
+  useVimScroll(pageRef);
   return (
     <div
+      ref={pageRef}
       className="panel-pane panel-page"
       style={{
         flex: "1 1 0",

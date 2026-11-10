@@ -22,6 +22,11 @@ pub(super) fn copy_source_args(manifest: &mut Value, body: &Value) {
             manifest[key] = json!(v);
         }
     }
+    // The row's skill selection is a LIST, not an address string: copy it
+    // verbatim so an update from source keeps the same subset.
+    if let Some(list) = body[SOURCE_SKILLS].as_array().filter(|a| !a.is_empty()) {
+        manifest[SOURCE_SKILLS] = json!(list);
+    }
 }
 
 pub(super) fn plugins_dir(root: &Path) -> PathBuf {

@@ -71,7 +71,7 @@ const POST_ACTION_SNAPSHOT_OPS: &[&str] =
 // ---------------------------------------------------------------------------
 
 
-mod actions;
+pub(crate) mod actions;
 mod cdp;
 mod driver;
 mod ops;

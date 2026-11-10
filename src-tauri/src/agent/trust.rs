@@ -125,7 +125,7 @@ pub(super) async fn ask_outside_access(
     chat_id: &str,
     cancel: &std::sync::atomic::AtomicBool,
     action: &str,
-    path: &std::path::Path,
+    ask: &OutsideAsk,
     headless: bool,
 ) -> bool {
     // A scheduled run has NO renderer: the `Permission` event is dropped by its
@@ -137,17 +137,23 @@ pub(super) async fn ask_outside_access(
     if headless {
         eprintln!(
             "[tool] {action}: refused (scheduled run has no user to approve {})",
-            path.display()
+            ask.target.display()
         );
         return false;
     }
     let gate = next_gate_id();
-    let folder = path.to_string_lossy().to_string();
+    let target = ask.target.to_string_lossy().to_string();
+    let folder = ask.folder.to_string_lossy().to_string();
+    // The reason is BUILT, never a fixed string: a constant "outside the
+    // workspace" told the user nothing they did not already know. Now it says
+    // which act and which file — "Overwrite the whole file /etc/hosts" vs
+    // "Create a new file" — so the answer is informed instead of reflexive.
+    let reason = outside_reason(action, &target, ask.target.exists());
     emit(&AgentEvent::Permission {
         id: gate.clone(),
         action: action.to_string(),
-        path: folder.clone(),
-        reason: "outside the workspace".to_string(),
+        path: target,
+        reason,
         scope: "outside".to_string(),
         folder,
     });
@@ -155,6 +161,22 @@ pub(super) async fn ask_outside_access(
         Some(v) => v["allowed"].as_bool().unwrap_or(false),
         None => false,
     }
+}
+
+/// The human reason shown on an out-of-workspace card: WHAT the tool is about
+/// to do to which path. A fixed string here made the prompt useless.
+fn outside_reason(action: &str, target: &str, exists: bool) -> String {
+    let act = match action {
+        "write_file" if exists => format!("Overwrite the whole file {target}"),
+        "write_file" => format!("Create a new file {target}"),
+        "edit_file" if exists => format!("Edit {target}"),
+        "edit_file" => format!("Edit a file that does not exist yet {target}"),
+        "delete" | "delete_file" => format!("Delete {target}"),
+        "run_terminal" => format!("Run a command that touches {target}"),
+        "plugin" => format!("Run a bundle script working inside {target}"),
+        _ => format!("Access {target}"),
+    };
+    format!("{act}: this path is outside the project folder.")
 }
 
 /// Ask the user to approve an SSH connection to `dest` (`user@host`), then
@@ -202,6 +224,65 @@ pub(super) fn denied_ssh(dest: &str) -> String {
         "The user DENIED the SSH connection to {dest}. Nothing was run — do NOT retry this \
 connection. Work only on the local workspace, or ask the user to run the remote steps \
 themselves."
+    )
+}
+
+/// Ask the user to approve DESKTOP control for ONE task, then report whether the
+/// answer was "allow".
+///
+/// The composer's Computer Use switch says the user is willing to allow desktop
+/// work in principle; it is not a per-task grant. Moving the real mouse, typing
+/// into any window and reading the screen reach outside the app, so the FIRST
+/// action of a task goes through this gate — and the card carries the model's
+/// own REASON, because "allow what?" is the only question the user has.
+///
+/// A scheduled run has nobody to answer: deny at once instead of parking the
+/// run forever (the same rule SSH and outside-workspace access follow).
+pub(super) async fn ask_desktop_access(
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+    chat_id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    action: &str,
+    reason: &str,
+    headless: bool,
+) -> bool {
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "The agent wants to control the desktop for this task."
+    } else {
+        reason
+    };
+    if headless {
+        eprintln!(
+            "[tool] computer: refused (scheduled run has no user to approve desktop control: \
+{reason})"
+        );
+        return false;
+    }
+    let gate = next_gate_id();
+    emit(&AgentEvent::Permission {
+        id: gate.clone(),
+        action: action.trim().to_string(),
+        // Desktop control has no path or folder: the reason is the whole story.
+        path: String::new(),
+        reason: reason.to_string(),
+        scope: "computer".to_string(),
+        folder: String::new(),
+    });
+    match await_answer(&gate, chat_id, cancel).await {
+        Some(v) => v["allowed"].as_bool().unwrap_or(false),
+        None => false,
+    }
+}
+
+/// The answer to a DENIED desktop request. Like [`denied_ssh`], it must not
+/// read as a transient tool error the model retries: nothing ran, and the model
+/// should finish with the tools it still has.
+pub(super) fn denied_desktop(reason: &str) -> String {
+    format!(
+        "The user DENIED desktop control ({reason}). NOTHING was done on the desktop — do NOT \
+retry this action. Finish the task with the browser and the other tools you already have, or \
+ask the user to do the desktop step themselves."
     )
 }
 
@@ -407,13 +488,26 @@ pub(super) fn remote_spec(word: &str) -> Option<String> {
 /// SAME path, so one answer was billed twice. The user's rule is that every READ
 /// works everywhere and only APPLYING a change needs Build, so an out-of-tree
 /// read needs a GRANT, never a refusal.
+/// What a pre-flight gate reports: the EXACT path the call names (for the
+/// card) and the folder a grant must cover (for "Always allow").
+///
+/// These two are NOT the same thing: `path_access` walks up to the nearest
+/// existing parent, so /etc/hosts used to be shown as /etc and the user was
+/// asked to approve a directory without seeing which file changes.
+pub(super) struct OutsideAsk {
+    /// The canonical target the call would touch — what the card shows.
+    pub target: std::path::PathBuf,
+    /// The nearest existing parent — what "Always allow" widens.
+    pub folder: std::path::PathBuf,
+}
+
 pub(super) fn outside_target(
     name: &str,
     args: &Value,
     root: &str,
     permit: Option<&Value>,
     caps: &ToolCaps,
-) -> Option<std::path::PathBuf> {
+) -> Option<OutsideAsk> {
     let mut rels = if name == "run_terminal" {
         shell_targets(args["command"].as_str().unwrap_or_default())
     } else {
@@ -438,7 +532,12 @@ pub(super) fn outside_target(
         if let crate::tools::PathAccess::NeedsPermission(folder) =
             crate::tools::path_access(root, &rel, permit)
         {
-            return Some(folder);
+            // The exact target the call names, resolved the same way
+            // `path_access` resolved it but WITHOUT walking up to a parent.
+            // An unexpandable path (`~bad`) has no target; the folder alone is
+            // still worth showing, so fall back to it.
+            let target = crate::tools::absolute_target(root, &rel).unwrap_or_else(|_| folder.clone());
+            return Some(OutsideAsk { target, folder });
         }
     }
     None
@@ -500,7 +599,7 @@ pub(super) fn canonical_tool_name(name: &str, advertised: &[String]) -> Option<S
         "fetch_url" | "fetch" | "open_url" | "read_url" | "webfetch" | "http_get" => {
             "fetch_url"
         }
-        "skill" | "load_skill_file" => "load_skill",
+        "load_plugin" | "skill" | "load_skill" | "load_skill_file" => "load_plugin",
         "create_file" | "writefile" => "write_file",
         "str_replace" | "replace_in_file" | "editfile" => "edit_file",
         "plan" | "todos" | "todo_write" | "write_todos" | "update_todos" => "update_plan",

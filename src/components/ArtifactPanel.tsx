@@ -5,6 +5,7 @@ import { getHighlightedLines } from "../lib/highlight";
 import { getArtifact, getArtifactAssets } from "../lib/artifacts";
 import { callMcpTool } from "../lib/api";
 import { useStore } from "../lib/store";
+import { useVimScroll } from "../lib/useVimScroll";
 import type { McpServerConfig } from "../types";
 
 /** One request the sandboxed page may send to the host. Narrow on purpose: the
@@ -74,6 +75,11 @@ export function ArtifactPanel({
   // The frame is sandboxed and opaque: only a channel THIS ref points at may
   // be answered, so another origin's frame cannot ask on the page's behalf.
   const frameRef = useRef<HTMLIFrameElement | null>(null);
+  // Shared vim scroll keys over the markdown preview (j/k, gg/G, Ctrl+D/U).
+  // The sandboxed HTML frame keeps its own keyboard focus; this root only
+  // carries the scroll contract for the document variants that scroll here.
+  const rootRef = useRef<HTMLDivElement>(null);
+  useVimScroll(rootRef);
   // Connectors the user enabled, read the same way the composer reads them: a
   // page in the sandbox may ask for a TOOL, and only the tools these servers
   // expose are ever reachable.
@@ -174,7 +180,7 @@ export function ArtifactPanel({
 
   if (!doc.trim()) {
     return (
-      <div className="artifact-panel">
+      <div ref={rootRef} className="artifact-panel">
         <div className="artifact-panel-head">
           <span className="artifact-panel-title">{title}</span>
         </div>
@@ -190,7 +196,7 @@ export function ArtifactPanel({
   }
   if (kind === "md") {
     return (
-      <div className="artifact-panel">
+      <div ref={rootRef} className="artifact-panel">
         <div className="artifact-panel-head">
           <span className="artifact-panel-title">{title}</span>
         </div>
@@ -201,7 +207,7 @@ export function ArtifactPanel({
     );
   }
   return (
-    <div className="artifact-panel">
+    <div ref={rootRef} className="artifact-panel">
       <div className="artifact-panel-head">
         <span className="artifact-panel-title">{title}</span>
         {assets.length > 0 && (

@@ -2,22 +2,19 @@
 //
 // Regression guard: both `useVimScroll` and the sidebar's bare j/k are CAPTURE
 // listeners, so they see the chord's SECOND key before App.tsx does. When they
-// treated it as their own key, `Ctrl+X h/k/l` silently did nothing while
-// `Ctrl+X j` only appeared to work (it also scrolls down). They now stand down
-// while the prefix is armed.
-import { watchPrefixFlag, isPrefixArmed } from '../src/lib/prefixState'
+// treated it as their own key, `Ctrl+X h/k/l` silently scrolled instead of
+// running the chord.
+//
+// The bug this locks in: the flag used to be set ONLY while some component had
+// called `watchPrefixFlag()`. When no vim-scroll pane was mounted the flag was
+// stuck at `false`, so the bare-key listeners stole the second key and the
+// chord became INTERMITTENT — the "I have to press Ctrl+X J several times"
+// report. The module now registers its own listener on import, which is why
+// this test must install `window` BEFORE importing it.
 
-export {}
-let failures = 0
-function check(name: string, cond: boolean) {
-  if (cond) console.log(`  ok  ${name}`)
-  else {
-    failures++
-    console.error(`  FAIL ${name}`)
-  }
-}
-
-// Minimal event target stand-in: prefixState only reads window + CustomEvent.
+// Minimal `window` so the module-level listener has somewhere to bind (this runs
+// in Node, where the real app has a DOM). The import below is dynamic on
+// purpose: a static one would be hoisted above this stub.
 const listeners = new Map<string, Set<(e: Event) => void>>()
 ;(globalThis as any).window = {
   addEventListener(type: string, cb: (e: Event) => void) {
@@ -27,31 +24,72 @@ const listeners = new Map<string, Set<(e: Event) => void>>()
   removeEventListener(type: string, cb: (e: Event) => void) {
     listeners.get(type)?.delete(cb)
   },
+  dispatchEvent(e: Event) {
+    listeners.get(e.type)?.forEach((cb) => cb(e))
+    return true
+  },
 }
-function emitArmed(armed: boolean) {
-  listeners.get('coder:prefix')?.forEach((cb) => cb({ detail: armed } as unknown as Event))
+
+const { isPrefixArmed, setPrefixArmedForTest, watchPrefixFlag } = await import(
+  '../src/lib/prefixState'
+)
+
+let failed = 0
+function check(label: string, ok: boolean) {
+  console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${label}`)
+  if (!ok) failed++
 }
 
-const unwatch = watchPrefixFlag()
+function broadcast(detail: unknown) {
+  ;(globalThis as any).window.dispatchEvent({ type: 'coder:prefix', detail } as unknown as Event)
+}
 
-check('idle by default', !isPrefixArmed())
-emitArmed(true)
-check('armed after Ctrl+X', isPrefixArmed())
-emitArmed(false)
-check('disarmed once the chord ran', !isPrefixArmed())
+// The module installs its own listener, so a real event must move the flag
+// with NO `watchPrefixFlag()` call anywhere — that absence IS the fix.
+console.log('1) the flag follows the coder:prefix event with no component mounted:')
+{
+  setPrefixArmedForTest(false)
+  check('idle by default', !isPrefixArmed())
+  broadcast(true)
+  check('armed after Ctrl+X', isPrefixArmed())
+  broadcast(false)
+  check('disarmed after the chord ran', !isPrefixArmed())
+}
 
-// A second subscriber must not reset the first one's view: the flag is module
-// state, so a remount (StrictMode double-invoke) reports the same value.
-const unwatch2 = watchPrefixFlag()
-emitArmed(true)
-check('armed for both subscribers', isPrefixArmed())
-unwatch()
-check('still armed after one unwatch', isPrefixArmed())
-unwatch2()
-check('unwatching the last listener keeps the last value', isPrefixArmed())
+console.log('2) test hook (drives the flag without an event):')
+{
+  setPrefixArmedForTest(true)
+  check('setPrefixArmedForTest(true) arms', isPrefixArmed())
+  setPrefixArmedForTest(false)
+  check('setPrefixArmedForTest(false) disarms', !isPrefixArmed())
+}
 
-if (failures) {
-  console.error(`\n${failures} prefixState assertion(s) failed`)
+console.log('3) watchPrefixFlag() is still callable and its unsubscribe is safe:')
+{
+  setPrefixArmedForTest(false)
+  const off = watchPrefixFlag()
+  broadcast(true)
+  check('module listener still arms with watchPrefixFlag active', isPrefixArmed())
+  off()
+  broadcast(false)
+  check('unsubscribe does not break the module listener', !isPrefixArmed())
+}
+
+console.log('4) the flag is a plain boolean (truthiness coercion is deliberate):')
+{
+  // Listeners only care "is a chord in progress". App.tsx always broadcasts a
+  // real boolean, so coercing through `!!` keeps a stray `CustomEvent` written
+  // elsewhere (a test, a browser extension) from arming on the string 'yes' —
+  // which WOULD arm, and that is the honest behaviour: `!!'yes'` is true.
+  setPrefixArmedForTest(false)
+  broadcast('yes')
+  check('truthy detail coerces to armed', isPrefixArmed())
+  broadcast(undefined)
+  check('undefined detail disarms', !isPrefixArmed())
+}
+
+if (failed > 0) {
+  console.error(`\n❌ ${failed} prefixState check(s) failed`)
   process.exit(1)
 }
-console.log('\nprefixState: all assertions passed')
+console.log('\nprefixState: all checks passed')

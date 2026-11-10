@@ -71,12 +71,17 @@ export function planDisplay(message: ChatMessage): PlanDisplay {
   // `isPlanDoc`); the reply's own stream then carries the real document, so
   // recover it and collapse the plan prose into the card exactly the same way.
   const stored = isPlanDoc(message.planDoc) ? message.planDoc : null;
+  // Plan mode is read-only, so the planner may save the plan as a markdown
+  // artifact. That body never enters the text stream, and the stored planDoc
+  // is then only the closing summary — prefer the artifact document.
+  const artifact = planFromArtifact(message);
   // A stored doc without a heading may be a plan-mode ANSWER that the old save
   // wrote over the plan (see `hasHeading`). Recover the real document from this
   // message's own stream in that case; when the message carries none, it is not
   // a plan message at all and it keeps its prose.
   const planDoc =
-    stored && hasHeading(stored.body) ? stored : planFromMessage(message);
+    artifact ??
+    (stored && hasHeading(stored.body) ? stored : planFromMessage(message));
   if (!planDoc) return { content: message.content, segments: message.segments };
   const exact = planDoc === message.planDoc;
   let segments = message.segments;
@@ -118,13 +123,19 @@ export function planDisplay(message: ChatMessage): PlanDisplay {
       }
     }
     if (!planStarted) {
-      // Plan body not found in any segment (truncated/edited stream): fall
-      // back to dropping prose after the last tool card.
-      let lastTool = -1;
-      for (let i = 0; i < kept.length; i++) {
-        if (kept[i].kind !== "text") lastTool = i;
+      // An artifact plan is not part of the text stream: keep every segment
+      // (the tool rows AND the artifact card) instead of dropping them.
+      if (artifact) {
+        segments = kept;
+      } else {
+        // Plan body not found in any segment (truncated/edited stream): fall
+        // back to dropping prose after the last tool card.
+        let lastTool = -1;
+        for (let i = 0; i < kept.length; i++) {
+          if (kept[i].kind !== "text") lastTool = i;
+        }
+        segments = lastTool >= 0 ? kept.slice(0, lastTool + 1) : [];
       }
-      segments = lastTool >= 0 ? kept.slice(0, lastTool + 1) : [];
     } else {
       segments = kept;
     }
@@ -176,6 +187,36 @@ export function planFromMessage(message: ChatMessage): PlanDoc | null {
   return null;
 }
 
+/** Whether a title or heading names a plan (English or Persian). */
+function looksLikePlanName(text: string): boolean {
+  return /\bplan(?:ning|s)?\b|پلن|طرح/i.test(text);
+}
+
+/**
+ * The plan a plan-mode turn saved as a markdown ARTIFACT.
+ *
+ * Plan mode is read-only, so a planner that cannot write `docs/PLAN.md` may
+ * call `artifact create` with the plan instead. That body rides on the artifact
+ * segment, not in the reply's text, so the stored `planDoc` can be only the
+ * closing summary ("## خلاصه") and the Plan card/panel would show that summary.
+ * Recover the artifact document here. Only an artifact whose title/heading
+ * names a plan qualifies; a supporting document (design notes, a report) must
+ * not replace the plan.
+ */
+export function planFromArtifact(message: ChatMessage): PlanDoc | null {
+  if (message.mode !== "plan") return null;
+  for (const seg of message.segments ?? []) {
+    if (seg.kind !== "artifact" || seg.artifactKind !== "md") continue;
+    const body = (seg.content ?? "").trim();
+    if (!body || !isPlanDoc({ body })) continue;
+    const title = (seg.title ?? "").trim();
+    const heading = /^#{1,6}[ \t]*(.+)$/m.exec(body)?.[1] ?? "";
+    if (!looksLikePlanName(title) && !looksLikePlanName(heading)) continue;
+    return { title, body };
+  }
+  return null;
+}
+
 /**
  * The active chat's latest plan document (scanned newest-first), for the
  * docked Plan viewer tab. Returns null when the chat has no plan yet.
@@ -193,6 +234,9 @@ export function latestPlanDoc(
   for (let i = chat.messages.length - 1; i >= 0; i--) {
     const message = chat.messages[i];
     if (!message) continue;
+    // A plan saved as an artifact wins over the stored closing summary.
+    const artifact = planFromArtifact(message);
+    if (artifact) return artifact;
     const stored = isPlanDoc(message.planDoc) ? message.planDoc : null;
     if (stored && hasHeading(stored.body)) return stored;
     // Legacy chats: the save once kept only the turn's closing note, so the

@@ -254,7 +254,6 @@
         let view = &rows[0];
         assert_eq!(view["name"], "Movie Finder");
         assert_eq!(view["skills"], json!(["Movie Finder"]));
-        assert!(view.get("fa_keywords").is_none());
         // The body and the extra file survive, so nothing the user wrote is lost.
         let row = &crate::plugins::all_plugin_skills(&root)[0];
         assert!(row["content"].as_str().unwrap().contains("the steps"));

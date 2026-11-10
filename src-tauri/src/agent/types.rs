@@ -42,6 +42,12 @@ pub struct AgentRequest {
     /// sidecar's ATTACHED SKILLS section.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Plugin slugs the user attached to this turn (the `/slug` composer
+    /// command or the open plugin-use session). A plugin is ONE unit: its
+    /// skills are inlined and its connectors are activated together, and the
+    /// model must not load any of them again.
+    #[serde(default)]
+    pub plugins: Vec<String>,
     #[serde(default)]
     #[allow(dead_code)]
     pub context_window: u64,
@@ -64,6 +70,18 @@ pub struct AgentRequest {
     /// (e.g. {"explore": "providerId/model"}); empty = the parent model.
     #[serde(default)]
     pub subagent_models: std::collections::HashMap<String, String>,
+    /// User-created sub-agent profiles from settings (`customSubagents`). Same
+    /// role as a plugin profile — prompt, optional tool narrowing, `kind` — but
+    /// stored in settings.json instead of a bundle. Carried on every request so
+    /// `delegation_schemas` can advertise them and `run_subagent` can resolve
+    /// one by id when the model delegates to it.
+    #[serde(default)]
+    pub custom_subagents: Vec<Value>,
+    /// Tool-set kind of THIS turn when it is a sub-agent turn: `research`
+    /// (default), `browser` or `computer`. `run_subagent` sets it on the CHILD
+    /// request; `turn.rs` reads it to bind the matching tool set.
+    #[serde(default)]
+    pub subagent_kind: Option<String>,
     /// Full provider configs keyed by id, so a "providerId/model" sub-agent
     /// entry routes to THAT provider's base URL / keys (cross-provider).
     #[serde(default)]
@@ -78,10 +96,11 @@ pub struct AgentRequest {
     /// never bound, so the agent cannot touch the desktop at all.
     #[serde(default)]
     pub allow_computer: bool,
-    /// True when the turn asks to create/edit a skill or an MCP connector
-    /// (`/plugin create` or `/plugin update`). The `create_skill` /
-    /// `create_mcp` tools are bound ONLY then, so an ordinary turn cannot
-    /// silently rewrite the user's skill store or connector list.
+    /// True when the turn asks to create or edit a PLUGIN (`/plugin create` /
+    /// `/plugin update`). The authoring actions of the `plugin` tool are bound
+    /// only then, so an ordinary turn cannot silently rewrite the user's
+    /// bundles. Skills and connectors are authored INSIDE a plugin — there is
+    /// no separate skill/connector tool.
     #[serde(default)]
     pub allow_create: bool,
     /// The composer's Browser switch, the same hard on/off as Computer Use.
@@ -174,13 +193,36 @@ pub struct AgentRequest {
     /// as history.
     #[serde(default, deserialize_with = "deserialize_images")]
     pub images: Vec<String>,
-    /// Tools a plugin sub-agent PROFILE declared in its `agents/*.md` frontmatter.
-    /// Empty = the built-in research set (`research_schemas`), which is what the
-    /// built-in `explore` uses. A profile narrows what its sub-agent can call; it
-    /// can never widen it beyond the research set, because the filter only ever
-    /// REMOVES entries.
+    /// Composer FILE attachments for THIS turn, as absolute paths or paths
+    /// relative to the workspace root. They ride into the first user message as
+    /// a short `Attached files:` text block (the same shape a mid-turn steer
+    /// uses), so the model knows the files exist and opens them with the normal
+    /// file tools. Empty for turns without attachments.
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    /// Tools a sub-agent PROFILE declared (a plugin `agents/*.md` row or a
+    /// Settings → Sub-agents row). Empty = the default set for the profile's
+    /// `kind`; non-empty = the exact tools it may call. Names are canonicalized
+    /// through [`canonical_subagent_tool`], so a Claude Code pack's `Bash` /
+    /// `Edit` / `Write` reach Codifa's `run_terminal` / `edit_file` /
+    /// `write_file` instead of being dropped.
     #[serde(default)]
     pub subagent_tools: Vec<String>,
+    /// True when this sub-turn runs a user or plugin PROFILE rather than the
+    /// builtin `explore`. A profile may reach the full sub-agent universe
+    /// ([`subagent_schemas`]) when it declares tools; `explore` keeps the
+    /// classic read-only research set. The distinction lives in the request
+    /// because both arrive with `mode: "subagent"`.
+    #[serde(default)]
+    pub subagent_profile: bool,
+    /// Who this sub-agent IS — its name, description and the head of its
+    /// prompt. Only used to pick WHICH of an attached bundle's skills belong to
+    /// it: a pack can ship dozens (the trading bundle has 82 skills / ~820 KB),
+    /// and inlining all of them would flood the child before its first tool
+    /// call. The rest are listed with their file path so the agent can `read`
+    /// the one it needs. Empty for the builtin `explore`.
+    #[serde(default)]
+    pub subagent_focus: String,
     /// The user's "Results per search" number (Settings → Web Providers). It is
     /// ONE setting with two effects: how many results `web_search` returns, and
     /// how many of those top results get their REAL page content fetched (not
@@ -265,45 +307,10 @@ pub fn caps_for_mode(mode: &str) -> ToolCaps {
             write_files: false,
             ..ToolCaps::default()
         },
-        // Sub-agents only ever get `research_schemas` (no mutating tool), and
-        // build/unknown ids keep the full set.
+        // Sub-agents run with the PARENT's table (`run_subagent` passes it
+        // explicitly). This row only applies to a caller that names `subagent`
+        // as its mode with no cap at all; build/unknown ids keep the full set.
         _ => ToolCaps::default(),
-    }
-}
-
-/// Whether this tool call edits an EXISTING skill/connector (vs creating a new
-/// one), and if so its kind, name and folder on disk. The tools.rs handlers
-/// return only a string, so the agent loop must ask the store BEFORE the call
-/// and emit the `EditTarget` badge event only when the dispatch succeeds. A
-/// delete or a first-ever create pins nothing.
-pub(super) fn edit_target_of(
-    tool: &str,
-    args: &Value,
-    store: &std::path::Path,
-) -> Option<(String, String, String)> {
-    match tool {
-        "create_skill" => {
-            if args["delete"].as_bool().unwrap_or(false) {
-                return None;
-            }
-            let nm = args["name"].as_str().unwrap_or("").trim().to_string();
-            let prev = args["previous_name"].as_str().unwrap_or("").trim().to_string();
-            let dir = crate::plugins::skill_update_dir(store, &nm)
-                .or_else(|| crate::plugins::skill_update_dir(store, &prev))?;
-            let name_out = if nm.is_empty() { prev } else { nm };
-            if name_out.is_empty() {
-                return None;
-            }
-            Some(("skill".into(), name_out, dir.to_string_lossy().to_string()))
-        }
-        "create_mcp" => {
-            let nm = args["name"].as_str().unwrap_or("").trim().to_string();
-            let prev = args["previous_name"].as_str().unwrap_or("").trim().to_string();
-            let (slug, dir) = crate::plugins::connector_update_target(store, args, &nm, &prev)?;
-            let name_out = if nm.is_empty() { slug } else { nm };
-            Some(("mcp".into(), name_out, dir.to_string_lossy().to_string()))
-        }
-        _ => None,
     }
 }
 
@@ -313,13 +320,6 @@ pub(super) fn edit_target_of(
 pub(super) fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
     let (allowed, action) = match name {
         "write_file" | "edit_file" => (caps.write_files, "write or edit files"),
-        // Authoring a skill or a connector SAVES a file, so it follows the same
-        // capability: a read-only turn never sees these tools, even when a
-        // sticky `allow_create` (an authoring request earlier in the chat) is
-        // still set. Connector VISIBILITY stays — an enabled connector's tools
-        // ride in through the MCP index, and `plugin action=list` names the
-        // bundles — only the WRITING is gated here.
-        "create_skill" | "create_mcp" => (caps.write_files, "create or edit skills and connectors"),
         // Media tools create NEW files only (the result paths are minted
         // unique under media/ — an existing file is never overwritten), so
         // they stay available in the read-only Ask/Plan modes exactly like
@@ -363,13 +363,16 @@ exact old text → new text. Tell the user to switch to Build mode if they want 
     ))
 }
 
-/// The `plugin` actions that only an AUTHORING turn may call.
+/// The `plugin` actions that WRITE the bundle store.
 ///
 /// `list` and `run` are not authoring: naming what a bundle ships and running a
 /// script already on disk are acts of the same kind as `run_terminal`, which
 /// Build and Ask already allow — while a scheduled Build run has nobody to ask
-/// and still has to be able to fire a bundle's script. Everything that WRITES a
-/// bundle stays behind the flag.
+/// and still has to be able to fire a bundle's script.
+///
+/// These actions stay behind `allow_create` ("the user asked for a bundle this
+/// turn"), which is a REQUEST gate, not a MODE gate: see `plugin_mode_refusal`
+/// for why the mode no longer refuses them.
 pub(super) fn plugin_action_needs_authoring(action: &str) -> bool {
     matches!(action, "install" | "create" | "update" | "toggle" | "delete")
 }
@@ -381,11 +384,17 @@ pub(super) fn plugin_action_needs_authoring(action: &str) -> bool {
 /// included — may run it, and Ask's own mutating-command gate still covers what
 /// the script does to the disk. Gating `run` on `write_files` as well was the
 /// MT5 bug: Ask refused every plugin script only because it forbids edits,
-/// while plain shell commands were fine. The AUTHORING actions are the mirror
-/// image: they WRITE the bundle, so they follow `write_files` — `allow_create`
-/// alone cannot arm them in a read-only turn, because the flag is sticky from
-/// the conversation history (an authoring request earlier in the chat keeps it
-/// set) and the compacted schema is only the first line of defence.
+/// while plain shell commands were fine.
+///
+/// The AUTHORING actions are NOT refused here either. They write the plugin
+/// bundle under `~/.codifa/plugins/`, which is not the workspace, so
+/// `write_files` — "may touch the project" — has nothing to say about them.
+/// Gating them on it was the same bug class as the `schedule` one ("[Schedule:
+/// update …]" answered with a read-only refusal): the user asks in plain words
+/// and a read-only chat silently refuses. The REQUEST gate on top of this one
+/// (`req.allow_create` in `turn.rs`, "the user asked for a bundle this turn")
+/// keeps an unasked-for write out; a mode cannot substitute for it, and
+/// requiring both meant an explicit user request never worked.
 pub(super) fn plugin_mode_refusal(action: &str, caps: &ToolCaps) -> Option<String> {
     if action == "run" && !caps.run_terminal {
         Some(
@@ -393,54 +402,126 @@ pub(super) fn plugin_mode_refusal(action: &str, caps: &ToolCaps) -> Option<Strin
 act as a terminal command, which this mode does not allow. Switch to Build mode to run it."
                 .into(),
         )
-    } else if plugin_action_needs_authoring(action) && !caps.write_files {
-        Some(
-            format!(
-                "blocked: this turn is read-only — `plugin action={action}` saves a bundle, \
-which this mode does not allow. Run the bundle's script instead (action=run), or ask the \
-user to switch to Build mode to edit the plugin."
-            ),
-        )
     } else {
         None
     }
 }
 
-/// Why a read-only turn refuses this `schedule` action, else `None`.
+/// Whether a `schedule` action is REFUSED in an unattended run, else `None`.
 ///
-/// Listing is reading; everything else SAVES a task, so it follows
-/// `write_files` exactly like `plugin`'s authoring actions. The schema is
-/// list-only in such a turn (`compact_schedule_schema`) — this is the loop
-/// backstop for a stale transcript, kept as a function so the refusal and its
-/// test live next to the same-shaped plugin gate.
-pub(super) fn schedule_mode_refusal(action: &str, caps: &ToolCaps) -> Option<String> {
-    if caps.write_files || action == "list" {
+/// Schedule actions are NEVER refused for being writes: a scheduled task lives in
+/// `~/.codifa/schedules/`, not in the workspace, so `write_files` — "may touch the
+/// project" — has nothing to say about it. Gating them on it was the
+/// "[Schedule: update …]" bug: the user typed the command and Ask answered with a
+/// read-only refusal, so create/update/toggle/delete silently did nothing unless
+/// the chat happened to be in Build mode. Every action (list, create, update,
+/// toggle, delete) is therefore allowed in every user-invoked mode; only a
+/// `headless` run is told otherwise, because a scheduled run has nobody to approve
+/// a change to that store and must not author or destroy a schedule on its own.
+pub(super) fn schedule_mode_refusal(action: &str, headless: bool) -> Option<String> {
+    if action == "list" || !headless {
         return None;
     }
     Some(
         format!(
-            "blocked: this turn is read-only — `schedule action={action}` saves a task, \
-which this mode does not allow. Use action=list to see the existing tasks, and tell the user \
-to switch to Build mode to change them."
+            "blocked: this run is unattended — `schedule action={action}` changes the schedule \
+store, and a scheduled run has nobody to approve that. Only action=list is allowed here."
         ),
     )
 }
 
+/// Codifa's canonical name for a tool a sub-agent PROFILE declared.
+///
+/// Profiles arrive in the Claude Code bundle format, so a pack's `tools:` list
+/// uses that vocabulary (`Read`, `Grep`, `Glob`, `Bash`, `WebSearch`,
+/// `WebFetch`, …) while Codifa's schemas are lowercase and sometimes spelled
+/// differently (`web_search`, `fetch_url`, `run_terminal`). Case alone already
+/// worked; this table covers the names that do NOT merely differ by case.
+///
+/// A name with no Codifa equivalent is returned lowercased/underscored, so it
+/// simply matches no schema and is dropped by [`retain_subagent_tools`] — a
+/// profile can never invent a tool.
+pub(super) fn canonical_subagent_tool(name: &str) -> String {
+    let key = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    let canonical = match key.as_str() {
+        "read" | "read_file" | "readfile" | "view" | "cat" => "read",
+        "grep" | "grep_search" | "ripgrep" | "rg" => "grep",
+        // Claude Code's LS is the file lister; Codifa's discovery tool is glob.
+        "glob" | "ls" | "list_files" | "list_dir" | "list_directory" => "glob",
+        "find_symbol" => "find_symbol",
+        "bash" | "shell" | "terminal" | "run_shell_command" => "run_terminal",
+        "websearch" | "web_search" | "search_web" => "web_search",
+        "webfetch" | "web_fetch" | "fetch" | "fetch_page" | "fetch_webpage" => "fetch_url",
+        "task" => "explore",
+        "write" | "write_file" | "create_file" => "write_file",
+        "edit" | "edit_file" | "multiedit" | "multi_edit" | "str_replace" | "apply_patch" => {
+            "edit_file"
+        }
+        "todowrite" | "todo_write" | "update_todos" => "update_plan",
+        other => other,
+    };
+    canonical.to_string()
+}
+
 /// Narrow a sub-agent's tool set to the profile's declared tools.
 ///
-/// `declared` is empty when the profile said nothing → the full research set,
-/// which is what the builtin `explore` runs with. The filter only ever REMOVES:
-/// a profile naming `write_file` gains nothing, because the research table never
-/// held it in the first place.
-pub(super) fn retain_subagent_tools(schemas: &mut Vec<Value>, declared: &[String]) {
+/// `declared` is empty when the profile said nothing → the default set for its
+/// kind, which is also what the builtin `explore` runs with. Names are
+/// canonicalized first ([`canonical_subagent_tool`]), so a Claude Code pack's
+/// `WebSearch` reaches Codifa's `web_search` instead of being silently dropped.
+///
+/// The filter only ever REMOVES work tools from the table it is given; the
+/// caller decides how wide that table starts. A profile with declared tools
+/// starts from the full sub-agent universe ([`subagent_schemas`]), which is what
+/// lets a pack's `Bash`/`Edit`/`Write` actually reach
+/// `run_terminal`/`edit_file`/`write_file` instead of being dropped on the
+/// floor. Parent capabilities still gate the result afterwards, so an Ask/Plan
+/// turn cannot become writable this way.
+///
+/// `load_plugin` is the ONE tool a declaration cannot remove: plugin access is
+/// not a per-agent setting, so even the narrowest sub-agent can load any
+/// installed toolbox on its own.
+///
+/// Returns `false` when a NON-EMPTY declaration matched nothing this table can
+/// actually run (an unknown name, or `Task`/`TodoWrite`, which stay with the
+/// parent). The caller then keeps the kind's default set: leaving a sub-agent
+/// with zero tools is useless, and silently granting it the whole universe
+/// would reward a malformed list with more reach than it asked for.
+pub(super) fn retain_subagent_tools(schemas: &mut Vec<Value>, declared: &[String]) -> bool {
     if declared.is_empty() {
-        return;
+        return true;
     }
-    schemas.retain(|s| {
-        s["function"]["name"]
-            .as_str()
-            .is_some_and(|n| declared.iter().any(|d| d.eq_ignore_ascii_case(n)))
-    });
+    let wanted: Vec<String> = declared.iter().map(|d| canonical_subagent_tool(d)).collect();
+    let mut kept: Vec<Value> = schemas
+        .iter()
+        .filter(|s| {
+            s["function"]["name"].as_str().is_some_and(|n| {
+                wanted.iter().any(|d| d.eq_ignore_ascii_case(n))
+            })
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return false;
+    }
+    // Plugin access is NOT a per-agent setting. A declaration narrows the work
+    // tools, but `load_plugin` stays: every sub-agent must be able to use any
+    // installed toolbox on its own (Settings → Sub-agents assigns none), and a
+    // pack that lists `Read`/`Bash` was never saying "no plugins".
+    if !kept
+        .iter()
+        .any(|s| s["function"]["name"].as_str() == Some("load_plugin"))
+    {
+        if let Some(schema) = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("load_plugin"))
+            .cloned()
+        {
+            kept.push(schema);
+        }
+    }
+    *schemas = kept;
+    true
 }
 
 /// Mode gating, part one: drop every tool this turn may not use. The model
@@ -547,6 +628,7 @@ impl AgentRequest {
             // inheriting the rule would only distort its research output.
             system_suffix: String::new(),
             skills: self.skills.clone(),
+            plugins: self.plugins.clone(),
             context_window: self.context_window,
             chat_id: self.chat_id.clone(),
             mcp_servers: self.mcp_servers.clone(),
@@ -557,6 +639,8 @@ impl AgentRequest {
             allow_computer: self.allow_computer,
             allow_create: self.allow_create,
             allow_browser: self.allow_browser,
+            custom_subagents: self.custom_subagents.clone(),
+            subagent_kind: self.subagent_kind.clone(),
             // A read grant is inherited: the user widened THIS TURN's reach, and
             // a sub-agent the turn delegates to searches the same disk.
             allow_outside: self.allow_outside,
@@ -587,9 +671,16 @@ impl AgentRequest {
             tool_fallbacks: self.tool_fallbacks.clone(),
             // A research sub-agent is text-only: images stay with the parent.
             images: Vec::new(),
+            // Composer attachments belong to the parent's user message; the
+            // child receives only the prompt that already names them.
+            attachments: Vec::new(),
             // A sub-agent's own tool narrowing is decided by the profile it runs
             // under, never inherited from the parent turn.
             subagent_tools: Vec::new(),
+            // The snapshot is a PARENT, not a profile: `run_subagent` sets these
+            // when it builds the child request.
+            subagent_profile: false,
+            subagent_focus: String::new(),
             // A research sub-agent searches the web the same way the parent does.
             web_search_auto_fetch: self.web_search_auto_fetch,
             // A research sub-agent has no mutating tool at all, so it runs with
@@ -676,5 +767,34 @@ pub(super) fn extract_plan_body(text: &str) -> Option<(String, String)> {
         },
         body,
     ))
+}
+
+/// The plan a plan-mode turn saved as a markdown ARTIFACT.
+///
+/// Plan mode is read-only, so a planner that wants a durable document can call
+/// `artifact create` with the plan instead of writing `docs/PLAN.md`. That
+/// content lives only in the tool call, never in the round's prose, so the
+/// end-of-turn save used to keep the closing summary ("## خلاصه") as `plan.md`
+/// and the Plan panel showed that summary instead of the real plan.
+///
+/// Only a document whose title or first heading names a plan qualifies — a
+/// supporting artifact (design notes, a diagram, a report) must not replace the
+/// plan with whichever document happened to be created last.
+pub(super) fn plan_document_from_artifact(
+    title: &str,
+    content: &str,
+) -> Option<(String, String)> {
+    let (heading, body) = extract_plan_body(content)?;
+    if !crate::plans::looks_like_plan_name(title)
+        && !crate::plans::looks_like_plan_name(&heading)
+    {
+        return None;
+    }
+    let title = if title.trim().is_empty() {
+        heading
+    } else {
+        title.trim().to_string()
+    };
+    Some((title, body))
 }
 

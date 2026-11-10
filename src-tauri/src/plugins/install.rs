@@ -6,11 +6,26 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     // from …" reads as a bug there, so say which action does what was asked.
     let spec = body["repo"].as_str().unwrap_or("").trim();
     require_repo_address(spec)?;
-    let read = crate::repo::read_plugin(
-        body["repo"].as_str().unwrap_or(""),
-        body["repo_path"].as_str().unwrap_or(""),
-        body["repo_ref"].as_str().unwrap_or(""),
-    )?;
+    // A marketplace row may name the skill folders it publishes. The source
+    // folder can hold a whole catalogue (`source: "./"`), so without this
+    // selection a row installs skills it never advertised — and PAYS to read
+    // them first. The reader filters before downloading.
+    let wanted_skills: Vec<String> = body["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|s| s.trim().trim_start_matches("./").trim_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let repo_spec = body["repo"].as_str().unwrap_or("");
+    let repo_path = body["repo_path"].as_str().unwrap_or("");
+    let repo_ref = body["repo_ref"].as_str().unwrap_or("");
+    let read = if wanted_skills.is_empty() {
+        crate::repo::read_plugin(repo_spec, repo_path, repo_ref)?
+    } else {
+        crate::repo::read_plugin_filtered(repo_spec, repo_path, repo_ref, &wanted_skills)?
+    };
     // The bundle's own manifest names it; an explicit `name` still wins so the
     // user can install the same repo twice under two names.
     let name = body["name"]
@@ -57,8 +72,27 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     if read["mcp"].as_object().is_some_and(|m| !m.is_empty()) {
         payload["mcp"] = read["mcp"].clone();
     }
+    if !wanted_skills.is_empty() {
+        payload[SOURCE_SKILLS] = json!(wanted_skills);
+    }
     let slug = plugin_ref(&payload);
     let existed = plugin_dir(root, &slug).join(MANIFEST).is_file();
+    // Every installed plugin must be findable: the description is the trigger
+    // the agent matches a request against. A repo that only ships a SKILL.md
+    // gets that skill's description lifted to the plugin; a connector- or
+    // command-only bundle gets a line derived from its parts.
+    lift_description(root, &slug, existed, &mut payload);
+    if payload["description"].as_str().unwrap_or("").trim().is_empty() {
+        payload["description"] = json!(derived_description(&payload));
+    }
+    if payload["description"].as_str().unwrap_or("").trim().is_empty() {
+        return Err(format!(
+            "the bundle at {} carries no parts Codifa can run (no skill, connector, command, \
+             agent, script or hook), so it cannot be installed as a findable plugin. Point \
+             `repo_path` at the folder that holds the bundle.",
+            read["source"].as_str().unwrap_or(spec)
+        ));
+    }
     // Writing is the install's LAST leg; the progress bubble shows it so a slow
     // disk write does not read as a hang either. Cleared on success, so a done
     // install does not leave a stale bar behind (an error path leaves the last
@@ -67,13 +101,17 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     let view = if existed {
         update_plugin(root, &payload)?
     } else {
-        create_plugin(root, &payload)?
+        create_plugin_relaxed(root, &payload)?
     };
     crate::repo::install_progress_clear();
     Ok(json!({
         "installed": if existed { "updated" } else { "created" },
         "slug": slug,
         "source": read["source"].clone(),
+        // The index file the source repo carries, when it is also a catalogue:
+        // the UI registers it as a marketplace from this flag instead of
+        // probing every install for an index that is almost never there.
+        "marketplace": read["marketplace"].clone(),
         // What actually landed, in words: a bundle carrying only commands used to
         // answer with three empty arrays, which reads exactly like a failed
         // install.

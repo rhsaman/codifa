@@ -996,7 +996,7 @@
   opacity: 0.75;
 }
 
-/* The skill a `load_skill` call pulled in — the head's only statement of it,
+/* The plugin/skill a `load_plugin` call pulled in — the head's only statement of it,
    since the label just says "Load Skill". Accent-tinted so it reads as the
    payload of the call, not as another arg chip. */
 .tool-card-head .tool-skill {

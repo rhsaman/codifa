@@ -20,50 +20,7 @@
         assert_eq!(v["path"], "/data/plugins/healer");
     }
 
-    #[test]
-    fn edit_target_of_marks_existing_skill_and_mcp_as_update_new_ones_as_none() {
-        let dir = std::env::temp_dir().join(format!("codifa-edit-target-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("skills")).unwrap();
-        // Nothing stored under the name yet: a first create is not an update.
-        assert!(edit_target_of("create_skill", &json!({"name": "Probe Skill"}), &dir).is_none());
-        // Create the skill for real, then the EDIT is recognized and pins its
-        // own folder.
-        crate::tools::dispatch_with_data_root(
-            dir.to_str().expect("temp path is utf-8"),
-            "create_skill",
-            &json!({
-                "name": "Probe Skill",
-                "description": "probe",
-                "content": "step 1",
-            }),
-            None,
-            None,
-        )
-        .expect("create the probe skill");
-        let pin = edit_target_of("create_skill", &json!({"name": "Probe Skill"}), &dir)
-            .expect("an existing skill counts as an update");
-        assert_eq!(pin.0, "skill");
-        assert!(
-            std::path::Path::new(&pin.2).is_dir(),
-            "the pinned folder must be the skill's own folder: {}",
-            pin.2
-        );
-        // A delete call never pins the badge.
-        assert!(edit_target_of(
-            "create_skill",
-            &json!({"name": "Probe Skill", "delete": true}),
-            &dir,
-        )
-        .is_none());
-        // Connectors: none stored yet → no pin.
-        assert!(edit_target_of(
-            "create_mcp",
-            &json!({"name": "Probe MCP", "command": "echo"}),
-            &dir,
-        )
-        .is_none());
-    }
+
 
     /// Model choice on media tools is a USER setting (Settings → Media
     /// Providers), never an agent lever: no media schema may expose a
@@ -111,10 +68,426 @@
         assert!(!is_delegation("reviewer"));
     }
 
-    /// A profile can only NARROW: naming a tool the research set does not hold
-    /// must not add it, and an empty declaration keeps the full set.
+    /// Custom sub-agents (Settings → Sub-agents) join the SAME delegation
+    /// table, but a `browser`/`computer` profile is only reachable while its
+    /// composer switch is on — its child turn is otherwise bound to the
+    /// research tool set, so advertising it would send the model into a dead
+    /// end. The prompt list must obey the same gate.
     #[test]
-    fn a_profile_narrows_the_research_tool_set_and_never_widens_it() {
+    fn a_custom_subagent_waits_for_its_composer_switch() {
+        let root = std::path::Path::new("/nonexistent-codifa-delegation-test");
+        let rows = vec![
+            serde_json::json!({
+                "id": "browser", "name": "Browser Navigator", "kind": "browser",
+                "description": "clicks pages", "prompt": "drive the browser"
+            }),
+            serde_json::json!({
+                "id": "computer", "name": "Desktop Operator", "kind": "computer",
+                "description": "", "prompt": "drive the desktop"
+            }),
+            serde_json::json!({
+                "id": "researcher", "name": "Researcher", "kind": "research",
+                "description": "", "prompt": "dig"
+            }),
+        ];
+        let names = |allow_browser: bool, allow_computer: bool| {
+            delegation_schemas(root, &rows, allow_browser, allow_computer)
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false, false), vec!["agent__researcher"]);
+        assert_eq!(names(true, false), vec!["agent__browser", "agent__researcher"]);
+        assert_eq!(names(false, true), vec!["agent__computer", "agent__researcher"]);
+
+        // The ID is what the turn uses to give the profile ownership of its
+        // driver; a switch that is off must yield none.
+        assert_eq!(
+            reachable_subagent_id(&rows, "browser", true, false).as_deref(),
+            Some("browser")
+        );
+        assert!(reachable_subagent_id(&rows, "browser", false, false).is_none());
+        assert_eq!(
+            reachable_subagent_id(&rows, "computer", false, true).as_deref(),
+            Some("computer")
+        );
+
+        // The prompt names exactly the profiles this turn can reach, under
+        // the same `agent__<id>` the schema advertises.
+        let hint = delegation_prompt_hint(root, &rows, true, false);
+        assert!(hint.contains("`agent__browser`"), "{hint}");
+        assert!(hint.contains("Browser Navigator"), "{hint}");
+        assert!(hint.contains("`agent__researcher`"), "{hint}");
+        assert!(!hint.contains("Desktop Operator"), "{hint}");
+        // The selection contract is generic: the FEWEST matching agents, never
+        // the whole list, and nothing at all when no description matches.
+        assert!(hint.contains("Use the FEWEST agents"), "{hint}");
+        assert!(
+            hint.contains("If no agent clearly matches, do the piece yourself"),
+            "{hint}"
+        );
+        // A page screenshot belongs to the BROWSER agent, not the desktop one.
+        assert!(hint.contains("screenshot of a page"), "{hint}");
+        assert!(hint.contains("never use the desktop agent"), "{hint}");
+        // The direct driver is withheld, and the prompt says so: otherwise a
+        // weak model keeps trying the tool it remembers from older turns.
+        assert!(hint.contains("NO direct `browser_*` tools"), "{hint}");
+        assert!(!hint.contains("NO direct `computer` tool"), "{hint}");
+        let dark = delegation_prompt_hint(root, &rows, false, false);
+        assert!(dark.contains("Researcher"), "{dark}");
+        assert!(!dark.contains("Browser Navigator"), "{dark}");
+        assert!(!dark.contains("Desktop Operator"), "{dark}");
+        assert!(!dark.contains("NO direct `browser_*` tools"), "{dark}");
+    }
+
+    /// A browser profile with an empty prompt is NOT delegable
+    /// (`delegation_schemas` skips it), so it must not take the direct driver
+    /// away — that would leave the turn with no browser at all.
+    #[test]
+    fn an_empty_prompt_does_not_claim_the_browser_driver() {
+        let rows = vec![serde_json::json!({
+            "id": "browser", "name": "Browser Navigator", "kind": "browser",
+            "description": "clicks pages", "prompt": "   "
+        })];
+        assert!(reachable_subagent_id(&rows, "browser", true, false).is_none());
+        let root = std::path::Path::new("/nonexistent-codifa-delegation-test");
+        let hint = delegation_prompt_hint(root, &rows, true, false);
+        assert!(hint.is_empty(), "an empty profile has no hint: {hint}");
+    }
+
+    /// A bundle profile is a sub-agent like any other: the model must see it in
+    /// BOTH the tool table and the prompt. The prompt is what teaches WHEN to
+    /// use it, so a schema with no prompt line leaves the tool unused.
+    #[test]
+    fn bundle_agents_join_the_same_delegation_list() {
+        let root = bundle_root("listing");
+        let bundle = delegation_schemas(&root, &[], false, false);
+        assert_eq!(bundle.len(), 1, "{bundle:?}");
+        assert_eq!(
+            bundle[0]["function"]["name"].as_str(),
+            Some("agent__reviewer")
+        );
+        let hint = delegation_prompt_hint(&root, &[], false, false);
+        assert!(hint.contains("Reviewer"), "{hint}");
+        assert!(hint.contains("plugin `Review Pack`"), "{hint}");
+
+        // A custom row with the same slug wins the tool name (the user's own
+        // profile is not shadowed by an installed bundle), and the list holds
+        // the name exactly ONCE: duplicate function names are rejected by
+        // providers.
+        let custom = vec![serde_json::json!({
+            "id": "reviewer", "name": "My Reviewer", "kind": "research",
+            "description": "my own review rules", "prompt": "review the change"
+        })];
+        let rows = delegation_schemas(&root, &custom, false, false);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0]["function"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("my own review rules"));
+        let hint = delegation_prompt_hint(&root, &custom, false, false);
+        assert!(hint.contains("My Reviewer"), "{hint}");
+        assert!(!hint.contains("Review Pack"), "{hint}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A bundle agent's tools decide its capability exactly like a Settings
+    /// row: browser tools must gate it on the Browser switch and give it
+    /// ownership of page work. Before this, every bundle agent ran as research,
+    /// so its `browser_*` tools were silently withheld.
+    #[test]
+    fn a_bundle_agents_declared_browser_tools_gate_and_derive_their_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "codifa-agent-browser-bundle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plugins").join("web-pack");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            json!({"name": "Web Pack", "enabled": true}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agents").join("navigator.md"),
+            "---\nname: Navigator\ndescription: opens pages\n\
+             tools: browser_navigate, browser_snapshot\n---\nOpen the page and report.\n",
+        )
+        .unwrap();
+
+        // Browser switch off: a browser bundle agent is not reachable.
+        assert!(delegation_schemas(&root, &[], false, false).is_empty());
+        // On: advertised with the same scope wording a custom browser row gets.
+        let on = delegation_schemas(&root, &[], true, false);
+        assert_eq!(on.len(), 1, "{on:?}");
+        assert_eq!(on[0]["function"]["name"].as_str(), Some("agent__navigator"));
+        assert!(on[0]["function"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Page work only"));
+        let hint = delegation_prompt_hint(&root, &[], true, false);
+        assert!(hint.contains("`agent__navigator`"), "{hint}");
+        // A plugin agent is an EXTRA tool, not the turn's canonical driver
+        // owner: ownership (and withholding direct tools) stays with the
+        // built-in custom row.
+        assert!(!hint.contains("NO direct `browser_*` tools"), "{hint}");
+
+        // Dispatch derives the same kind from the declared tools.
+        let mut req = base_req();
+        req.data_root = root.to_string_lossy().to_string();
+        assert_eq!(delegation_kind(&req, "agent__navigator"), "browser");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Desktop delegation is the one kind that reaches outside the app, so its
+    /// schema REQUIRES a reason: the permission card has to explain why the
+    /// desktop is needed. The browser/research tools must not ask for one.
+    #[test]
+    fn a_desktop_delegation_requires_a_reason() {
+        let root = std::path::Path::new("/nonexistent-codifa-delegation-test");
+        let rows = vec![
+            serde_json::json!({
+                "id": "desktop", "name": "Desktop Operator", "kind": "computer",
+                "description": "native apps", "prompt": "drive the desktop"
+            }),
+            serde_json::json!({
+                "id": "browser", "name": "Browser Navigator", "kind": "browser",
+                "description": "page work", "prompt": "drive the page"
+            }),
+        ];
+        let schemas = delegation_schemas(root, &rows, true, true);
+        let find = |name: &str| {
+            schemas
+                .iter()
+                .find(|s| s["function"]["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}: {schemas:?}"))
+        };
+        let desktop = find("agent__desktop");
+        assert_eq!(
+            desktop["function"]["parameters"]["required"],
+            serde_json::json!(["description", "prompt", "reason"])
+        );
+        assert!(desktop["function"]["parameters"]["properties"]["reason"].is_object());
+        let desktop_desc = desktop["function"]["description"].as_str().unwrap_or_default();
+        assert!(desktop_desc.contains("Native apps/windows only"), "{desktop_desc}");
+        // The boundary is stated on BOTH sides so "screenshot the page" cannot
+        // drift into the desktop agent.
+        assert!(desktop_desc.contains("including page screenshots"), "{desktop_desc}");
+
+        let browser = find("agent__browser");
+        assert_eq!(
+            browser["function"]["parameters"]["required"],
+            serde_json::json!(["description", "prompt"])
+        );
+        let browser_desc = browser["function"]["description"].as_str().unwrap_or_default();
+        assert!(browser_desc.contains("Page work only"), "{browser_desc}");
+        assert!(browser_desc.contains("page screenshots"), "{browser_desc}");
+    }
+
+    /// The permission card for desktop control must carry the agent's reason
+    /// and wait for the user. A scheduled run has no user: it is denied at
+    /// once rather than parked forever.
+    #[tokio::test]
+    async fn a_desktop_request_carries_its_reason_and_waits_for_an_answer() {
+        let chat = format!("desktop-gate-{}", crate::state::now_ms());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let chat_c = chat.clone();
+        let handle = tokio::spawn(async move {
+            let mut emit = move |ev: &AgentEvent| {
+                let _ = tx.send(ev.clone());
+            };
+            let cancel = CancelFlag::new(std::sync::atomic::AtomicBool::new(false));
+            ask_desktop_access(
+                &mut emit,
+                &chat_c,
+                &cancel,
+                "Open the calculator",
+                "The task needs a native app that has no browser equivalent",
+                false,
+            )
+            .await
+        });
+        let ev = rx.recv().await.expect("a permission event");
+        let AgentEvent::Permission {
+            id,
+            action,
+            reason,
+            scope,
+            path,
+            folder,
+        } = ev
+        else {
+            panic!("expected a permission event, got {ev:?}");
+        };
+        assert_eq!(scope, "computer");
+        assert_eq!(action, "Open the calculator");
+        assert!(reason.contains("native app"), "{reason}");
+        assert!(path.is_empty() && folder.is_empty());
+        // Answer only once the waiter has registered the gate (the event is
+        // emitted a moment before the oneshot is parked).
+        let mut delivered = false;
+        for _ in 0..50 {
+            if deliver_answer(&id, serde_json::json!({"allowed": true})) {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(delivered, "the gate never opened");
+        assert!(handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_desktop_request_is_denied_without_a_popup() {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut emit = |ev: &AgentEvent| events.push(ev.clone());
+        let cancel = CancelFlag::new(std::sync::atomic::AtomicBool::new(false));
+        let allowed = ask_desktop_access(
+            &mut emit,
+            "scheduled-desktop",
+            &cancel,
+            "Control the desktop",
+            "check the app",
+            true,
+        )
+        .await;
+        assert!(!allowed);
+        assert!(events.is_empty(), "nobody can answer a scheduled popup");
+        let denial = denied_desktop("check the app");
+        assert!(denial.contains("DENIED"), "{denial}");
+        assert!(denial.contains("do NOT retry"), "{denial}");
+    }
+
+    /// A bundle root with one enabled pack and one agent profile.
+    fn bundle_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "codifa-agent-bundle-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plugins").join("review-pack");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            serde_json::json!({"name": "Review Pack", "enabled": true}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agents").join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: reviews diffs\n---\nReview the change and report findings.\n",
+        )
+        .unwrap();
+        root
+    }
+
+    /// The name the chat shows while a sub-agent works is the profile's OWN
+    /// name, never the raw `agent__<id>` the model called. A bundle profile is
+    /// not in `custom_subagents`; the readable fallback covers it.
+    #[test]
+    fn a_custom_subagent_is_named_the_way_the_user_named_it() {
+        let mut req = base_req();
+        req.data_root = "/nonexistent-codifa-delegation-test".into();
+        req.custom_subagents = vec![serde_json::json!({
+            "id": "browser", "name": "Browser Navigator", "prompt": "drive the browser"
+        })];
+        assert_eq!(
+            delegation_display_name(&req, "agent__browser"),
+            "Browser Navigator"
+        );
+        assert_eq!(delegation_display_name(&req, "agent__note_taker"), "Note Taker");
+        assert_eq!(delegation_display_name(&req, "explore"), "Explore");
+    }
+
+    #[test]
+    fn a_profile_kind_follows_its_tools_when_no_kind_is_saved() {
+        // Settings rows store `kind`, but a plugin profile has no such field:
+        // its declared tools are the only signal. The rule must match the one
+        // Settings applies on save, or a bundle's browser agent silently runs
+        // as a research agent and never receives its browser tools.
+        assert_eq!(profile_kind(None), "research");
+        assert_eq!(
+            profile_kind(Some(&json!({"tools": ["browser_navigate"]}))),
+            "browser"
+        );
+        assert_eq!(profile_kind(Some(&json!({"tools": ["Computer"]}))), "computer");
+        assert_eq!(
+            profile_kind(Some(&json!({"tools": ["read", "grep"]}))),
+            "research"
+        );
+        // An explicit Settings kind wins, even if the tool list says otherwise.
+        assert_eq!(
+            profile_kind(Some(&json!({"kind": "browser", "tools": ["computer"]}))),
+            "browser"
+        );
+    }
+
+    #[test]
+    fn delegation_scheduling_uses_the_same_profile_kind_as_dispatch() {
+        let mut req = base_req();
+        req.data_root = "/nonexistent-codifa-delegation-test".into();
+        req.custom_subagents = vec![
+            json!({"id": "browser", "name": "Browser Navigator", "kind": "browser"}),
+            json!({"id": "desktop", "name": "Desktop Operator", "kind": "computer"}),
+            json!({"id": "researcher", "name": "Researcher", "kind": "research"}),
+        ];
+        assert_eq!(delegation_kind(&req, "agent__browser"), "browser");
+        assert_eq!(delegation_kind(&req, "agent__desktop"), "computer");
+        assert_eq!(delegation_kind(&req, "agent__researcher"), "research");
+        assert_eq!(delegation_kind(&req, "explore"), "research");
+    }
+
+    #[test]
+    fn an_identical_plugin_load_is_dedupable_but_a_long_skill_is_still_loadable() {
+        let toolbox = json!({"slug": "instagram-api-less"});
+        assert_eq!(
+            lookup_key("load_plugin", &toolbox),
+            lookup_key("load_plugin", &toolbox.clone())
+        );
+        // The toolbox result explicitly tells the model to load a long body
+        // with slug+skill: that MUST be a different key, or the body becomes
+        // unreachable after the toolbox.
+        let skill = json!({"slug": "instagram-api-less", "skill": "caption"});
+        assert_ne!(lookup_key("load_plugin", &toolbox), lookup_key("load_plugin", &skill));
+        assert_eq!(
+            lookup_key("load_plugin", &skill),
+            lookup_key("load_plugin", &skill.clone())
+        );
+        // A bare skill resolves its owner, so it is dedupable on its own.
+        assert!(lookup_key("load_plugin", &json!({"skill": "caption"})).is_some());
+        // A search is a cheap lookup and its result may change: no guard.
+        assert!(lookup_key("load_plugin", &json!({"query": "instagram"})).is_none());
+    }
+
+    #[test]
+    fn the_same_agent_prompt_is_deduped_but_two_agents_sharing_it_are_not() {
+        let args = json!({"description": "label", "prompt": "Check the feed"});
+        assert_eq!(
+            lookup_key("explore", &args).as_deref(),
+            Some("explore|check the feed")
+        );
+        assert_eq!(
+            lookup_key("agent__browser", &args).as_deref(),
+            Some("agent__browser|check the feed")
+        );
+        // Two different agents may legitimately answer the same question.
+        assert_ne!(lookup_key("explore", &args), lookup_key("agent__browser", &args));
+        // Whitespace and case normalize; an empty prompt is not dedupable.
+        assert_eq!(
+            lookup_key("agent__browser", &json!({"prompt": "  Check   THE feed "})),
+            lookup_key("agent__browser", &json!({"prompt": "check the feed"}))
+        );
+        assert!(lookup_key("agent__browser", &json!({"prompt": "   "})).is_none());
+    }
+
+    /// `retain_subagent_tools` only FILTERS the work tools: naming a tool that
+    /// the table does not hold must not invent it, and an empty declaration
+    /// keeps the table untouched. The one exception is `load_plugin`, which is
+    /// always kept so a narrowed agent can still load any installed plugin.
+    /// (The caller chooses how wide the table starts — declared profiles start
+    /// from `subagent_schemas`, `explore` from `research_schemas`.)
+    #[test]
+    fn retain_subagent_tools_never_invents_a_tool() {
         let mut schemas = research_schemas();
         let before = schemas.len();
         retain_subagent_tools(
@@ -125,12 +498,221 @@
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
-        assert_eq!(names, vec!["read"], "only the declared, existing tool survives");
+        assert_eq!(
+            names,
+            vec!["read", "load_plugin"],
+            "only the declared, existing work tool survives — plus the always-on plugin loader"
+        );
 
         // No declaration at all = the builtin explore set, untouched.
         let mut schemas = research_schemas();
-        retain_subagent_tools(&mut schemas, &[]);
+        assert!(retain_subagent_tools(&mut schemas, &[]));
         assert_eq!(schemas.len(), before);
+
+        // A list that names nothing this table can run reports the miss without
+        // emptying it; the caller decides the fallback.
+        let mut schemas = research_schemas();
+        assert!(!retain_subagent_tools(
+            &mut schemas,
+            &["teleport".to_string()]
+        ));
+        assert_eq!(schemas.len(), before);
+    }
+
+    /// Bundle packs declare their tools in Claude Code's vocabulary, where some
+    /// names differ by more than case (`WebSearch` vs `web_search`). Those must
+    /// be canonicalized, not silently dropped; a declaration that matches
+    /// nothing keeps the kind's full set so the sub-agent is never tool-less.
+    #[test]
+    fn foreign_subagent_tool_names_are_canonicalized() {
+        let names = |declared: &[&str]| {
+            let mut schemas = research_schemas();
+            retain_subagent_tools(
+                &mut schemas,
+                &declared.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            schemas
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        // Case-only differences already worked and must keep working.
+        assert_eq!(
+            names(&["Read", "Grep", "Glob"]),
+            vec!["read", "grep", "glob", "load_plugin"]
+        );
+        // These differ by SPELLING; before the alias table they vanished.
+        assert_eq!(
+            names(&["WebSearch", "WebFetch"]),
+            vec!["web_search", "fetch_url", "load_plugin"]
+        );
+        assert_eq!(names(&["LS"]), vec!["glob", "load_plugin"]);
+        // `Bash` canonicalizes to `run_terminal`, which the research table does
+        // not hold: nothing matches, so the function reports the miss and the
+        // caller keeps the table rather than leaving the agent tool-less. (A
+        // PROFILE sub-agent starts from `subagent_schemas`, where Bash matches.)
+        let full = research_schemas().len();
+        assert_eq!(names(&["Bash"]).len(), full);
+        // An unknown name is dropped, never invented.
+        assert_eq!(names(&["teleport"]).len(), full);
+    }
+
+    /// The sub-agent universe is the MAIN work set plus discovery, minus every
+    /// door that belongs to the parent's own turn. A profile declaring `Bash`
+    /// must actually receive `run_terminal` — the whole point of a plugin agent
+    /// is that it can run the work it was written for.
+    #[test]
+    fn a_profiles_declared_work_tools_survive_on_the_subagent_universe() {
+        let names = |declared: &[&str]| {
+            let mut schemas = subagent_schemas();
+            retain_subagent_tools(
+                &mut schemas,
+                &declared.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            let mut names: Vec<String> = schemas
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        };
+        // The real bundle shape found on this machine.
+        assert_eq!(
+            names(&["Read", "Grep", "Glob", "Bash"]),
+            vec!["glob", "grep", "load_plugin", "read", "run_terminal"]
+        );
+        // A write-capable pack keeps its writing tools too.
+        assert_eq!(
+            names(&["Read", "Bash", "Edit", "Write"]),
+            vec!["edit_file", "load_plugin", "read", "run_terminal", "write_file"]
+        );
+    }
+
+    /// The universe must never hand a sub-agent the parent's own doors:
+    /// delegation, planning, user interaction, artifacts, schedules, authoring,
+    /// media or `use_mcp`. `load_plugin` IS allowed: a sub-agent loads any
+    /// installed toolbox on its own, exactly like the main agent.
+    #[test]
+    fn the_subagent_universe_excludes_parent_only_tools() {
+        let schemas = subagent_schemas();
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        for wanted in [
+            "read",
+            "grep",
+            "glob",
+            "run_terminal",
+            "write_file",
+            "edit_file",
+            "web_search",
+            "fetch_url",
+            "batch",
+            "load_plugin",
+        ] {
+            assert!(names.contains(&wanted), "{wanted} must be available");
+        }
+        for forbidden in [
+            "explore",
+            "update_plan",
+            "ask_user",
+            "confirm_action",
+            "artifact",
+            "schedule",
+            "plugin",
+            "use_mcp",
+        ] {
+            assert!(!names.contains(&forbidden), "{forbidden} must stay with the parent");
+        }
+    }
+
+    /// Parent capabilities still win: an Ask/Plan turn cannot become writable
+    /// just because a profile declares Write/Edit. The terminal stays — Ask
+    /// needs it for `git status` / `du` — but the writing tools vanish.
+    #[test]
+    fn parent_caps_keep_a_declared_write_out_of_a_read_only_turn() {
+        let narrowed = |caps: &ToolCaps| {
+            let mut schemas = subagent_schemas();
+            retain_subagent_tools(
+                &mut schemas,
+                &["Read", "Bash", "Edit", "Write"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            retain_allowed_tools(&mut schemas, caps, "subagent");
+            let mut names: Vec<String> = schemas
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        };
+        let ask = narrowed(&caps_for_mode("ask"));
+        assert!(ask.contains(&"read".to_string()));
+        assert!(ask.contains(&"run_terminal".to_string()));
+        assert!(!ask.contains(&"write_file".to_string()));
+        assert!(!ask.contains(&"edit_file".to_string()));
+
+        let build = narrowed(&caps_for_mode("build"));
+        assert!(build.contains(&"write_file".to_string()));
+        assert!(build.contains(&"edit_file".to_string()));
+    }
+
+    /// A bundle agent carries its owning bundle automatically; a custom row
+    /// carries the slugs the user checked. No profile = no plugin.
+    #[test]
+    fn a_subagent_carries_its_own_or_its_checked_plugins() {
+        assert!(attached_plugin_slugs(None).is_empty());
+        let bundle = json!({
+            "name": "Judge",
+            "plugin_slug": "advisor",
+            "tools": ["Read"]
+        });
+        assert_eq!(attached_plugin_slugs(Some(&bundle)), vec!["advisor"]);
+        let custom = json!({
+            "id": "notetaker",
+            "plugins": ["advisor", " designlang ", "advisor", ""]
+        });
+        assert_eq!(
+            attached_plugin_slugs(Some(&custom)),
+            vec!["advisor", "designlang"]
+        );
+    }
+
+    /// The user's `@` attachment belongs to the whole task, including the part
+    /// a sub-agent performs. This used to be `Vec::new()`, so a browser child
+    /// ran a live-UI request without the Test UI harness the parent carried.
+    #[test]
+    fn a_subagent_inherits_the_parents_attached_skills() {
+        let mut req = base_req();
+        assert!(inherited_skills(&req).is_empty(), "no attachment, no skills");
+        req.skills = vec!["Test UI".into(), "humanizer".into()];
+        assert_eq!(
+            inherited_skills(&req),
+            vec!["Test UI".to_string(), "humanizer".to_string()]
+        );
+    }
+
+    /// A sub-agent never invents capabilities: it uses the parent's table when
+    /// the renderer sent one, otherwise it derives the row from the parent MODE.
+    /// The old `parent.cap.clone()` passed `None` straight through, and
+    /// `caps_for_mode("subagent")` is permissive — an Ask turn became writable
+    /// as soon as a profile declared `Write`.
+    #[test]
+    fn a_subagent_inherits_the_parent_caps_or_derives_them_from_its_mode() {
+        let mut req = base_req();
+        req.mode = "ask".into();
+        req.cap = None;
+        assert!(!inherited_caps(&req).write_files);
+        assert!(inherited_caps(&req).run_terminal);
+
+        req.cap = Some(ToolCaps {
+            write_files: true,
+            ..ToolCaps::default()
+        });
+        assert!(inherited_caps(&req).write_files);
     }
 
     /// The single model decision: EVERY sub-agent reads the `explore` slot, so
@@ -649,67 +1231,80 @@
             }
         )
         .is_some());
-        // The mirror image: authoring actions WRITE the bundle, so a read-only
-        // mode refuses them even when sticky allow_create armed the tool —
-        // this is the gate that stops Ask from "updating the plugin" instead
-        // of running it. Build may still author.
-        assert!(plugin_mode_refusal("update", &caps_for_mode("ask")).is_some());
-        assert!(plugin_mode_refusal("toggle", &caps_for_mode("ask")).is_some());
+        // The mirror image: authoring actions WRITE the bundle store, which is
+        // NOT the workspace, so the MODE has nothing to say about them — the
+        // request gate (`req.allow_create`, checked in turn.rs) is what stops an
+        // unasked-for write. Refusing on `write_files` too was the bug that made
+        // an explicit "update the plugin" fail in a read-only chat.
+        assert!(plugin_mode_refusal("update", &caps_for_mode("ask")).is_none());
+        assert!(plugin_mode_refusal("toggle", &caps_for_mode("ask")).is_none());
         assert!(plugin_mode_refusal("update", &caps_for_mode("build")).is_none());
         assert!(plugin_mode_refusal("list", &caps_for_mode("plan")).is_none());
     }
 
     #[test]
-    fn schedule_refusal_mirrors_the_plugin_gate() {
-        // Listing is reading: every mode may do it, and Build/unknown may write.
-        assert!(schedule_mode_refusal("list", &caps_for_mode("ask")).is_none());
-        assert!(schedule_mode_refusal("list", &caps_for_mode("plan")).is_none());
-        assert!(schedule_mode_refusal("create", &caps_for_mode("build")).is_none());
-        // The writes follow `write_files`: a read-only turn refuses them even
-        // with a sticky allow_create, in the same words the plugin gate uses.
+    fn schedule_is_never_refused_for_a_user_invoked_turn() {
+        // A schedule lives in `~/.codifa/schedules/`, not the workspace, so the
+        // MODE has no say: the user's own words are the approval. Every action
+        // works in every mode of a user-invoked turn.
+        for action in ["list", "create", "update", "toggle", "delete"] {
+            assert!(
+                schedule_mode_refusal(action, false).is_none(),
+                "{action} must be allowed in a user-invoked turn"
+            );
+        }
+        // Only an UNATTENDED run is told otherwise: nobody is there to approve
+        // a change to that store, and a scheduled run must not rewrite itself.
+        assert!(schedule_mode_refusal("list", true).is_none());
         for action in ["create", "update", "toggle", "delete"] {
-            let refusal = schedule_mode_refusal(action, &caps_for_mode("ask"))
-                .unwrap_or_else(|| panic!("ask must refuse schedule {action}"));
-            assert!(refusal.contains("read-only"), "{refusal}");
+            let refusal = schedule_mode_refusal(action, true)
+                .unwrap_or_else(|| panic!("a headless run must refuse schedule {action}"));
+            assert!(refusal.contains("unattended"), "{refusal}");
             assert!(refusal.contains("action=list"), "{refusal}");
         }
     }
 
     #[test]
-    fn authoring_tools_follow_write_files_wherever_they_come_from() {
-        // A sticky `allow_create` (an authoring request earlier in the chat)
-        // must not arm the authoring tools in a read-only turn: the schema
-        // filter drops them for a non-authoring turn, and `denied_by_caps`
-        // drops AND refuses them for a turn that cannot write — the second
-        // gate a stale transcript or a hallucinated call meets.
-        let caps = ToolCaps { write_files: false, ..ToolCaps::default() };
-        for name in ["create_skill", "create_mcp"] {
-            let refusal = denied_by_caps(&caps, name)
-                .unwrap_or_else(|| panic!("{name} must be gated on write_files"));
-            assert!(refusal.contains("read-only"), "{refusal}");
+    fn plugin_authoring_is_the_only_authoring_door() {
+        // Skills and connectors are authored INSIDE a plugin. The standalone
+        // tools are gone from the schema list entirely, so a stale transcript
+        // cannot reach a store the plugin model no longer has.
+        let names: Vec<String> = tool_schemas(true, true)
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        for gone in ["create_skill", "create_mcp", "load_skill"] {
+            assert!(!names.contains(&gone.to_string()), "{gone} must not exist");
         }
-        // A writable turn keeps them (the allow_create filter governs there).
-        assert!(denied_by_caps(&caps_for_mode("build"), "create_mcp").is_none());
+        assert!(names.contains(&"load_plugin".to_string()));
+        assert!(names.contains(&"plugin".to_string()));
+        // A read-only turn still refuses a workspace write.
+        let caps = ToolCaps { write_files: false, ..ToolCaps::default() };
+        let refusal = denied_by_caps(&caps, "write_file").expect("write_file is gated");
+        assert!(refusal.contains("read-only"), "{refusal}");
+        assert!(denied_by_caps(&caps_for_mode("build"), "write_file").is_none());
     }
 
     #[test]
-    fn read_only_turns_see_the_compact_read_schema() {
-        // Ask (caps.write_files=false): the schema list is the first gate —
-        // authoring is ABSENT, plugin is list/run only, and schedule stays
-        // reachable but list-only, so "what is scheduled" costs no refusal.
+    fn read_only_turns_keep_the_full_plugin_enum() {
+        // Ask (caps.write_files=false): the schema list is the first gate and
+        // the authoring TOOLS are absent, but `plugin` and `schedule` keep their
+        // FULL enums — both stores live outside the workspace, so NEITHER the
+        // mode NOR the request-text guess (`allow_create`) may narrow them. That
+        // narrowing is what answered a plain "update the schedule" with a
+        // `list`-only enum. The call-time mode gates are the real guard.
         let mut schemas = tool_schemas(false, false);
         let ask = caps_for_mode("ask");
         retain_allowed_tools(&mut schemas, &ask, "ask");
-        compact_plugin_schema(&mut schemas);
-        compact_schedule_schema(&mut schemas);
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
-        assert!(!names.contains(&"create_skill"), "ask must not offer create_skill");
-        assert!(!names.contains(&"create_mcp"), "ask must not offer create_mcp");
+        assert!(!names.contains(&"create_skill"), "create_skill is gone");
+        assert!(!names.contains(&"create_mcp"), "create_mcp is gone");
+        assert!(names.contains(&"load_plugin"), "ask may load a plugin (a read)");
         assert!(names.contains(&"plugin"), "ask keeps the plugin door");
-        assert!(names.contains(&"schedule"), "ask keeps schedule for listing");
+        assert!(names.contains(&"schedule"), "ask keeps schedule");
         let plugin = schemas
             .iter()
             .find(|s| s["function"]["name"] == "plugin")
@@ -721,7 +1316,15 @@
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(plugin_enum, ["list", "run"], "ask plugin enum");
+        assert!(
+            plugin_enum.contains(&"update")
+                && plugin_enum.contains(&"delete")
+                && plugin_enum.contains(&"create")
+                && plugin_enum.contains(&"install")
+                && plugin_enum.contains(&"list")
+                && plugin_enum.contains(&"run"),
+            "plugin enum must stay full: {plugin_enum:?}"
+        );
         let schedule = schemas
             .iter()
             .find(|s| s["function"]["name"] == "schedule")
@@ -733,7 +1336,10 @@
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(schedule_enum, ["list"], "ask schedule enum");
+        assert!(
+            schedule_enum.contains(&"update") && schedule_enum.contains(&"delete"),
+            "ask schedule enum must stay full: {schedule_enum:?}"
+        );
     }
 
     #[test]
@@ -762,8 +1368,9 @@
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
-        assert!(names.contains(&"create_skill"));
-        assert!(names.contains(&"create_mcp"));
+        assert!(names.contains(&"load_plugin"));
+        assert!(names.contains(&"plugin"));
+        assert!(!names.contains(&"create_skill"));
     }
 
     #[test]
@@ -1543,11 +2150,19 @@
             "path": outside.join("stt-server.py").to_string_lossy(),
             "old_string": "a", "new_string": "b",
         });
-        let folder = outside_target("edit_file", &args, root.to_str().unwrap(), None, &caps)
+        let ask = outside_target("edit_file", &args, root.to_str().unwrap(), None, &caps)
             .expect("an out-of-tree write must pre-flight");
         assert!(
-            outside.starts_with(&folder),
-            "the grant must cover the write's own folder: {folder:?}"
+            outside.starts_with(&ask.folder),
+            "the grant must cover the write's own folder: {:?}",
+            ask.folder
+        );
+        // The CARD shows the file itself, never the parent folder — the old
+        // event put `folder` in `path`, so /etc/hosts was shown as /etc.
+        assert!(
+            ask.target.ends_with("stt-server.py"),
+            "the card must name the exact target, got {:?}",
+            ask.target
         );
         // A read-only mode refuses the call by caps anyway: no popup.
         caps.write_files = false;
@@ -1736,6 +2351,33 @@
     }
 
     #[test]
+    fn a_quoted_operator_is_an_argument_not_a_redirect_or_a_chain() {
+        // MEASURED (mw94lr47): the ordinary docx→text pipeline was refused in
+        // a read-only turn because the `>` inside the sed REGEX (`<[^>]*>`) was
+        // read as a shell redirect — so the agent could not read the user's
+        // Word file at all. A quoted `>`/`|`/`;` is an ARGUMENT.
+        for cmd in [
+            r#"unzip -p report.docx word/document.xml | sed -e 's/<\/w:p>/\n/g' -e 's/<[^>]*>//g' | head -80"#,
+            r#"sed -n 's/foo>bar/baz/p' notes.txt"#,
+            r#"grep -n 'a|b;c' src/app.ts"#,
+            r#"awk '{ if ($1 > 2) print }' data.txt"#,
+        ] {
+            assert!(
+                !is_mutating_command(cmd),
+                "{cmd:?} only reads; the operator is inside quotes"
+            );
+        }
+        // A redirect OUTSIDE the quotes is still a write.
+        for cmd in [
+            "echo hi > notes.md",
+            "sed 's/a/b/' f > out.txt",
+            "grep -n 'a|b' src/app.ts > hits.txt",
+        ] {
+            assert!(is_mutating_command(cmd), "{cmd:?} redirects into a real file");
+        }
+    }
+
+    #[test]
     fn a_read_only_turn_cannot_smuggle_a_write_through_an_interpreter() {
         // `node -e "fs.writeFileSync(...)"` changes the workspace without naming
         // a single mutating binary, so the eval forms are refused while the turn
@@ -1762,8 +2404,9 @@
 
     #[test]
     fn authoring_tools_are_bound_only_when_the_turn_asks_for_them() {
-        // An ordinary turn must not be able to rewrite the skill store or the
-        // connector list, so the authoring tools are gated on allow_create.
+        // An ordinary turn must not be able to rewrite a plugin, so the
+        // authoring ACTIONS of the one `plugin` tool are gated on allow_create.
+        // Loading a plugin is a read and stays available in every turn.
         let names = |allow: bool| -> Vec<String> {
             tool_schemas(allow, true)
                 .iter()
@@ -1773,12 +2416,11 @@
         let plain = names(false);
         assert!(!plain.contains(&"create_skill".to_string()));
         assert!(!plain.contains(&"create_mcp".to_string()));
-        // load_skill stays available: reading a skill is not authoring.
-        assert!(plain.contains(&"load_skill".to_string()));
+        assert!(plain.contains(&"load_plugin".to_string()));
 
         let authoring = names(true);
-        assert!(authoring.contains(&"create_skill".to_string()));
-        assert!(authoring.contains(&"create_mcp".to_string()));
+        assert!(authoring.contains(&"load_plugin".to_string()));
+        assert!(authoring.contains(&"plugin".to_string()));
     }
 
     #[test]
@@ -1812,6 +2454,9 @@
             "lsp_hover",
             "lsp_symbols",
             "lsp_diagnostics",
+            "web_search",
+            "fetch_url",
+            "load_plugin",
             "search_memory",
             "save_memory",
             "delete_memory",
@@ -1974,7 +2619,7 @@
             // Re-based once more when `schedule` joined every NON-authoring set
             // as the list-only compact schema (~0.4K chars: "what is scheduled"
             // no longer costs a refusal round in a read-only turn), and
-            // `load_skill` learned the `bundle` drill-in + the `plugin` schema's
+            // `load_plugin` learned the plugin-unit contract + the `plugin` schema's
             // `list` line grew its slug-detail hint. The step is those schemas
             // themselves; the ~3.5% headroom convention still holds.
             // Re-based for the batch params the round-elimination work added:
@@ -1993,8 +2638,36 @@
             // +111: the glob/grep/terminal ownership lines (file discovery =
             // glob, content = grep — the traced batch used grep+ls for what
             // one glob answers).
-            ("main", tool_schemas(false, false), 19_500usize),
-            ("main+browser", tool_schemas(false, true), 26_350),
+            // Re-based for the plugin-unit redesign: `load_skill` became
+            // `load_plugin` (one call returns every skill body, the connector
+            // inventory and the script/command list) and the `plugin` schema
+            // learned `mcp`/`deleted_mcp`, so ONE call can author a whole
+            // toolbox. The step is exactly those schemas' chars.
+            // Re-based for the honest-gate fix: `write_file`'s `files` batch shape
+            // and `edit_file`'s per-entry `path` are spelled out in the schemas
+            // (a nameless batch cost a traced round). The kinds are unchanged; the
+            // ceilings moved by the prose that fixes those two failures.
+            // Re-based for the schedule/plugin gate fix: the compact `plugin`
+            // schema narrowing is GONE, because it was the second half of the
+            // same bug — `allow_create` is a prompt-text guess, so an ordinary
+            // "update the schedule" turn got a `list`-only enum and could not
+            // name the action at all. The two non-authoring sets therefore pay
+            // the full `plugin` enum (~+3.5K chars: measured 24371 vs 31005) on
+            // every round of a plain turn. That is the deliberate price of a
+            // door the user's own words can open in ANY mode; the call-time
+            // mode gate is what actually protects the store.
+            // Re-based for sub-agent plugin access: every sub-agent now has
+            // `load_plugin` and the plugin catalog, so Settings assigns no
+            // plugins. The research set pays that schema (+~0.6K) and the
+            // explore description names `web_search`/`fetch_url` (+~0.1K on the
+            // main set, which advertises the same tool).
+            // Re-based for document reads: `read` now returns `.pdf`/`.docx`/
+            // `.xlsx` as extracted TEXT, so the agent never needs
+            // `unzip … | sed …` or `pdftotext` in the shell (+~45 chars). The
+            // measured tree was already 41 chars over the old ceiling from the
+            // `update_plan` multi-step prose, so this step absorbs both.
+            ("main", tool_schemas(false, false), 24_750usize),
+            ("main+browser", tool_schemas(false, true), 31_400),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -2011,7 +2684,9 @@
             // Re-based when `batch` joined the RESEARCH set: the explore
             // sub-agent is the heaviest search caller, so the whole-step
             // executor rides there too (that is where the round-trips are).
-            ("explore", research_schemas(), 9_950),
+            // Raised again for `load_plugin`: a sub-agent loads any installed
+            // plugin on its own, so the schema is part of this set.
+            ("explore", research_schemas(), 11_200),
         ] {
             let got = chars(&schemas);
             if got > budget {
@@ -2026,12 +2701,21 @@
     }
 
     #[test]
-    fn a_plain_turn_keeps_the_script_door_but_not_the_authoring_actions() {
+    fn a_plain_turn_keeps_the_script_door_and_can_name_every_action() {
         // A scheduled Build run sends `allow_create: false` and has nobody to
         // ask, so binding the WHOLE `plugin` tool behind that flag meant a
         // bundle's scripts were unreachable there — the plugin was installed,
-        // on, and invisible. `list`/`run` are acts like `run_terminal`, so a
-        // plain turn keeps exactly those two, and the write actions stay out.
+        // on, and invisible.
+        //
+        // The FIX is that the flag no longer narrows the schema at all. It used
+        // to compact `action` down to ["list", "run"] on a plain turn, and that
+        // was the second half of the "[Schedule: update …] is silently refused"
+        // bug: `allow_create` is a prompt-text guess, never set by an ordinary
+        // request, so a user who plainly said "update the schedule" got a
+        // `list`-only enum and the model could not name the action — the
+        // refusal happened in the SCHEMA, before any mode gate ran. Naming an
+        // action is not doing it: `plugin_mode_refusal` and the `allow_create`
+        // check at the call site stay the real gate.
         let schemas = tool_schemas(false, false);
         let plugin = schemas
             .iter()
@@ -2043,14 +2727,12 @@
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(actions, vec!["list", "run"], "{actions:?}");
-        // The authoring prose must NOT ride along: it is ~2.9K chars re-sent on
-        // every round-trip of every ordinary turn.
-        let desc = plugin["function"]["description"].as_str().unwrap_or("");
-        assert!(
-            !desc.contains("git repo"),
-            "the authoring description must stay out of a plain turn: {desc}"
-        );
+        for action in ["list", "run", "install", "create", "update", "toggle", "delete"] {
+            assert!(
+                actions.contains(&action),
+                "a plain turn must be able to NAME {action}: {actions:?}"
+            );
+        }
         // The authoring turn keeps the full set.
         let full = tool_schemas(true, false);
         let authored = full
@@ -2208,6 +2890,11 @@
         assert!(p.contains("backend/: server.py"), "{p}");
         // LSP + glob semantics are spelled out (the old prompt never named LSP).
         assert!(p.contains("lsp_definition") && p.contains("lsp_references") && p.contains("lsp_symbols"));
+        // Web research is part of this agent's job: the schemas carry
+        // web_search/fetch_url and the prompt must point at them, or the model
+        // reads the file-only search strategy and answers external questions
+        // from memory.
+        assert!(p.contains("web_search") && p.contains("fetch_url"), "{p}");
         // find_symbol is the one-call replacement for the grep -> lsp chain.
         assert!(p.contains("find_symbol"), "{p}");
         // The single-call rule and the offset rule are what stop the 4-round
@@ -2269,6 +2956,136 @@
         assert_eq!(report, "ANSWER: x (saved)");
         fold_subagent_event(&mut report, &mut err, &AgentEvent::Error { content: "boom".into() });
         assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn a_clean_run_with_work_but_no_closing_text_is_not_retried() {
+        // The report buffer is cleared by each tool start, so a model that ends
+        // right after publishing leaves it empty. Retrying that is the traced
+        // duplicate publish; the evidence makes it a finished run instead.
+        let entries = vec!["browser_click(text=\"Post\") -> ok".to_string()];
+        assert!(finished_with_evidence_but_no_report(
+            &Ok(()),
+            "",
+            "",
+            &entries
+        ));
+        // A real provider error must still retry, even with partial text.
+        assert!(!finished_with_evidence_but_no_report(
+            &Err("429".into()),
+            "",
+            "",
+            &entries
+        ));
+        assert!(!finished_with_evidence_but_no_report(
+            &Ok(()),
+            "stream error",
+            "",
+            &entries
+        ));
+        // No evidence at all: empty output is still a failure.
+        assert!(!finished_with_evidence_but_no_report(&Ok(()), "", "", &[]));
+        // A written report is handled by the normal success path.
+        assert!(!finished_with_evidence_but_no_report(
+            &Ok(()),
+            "",
+            "Done",
+            &entries
+        ));
+    }
+
+    #[test]
+    fn giving_up_after_real_work_returns_evidence_not_no_findings() {
+        // The parent must never hear "no findings" from a child that already
+        // changed the world: that is what made the next model repeat the
+        // Instagram publish.
+        let progress = vec![
+            "browser_navigate(url=\"https://www.instagram.com/\") -> ok".to_string(),
+            "browser_click(text=\"Share\") -> ok".to_string(),
+            "browser_click(text=\"Post\") was still running when the attempt stopped — it MAY \
+             have completed; verify the current state before repeating it."
+                .to_string(),
+        ];
+        let report = partial_subagent_report(&progress, "", "sub-agent hung: no activity for 120s")
+            .expect("progress must produce a partial report");
+        assert!(report.contains("STOPPED BEFORE FINISHING"), "{report}");
+        assert!(!report.contains("no findings"), "{report}");
+        assert!(report.contains("browser_click(text=\"Share\")"), "{report}");
+        assert!(report.contains("MAY have completed"), "{report}");
+        assert!(report.contains("STOP REASON: sub-agent hung"), "{report}");
+        // Text without tools is still evidence.
+        assert!(partial_subagent_report(&[], "I found the answer", "provider 500")
+            .unwrap()
+            .contains("I found the answer"));
+        // Nothing at all: keep the ordinary failure, not a fake partial report.
+        assert!(partial_subagent_report(&[], "   ", "provider 401").is_none());
+    }
+
+    #[test]
+    fn a_retried_subagent_gets_the_task_plus_what_already_happened() {
+        // Traced: a browser attempt published an Instagram post, hung while
+        // verifying it, and the next model was handed the ORIGINAL prompt with
+        // no memory of the publish — so it opened the composer and published
+        // again. The continuation block is the generic fix: keep the task, carry
+        // the completed steps, and say an interrupted call may have landed.
+        let progress = vec![
+            "browser_navigate(url=\"https://www.instagram.com/\") -> ok: refs v1".to_string(),
+            "browser_click(text=\"Share\") -> ok".to_string(),
+            "browser_file_upload(paths=\"/tmp/post.png\") -> ok".to_string(),
+            "browser_click(text=\"Post\") was still running when the attempt stopped — it MAY \
+             have completed; verify the current state before repeating it."
+                .to_string(),
+        ];
+        let block = continuation_block(&progress);
+        assert!(block.contains("CONTINUATION"), "{block}");
+        assert!(block.contains("NOT A NEW REQUEST"), "{block}");
+        assert!(block.contains("Do NOT repeat an action that already completed"), "{block}");
+        assert!(block.contains("IRREVERSIBLE"), "{block}");
+        assert!(block.contains("verify the current state"), "{block}");
+        assert!(block.contains("toolbox/connector"), "{block}");
+        assert!(block.contains("browser_file_upload"), "{block}");
+        // A first attempt gets no block at all: the prompt stays byte-for-byte
+        // the user's/delegator's task.
+        assert_eq!(continuation_block(&[]), "");
+    }
+
+    #[test]
+    fn progress_args_names_the_fields_a_continuation_needs() {
+        let args = json!({
+            "url": "https://example.test/a",
+            "selector": "#go",
+            "expression": "document.title",
+            "paths": ["/tmp/a.png"],
+            "unrelated": "dropped",
+            "long": "x".repeat(500),
+        });
+        let text = progress_args(&args);
+        assert!(text.contains("url=\"https://example.test/a\""), "{text}");
+        assert!(text.contains("selector=\"#go\""), "{text}");
+        assert!(text.contains("expression=\"document.title\""), "{text}");
+        assert!(text.contains("paths="), "{text}");
+        assert!(!text.contains("unrelated"), "{text}");
+        assert!(!text.contains("long="), "{text}");
+        // Values are clipped so one giant argument cannot fill the window.
+        let long = progress_args(&json!({"command": "y".repeat(400)}));
+        assert!(long.chars().count() < 260, "{}", long.chars().count());
+    }
+
+    #[test]
+    fn continuation_progress_keeps_the_newest_entries_and_stays_bounded() {
+        let mut progress: Vec<String> = (0..60).map(|i| format!("call {i} -> ok")).collect();
+        trim_progress(&mut progress);
+        // Entry cap: the OLDEST calls are dropped, the latest survives.
+        assert!(progress.len() <= 40, "{}", progress.len());
+        assert!(progress.iter().any(|e| e.contains("call 59")), "{progress:?}");
+        assert!(!progress.iter().any(|e| e.contains("call 0 ")), "{progress:?}");
+        // Char cap: one huge plugin body is kept (clipped), and the window
+        // never exceeds the continuation budget.
+        let mut one = vec!["load_plugin(slug=\"x\") -> ok: ".to_string() + &"z".repeat(40_000)];
+        trim_progress(&mut one);
+        let total = one.join("\n").chars().count();
+        assert!(total <= 12_000, "{total}");
+        assert!(one[0].starts_with("load_plugin"), "{}", one[0]);
     }
 
     #[test]
@@ -2389,10 +3206,16 @@
         assert!(single_call_hint("subagent", &one("grep"), 1, root)
             .unwrap()
             .contains("NEXT step"));
-        // The main agent: a single broad explore wastes the concurrent fan-out
-        // (a traced turn fired one wide explore and got a 4-round report).
+        // The main agent: a single delegation is a missed concurrent fan-out
+        // when the request genuinely splits. Browser/desktop are called out as
+        // the serialized exception so the hint cannot tell the model to run two
+        // drivers at once.
         let main = single_call_hint("agent", &one("explore"), 1, root).unwrap();
-        assert!(main.contains("CONCURRENTLY") && main.contains("2-4 focused explores"), "{main}");
+        assert!(main.contains("CONCURRENTLY"), "{main}");
+        assert!(main.contains("browser/desktop"), "{main}");
+        let custom = single_call_hint("agent", &one("agent__browser"), 1, root).unwrap();
+        assert!(custom.contains("ONE sub-agent"), "{custom}");
+        assert!(custom.contains("one at a time"), "{custom}");
         // Batched steps are left alone, and so is a single non-explore call.
         let two = vec![
             ("a".to_string(), "grep".to_string(), "{}".to_string()),
@@ -2471,7 +3294,7 @@
         // was foreseeable); `glob` joins for the same execution semantics (it
         // runs in the concurrent batch phase, so the wording stays truthful).
         for name in [
-            "read", "grep", "glob", "fetch_url", "load_skill", "find_symbol", "lsp_symbols",
+            "read", "grep", "glob", "fetch_url", "find_symbol", "lsp_symbols",
         ] {
             let hint = single_call_hint("agent", &one(name), 1, root)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
@@ -2547,7 +3370,6 @@
             "lsp_hover",
             "lsp_diagnostics",
             "fetch_url",
-            "load_skill",
         ] {
             let lookup = vec![("c1".to_string(), name.to_string(), "{}".to_string())];
             assert!(
@@ -2813,11 +3635,12 @@
     }
 
     #[test]
-    fn the_explore_spent_budget_nudge_lands_before_the_exhaustion_nudge() {
-        // The round-3 nudge only helps while rounds remain, and it has to be
-        // distinguishable from the "nearly exhausted" one (step + 3 == max).
-        assert!(EXPLORE_BUDGET_STEPS < SUBAGENT_MAX_STEPS);
-        assert!(EXPLORE_BUDGET_STEPS < SUBAGENT_MAX_STEPS - 3);
+    fn a_subagent_has_no_step_budget_nudges() {
+        // The sub-agent loop is uncapped (max_steps == usize::MAX). A "report
+        // now, you are nearly out of steps" message was what produced
+        // half-finished browser runs, so no nudge may key off a sub-agent cap.
+        assert!(main_wrapup_message(0, usize::MAX, false, "subagent").is_none());
+        assert!(main_wrapup_message(9, usize::MAX, false, "subagent").is_none());
     }
 
     #[test]
@@ -2932,7 +3755,7 @@
         assert!(!subagent_error_is_fatal("500 internal server error"));
         assert!(!subagent_error_is_fatal("connection refused"));
         assert!(!subagent_error_is_fatal("sub-agent hung: no activity for 300s"));
-        assert!(!subagent_error_is_fatal("explore returned no findings: empty"));
+        assert!(!subagent_error_is_fatal("sub-agent returned no findings: empty"));
         assert!(!subagent_error_is_fatal(""));
     }
 
@@ -3008,9 +3831,6 @@
             "9router reported an error mid-stream: No active credentials for provider: openrouter"
         ));
         // Prefixes the ladder adds on its way through.
-        assert!(subagent_error_is_fatal(
-            "explore failed: No active credentials for provider: openrouter"
-        ));
         assert!(subagent_error_is_fatal(
             "sub-agent failed: No active credentials for provider: openrouter"
         ));
@@ -3197,304 +4017,333 @@
     }
 
     #[test]
-    fn create_skill_persists_the_description_into_the_catalog() {
-        use crate::tools::dispatch;
-        let dir = std::env::temp_dir().join(format!("codifa-create-skill-{}", std::process::id()));
+    fn create_plugin_persists_the_description_into_the_catalog() {
+        use crate::tools::dispatch_with_data_root;
+        let dir = std::env::temp_dir().join(format!("codifa-create-plugin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let root = dir.to_str().unwrap();
 
-        let out = dispatch(
+        let out = dispatch_with_data_root(
             root,
-            "create_skill",
+            "plugin",
             &json!({
+                "action": "create",
                 "name": "Movie Finder",
-                "description": "find movies",
-                "content": "Step 1: ask for the genre.",
+                "description": "find movies and where to watch them",
+                "skills": [{
+                    "name": "Movie Finder",
+                    "description": "find movies",
+                    "content": "Step 1: ask for the genre.",
+                }]
             }),
             None,
+            Some(root),
         )
         .unwrap();
-        assert!(out.contains("Movie Finder"), "{out}");
+        assert!(out.contains("movie-finder"), "{out}");
 
-        // The description is the trigger: the catalog lists the skill with it,
-        // and a legacy keyword line never becomes a catalog line.
+        // The top-level description is the trigger: the catalog lists the
+        // PLUGIN with it, and the skill body never leaks into the catalog.
         let section = crate::skill_router::build_section(root, &[]);
-        assert!(section.text.contains("- Movie Finder"), "{}", section.text);
-        assert!(section.text.contains("find movies"), "{}", section.text);
-        assert!(!section.text.contains("[fa:"), "{}", section.text);
-
-        // A missing name/content is rejected instead of writing a broken skill.
-        assert!(dispatch(root, "create_skill", &json!({"content": "x"}), None).is_err());
-        assert!(dispatch(root, "create_skill", &json!({"name": "x"}), None).is_err());
-
-        // The saved skill is marked user-owned, so a later launch cannot revert
-        // an edit made here on the user's behalf.
-        let dir_path = crate::skills::find_skill_dir_pub(&dir, "Movie Finder").expect("folder");
+        assert!(section.text.contains("- movie-finder"), "{}", section.text);
         assert!(
-            crate::skills::marker_origin(&dir_path).as_deref() == Some("user"),
-            "create_skill must claim the file so the seeder leaves it alone"
+            section.text.contains("find movies and where to watch them"),
+            "{}",
+            section.text
         );
+        assert!(!section.text.contains("Step 1"), "{}", section.text);
 
-        // A plain create is ordinary: selection runs off the description.
-        let out = dispatch(
+        // A plugin without a description is refused: the agent discovers
+        // plugins by that line, so an undescribed bundle would be invisible.
+        let err = dispatch_with_data_root(
             root,
-            "create_skill",
-            &json!({"name": "No Keywords", "description": "d", "content": "c"}),
-            None,
-        )
-        .unwrap();
-        assert!(out.contains("No Keywords"), "{out}");
-
-        // deleted_files from the model actually removes the extra file.
-        dispatch(
-            root,
-            "create_skill",
+            "plugin",
             &json!({
-                "name": "Movie Finder",
-                "extra_files": {"note.txt": "hello"}
+                "action": "create",
+                "name": "Invisible",
+                "skills": [{"name": "Ghost", "content": "x"}]
             }),
             None,
+            Some(root),
         )
-        .unwrap();
-        let dir_path = crate::skills::find_skill_dir_pub(&dir, "Movie Finder").expect("folder");
-        assert!(dir_path.join("note.txt").is_file());
-        dispatch(
-            root,
-            "create_skill",
-            &json!({"name": "Movie Finder", "deleted_files": ["note.txt"]}),
-            None,
-        )
-        .unwrap();
-        assert!(!dir_path.join("note.txt").exists(), "deleted_files is wired");
+        .unwrap_err();
+        assert!(err.contains("description"), "{err}");
 
-        // An OMITTED body must not destroy the stored one: an extra-file-only
-        // save, a frontmatter-only edit and a delete all arrive without it.
-        dispatch(
+        // A plugin with nothing inside is refused too: there would be nothing
+        // to load even if the model found it.
+        let err = dispatch_with_data_root(
             root,
-            "create_skill",
-            &json!({"name": "Movie Finder"}),
+            "plugin",
+            &json!({"action": "create", "name": "Empty", "description": "nothing"}),
             None,
+            Some(root),
         )
-        .unwrap();
-        let kept = std::fs::read_to_string(dir_path.join("skill.md")).unwrap();
-        assert!(
-            kept.contains("Step 1: ask for the genre."),
-            "the stored body survives a body-less save: {kept}"
-        );
-        // …and the empty body must never be treated as "erase the description".
-        assert!(kept.contains("description: find movies"), "{kept}");
-
-        // A NEW skill with no body is still rejected (no empty skill.md).
-        assert!(dispatch(
-            root,
-            "create_skill",
-            &json!({"name": "Bodyless", "description": "d"}),
-            None,
-        )
-        .is_err());
-
-        // Deleting needs no body either — the old guard rejected this call.
-        let out = dispatch(
-            root,
-            "create_skill",
-            &json!({"name": "Movie Finder", "delete": true}),
-            None,
-        )
-        .unwrap();
-        assert!(out.contains("Movie Finder"), "{out}");
-        assert!(!dir_path.exists(), "delete removes the folder: {out}");
+        .unwrap_err();
+        assert!(err.contains("carries nothing"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_skill_returns_body_and_lists_names_when_missing() {
-        use crate::tools::dispatch;
-        let dir = std::env::temp_dir().join(format!("codifa-load-skill-{}", std::process::id()));
+    fn load_plugin_returns_the_whole_toolbox_in_one_call() {
+        use crate::tools::dispatch_with_data_root;
+        let dir = std::env::temp_dir().join(format!("codifa-load-plugin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // A skill lives inside a bundle now, so the fixture builds that folder —
-        // the same shape `create_skill` writes.
-        let bundle = dir.join("plugins").join("movie-finder");
-        let sdir = bundle.join("skills").join("movie-finder");
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(
-            bundle.join("plugin.json"),
-            r#"{"name":"Movie Finder","slug":"movie-finder","enabled":true}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            sdir.join("skill.md"),
-            "---\nname: Movie Finder\ndescription: find movies\n---\nBODY HERE\n",
-        )
-        .unwrap();
-        std::fs::write(sdir.join("extra.md"), "EXTRA BODY").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         let root = dir.to_str().unwrap();
+        crate::plugins::create_plugin(
+            &dir,
+            &json!({
+                "name": "Shipping",
+                "slug": "shipping",
+                "description": "ship releases and tag them",
+                "skills": [
+                    {
+                        "name": "Release Notes",
+                        "description": "write release notes",
+                        "content": "READ THE GIT LOG",
+                        "extra_files": {"checklist.md": "- tag it"}
+                    },
+                    {
+                        "name": "Tagging",
+                        "description": "tag a release",
+                        "content": "CREATE THE TAG"
+                    }
+                ],
+                "scripts": [{"name": "run-me", "content": "fn main() {}"}],
+                "commands": [{"name": "ship", "content": "Ship it."}]
+            }),
+        )
+        .unwrap();
 
-        let body = dispatch(root, "load_skill", &json!({"name": "Movie Finder"}), None).unwrap();
-        assert!(body.contains("BODY HERE"), "{body}");
-        assert!(body.contains("Extra files: extra.md"), "{body}");
-        // Slug works too, and an extra file is readable on demand.
-        let extra = dispatch(root, "load_skill", &json!({"name": "movie-finder", "file": "extra.md"}), None).unwrap();
-        assert_eq!(extra, "EXTRA BODY");
-        // A miss names the available skills instead of a bare error.
-        let err = dispatch(root, "load_skill", &json!({"name": "Ghost"}), None).unwrap_err();
-        assert!(err.contains("Movie Finder"), "{err}");
-        assert!(dispatch(root, "load_skill", &json!({}), None).is_err());
+        // ONE call: every skill body, the script/command inventory, and the
+        // connector half (none here, but the contract is stated).
+        let out = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"slug": "shipping"}),
+            None,
+            Some(root),
+        )
+        .unwrap();
+        assert!(out.contains("READ THE GIT LOG"), "{out}");
+        assert!(out.contains("CREATE THE TAG"), "{out}");
+        assert!(out.contains("run-me"), "{out}");
+        assert!(out.contains("/ship"), "{out}");
+        assert!(out.contains("Connectors: none"), "{out}");
+        // The toolbox is loaded BEFORE the work: a multi-step workflow must
+        // become the right panel's checklist, not run with an empty Todos card.
+        assert!(out.contains("update_plan"), "{out}");
+        assert!(out.contains("complete checklist"), "{out}");
+
+        // Re-reading ONE body of the loaded plugin works by name and by slug.
+        let one = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"slug": "shipping", "skill": "Release Notes"}),
+            None,
+            Some(root),
+        )
+        .unwrap();
+        assert!(one.contains("READ THE GIT LOG"), "{one}");
+        assert!(!one.contains("CREATE THE TAG"), "{one}");
+
+        // An extra file is readable on demand.
+        let extra = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"slug": "shipping", "skill": "Release Notes", "file": "checklist.md"}),
+            None,
+            Some(root),
+        )
+        .unwrap();
+        assert_eq!(extra, "- tag it");
+
+        // A bare skill name never loads a body: it names the OWNING plugin so
+        // the next call is plugin-first (`slug` + `skill`).
+        let bare = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"skill": "Release Notes"}),
+            None,
+            Some(root),
+        )
+        .unwrap_err();
+        assert!(
+            bare.contains("slug=shipping") && bare.contains("Release Notes"),
+            "{bare}"
+        );
+        assert!(!bare.contains("READ THE GIT LOG"), "{bare}");
+
+        // A skill name used as a SLUG is redirected to its plugin, not served
+        // as a standalone body.
+        let err = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"slug": "Release Notes"}),
+            None,
+            Some(root),
+        )
+        .unwrap_err();
+        assert!(err.contains("is a skill inside plugin"), "{err}");
+
+        // `query` searches PLUGINS and never inlines a skill body.
+        let found = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"query": "release notes"}),
+            None,
+            Some(root),
+        )
+        .unwrap();
+        assert!(found.contains("shipping"), "{found}");
+        assert!(!found.contains("READ THE GIT LOG"), "{found}");
+
+        // An unknown slug names the way out instead of failing blankly.
+        let err = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"slug": "ghost"}),
+            None,
+            Some(root),
+        )
+        .unwrap_err();
+        assert!(err.contains("plugin not found") && err.contains("shipping"), "{err}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_skill_query_finds_a_skill_a_huge_store_cannot_list() {
-        use crate::tools::dispatch;
+    fn load_plugin_query_finds_a_plugin_a_huge_store_cannot_list() {
+        use crate::tools::dispatch_with_data_root;
         // The prompt's catalog is byte-capped, so a store with hundreds of
-        // skills cannot be listed there. `query` is the way to the ones it had
-        // to leave out: scoring runs over EVERY installed skill.
-        let dir = std::env::temp_dir().join(format!("codifa-skill-query-{}", std::process::id()));
+        // plugins cannot be listed there. `query` is the way to the ones it had
+        // to leave out: scoring runs over EVERY installed plugin.
+        let dir = std::env::temp_dir().join(format!("codifa-plugin-query-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for i in 0..40 {
-            let name = format!("Bulk Skill {i}");
+            let name = format!("Bulk Plugin {i}");
             let slug = name.to_lowercase().replace(' ', "-");
             let bundle = dir.join("plugins").join(&slug);
             let sdir = bundle.join("skills").join(&slug);
             std::fs::create_dir_all(&sdir).unwrap();
-            std::fs::write(
-                bundle.join("plugin.json"),
-                format!(r#"{{"name":"{name}","slug":"{slug}","enabled":true}}"#),
-            )
-            .unwrap();
-            // One distinctive description per findable skill, the rest filler —
-            // the description is the one thing a real query has to find.
             let description = match i {
                 39 => "bewildering xylophone maintenance",
                 38 => "earthquake drill — زلزله",
-                _ => "a filler skill",
+                _ => "a filler plugin",
             };
             std::fs::write(
-                sdir.join("skill.md"),
+                bundle.join("plugin.json"),
                 format!(
-                    "---\nname: {name}\ndescription: {description}\n---\nBODY OF {i}\n"
+                    r#"{{"name":"{name}","slug":"{slug}","enabled":true,"description":"{description}"}}"#
                 ),
+            )
+            .unwrap();
+            std::fs::write(
+                sdir.join("skill.md"),
+                format!("---\nname: {name}\ndescription: {description}\n---\nBODY OF {i}\n"),
             )
             .unwrap();
         }
         let root = dir.to_str().unwrap();
 
-        // Exactly one match returns its body: the model never guesses a name.
-        let hit = dispatch(root, "load_skill", &json!({"query": "xylophone"}), None).unwrap();
-        assert!(hit.contains("BODY OF 39"), "{hit}");
-        // A Persian query term finds its skill through the description — the
-        // matcher is Unicode-aware, so a Persian word works like any other.
-        let fa = dispatch(root, "load_skill", &json!({"query": "زلزله"}), None).unwrap();
-        assert!(fa.contains("BODY OF 38"), "{fa}");
-        // Several matches list the candidates instead of inlining a wrong body.
-        let many = dispatch(root, "load_skill", &json!({"query": "filler"}), None).unwrap();
-        assert!(many.contains("Bulk Skill 0"), "{many}");
-        assert!(!many.contains("BODY OF"), "an ambiguous query must not inline a body: {many}");
-        // A query that names its skill in SEVERAL words beats the filler matches
-        // outright, so it answers on the FIRST call. Traced (`mvyy1qf7`): such a
-        // query listed the right skill beside three one-word matches and the model
-        // then spent a second call naming it — twice in one turn. Under IDF the
-        // lead only grows: one unique word against boilerplate ("skill" is in
-        // every name) is already a clear winner, so the one-unique-word query
-        // below answers with the body too. A GENUINE tie — every candidate
-        // matching the same words — is what still lists candidates.
-        let dominant = dispatch(
+        // A distinctive word finds the PLUGIN and names its slug; no skill body
+        // is inlined by a search.
+        let hit = dispatch_with_data_root(
             root,
-            "load_skill",
-            &json!({"query": "bewildering xylophone maintenance skill"}),
+            "load_plugin",
+            &json!({"query": "xylophone"}),
             None,
+            Some(root),
         )
         .unwrap();
-        assert!(dominant.contains("BODY OF 39"), "a clear winner answers at once: {dominant}");
-        let one_unique = dispatch(
+        assert!(hit.contains("bulk-plugin-39"), "{hit}");
+        assert!(!hit.contains("BODY OF 39"), "{hit}");
+        // A Persian query term finds its plugin through the description.
+        let fa = dispatch_with_data_root(
             root,
-            "load_skill",
-            &json!({"query": "maintenance skill"}),
+            "load_plugin",
+            &json!({"query": "زلزله"}),
             None,
+            Some(root),
         )
         .unwrap();
-        assert!(one_unique.contains("BODY OF 39"), "the unique word decides: {one_unique}");
-        let tied = dispatch(
+        assert!(fa.contains("bulk-plugin-38"), "{fa}");
+        // Several matches list the candidates instead of picking one.
+        let many = dispatch_with_data_root(
             root,
-            "load_skill",
-            &json!({"query": "filler skill"}),
+            "load_plugin",
+            &json!({"query": "filler"}),
             None,
+            Some(root),
         )
         .unwrap();
-        assert!(tied.contains("Bulk Skill 0"), "{tied}");
-        assert!(!tied.contains("BODY OF"), "a real tie must still list candidates: {tied}");
-        // A miss answers with a HINT, not with 40 names: a store with hundreds
-        // of skills would spend a turn's worth of tokens on a failed lookup.
-        let miss = dispatch(root, "load_skill", &json!({"query": "zzzz"}), None).unwrap_err();
-        assert!(miss.contains("no skill matches"), "{miss}");
-        assert!(miss.contains("and 10 more"), "the hint must say it is truncated: {miss}");
+        assert!(many.contains("bulk-plugin-0"), "{many}");
+        // A miss lists the enabled plugins instead of a bare error.
+        let miss = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"query": "zzzz"}),
+            None,
+            Some(root),
+        )
+        .unwrap_err();
+        assert!(miss.contains("no plugin matches"), "{miss}");
+        assert!(miss.contains("Enabled plugins:"), "{miss}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_skill_reaches_a_skill_that_lives_inside_a_plugin() {
-        // Regression: the catalog advertises enabled-plugin skills, but this
-        // tool read only the standalone store, so a plugin skill answered
-        // "skill not found: … Available: (none)" right after being listed.
+    fn load_plugin_query_finds_a_skill_inside_a_generically_described_plugin() {
+        // The catalog matches plugins by their own line, but a bundle may
+        // advertise nothing about a particular skill. `query` must search the
+        // SKILL names/descriptions too and return the OWNING plugin — never a
+        // bare skill body — so a hidden skill (the 20th of 24) is still
+        // reachable through `slug` + `skill`.
         use crate::tools::dispatch_with_data_root;
-        let root = std::env::temp_dir().join(format!("codifa-plugin-skill-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("codifa-plugin-skill-query-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         crate::plugins::create_plugin(
-            &root,
+            &dir,
             &json!({
-                "name": "Release Notes",
-                "skills": [{
-                    "name": "Release Notes",
-                    "content": "READ THE GIT LOG",
-                    "extra_files": {"checklist.md": "- tag it"}
-                }]
+                "name": "Codifa Library",
+                "slug": "codifa-library",
+                "description": "a general purpose library",
+                "skills": [
+                    {"name": "Writing", "description": "write prose", "content": "WRITE"},
+                    {"name": "Test UI", "description": "Live-test the renderer UI in a browser harness", "content": "HARNESS"}
+                ]
             }),
         )
         .unwrap();
-        let r = root.to_str().unwrap();
-
-        // Part of the catalog…
-        let section = crate::skill_router::build_section(r, &[]);
-        assert!(section.text.contains("- Release Notes"), "{}", section.text);
-        // …loadable by name and by slug…
-        let body = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes"}), None, Some(r)).unwrap();
-        assert!(body.contains("READ THE GIT LOG"), "{body}");
-        let by_slug = dispatch_with_data_root(r, "load_skill", &json!({"name": "release-notes"}), None, Some(r)).unwrap();
-        assert!(by_slug.contains("READ THE GIT LOG"), "{by_slug}");
-        // …and its extra files are readable too.
-        let extra = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes", "file": "checklist.md"}), None, Some(r)).unwrap();
-        assert_eq!(extra, "- tag it");
-        // A plugin skill is listed in the catalog (with its clipped detail), so
-        // the model can load it by name — an unrelated prompt carries no body.
-        let cat = crate::skill_router::build_section(r, &[]);
-        assert!(cat.text.contains("- Release Notes"), "{}", cat.text);
-        assert!(!cat.text.contains("READ THE GIT LOG"), "{}", cat.text);
-
-        // …and the skill's own keyword in the prompt attaches NOTHING: picking a
-        // skill is the model's call, made from the catalog (load_skill).
-        let matched = crate::skill_router::build_section(r, &[]);
-        assert!(matched.text.contains("- Release Notes"), "{}", matched.text);
-        assert!(!matched.text.contains("READ THE GIT LOG"), "{}", matched.text);
-
-        // Disabled plugin = gone from the catalog AND unloadable.
-        crate::plugins::toggle_plugin(&root, &json!({"slug": "release-notes", "enabled": false})).unwrap();
-        assert!(!crate::skill_router::build_section(r, &[]).text.contains("- Release Notes"));
-        let err = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes"}), None, Some(r)).unwrap_err();
-        assert!(err.contains("skill not found"), "{err}");
-
-        let _ = std::fs::remove_dir_all(&root);
+        let root = dir.to_str().unwrap();
+        let found = dispatch_with_data_root(
+            root,
+            "load_plugin",
+            &json!({"query": "live test ui harness"}),
+            None,
+            Some(root),
+        )
+        .unwrap();
+        assert!(found.contains("codifa-library"), "{found}");
+        assert!(
+            found.contains("slug=codifa-library skill=Test UI"),
+            "the owning plugin and the exact skill path must be named: {found}"
+        );
+        assert!(!found.contains("HARNESS"), "a search never inlines a body: {found}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_skill_resolves_from_the_data_root_not_the_workspace() {
+    fn load_plugin_resolves_from_the_data_root_not_the_workspace() {
         // The catalog is built from the DATA root, but dispatch used to resolve
         // skills against the WORKSPACE root: a real chat showed the catalog and
-        // then failed every load with "Available: (none)" (in a trace). A bare
-        // workspace must still load a skill that lives in the data root.
+        // then failed every load with "Available: (none)". A bare workspace must
+        // still load a plugin that lives in the data root.
         use crate::tools::dispatch_with_data_root;
-        let base = std::env::temp_dir().join(format!("codifa-skill-root-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("codifa-plugin-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let data = base.join("data");
         let ws = base.join("workspace");
@@ -3507,7 +4356,7 @@
         std::fs::create_dir_all(&sdir).unwrap();
         std::fs::write(
             data.join("plugins").join("playwrite").join("plugin.json"),
-            r#"{"name":"Playwrite","slug":"playwrite","enabled":true}"#,
+            r#"{"name":"Playwrite","slug":"playwrite","enabled":true,"description":"browser automation"}"#,
         )
         .unwrap();
         std::fs::write(
@@ -3518,30 +4367,39 @@
         let data = data.to_str().unwrap();
         let ws = ws.to_str().unwrap();
 
-        // Data root known -> found even though the workspace has no skills.
         let body = dispatch_with_data_root(
             ws,
-            "load_skill",
-            &json!({"name": "Playwrite"}),
+            "load_plugin",
+            &json!({"slug": "playwrite"}),
             None,
             Some(data),
         )
         .unwrap();
         assert!(body.contains("BROWSER BODY"), "{body}");
 
-        // No data root given -> the old workspace-relative behaviour stays.
+        // No data root given: there is no store to resolve against.
         let err = dispatch_with_data_root(
             ws,
-            "load_skill",
-            &json!({"name": "Playwrite"}),
+            "load_plugin",
+            &json!({"slug": "playwrite"}),
             None,
             None,
         )
         .unwrap_err();
-        assert!(err.contains("(none)"), "{err}");
+        assert!(err.contains("data root"), "{err}");
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+
+
+
+
+
+
+
+
+
 
     #[test]
     fn dispatch_via_tools_roundtrip() {
@@ -3801,7 +4659,7 @@
             ("system_stats", json!({})),
             ("save_memory", json!({})),
             ("ask_user", json!({})),
-            ("load_skill", json!({})),
+            ("load_plugin", json!({})),
             ("confirm_action", json!({})),
         ] {
             assert!(
@@ -3819,7 +4677,6 @@
             ("edit_file", json!({})),
             ("artifact", json!({})),
             ("plugin", json!({})),
-            ("create_skill", json!({})),
             // The whole terminal counts as a writer, even for a look: `sh -c`
             // cannot be proven non-writing, and the measured cost is zero.
             ("run_terminal", json!({"command": "ls -la src"})),
@@ -3912,8 +4769,7 @@
             "run_terminal", // arbitrary `sh -c` in the workspace root
             "delete_memory",
             "save_memory",
-            "create_skill",
-            "create_mcp",
+            "plugin",
             "explore",
         ] {
             assert!(
@@ -4069,12 +4925,15 @@
             system_prompt: String::new(),
             system_suffix: String::new(),
             skills: Vec::new(),
+            plugins: Vec::new(),
             context_window: 0,
             chat_id: String::new(),
             mcp_servers: Value::Null,
             mcp_active: Vec::new(),
             providers: std::collections::HashMap::new(),
             subagent_models: std::collections::HashMap::new(),
+            custom_subagents: Vec::new(),
+            subagent_kind: None,
             data_root: String::new(),
             allow_computer: false,
             allow_create: false,
@@ -4099,12 +4958,17 @@
             subagent_thinking: std::collections::HashMap::new(),
             tool_fallbacks: std::collections::HashMap::new(),
             images: Vec::new(),
+            attachments: Vec::new(),
             subagent_tools: Vec::new(),
+            subagent_profile: false,
+            subagent_focus: String::new(),
             web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
             // No renderer to send a table: derive it from the mode instead.
             cap: None,
             // Tests exercise the interactive protocol (Error/Done events).
             headless: false,
+            // A plain top-level turn: no settings-driven custom sub-agents, and
+            // not a sub-agent turn itself.
         }
     }
 
@@ -4401,6 +5265,26 @@
         // An empty reply is still refused — there is nothing to save.
         assert!(extract_plan_body("").is_none());
         assert!(extract_plan_body("   \n\n  ").is_none());
+    }
+
+    #[test]
+    fn a_plan_artifact_is_the_plan_not_the_closing_summary() {
+        // Plan mode is read-only, so a planner may save the plan as an artifact.
+        // Its body must win over the closing summary round, which used to become
+        // plan.md because it was the only text carrying a heading.
+        let content = "# Plan — sub-agent tab\n\n1. rename the row\n2. add the tab\n\n## خلاصه\nپلن آماده است.";
+        let (title, body) =
+            plan_document_from_artifact("Plan — sub-agent tab", content).expect("plan artifact");
+        assert_eq!(title, "Plan — sub-agent tab");
+        assert!(body.starts_with("# Plan"), "{body}");
+        assert!(body.contains("1. rename the row"), "{body}");
+
+        // A supporting document is not a plan and must not replace it.
+        assert!(
+            plan_document_from_artifact("Design notes", "# Design notes\ncolors and spacing")
+                .is_none()
+        );
+        assert!(plan_document_from_artifact("Notes", "").is_none());
     }
 
     #[test]
@@ -4826,7 +5710,7 @@
             .unwrap()
             .entry(chat.to_string())
             .or_default()
-            .push(SteerMessage { id: "m1".into(), prompt: "keep working".into() });
+            .push(SteerMessage { id: "m1".into(), prompt: "keep working".into(), attachments: Vec::new(), images: Vec::new() });
         let mut seen: Vec<Value> = Vec::new();
         let mut emit = |e: &AgentEvent| seen.push(e.to_json());
         let n = drop_steers(chat, &mut emit);
@@ -4865,7 +5749,7 @@
             .unwrap()
             .entry(chat.to_string())
             .or_default()
-            .push(SteerMessage { id: "blank".into(), prompt: "   ".into() });
+            .push(SteerMessage { id: "blank".into(), prompt: "   ".into(), attachments: Vec::new(), images: Vec::new() });
         {
             let mut emit = |e: &AgentEvent| seen.push(e.to_json());
             assert_eq!(drop_steers(chat, &mut emit), 0);
@@ -4873,6 +5757,140 @@
         assert!(seen.is_empty());
         // It is still cleared, so it can never leak into a later turn.
         assert!(steer_inbox().lock().unwrap().get(chat).is_none());
+    }
+
+    #[test]
+    fn image_only_steer_is_delivered_as_content_blocks() {
+        // A mid-turn picture (screenshot / photo) with no typed prompt used to
+        // be rejected by /chat/steer, so the image was silently dropped. The
+        // steer now carries it as the same neutral content blocks a normal turn
+        // uses, together with a note for any file attachments.
+        let chat = "steer-image-chat";
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        steer_inbox()
+            .lock()
+            .unwrap()
+            .entry(chat.to_string())
+            .or_default()
+            .push(SteerMessage {
+                id: "img".into(),
+                prompt: String::new(),
+                attachments: vec!["/ws/notes.txt".into()],
+                images: vec![png.into()],
+            });
+        let mut messages: Vec<Value> = Vec::new();
+        let mut seen: Vec<Value> = Vec::new();
+        {
+            let mut emit = |e: &AgentEvent| seen.push(e.to_json());
+            assert_eq!(deliver_steers(&mut messages, chat, &mut emit), 1);
+        }
+        assert_eq!(messages.len(), 1, "one user message carries the steer");
+        let blocks = messages[0]["content"].as_array().expect("content blocks");
+        assert!(
+            blocks.iter().any(|b| b["type"] == "text"
+                && b["text"].as_str().is_some_and(|t| t.contains("/ws/notes.txt"))),
+            "the attachment path must reach the model: {blocks:?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["type"] == crate::llm::IMAGE_BLOCK_TYPE && b["data_url"] == png),
+            "the image must ride as a data-url block: {blocks:?}"
+        );
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["kind"], "steer_applied");
+        assert_eq!(seen[0]["ids"][0], "img");
+    }
+
+    #[test]
+    fn blank_steer_without_files_is_rejected() {
+        // Nothing sendable must answer ok:false so the renderer falls back to a
+        // normal turn instead of leaving a pending bubble nobody consumes.
+        let chat = "steer-empty-chat";
+        test_set_turn_running(chat, true);
+        assert!(!push_steer(chat, "empty", "   ", Vec::new(), Vec::new()));
+        assert!(
+            steer_inbox().lock().unwrap().get(chat).is_none(),
+            "a rejected steer must not stay queued"
+        );
+        test_set_turn_running(chat, false);
+    }
+
+    #[tokio::test]
+    async fn a_parent_steer_cancels_a_running_delegation() {
+        // `run_subagent` blocks the parent until the child returns, and the
+        // child's own steer guard is inert. Without this watcher a steer typed
+        // during a long browser/explore run waited for the whole child turn —
+        // the stuck "Steering the running agent…" bubble. A parent steer must
+        // become a CHILD cancel so the delegation unwinds promptly.
+        let stop: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let steer = std::sync::Arc::new(InterruptSignal::new());
+        let guard = SteerAwareCancel::new(&stop, &steer);
+        assert!(!guard.flag.load(Ordering::Relaxed));
+        steer.raise();
+        let mut tripped = false;
+        for _ in 0..100 {
+            if guard.flag.load(Ordering::Relaxed) {
+                tripped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tripped, "a parent steer must cancel the child delegation");
+        assert!(guard.steered(), "the parent must know the child was steered");
+    }
+
+    #[tokio::test]
+    async fn a_parent_stop_still_cancels_the_delegation_without_reading_as_a_steer() {
+        // Stop reached the child before this helper existed; the watcher must
+        // keep that path intact and must not misreport it as a steer (the model
+        // would then be told to read a new message that does not exist).
+        let stop: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let steer = std::sync::Arc::new(InterruptSignal::new());
+        let guard = SteerAwareCancel::new(&stop, &steer);
+        stop.store(true, Ordering::Relaxed);
+        let mut tripped = false;
+        for _ in 0..100 {
+            if guard.flag.load(Ordering::Relaxed) {
+                tripped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tripped, "Stop must still reach the child delegation");
+        assert!(!guard.steered(), "Stop is not a steer");
+    }
+
+    #[tokio::test]
+    async fn a_finished_delegation_leaves_no_watcher_behind() {
+        let stop: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let steer = std::sync::Arc::new(InterruptSignal::new());
+        let guard = SteerAwareCancel::new(&stop, &steer);
+        let child = guard.flag.clone();
+        drop(guard);
+        steer.raise();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !child.load(Ordering::Relaxed),
+            "a dropped guard must not keep watching the parent"
+        );
+    }
+
+    #[test]
+    fn a_steered_delegation_result_tells_the_model_not_to_retry() {
+        let empty = steered_tool_result(String::new());
+        assert!(empty.contains("Do NOT retry"), "empty result: {empty}");
+        let partial = steered_tool_result("found 3 pages".into());
+        assert!(
+            partial.starts_with("Stopped because the user sent a new instruction"),
+            "partial result: {partial}"
+        );
+        assert!(partial.ends_with("found 3 pages"), "partial result: {partial}");
+        // A call that never started is still ANSWERED (the assistant message
+        // already carries its tool_call id) but must not be retried either.
+        let skipped = steered_skip_result();
+        assert!(skipped.contains("Skipped"), "skip result: {skipped}");
+        assert!(skipped.contains("Do NOT retry"), "skip result: {skipped}");
     }
 
     #[tokio::test]
@@ -5197,6 +6215,220 @@
         assert_eq!(count_kind(&ev, "usage"), 2, "two rounds = two calls");
         assert_eq!(count_kind(&ev, "tool"), 1);
         assert_eq!(count_kind(&ev, "done"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal stdio MCP server: initialize, list one `echo` tool, answer
+    /// `tools/call` with "pong". Enough to prove the real handshake and the
+    /// deferred-schema activation path end to end.
+    fn live_toolbox_mcp() -> Value {
+        json!({
+            "command": "sh",
+            "args": ["-c", r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}\n' "$id" ;;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
+  esac
+done
+"#]
+        })
+    }
+
+    /// Install the "live toolbox" plugin (one skill + one connector) into a
+    /// fresh data root and return its MCP config. The skill body and connector
+    /// name are the test's probes for "the toolbox is loaded".
+    fn live_toolbox_fixture(data: &std::path::Path) -> Value {
+        let mcp = live_toolbox_mcp();
+        crate::plugins::create_plugin(
+            data,
+            &json!({
+                "name": "Live Toolbox",
+                "slug": "live-toolbox",
+                "description": "the live toolbox plugin",
+                "skills": [{
+                    "name": "Live Skill",
+                    "description": "does live things",
+                    "content": "LIVE PLUGIN BODY 123"
+                }],
+                "mcp": { "live": mcp.clone() }
+            }),
+        )
+        .unwrap();
+        mcp
+    }
+
+    /// Discovery is LAZY in production: the first call in a process hands out
+    /// an empty set and walks the connectors on a background thread, so the
+    /// very next turn carries them. A test that inspects the FIRST request must
+    /// warm that cache first, exactly as the user's second turn finds it.
+    async fn warm_live_toolbox_discovery(data: &std::path::Path, mcp: &Value) {
+        let mut servers = crate::plugins::enabled_connectors(data);
+        servers.insert("live".into(), mcp.clone());
+        let servers = Value::Object(servers);
+        let _ = crate::mcp::discover(&servers);
+        for _ in 0..100 {
+            if !crate::mcp::discover(&servers).index.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn tool_names(body: &Value) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The plugin is ONE unit, live: a scripted model calls `load_plugin` and
+    /// the very next request must carry every skill body AND the connector's
+    /// tools — no second `load_skill`, no separate connector activation.
+    #[tokio::test]
+    async fn load_plugin_inlines_the_toolbox_and_activates_its_connector() {
+        let dir = std::env::temp_dir().join(format!("codifa-scen-plugin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let mcp = live_toolbox_fixture(&data);
+
+        let (base, mut rx) = spawn_scripted_mock_upstream(vec![
+            vec![
+                tool_call_frame("c1", "load_plugin", r#"{"slug":"live-toolbox"}"#),
+                finish_frame("tool_calls", 100, 5),
+            ],
+            vec![text_frame("done"), finish_frame("stop", 120, 3)],
+        ])
+        .await;
+        warm_live_toolbox_discovery(&data, &mcp).await;
+
+        let req: AgentRequest = serde_json::from_value(json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir,
+            "mode": "build",
+            "prompt": "use the live toolbox",
+            "chat_id": "scen-plugin",
+            "data_root": data,
+            "mcp_servers": { "live": mcp },
+        }))
+        .unwrap();
+        let events = scenario_events();
+        let ev_c = events.clone();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        let res = run_turn(&req, &mut emit, &cancel).await;
+        assert!(res.is_ok(), "{res:?}");
+
+        // Round 1 is discovery only: the catalog names the plugin, but neither
+        // the skill body nor the connector tool is in the prompt yet.
+        let first = rx.recv().await.expect("first request");
+        let first_text = first.to_string();
+        assert!(first_text.contains("- live-toolbox"), "{first_text}");
+        assert!(!first_text.contains("LIVE PLUGIN BODY 123"), "{first_text}");
+        assert!(
+            !tool_names(&first).iter().any(|n| n.contains("echo")),
+            "the connector tool must stay deferred until the plugin is loaded: {:?}",
+            tool_names(&first)
+        );
+
+        // Round 2 proves the ONE call did everything: the skill body is in the
+        // conversation and the connector's tool is now advertised.
+        let second = rx.recv().await.expect("second request");
+        let second_text = second.to_string();
+        assert!(second_text.contains("LIVE PLUGIN BODY 123"), "{second_text}");
+        assert!(
+            tool_names(&second).iter().any(|n| n.contains("echo")),
+            "load_plugin must activate the connector: {:?}\nBODY: {second_text}",
+            tool_names(&second)
+        );
+
+        // The card text reports the activation, and the turn completed.
+        let ev = events.lock().unwrap();
+        assert!(
+            ev.iter().any(|e| e["kind"] == "tool_result"
+                && e.to_string().contains("Connectors activated")),
+            "{ev:?}"
+        );
+        assert!(ev.iter().any(|e| e["kind"] == "done"), "{ev:?}");
+        drop(ev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ATTACHED plugin (a `/plugin` turn, or a plugin-use session) is a
+    /// toolbox the user already opened: the FIRST request must already carry
+    /// every skill body, the ACTIVE PLUGIN note, and the connector's tools.
+    /// Nothing may wait for a `load_plugin` call the model has no reason to make.
+    #[tokio::test]
+    async fn an_attached_plugin_arrives_already_loaded_in_the_first_request() {
+        let dir =
+            std::env::temp_dir().join(format!("codifa-scen-attached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let mcp = live_toolbox_fixture(&data);
+
+        let (base, mut rx) =
+            spawn_scripted_mock_upstream(vec![vec![
+                text_frame("done"),
+                finish_frame("stop", 100, 3),
+            ]])
+            .await;
+        warm_live_toolbox_discovery(&data, &mcp).await;
+
+        let req: AgentRequest = serde_json::from_value(json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/scenario-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir,
+            "mode": "build",
+            "prompt": "work inside the live toolbox",
+            "chat_id": "scen-attached",
+            "data_root": data,
+            "plugins": ["live-toolbox"],
+            "mcp_servers": { "live": mcp },
+        }))
+        .unwrap();
+        let events = scenario_events();
+        let ev_c = events.clone();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut emit = move |e: &AgentEvent| ev_c.lock().unwrap().push(e.to_json());
+        let res = run_turn(&req, &mut emit, &cancel).await;
+        assert!(res.is_ok(), "{res:?}");
+
+        let first = rx.recv().await.expect("first request");
+        let text = first.to_string();
+        assert!(text.contains("LIVE PLUGIN BODY 123"), "{text}");
+        assert!(text.contains("active plugin, already loaded"), "{text}");
+        assert!(
+            text.contains("update_plan"),
+            "an attached plugin's multi-step workflow must ask for a checklist: {text}"
+        );
+        assert!(
+            tool_names(&first).iter().any(|n| n.contains("echo")),
+            "an attached plugin's connector must be advertised from round 1: {:?}",
+            tool_names(&first)
+        );
+        // The turn is one model call: the toolbox was already there.
+        assert!(rx.try_recv().is_err(), "no second model call is needed");
+
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e["kind"] == "done"), "{ev:?}");
+        drop(ev);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6184,6 +7416,58 @@
     }
 
     #[tokio::test]
+    async fn composer_attachments_reach_the_main_model_as_a_text_block() {
+        // The renderer posts composer FILE attachments as `attachments`; the
+        // request used to have no such field, so serde silently dropped them
+        // and the model was told nothing about the file the user meant.
+        let (mock_base, rx) = spawn_explore_mock_upstream().await;
+        let bodies = drain_bodies(rx);
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/parent-model",
+            "base_url": format!("{mock_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": "/tmp/codifa-live-attachments",
+            "mode": "build",
+            "prompt": "این فایل رو بخون",
+            "history": [],
+            "attachments": [
+                "/Users/saman/.codifa/uploads/1_27754101364.pdf",
+                "notes.md"
+            ],
+            "data_root": "/tmp/codifa-live-attachments-data"
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        assert_eq!(req.attachments.len(), 2, "serde must keep the attachments");
+        let mut emit = |_e: &AgentEvent| {};
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let sent = bodies.lock().unwrap().clone();
+        let first = sent.first().cloned().expect("the main turn must send a request");
+        let texts: Vec<String> = first["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| match &m["content"] {
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>(),
+                Value::String(s) => vec![s.clone()],
+                _ => Vec::new(),
+            })
+            .collect();
+        let note = "Attached files:\n/Users/saman/.codifa/uploads/1_27754101364.pdf\nnotes.md";
+        assert!(
+            texts.iter().any(|t| t == note),
+            "the attachment paths must reach the model as a text block: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn main_model_receives_the_images_even_when_a_vision_slot_is_configured() {
         // MAIN MODEL FIRST. A configured Vision slot must NOT preempt the main
         // model: the images travel to the main model as blocks (llm.rs translates
@@ -6338,6 +7622,639 @@
                 .iter()
                 .all(|m| !m["content"].is_array()),
             "the main model must not receive raw image blocks: {mbody}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_capture_goes_through_the_vision_slot_for_a_text_only_model() {
+        // A tool capture INSIDE a turn (reading a PNG, or a screenshot) used to
+        // be attached as raw image blocks even when the capability map said the
+        // model cannot read images. The provider rejected the request and the
+        // sub-agent was left blind. Captures now follow the same rule as
+        // composer images: a text-only model gets the Vision slot's DESCRIPTION
+        // (the slot brings its own model and fallback chain), never the bytes.
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-capture-vision-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // One real 1x1 PNG on disk, read through the `read` tool.
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(dir.join("shot.png"), png).unwrap();
+
+        let (vision_base, vision_rx) =
+            spawn_json_mock_upstream("a tiny red dot on a white background").await;
+        let vision_bodies = drain_bodies(vision_rx);
+        let (main_base, main_rx) = spawn_scripted_mock_upstream(vec![
+            vec![tool_call_frame(
+                "c1",
+                "read",
+                r#"{"filePath":"shot.png"}"#,
+            )],
+            vec![text_frame("done"), finish_frame("stop", 11, 2)],
+        ])
+        .await;
+        let main_bodies = drain_bodies(main_rx);
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/capture-model",
+            "base_url": format!("{main_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_string_lossy(),
+            "mode": "subagent",
+            "subagent_kind": "explore",
+            "prompt": "look at the screenshot and tell me what it shows",
+            "history": [],
+            "subagent_models": { "vision": "vision-prov/vision-capture-model" },
+            "providers": {
+                "chat-provider": {
+                    "kind": "custom",
+                    "manualVisionMap": { "main/capture-model": false }
+                },
+                "vision-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{vision_base}/v1"),
+                    "apiKeys": ["sk-vision"]
+                }
+            },
+            "data_root": dir.to_string_lossy()
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut emit = |_e: &AgentEvent| {};
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        // 1) The capture reached the Vision slot as image bytes.
+        let vbody = vision_bodies
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the Vision slot must receive the capture"));
+        assert_eq!(vbody["model"], "vision-capture-model");
+        let vcontent = &vbody["messages"][1]["content"];
+        assert!(
+            vcontent.as_array().is_some_and(|blocks| blocks.iter().any(|b| {
+                b["type"] == "image_url"
+                    && b["image_url"]["url"]
+                        .as_str()
+                        .is_some_and(|u| u.starts_with("data:image/png;base64,"))
+            })),
+            "the capture's bytes must be on the vision request: {vbody}"
+        );
+
+        // 2) The text-only model is not told an image was omitted when the turn
+        //    carried none: the cap gate must only speak about real captures.
+        let bodies = main_bodies.lock().unwrap().clone();
+        let first_text = bodies
+            .first()
+            .and_then(|b| b["messages"].as_array())
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        assert!(
+            !first_text.contains("image omitted"),
+            "a turn with no attached image must not claim one was omitted: {first_text}"
+        );
+
+        // 3) The sub-agent model only ever saw the DESCRIPTION as text.
+        let second = bodies
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| panic!("the tool round must be followed by an answer round: {bodies:#?}"));
+        let text = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| match &m["content"] {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("IMAGE ANALYSIS") && text.contains("a tiny red dot"),
+            "the vision description must reach the sub-agent: {second}"
+        );
+        assert!(
+            second["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["content"].as_array().is_none_or(|blocks| blocks
+                    .iter()
+                    .all(|b| b["type"] != "image_url"))),
+            "a text-only sub-agent model must never receive raw image blocks: {second}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_with_unknown_vision_uses_the_configured_slot() {
+        // The provider payload and models.dev both stayed silent about this
+        // model. A MAIN turn keeps sending the image to the model first, but a
+        // SUB-AGENT runs unattended: it must not gamble on a gateway that may
+        // silently drop the bytes (the traced desktop run spent 30 minutes
+        // blind). With a Vision slot configured, the capture is described.
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-unknown-vision-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(dir.join("shot.png"), png).unwrap();
+
+        let (vision_base, vision_rx) =
+            spawn_json_mock_upstream("a blue square on a white background").await;
+        let vision_bodies = drain_bodies(vision_rx);
+        let (main_base, main_rx) = spawn_scripted_mock_upstream(vec![
+            vec![tool_call_frame("c1", "read", r#"{"filePath":"shot.png"}"#)],
+            vec![text_frame("done"), finish_frame("stop", 11, 2)],
+        ])
+        .await;
+        let main_bodies = drain_bodies(main_rx);
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/unknown-model",
+            "base_url": format!("{main_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_string_lossy(),
+            "mode": "subagent",
+            "subagent_kind": "explore",
+            "prompt": "look at the screenshot and tell me what it shows",
+            "history": [],
+            "subagent_models": { "vision": "vision-prov/vision-unknown-model" },
+            "providers": {
+                "vision-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{vision_base}/v1"),
+                    "apiKeys": ["sk-vision"]
+                }
+            },
+            "data_root": dir.to_string_lossy()
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut emit = |_e: &AgentEvent| {};
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let vbody = vision_bodies
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("an unknown sub-agent capability must ask the slot"));
+        assert_eq!(vbody["model"], "vision-unknown-model");
+        assert!(
+            vbody["messages"][1]["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "image_url")),
+            "the capture's bytes must reach the vision model: {vbody}"
+        );
+
+        let bodies = main_bodies.lock().unwrap().clone();
+        let second = bodies
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| panic!("the answer round must run: {bodies:#?}"));
+        let text = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| match &m["content"] {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("IMAGE ANALYSIS") && text.contains("a blue square"),
+            "the description must reach the sub-agent: {second}"
+        );
+        assert!(
+            second["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["content"].as_array().is_none_or(|blocks| blocks
+                    .iter()
+                    .all(|b| b["type"] != "image_url"))),
+            "the sub-agent model must not receive the raw bytes: {second}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_subagent_kind_has_a_bounded_wall_clock_budget() {
+        // A sub-agent exists to make the main agent faster. The idle guard
+        // catches silence only; this budget bounds a child that stays busy but
+        // makes no progress (the traced desktop run: 1_851 s of `command+tab`).
+        for kind in ["explore", "research", "browser", "computer", "custom"] {
+            let (soft, hard) = subagent_budget_secs(kind);
+            assert!(soft >= 30, "{kind}: soft={soft}");
+            assert!(soft < hard, "{kind}: soft={soft} hard={hard}");
+            assert!(
+                hard <= 600,
+                "{kind}: an attempt must not run for hours (hard={hard})"
+            );
+        }
+        // Desktop work is slower than a code lookup but not unbounded.
+        assert!(
+            subagent_budget_secs("computer").1 > subagent_budget_secs("explore").1,
+            "GUI work needs a longer window than research"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_stops_after_repeating_the_same_noop_call() {
+        // The traced desktop loop repeated one action while the screen never
+        // changed. The repeat guard must NAME the loop once, then end the
+        // attempt with the evidence instead of running until the idle guard
+        // (which never fires while events keep flowing).
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-stall-guard-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = r#"{"query":"nothing-here"}"#;
+        let repeat = || vec![tool_call_frame("c1", "search_memory", call)];
+        let (base, rx) = spawn_scripted_mock_upstream(vec![
+            repeat(),
+            repeat(),
+            repeat(),
+            vec![
+                text_frame("final report from the evidence gathered"),
+                finish_frame("stop", 10, 2),
+            ],
+        ])
+        .await;
+        let bodies = drain_bodies(rx);
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/stall-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_string_lossy(),
+            "mode": "subagent",
+            "subagent_kind": "explore",
+            "prompt": "find the answer",
+            "history": [],
+            "data_root": dir.to_string_lossy()
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut texts: Vec<String> = Vec::new();
+        let mut emit = |e: &AgentEvent| {
+            if let AgentEvent::Text { content } = e {
+                texts.push(content.clone());
+            }
+        };
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "three identical rounds, then ONE forced tools-off report: {bodies:#?}"
+        );
+        assert!(
+            serde_json::to_string(&bodies[3])
+                .unwrap_or_default()
+                .contains("The work window is over"),
+            "the fourth call must be the forced report, not another tool round: {:#?}",
+            bodies[3]
+        );
+        // The nudge must reach the model BEFORE the third repeat, naming what is
+        // wrong, so a model that can still recover gets the chance.
+        let third = serde_json::to_string(&bodies[2]).unwrap_or_default();
+        assert!(
+            third.contains("NO PROGRESS"),
+            "the loop nudge must be delivered: {third}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("final report from the evidence")),
+            "the parent must receive the forced report: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_stops_after_three_rounds_of_nonexistent_tools() {
+        // A weak model can invent a tool family and ignore the unknown-tool
+        // reply round after round. Three rounds is the ceiling: the listing of
+        // valid names has been delivered twice by then.
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-invalid-tool-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bogus = || vec![tool_call_frame("c1", "definitely_not_a_tool", "{}")];
+        let (base, rx) = spawn_scripted_mock_upstream(vec![
+            bogus(),
+            bogus(),
+            bogus(),
+            vec![
+                text_frame("report after the tool-name failures"),
+                finish_frame("stop", 10, 2),
+            ],
+        ])
+        .await;
+        let bodies = drain_bodies(rx);
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/invalid-tool-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_string_lossy(),
+            "mode": "subagent",
+            "subagent_kind": "explore",
+            "prompt": "find the answer",
+            "history": [],
+            "data_root": dir.to_string_lossy()
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut texts: Vec<String> = Vec::new();
+        let mut emit = |e: &AgentEvent| {
+            if let AgentEvent::Text { content } = e {
+                texts.push(content.clone());
+            }
+        };
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "three hallucinated rounds, then ONE forced tools-off report: {bodies:#?}"
+        );
+        assert!(
+            serde_json::to_string(&bodies[3])
+                .unwrap_or_default()
+                .contains("The work window is over"),
+            "the fourth call must be the forced report, not another tool round: {:#?}",
+            bodies[3]
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("report after the tool-name failures")),
+            "the parent must receive the forced report: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_stops_after_twelve_identical_actions_even_when_results_change() {
+        // `command+tab` in the traced desktop run changed the screenshot every
+        // round, so neither the idle guard nor a result digest could see the
+        // loop. The per-action ceiling must still stop it: six calls earn a
+        // named nudge, twelve end the attempt with the forced report.
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-repeat-action-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = r#"{"command":"date +%s%N"}"#;
+        let mut script: Vec<Vec<Value>> = (0..12)
+            .map(|_| vec![tool_call_frame("c1", "run_terminal", call)])
+            .collect();
+        script.push(vec![
+            text_frame("report after the repeated action"),
+            finish_frame("stop", 10, 2),
+        ]);
+        let (base, rx) = spawn_scripted_mock_upstream(script).await;
+        let bodies = drain_bodies(rx);
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/repeat-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_string_lossy(),
+            "mode": "subagent",
+            "subagent_kind": "computer",
+            "allow_computer": true,
+            "prompt": "press the same key until the task is done",
+            "history": [],
+            "data_root": dir.to_string_lossy()
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut texts: Vec<String> = Vec::new();
+        let mut emit = |e: &AgentEvent| {
+            if let AgentEvent::Text { content } = e {
+                texts.push(content.clone());
+            }
+        };
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            13,
+            "twelve identical actions, then ONE forced tools-off report: {bodies:#?}"
+        );
+        assert!(
+            serde_json::to_string(&bodies[6])
+                .unwrap_or_default()
+                .contains("REPEATED ACTION"),
+            "the per-action nudge must be delivered on the seventh call: {:#?}",
+            bodies[6]
+        );
+        assert!(
+            serde_json::to_string(&bodies[12])
+                .unwrap_or_default()
+                .contains("The work window is over"),
+            "the thirteenth call must be the forced report: {:#?}",
+            bodies[12]
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("report after the repeated action")),
+            "the parent must receive the forced report: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repeated_action_ignores_its_reason_narration() {
+        // The traced desktop loop pressed `command+tab` 56 times: the calls
+        // differed ONLY in the sentence explaining why, so a raw-args key saw
+        // 56 distinct actions and never fired. The identity of the action is
+        // its execution fields.
+        let a = repeat_action_key(
+            "computer",
+            r#"{"action":"key","key":"command+tab","reason":"Switch to Terminal application"}"#,
+        );
+        let b = repeat_action_key(
+            "computer",
+            r#"{"action":"key","key":"command+tab","reason":"Switch to PowerPoint application"}"#,
+        );
+        assert_eq!(a, b, "the same key press is ONE action however it is narrated");
+        let c = repeat_action_key(
+            "computer",
+            r#"{"action":"key","key":"command+space","reason":"Switch to Terminal application"}"#,
+        );
+        assert_ne!(a, c, "a different key is a different action");
+        assert_ne!(
+            repeat_action_key("run_terminal", r#"{"command":"date"}"#),
+            repeat_action_key("run_terminal", r#"{"command":"ls"}"#),
+            "a different command is a different action"
+        );
+        // Unparseable arguments still compare deterministically.
+        assert_eq!(
+            repeat_action_key("x", "not json"),
+            repeat_action_key("x", "not json")
+        );
+    }
+
+    #[test]
+    fn a_duplicate_screenshot_is_detected_by_its_pixels() {
+        // The dedupe keys on the encoded file, so identical pixels must produce
+        // the same digest and a changed capture a different one.
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-shot-digest-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.png");
+        let b = dir.join("b.png");
+        let c = dir.join("c.png");
+        std::fs::write(&a, b"same-bytes").unwrap();
+        std::fs::write(&b, b"same-bytes").unwrap();
+        std::fs::write(&c, b"different-bytes").unwrap();
+        let da = shot_file_digest(a.to_str().unwrap()).unwrap();
+        let db = shot_file_digest(b.to_str().unwrap()).unwrap();
+        let dc = shot_file_digest(c.to_str().unwrap()).unwrap();
+        assert_eq!(da, db, "identical captures share a digest");
+        assert_ne!(da, dc, "a changed screen has a different digest");
+        assert_eq!(shot_file_digest("/no/such/file.png"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_vision_slot_walks_its_own_fallback_list() {
+        // Settings → Tools → Vision carries its own fallback rows. A text-only
+        // model hands the image to the slot, and a failing primary vision model
+        // must pass the SAME capture to the next rung the user picked — the
+        // slot's list is not decorative.
+        let primary_base = spawn_failing_mock_upstream(500, "vision primary down").await;
+        let (secondary_base, secondary_rx) =
+            spawn_json_mock_upstream("a blue banner with the word ERROR").await;
+        let secondary_bodies = drain_bodies(secondary_rx);
+        let (main_base, main_rx) = spawn_scripted_mock_upstream(vec![vec![
+            text_frame("done"),
+            finish_frame("stop", 5, 2),
+        ]])
+        .await;
+        let main_bodies = drain_bodies(main_rx);
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/vision-fallback-model",
+            "base_url": format!("{main_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": "/tmp/codifa-vision-fallback",
+            "mode": "build",
+            "prompt": "what does the screenshot say?",
+            "history": [],
+            "images": [PNG_URL],
+            "subagent_models": { "vision": "primary-prov/vision-primary" },
+            "tool_fallbacks": { "vision": ["secondary-prov/vision-secondary"] },
+            "providers": {
+                "chat-provider": {
+                    "kind": "custom",
+                    "manualVisionMap": { "main/vision-fallback-model": false }
+                },
+                "primary-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{primary_base}/v1"),
+                    "apiKeys": ["sk-primary"]
+                },
+                "secondary-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{secondary_base}/v1"),
+                    "apiKeys": ["sk-secondary"]
+                }
+            },
+            "data_root": "/tmp/codifa-vision-fallback-data"
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut emit = |_e: &AgentEvent| {};
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let sbody = secondary_bodies
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the vision fallback rung must be called"));
+        assert_eq!(sbody["model"], "vision-secondary");
+        assert!(
+            sbody["messages"][1]["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks
+                    .iter()
+                    .any(|b| b["type"] == "image_url" && b["image_url"]["url"] == PNG_URL)),
+            "the fallback rung must receive the same image: {sbody}"
+        );
+
+        let mbody = main_bodies
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the main turn must run"));
+        let mtext = mbody["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            mtext.contains("IMAGE ANALYSIS") && mtext.contains("a blue banner"),
+            "the fallback description must reach the model: {mbody}"
         );
     }
 
@@ -6575,12 +8492,12 @@
         // The reminder exists to make the model CALL the tool, so it must name
         // the tool and the catalog it refers to — and it must stay out of the
         // renderer's fold count, exactly like the plan context message.
-        let m = skills_context_message();
+        let m = skills_context_message(&[], &[]);
         assert_eq!(m["role"], "user");
         let text = m["content"].as_str().unwrap();
         assert!(text.starts_with(SKILLS_CONTEXT_HEAD), "{text}");
-        assert!(text.contains("load_skill"), "{text}");
-        assert!(text.contains("AVAILABLE SKILLS"), "{text}");
+        assert!(text.contains("load_plugin"), "{text}");
+        assert!(text.contains("AVAILABLE PLUGINS"), "{text}");
         // A capped catalog cannot list a large store, so the reminder must name
         // the way to reach what it left out — otherwise "no entry" reads as
         // "no such skill" and the model answers from memory.
@@ -6589,13 +8506,34 @@
         assert!(!text.contains("name="), "{text}");
         assert!(!text.contains("query="), "{text}");
 
+        // An ATTACHED skill is not a suggestion: the tail must say so, and it
+        // must point at the plugin door rather than a bare skill load.
+        let attached = skills_context_message(&["Test UI".into()], &[]);
+        let at = attached["content"].as_str().unwrap();
+        assert!(at.contains("MANDATORY"), "{at}");
+        assert!(at.contains("Test UI"), "{at}");
+        assert!(at.contains("verification"), "{at}");
+        assert!(
+            at.contains("Never load a bare skill name"),
+            "plugin-first must remain explicit: {at}"
+        );
+
+        let auto = json!({
+            "role": "user",
+            "content": format!(
+                "{}\n- Test UI — plugin builtin-plugin.\n--- end of matches ---",
+                crate::skill_router::AUTO_MATCH_HEAD
+            ),
+        });
         let tail = vec![
             json!({"role": "assistant", "content": "a"}),
             plan_context_message("\n\n=== SAVED PLAN (from disk) ===\nstep one\n").unwrap(),
-            skills_context_message(),
+            skills_context_message(&[], &[]),
+            auto,
         ];
-        assert_eq!(tail.len(), 3);
-        // Only the stored assistant message counts toward the fold.
+        assert_eq!(tail.len(), 4);
+        // Only the stored assistant message counts toward the fold: the plan,
+        // the skills reminder and the automatic match hint are wire-only.
         assert_eq!(plan_context_keep(&tail), 1);
         // A plain message is still counted.
         assert!(!is_wire_only_context("just a question"));
@@ -6739,10 +8677,24 @@
     }
 
     #[test]
+    fn build_asks_for_a_checklist_on_multi_step_work() {
+        // The live build prompt is what the model actually reads; the same rule
+        // in `appstate::system_prompts` is display-only. Without it the model
+        // ran a 20-call plugin workflow with no update_plan at all, so the right
+        // panel had no todos to show.
+        let build = default_system_prompt("build", "/tmp/x");
+        assert!(build.contains("CHECKLIST"), "{build}");
+        assert!(build.contains("update_plan"), "{build}");
+        assert!(build.contains("plugin workflow"), "{build}");
+        // Ask stays a short answer: no checklist duty there.
+        assert!(!default_system_prompt("ask", "/tmp/x").contains("CHECKLIST"));
+    }
+
+    #[test]
     fn only_the_writable_intent_modes_inline_the_coding_rules() {
         // The generic coding rules are a prompt ASSET (`src-tauri/prompts/
         // coding-rules.md`), not a skill: a skill only applied when the model
-        // chose to spend a `load_skill` call, and a rule that is never read is
+        // chose to spend a `load_plugin` call, and a rule that is never read is
         // not a rule.
         //
         // They belong to the modes that can ACT on them — `build` writes
@@ -7083,11 +9035,11 @@
         assert!(!fold_pays_off(1)); // the run's LAST model call
         assert!(!fold_pays_off(2));
         assert!(fold_pays_off(3)); // the threshold
-        assert!(fold_pays_off(SUBAGENT_MAX_STEPS)); // a full sub-agent budget
+        assert!(fold_pays_off(12)); // a long sub-agent run
 
         // The guard must not shadow the elision it protects: it sits far below
         // the run length, so an explore run that folds at all still folds.
-        assert!(SUBAGENT_MAX_STEPS > FOLD_MIN_REMAINING_CALLS);
+        assert!(12 > FOLD_MIN_REMAINING_CALLS);
     }
 
     #[test]
@@ -7102,8 +9054,8 @@
                 "a turn with no cap must never be told its budget is nearly spent"
             );
         }
-        // A sub-agent keeps its own budget nudges and never sees this one.
-        assert!(main_wrapup_message(0, SUBAGENT_MAX_STEPS, false, "subagent").is_none());
+        // A sub-agent has no step cap either, so it never sees this nudge.
+        assert!(main_wrapup_message(0, usize::MAX, false, "subagent").is_none());
         // A bounded budget can still exist (tests, future callers): the nudge
         // lands MAIN_WRAPUP_STEPS_LEFT rounds before it, exactly once.
         let capped = 60;

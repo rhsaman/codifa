@@ -166,6 +166,39 @@ pub(super) fn wait_load(d: &mut Driver, before: u64, ttl: Duration) -> Result<()
     }
 }
 
+/// Answer for a snapshot whose signature did not move. `full` is the model's
+/// explicit "show me the page again", so only that path re-renders; a plain
+/// snapshot returns the short note (the refs it already has are still valid).
+/// `full_sent` says this version's full page already went out: repeating the
+/// request must not resend the same body, so it gets the short note too.
+pub(super) fn unchanged_snapshot_text(
+    snap: &Snapshot,
+    version: usize,
+    budget: usize,
+    full: bool,
+    full_sent: bool,
+) -> String {
+    if full && !full_sent {
+        return format!(
+            "[unchanged since refs v{version} — the refs below are still valid]\n{}",
+            render_snapshot(snap, budget, true)
+        );
+    }
+    if full {
+        return format!(
+            "[full page for refs v{version} was already sent and the page has not changed — \
+             do not re-read it; act on the refs you already have.]\nURL: {}\nTitle: {}",
+            snap.url, snap.title
+        );
+    }
+    format!(
+        "[unchanged since refs v{version} — the page did not change and every ref you already \
+         have is still valid. Call browser_snapshot with full=true only if you need the page text \
+         again.]\nURL: {}\nTitle: {}",
+        snap.url, snap.title
+    )
+}
+
 pub(super) fn op_snapshot(d: &mut Driver, budget: usize, full: bool) -> Result<Value, String> {
     let raw = {
         let conn = &d.conn;
@@ -195,13 +228,18 @@ pub(super) fn op_snapshot(d: &mut Driver, budget: usize, full: bool) -> Result<V
     if let Some(version) = d.current {
         if let Some((_, snap)) = d.snapshots.iter().find(|(v, _)| *v == version) {
             if snap.sig == sig {
-                // Unchanged page: the note says the refs still stand, and the
-                // same render (at the caller's budget) goes back — the model
-                // asked to see the page, and the page it has is this one.
-                let text = format!(
-                    "[unchanged since refs v{version} — the refs below are still valid]\n{}",
-                    render_snapshot(snap, budget, full)
-                );
+                // Unchanged page. Re-rendering the whole thing was the single
+                // largest token sink in a traced browser run (107K chars of
+                // snapshots, 17 identical `{}` calls): the model already holds
+                // these refs, so answer with the fact that matters — nothing
+                // moved. `full=true` stays an explicit escape hatch for a real
+                // re-read (page text, headings, body copy), but only once per
+                // version: repeating it cannot reveal anything new.
+                let full_sent = d.full_sent_version == Some(version);
+                let text = unchanged_snapshot_text(snap, version, budget, full, full_sent);
+                if full && !full_sent {
+                    d.full_sent_version = Some(version);
+                }
                 return Ok(json!({
                     "text": text,
                     "version": version,
@@ -273,6 +311,9 @@ pub(super) fn op_snapshot(d: &mut Driver, budget: usize, full: bool) -> Result<V
         d.snapshots.remove(0);
     }
     d.current = Some(version);
+    // A new version's render decides whether the model already holds the full
+    // page for it; a summary render leaves the full re-read available once.
+    d.full_sent_version = if full { Some(version) } else { None };
 
     let stored = &d.snapshots.last().expect("just pushed").1;
     let text = format!("refs v{version}\n\n{}", render_snapshot(stored, budget, full));
@@ -648,13 +689,73 @@ pub(super) fn op_press_key(d: &mut Driver, args: &Value) -> Result<Value, String
     Ok(json!({"text": format!("Pressed {spec}")}))
 }
 
+/// The script a `browser_evaluate` call carries. Models routinely reach for
+/// `script`/`code`/`js` instead of the advertised `expression`; rejecting those
+/// cost a full round-trip each time in the traced run, so every spelling is
+/// accepted here.
+pub(super) fn evaluate_script(args: &Value) -> Option<&str> {
+    ["expression", "script", "code", "js", "javascript"]
+        .iter()
+        .find_map(|key| {
+            args.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// True when the script already is an IIFE / arrow function body, i.e. wrapping
+/// it again would change what it returns.
+fn already_wrapped(script: &str) -> bool {
+    let t = script.trim_start();
+    t.starts_with("(function")
+        || t.starts_with("(()")
+        || t.starts_with("(async")
+        || t.starts_with("async (")
+        || t.starts_with("async function")
+        || t.starts_with("function(")
+        || t.starts_with("function (")
+}
+
+/// A `return` statement written at the START of a line. Nested one-line
+/// returns (`map(function(x){return x})`) are legal where they stand and are
+/// intentionally not matched.
+fn has_top_level_return(script: &str) -> bool {
+    script.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix("return") else {
+            return false;
+        };
+        match rest.chars().next() {
+            None => true,
+            Some(c) => !(c.is_alphanumeric() || c == '_' || c == '$'),
+        }
+    })
+}
+
+/// Runtime.evaluate evaluates an EXPRESSION, so a top-level `return` is an
+/// `Illegal return statement`. Models write function-shaped snippets anyway
+/// (`const rows = …; return rows;`), so run those in an IIFE — async when the
+/// snippet awaits — instead of failing the call.
+pub(super) fn wrap_top_level_return(script: &str) -> String {
+    if !has_top_level_return(script) || already_wrapped(script) {
+        return script.to_string();
+    }
+    if script.contains("await") {
+        format!("(async function(){{\n{script}\n}})()")
+    } else {
+        format!("(function(){{\n{script}\n}})()")
+    }
+}
+
 pub(super) fn op_evaluate(d: &mut Driver, args: &Value) -> Result<Value, String> {
-    let expr = args["expression"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "evaluate needs `expression`".to_string())?;
-    let value = d.eval(expr, true).map_err(evaluate_error_hint)?;
+    let expr = evaluate_script(args)
+        .ok_or_else(|| {
+            "evaluate needs `expression` (or `script`/`code`; a JS expression or snippet)"
+                .to_string()
+        })?
+        .to_string();
+    let expr = wrap_top_level_return(&expr);
+    let value = d.eval(&expr, true).map_err(evaluate_error_hint)?;
     let rendered = match &value {
         Value::String(s) => s.clone(),
         Value::Null => "(null)".to_string(),
@@ -822,12 +923,22 @@ pub(super) fn op_network_requests(d: &mut Driver, args: &Value) -> Result<Value,
     }))
 }
 
+/// The text a `browser_find` call searches for. `pattern`/`query` are common
+/// spellings from models and a rejection costs a round-trip for no reason.
+pub(super) fn find_needle(args: &Value) -> Option<&str> {
+    ["text", "pattern", "query", "needle"]
+        .iter()
+        .find_map(|key| {
+            args.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+}
+
 pub(super) fn op_find(d: &mut Driver, args: &Value) -> Result<Value, String> {
-    let needle = args["text"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "find needs `text`".to_string())?;
+    let needle = find_needle(args)
+        .ok_or_else(|| "find needs `text` (the page text to search for)".to_string())?;
     let expr = format!(
         r#"(function(){{var n={};var t=document.body?(document.body.innerText||''):'';
         var low=t.toLowerCase(),needle=n.toLowerCase(),out=[],i=0,from=0;
@@ -949,30 +1060,103 @@ pub(super) fn op_handle_dialog(d: &mut Driver, args: &Value) -> Result<Value, St
     }))
 }
 
+/// Paths an upload carries. A model that was handed a JSON array can send it as
+/// a STRING (`"paths": "[\"/tmp/a.png\"]"`), and a single file is often sent as
+/// a bare string; both used to fail with "file_upload needs `paths`".
+pub(super) fn upload_paths(args: &Value) -> Vec<String> {
+    let Some(raw) = ["paths", "files", "file_paths", "file", "path"]
+        .iter()
+        .find_map(|key| args.get(*key))
+    else {
+        return Vec::new();
+    };
+    match raw {
+        Value::String(s) => {
+            let text = s.trim();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            if text.starts_with('[') {
+                serde_json::from_str::<Vec<String>>(text).unwrap_or_else(|_| vec![text.to_string()])
+            } else {
+                vec![text.to_string()]
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve the node an upload should target. `selector` wins over `ref` when
+/// both are present: the model added the selector because the ref pointed at a
+/// wrapper, and the ref is the stale half of the pair. If the resolved node is
+/// a wrapper (a label/button around a hidden input), descend to the real
+/// `input[type=file]` instead of failing `DOM.setFileInputFiles`.
+fn file_input_node(d: &mut Driver, args: &Value) -> Result<String, String> {
+    let mut node_args = args.clone();
+    let has_selector = args["selector"]
+        .as_str()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if has_selector {
+        if let Some(obj) = node_args.as_object_mut() {
+            obj.remove("ref");
+        }
+    }
+    let node = resolve_node(d, &node_args)?;
+    let conn = &d.conn;
+    let res = conn.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": node,
+            "functionDeclaration": "function(){\
+                var n=this;\
+                if(n&&n.tagName==='INPUT'&&n.type==='file') return n;\
+                var i=n&&n.querySelector?n.querySelector('input[type=file]'):null;\
+                if(i) return i;\
+                var l=n&&n.closest?n.closest('label'):null;\
+                if(l){var j=l.querySelector('input[type=file]');if(j)return j;}\
+                return n;}",
+            "returnByValue": false,
+        }),
+    )?;
+    res["result"]["objectId"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "file_upload: the target is not a file input and contains none".to_string())
+}
+
 pub(super) fn op_file_upload(d: &mut Driver, args: &Value) -> Result<Value, String> {
-    let paths: Vec<String> = args["paths"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|p| p.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let paths = upload_paths(args);
     if paths.is_empty() {
-        return Err("file_upload needs `paths` (absolute file paths)".to_string());
+        return Err(
+            "file_upload needs `paths` (one absolute file path, or an array of them)".to_string(),
+        );
     }
     for p in &paths {
         if !std::path::Path::new(p).is_file() {
             return Err(format!("no such file: {p}"));
         }
     }
-    let node = resolve_node(d, args)?;
+    let node = file_input_node(d, args)?;
     {
         let conn = &d.conn;
         conn.call(
             "DOM.setFileInputFiles",
             json!({"files": paths, "objectId": node}),
-        )?;
+        )
+        .map_err(|e| {
+            format!(
+                "{e} — the target must be an `input[type=file]`; pass its `selector` \
+                 (or use browser_click on the upload button when the page opens a native picker)"
+            )
+        })?;
     }
     Ok(json!({
         "text": format!("Attached {} file(s) to the file input.", paths.len())

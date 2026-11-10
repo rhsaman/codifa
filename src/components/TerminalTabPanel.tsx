@@ -71,6 +71,8 @@ export function TerminalTabPanel({ tabId, cwd, program, args, shell, reopenSeq }
   // it), while a LIVE session is kept as-is — the bump alone must never blank a
   // running nvim just because its pane was re-focused.
   const [ready, setReady] = useState(false)
+  // Tab id being renamed inline (double-click a chip); null = not renaming.
+  const [renamingId, setRenamingId] = useState<string | null>(null)
   useEffect(() => {
     let cancelled = false
     // Flags reset only ahead of an actual (re)spawn: when the session is alive
@@ -145,15 +147,50 @@ export function TerminalTabPanel({ tabId, cwd, program, args, shell, reopenSeq }
       <div className="terminal-tabbar">
         <span className="terminal-title">Terminal</span>
         <div className="terminal-tabs" role="tablist" aria-label="Terminal tabs">
-          {terminalTabs.map((t) => (
+          {terminalTabs.map((t) =>
+            renamingId === t.id ? (
+              <div key={t.id} className="terminal-tab terminal-tab-active terminal-tab-renaming">
+                <input
+                  className="terminal-tab-rename"
+                  autoFocus
+                  defaultValue={t.title}
+                  aria-label={`Rename ${t.title}`}
+                  onFocus={(e) => e.currentTarget.select()}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    // The rename box owns the keyboard while it is open: a
+                    // bubble to the window handler would fire the app's chords
+                    // (and the xterm's) from a plain text field.
+                    e.stopPropagation()
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      useViewerTabs.getState().renameViewer(t.id, e.currentTarget.value)
+                      setRenamingId(null)
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault()
+                      setRenamingId(null)
+                    }
+                  }}
+                  onBlur={(e) => {
+                    useViewerTabs.getState().renameViewer(t.id, e.currentTarget.value)
+                    setRenamingId(null)
+                  }}
+                />
+              </div>
+            ) : (
             <div
               key={t.id}
               role="tab"
               aria-selected={t.id === activeId}
               tabIndex={-1}
               className={'terminal-tab' + (t.id === activeId ? ' terminal-tab-active' : '')}
-              title={t.title}
+              title={`${t.title} — double-click to rename`}
               onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
+              onDoubleClick={(e) => {
+                e.stopPropagation()
+                useViewerTabs.getState().setActiveViewer(t.id)
+                setRenamingId(t.id)
+              }}
             >
               <span className="terminal-tab-shell">{(t.title || '').split('/').pop() || t.title}</span>
               <button
@@ -170,7 +207,8 @@ export function TerminalTabPanel({ tabId, cwd, program, args, shell, reopenSeq }
                 </svg>
               </button>
             </div>
-          ))}
+            )
+          )}
         </div>
         <div className="terminal-actions">
           <button
@@ -181,9 +219,17 @@ export function TerminalTabPanel({ tabId, cwd, program, args, shell, reopenSeq }
             onClick={() => {
               // An ordinary right-pane TAB with its own pty (like the bottom
               // panel's +): the bottom panel and the pane stay separate hosts.
+              //
+              // cwd is the CURRENT VIEW's workspace root, never the app glance
+              // root: with a chat from another project open, a new tab used to
+              // land in whichever project was loaded first. `scope.wsKey` IS
+              // the workspace this strip lists, so the tab is created in it and
+              // cannot appear in a different workspace's strip.
               const app = useStore.getState()
+              const chat = app.chats.find((c) => c.id === app.activeChatId)
+              const wsRoot = chat?.root || app.root || ''
               useViewerTabs.getState().openTerminal({
-                cwd: app.root,
+                cwd: wsRoot,
                 shell,
                 fresh: true,
               })

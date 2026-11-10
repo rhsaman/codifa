@@ -5,18 +5,33 @@
 .right-panel .right-panel-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+  gap: 0;
+  padding: 0;
 }
 
+/* One flat surface: the panel itself is the card, so the sections inside it
+   carry no border / radius / shadow (no card-in-card). A section that follows
+   another is separated by air only — no hairline: every divider in here was a
+   line the screen did not need, and the "one panel" reading depends on the
+   surface being unbroken from the icon dock to the last row. */
 .right-panel .sidebar-panel {
   margin: 0;
-  border-radius: 12px;
-  border: 1px solid var(--hairline);
-  background: var(--bg-panel);
-  box-shadow: var(--shadow-card);
-  overflow: hidden;
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  overflow: visible;
   flex: 0 0 auto;
+}
+
+.right-panel .sidebar-panel + .sidebar-panel {
+  border-top: none;
+  padding-top: 6px;
+}
+
+/* Section headers sit on the same surface — no divider under the header. */
+.right-panel .sidebar-panel-head {
+  border-bottom: none;
 }
 
 /* ---------- header ---------- */

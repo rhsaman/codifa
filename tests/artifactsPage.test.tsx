@@ -3,9 +3,10 @@
 // Locked here:
 //   * `artifacts` survives a restart (both load whitelists), and it is a
 //     GLOBAL page: no chatId, visible in every chat, still one single tab.
-//   * `artifact` (one document) is GLOBAL too: opening a row must show the
-//     document in whatever chat is on screen, never switch chats, and survive
-//     its owner chat being deleted.
+//   * `artifact` (one document) belongs to its chat: the tab is visible ONLY
+//     in the owner chat, the owner is recovered from the tab id when an older
+//     payload omitted it, and a plan/document from chat A never shows in
+//     chat B.
 //   * it is rail-owned, so it is never ALSO drawn as a rail row (one entry
 //     point per page) and its label is its own kind label.
 //   * the panel renders chrome + a loading state without a backend (the list
@@ -34,8 +35,9 @@ const disk = new Map<string, string>([
       tabs: [
         { id: 'artifacts', kind: 'artifacts', title: 'Artifacts', createdAt: 300 },
         { id: 'schedule', kind: 'schedule', title: 'Schedule', createdAt: 200 },
-        // An artifact tab is global: it is kept even without an owner chat,
-        // because its id still carries the artifact id the panel re-reads.
+        // An artifact tab is chat-scoped. This older payload carries the owner
+        // only inside the id (`artifact:<chatId>:<artifactId>`): the load path
+        // must recover it instead of dropping the tab as ownerless.
         { id: 'artifact:c1:x', kind: 'artifact', title: 'X', createdAt: 100 },
       ],
       activeId: 'artifacts',
@@ -104,18 +106,23 @@ console.log('2) it survives a restart as ONE global tab:')
   check('it has no owner chat (global)', mine[0]?.chatId === undefined, mine[0])
   check('it is the active tab again', useViewerTabs.getState().activeId === 'artifacts')
   check(
-    'the artifact tab is kept as a global one',
-    tabs.some((t) => t.kind === 'artifact'),
-    tabs.map((t) => t.id),
+    'the artifact tab survives with its owner chat recovered from its id',
+    tabs.some((t) => t.kind === 'artifact' && t.chatId === 'c1'),
+    tabs.map((t) => `${t.id}@${t.chatId}`),
   )
-  // A document belongs to a chat, but the TAB does not: it must show in every
-  // chat, or opening a row from the Artifacts page would look like a no-op in
-  // any chat but the owner's.
+  // A document belongs to a chat, so its tab follows that chat only: another
+  // chat must never display chat A's plan/document preview.
   check(
-    'an artifact tab is visible in every chat',
-    visibleTabs(tabs, 'c1').some((t) => t.kind === 'artifact') &&
-      visibleTabs(tabs, 'zzz').some((t) => t.kind === 'artifact'),
-    visibleTabs(tabs, 'zzz').map((t) => t.id),
+    'an artifact tab is visible in its OWN chat only',
+    visibleTabs(tabs, { wsKey: 'w', chatId: 'c1' }).some((t) => t.kind === 'artifact') &&
+      !visibleTabs(tabs, { wsKey: 'w', chatId: 'zzz' }).some((t) => t.kind === 'artifact'),
+    visibleTabs(tabs, { wsKey: 'w', chatId: 'zzz' }).map((t) => t.id),
+  )
+  // The LIST page is the cross-chat browser and stays global.
+  check(
+    'the artifacts page itself stays visible in every chat',
+    visibleTabs(tabs, { wsKey: 'w', chatId: 'c1' }).some((t) => t.kind === 'artifacts') &&
+      visibleTabs(tabs, { wsKey: 'w', chatId: 'zzz' }).some((t) => t.kind === 'artifacts'),
   )
 }
 

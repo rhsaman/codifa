@@ -62,6 +62,9 @@ export interface PluginInfo {
   source_repo?: string
   source_path?: string
   source_ref?: string
+  /** The skill folders the marketplace row selected, so "update from source"
+   *  re-reads the same subset instead of the whole source folder. */
+  source_skills?: string[]
   created_at?: number
   updated_at?: number
 }
@@ -80,6 +83,9 @@ export interface PluginInstallResult {
   /** One line naming what actually landed — a bundle carrying only commands
    *  used to answer with three empty arrays, which reads like a failed install. */
   summary?: string
+  /** The marketplace index file the source repo carries, when the repo is ALSO
+   *  a catalogue. Lets the UI register it without probing every install. */
+  marketplace?: string | null
   plugin?: PluginInfo
 }
 

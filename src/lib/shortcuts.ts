@@ -50,6 +50,9 @@ export function navChord(e: {
  *  (رگرسیون: Ctrl+K داخل پیکر @mention فوکوس را به سرچ سایدبار می‌برد). */
 export function shouldFocusSearch(e: {
   key: string;
+  /** Physical `e.code`; when present it wins over `e.key`, so Ctrl+K works on
+   *  Persian/Arabic layouts where the key reports "ن" instead of "k". */
+  code?: string;
   metaKey: boolean;
   ctrlKey: boolean;
   defaultPrevented: boolean;
@@ -57,7 +60,7 @@ export function shouldFocusSearch(e: {
   return (
     !e.defaultPrevented &&
     (e.metaKey || e.ctrlKey) &&
-    e.key.toLowerCase() === "k"
+    physicalKey({ code: e.code ?? "", key: e.key }) === "k"
   );
 }
 
@@ -74,12 +77,17 @@ export interface PrefixShortcut {
  *  spawning one when none exists.
    *  `terminal-next`/`terminal-prev` cycle the TERMINAL TABS ([ = previous,
    *  ] = next): right-pane terminal tabs first, the bottom panel's shells
-   *  as the fallback. `files`/`git`/`artifacts`/`schedule` open their right
-   *  pane pages (`files` also focuses the explorer's filter box). */
+   *  as the fallback. `files`/`git`/`artifacts`/`schedule`/`panel` open their
+   *  right pane pages (`files` also focuses the explorer's filter box).
+   *  `workspaces`
+   *  reveals + focuses the sidebar's workspace (project) list; both `files`
+   *  and `workspaces` close the sidebar again when their surface already has
+   *  the caret. */
   action?:
     | "voice"
     | "live"
     | "terminal"
+    | "terminal-leave"
     | "pane-left"
     | "pane-right"
     | "terminal-focus"
@@ -88,7 +96,9 @@ export interface PrefixShortcut {
     | "files"
     | "git"
     | "artifacts"
-    | "schedule";
+    | "schedule"
+    | "panel"
+    | "workspaces";
 }
 
 /** Second key (after Ctrl+X) -> the command it runs. Order is display order.
@@ -100,11 +110,14 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   c: { cmd: "/compact", label: "Summarize & compact the chat context" },
   v: { cmd: "/voice", label: "Toggle the live voice session", action: "live" },
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
-  j: { cmd: "", label: "Toggle the terminal panel", action: "terminal" },
-  e: { cmd: "", label: "Open the file explorer (right pane) and focus its filter", action: "files" },
+  j: { cmd: "", label: "Focus the bottom terminal panel (opens it if closed)", action: "terminal" },
+  k: { cmd: "", label: "Leave the terminal: focus the chat composer", action: "terminal-leave" },
+  w: { cmd: "", label: "Jump to the workspace list (sidebar) and focus the active workspace's row — j/k then walks the rows/chats, Enter opens — pressed again, closes the sidebar", action: "workspaces" },
+  e: { cmd: "", label: "Open the file explorer (sidebar Files view) — from an open file it focuses that file's row, otherwise its filter; Ctrl/Cmd+J walks the tree rows, Ctrl/Cmd+K returns; pressed again, closes the sidebar", action: "files" },
   g: { cmd: "", label: "Open the git diff panel (right pane)", action: "git" },
   a: { cmd: "", label: "Open the artifacts panel (right pane)", action: "artifacts" },
   s: { cmd: "", label: "Open the schedule panel (right pane)", action: "schedule" },
+  p: { cmd: "", label: "Open the Panel (right pane) — this turn's usage, background terminals and the agent plan", action: "panel" },
   l: { cmd: "", label: "Move focus right: sidebar → chats → right pane", action: "pane-right" },
   h: { cmd: "", label: "Move focus left: right pane → chats → sidebar", action: "pane-left" },
   t: { cmd: "", label: "Focus the terminal tab in the right pane (spawns one if there is none)", action: "terminal-focus" },
@@ -141,6 +154,36 @@ export function isWindowMoveChord(e: {
   return prefixMoveDir(physicalKey(e));
 }
 
+/** Direct tab-cycle chord, VS Code style: Cmd+Shift+[ / ] on Apple platforms,
+ *  Ctrl+Shift+[ / ] elsewhere. Returns -1 (previous), +1 (next) or null when
+ *  the event is not that chord. Layout-independent via physicalKey (the shifted
+ *  characters are `{` / `}`, so `e.key` alone would never match). Pure, for test. */
+export function tabCycleChord(
+  e: {
+    key: string;
+    code: string;
+    ctrlKey: boolean;
+    metaKey: boolean;
+    altKey?: boolean;
+    shiftKey?: boolean;
+  },
+  apple: boolean = isApplePlatform(),
+): 1 | -1 | null {
+  if (!e.shiftKey || e.altKey) return null;
+  const mod = apple ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  if (!mod) return null;
+  // `physicalKey` maps the event's `code` first (layout-independent: the
+  // shifted characters are `{` / `}`, so `e.key` alone would never match on a
+  // US layout) and falls back to `e.key`, keeping the chord alive on events
+  // that carry no `code` — that fallback is lowercased, so `{`/`}` (which the
+  // chord is pressed with, Shift held) must be normalized back to the bracket.
+  const raw = physicalKey(e);
+  const k = raw === "{" ? "[" : raw === "}" ? "]" : raw;
+  if (k === "[") return -1;
+  if (k === "]") return 1;
+  return null;
+}
+
 /** True on macOS/iOS — decides which half of the Cmd/Ctrl convention a chord
  *  uses (Cmd on Apple platforms, Ctrl elsewhere). */
 export function isApplePlatform(): boolean {
@@ -173,6 +216,18 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
     keys: "Cmd/Ctrl+F",
     label: "Find in the focused chat transcript — highlight all matches, Enter/Shift+Enter or the arrows to step, Esc to close",
   },
+  {
+    keys: "j / k (and h / l)",
+    label: "With a sidebar list or a scrollable pane focused: walk the rows / scroll the page — fields and the composer keep their letters",
+  },
+  {
+    keys: "gg / G",
+    label: "First / last row in the focused list, or the top / bottom of the focused scrollable page",
+  },
+  {
+    keys: "Ctrl/Cmd+D / Ctrl/Cmd+U",
+    label: "Half a screen down / up in the focused list or scrollable page (Neovim's Ctrl+D / Ctrl+U)",
+  },
   { keys: "Tab", label: "Cycle agent mode (Ask / Plan / Build)" },
   { keys: "/", label: "Open command palette" },
   { keys: "Cmd/Ctrl+M", label: "Fullscreen what has focus — the bottom terminal, else the right pane, else the focused chat window (press again to restore)" },
@@ -180,8 +235,13 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+P", label: "Quick-open / search overlay (⌘⇧F = content search)" },
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
-  { keys: "Ctrl+X then J", label: "Toggle the terminal panel (the only terminal toggle — works while the caret is inside the terminal too)" },
+  { keys: "Ctrl+X then J", label: "Jump INTO the bottom terminal panel — opens it when closed, focuses its active shell when open (works while the caret is inside the terminal too)" },
+  { keys: "Ctrl+X then K", label: "Leave the bottom terminal and focus the chat composer" },
+  { keys: "Ctrl+X then W", label: "Jump to the workspace list in the sidebar and focus the active workspace's row. j/k walk the rows; Enter opens a workspace, then j/k walk its chats and Enter opens the focused chat with the caret in its composer. Ctrl/Cmd+J/K move between the list and the search box — pressed again, closes the sidebar" },
+  { keys: "Ctrl+X then E", label: "Open the file explorer in the sidebar — from an open file it focuses that file's row (Ctrl/Cmd+J then walks the tree rows, Ctrl/Cmd+K returns to the filter), otherwise it focuses the filter — pressed again, closes the sidebar" },
+  { keys: "Ctrl+X then P", label: "Open the Panel in the right pane — the current turn's usage (skills/MCP/plugins), background terminals and the agent's plan checklist" },
   { keys: "Ctrl+X then [ / ]", label: "Previous / next TERMINAL tab — cycles the right-pane terminal tabs (reveals the pane if closed); with no terminal tabs there, cycles the bottom panel's shells" },
+  { keys: "Cmd+Shift+[ / ]", label: "Previous / next tab in the pane that has focus — chat tabs, right-pane tabs, or the bottom terminal's tabs (Ctrl+Shift+[ / ] on Linux/Windows)" },
   { keys: "Ctrl+H/J/K/L", label: "Move focus between the split CHAT windows vim-style (k=up, j=down, h=left, l=right) — to the window that really lies in that direction, nothing beyond them. The three sections (sidebar / chats / right pane / terminal) are reached only with Ctrl+X then L/H/T" },
   { keys: "Shift+Alt(Option)+H/J/K/L", label: "Swap (move) chat window positions in the same vim directions" },
   {

@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
+import { useVimScroll } from "../lib/useVimScroll";
 import {
   deleteArtifact,
   getArtifact,
@@ -29,9 +31,10 @@ export function ArtifactGlyph({ size = 14 }: { size?: number }) {
  *  form. Opening a row fetches the saved body and docks the sandboxed preview
  *  — the same panel the transcript card opens.
  *
- *  Independent of the chat on screen: a row opens a GLOBAL viewer tab (see
- *  `openArtifact`), so picking a document never switches or focuses a chat,
- *  and a document whose chat was deleted still opens. */
+ *  Independent of the chat on screen: the LIST is global, but each document
+ *  opens in its OWN chat (a document belongs to that chat), so picking a row
+ *  brings the owner chat on screen and docks its preview there.
+ */
 export function ArtifactsPanel() {
   const [items, setItems] = useState<ArtifactSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -41,6 +44,9 @@ export function ArtifactsPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   // Bumped by Refresh: re-runs the fetch effect without remounting the page.
   const [gen, setGen] = useState(0);
+  // Shared vim scroll keys over the list (j/k, gg/G, Ctrl+D/U).
+  const rootRef = useRef<HTMLDivElement>(null);
+  useVimScroll(rootRef);
 
   const load = useCallback(async () => {
     setError(null);
@@ -74,8 +80,10 @@ export function ArtifactsPanel() {
       setError(doc.error);
       return;
     }
-    // The tab is global, so it shows in whatever chat is on screen: the owner
-    // chat travels with it only so a restored tab can re-read its body.
+    // The document belongs to its chat, so its preview tab is chat-scoped.
+    // Bring that chat on screen — otherwise the tab would exist but render
+    // nowhere in the chat the user is currently looking at.
+    if (item.chatId) useStore.getState().focusWindow(item.chatId);
     useViewerTabs.getState().openArtifact(item.chatId, {
       id: doc.id,
       title: doc.title,
@@ -111,7 +119,7 @@ export function ArtifactsPanel() {
   const searchable = items !== null && items.length > 0;
 
   return (
-    <div className="artifacts-panel">
+    <div ref={rootRef} className="artifacts-panel">
       <div className="artifacts-panel-head">
         <span className="artifacts-panel-title">Artifacts</span>
         <span className="artifacts-panel-count">

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { copyToClipboard } from "../lib/clipboard";
@@ -6,6 +6,7 @@ import { detectDir } from "../lib/bidi";
 import { fmtSize } from "../lib/renderCap";
 import { mdComponents } from "./ChatMessage";
 import { rehypeLtrIslands } from "../lib/ltrIslands";
+import { useVimScroll } from "../lib/useVimScroll";
 
 /** Never paint more than this many characters of ONE text: a multi-megabyte
  *  paste would freeze the tab. Copy keeps the FULL text. */
@@ -29,6 +30,10 @@ export function TextViewerPanel({
 }) {
   const [copied, setCopied] = useState(false);
   const [view, setView] = useState<"md" | "text">(format ?? "md");
+  // Vim scroll keys (j/k, h/l, gg/G, Ctrl+D/U) over the body, same contract as
+  // the file viewer and the git diff.
+  const rootRef = useRef<HTMLDivElement>(null);
+  useVimScroll(rootRef);
   // Reopening the tab with a different hint resets the view (the tab object
   // updates in place, so a prop change — not a remount — carries it).
   useEffect(() => setView(format ?? "md"), [format]);
@@ -60,7 +65,7 @@ export function TextViewerPanel({
   };
 
   return (
-    <div className="file-viewer text-viewer" dir="ltr">
+    <div ref={rootRef} className="file-viewer text-viewer" dir="ltr">
       <div className="file-viewer-head">
         <span className="text-viewer-icon" aria-hidden="true">
           📝

@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode } from 'react'
 import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderHeader, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import type { MarketplaceSource, PluginInfo } from '../types'
 import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES, setPersistSuspended } from '../lib/store'
+import { SubagentsTab } from './settings/SubagentsTab'
 import { getSkillFile, listMcp, listSkills, providerHeaders, syncSkill } from '../lib/api'
 import {
   deletePlugin,
@@ -225,7 +226,7 @@ export function SettingsModal({
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'extensions' | 'marketplaces' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'extensions' | 'marketplaces' | 'storage' | 'tools' | 'subagents' | 'models' | 'general'>(initialTab as any || 'providers')
   // Search Console OAuth (Settings → Auth) — the ONLY Google sign-in. Gemini
   // models authenticate with an API key like every other provider.
   const searchConsole = useStore((s) => s.searchConsole)
@@ -1113,6 +1114,18 @@ export function SettingsModal({
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="7" y="7" width="10" height="10" rx="1.5" />
           <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.5 4.5 6.5 6.5M17.5 17.5l2 2M4.5 19.5l2-2M17.5 6.5l2-2" />
+        </svg>
+      ),
+    },
+    {
+      id: 'subagents',
+      label: 'Sub-agents',
+      group: 'Models',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" />
+          <rect x="8.5" y="14" width="7" height="7" rx="1.5" />
+          <path d="M6.5 10v2.5h11V10M12 12.5V14" />
         </svg>
       ),
     },
@@ -2453,6 +2466,8 @@ export function SettingsModal({
         </>
         )}
 
+        {tab === 'subagents' && <SubagentsTab />}
+
         {tab === 'tools' && (
         <>
           <div className="field">
@@ -2468,8 +2483,8 @@ export function SettingsModal({
 
             <ToolSlotRow
               agent="explore"
-              label="Explore"
-              desc="Research sub-agent that does ALL file reading, searching and LSP lookups for the main agent and reports the full findings. Plugin sub-agents (agents/*.md inside a bundle) run on THIS row too — same model, same fallback list. Falls back to the main model."
+              label="Sub-agent"
+              desc="The model EVERY sub-agent runs on: the built-in Explore research agent (file reading, searching, LSP lookups, plus web_search / fetch_url), the default Browser Navigator and Desktop Operator, every plugin sub-agent (agents/*.md inside a bundle) and every custom sub-agent from Settings → Sub-agents. Every sub-agent can also load any installed plugin on its own with load_plugin — nothing is assigned per agent. One model, one fallback list for all of them. Falls back to the main model."
               model={subagentModels.explore || ''}
               level={subagentThinking.explore || 'low'}
               onSelectModel={setSubagentModel}

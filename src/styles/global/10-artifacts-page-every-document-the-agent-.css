@@ -1909,6 +1909,11 @@
   flex: none;
   width: 100%;
   height: 28px;
+  /* Edge labels are centred on their tick; without an inset the first and
+     last (320 / 3840) stuck out of the panel and got clipped. The track below
+     carries the scale, the padding is just breathing room. */
+  box-sizing: border-box;
+  padding: 0 28px;
   border-radius: 0;
   border: none;
   background-color: #202124;
@@ -1916,6 +1921,20 @@
   background-size: 100% 5px;
   background-repeat: no-repeat;
   background-position: bottom;
+}
+
+/* Auto-fit mode: the width is the pane width, so the ruler is redundant.
+   Kept mounted (not conditionally rendered) so its track can be measured
+   immediately when fixed mode turns it back on. */
+.browser-width-ruler--hidden {
+  display: none;
+}
+
+/* The actual 0-100% scale, inset from the ruler's rounded ends. Ticks, the
+   thumb and the tooltip are positioned inside THIS box. */
+.browser-ruler-track {
+  position: absolute;
+  inset: 0 28px;
 }
 
 .browser-width-ruler:focus-visible {
@@ -1981,6 +2000,9 @@
 .browser-ruler-tip {
   position: absolute;
   top: -26px;
+  /* Never let the bubble hang past the scale: at the extremes its centred
+     position would push it outside the panel. */
+  left: clamp(70px, var(--browser-tip-x, 50%), calc(100% - 70px));
   transform: translateX(-50%);
   padding: 2px 8px;
   border-radius: 4px;
@@ -2079,6 +2101,16 @@
 
 
 .browser-panel .browser-tool-btn--on {
+  background: color-mix(in srgb, var(--link, #6ea8fe) 22%, transparent);
+  border-color: color-mix(in srgb, var(--link, #6ea8fe) 45%, transparent);
+  color: var(--link, #6ea8fe);
+}
+
+/* An active toggle keeps its accent on hover: the generic hover rule was
+   out-specificing this state and made ON look like it turned off under the
+   pointer. */
+.browser-panel .browser-tool-btn--on:hover:not(:disabled),
+.browser-panel .browser-tool-btn--on:active:not(:disabled) {
   background: color-mix(in srgb, var(--link, #6ea8fe) 22%, transparent);
   border-color: color-mix(in srgb, var(--link, #6ea8fe) 45%, transparent);
   color: var(--link, #6ea8fe);

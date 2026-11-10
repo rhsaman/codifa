@@ -580,8 +580,8 @@ pub(super) async fn degrade_images_to_text(
                 format!("{text}\n\n=== IMAGE ANALYSIS (from the vision model) ===\n{d}")
             }
             _ => format!(
-                "{text}\n\n[image omitted: the main model cannot read images and no Vision \
-                 model is configured in Settings → Tools]"
+                "{text}\n\n[image omitted: this model cannot read images and no Vision \
+                 model is configured in Settings → Tools → Vision]"
             ),
         };
         let role = messages[i]
@@ -601,8 +601,8 @@ pub(super) async fn degrade_images_to_text(
         messages[i] = json!({
             "role": role,
             "content": format!(
-                "{text}\n\n[image omitted: the main model cannot read images and no Vision \
-                 model is configured in Settings → Tools]"
+                "{text}\n\n[image omitted: this model cannot read images and no Vision \
+                 model is configured in Settings → Tools → Vision]"
             ),
         });
         changed += 1;

@@ -1,4 +1,5 @@
 import { ensureSidecar } from './api'
+import { looksLikeRepoAddress } from './repoAddress'
 import type { SkillRow } from './api'
 import type { McpServerConfig, PluginInfo, PluginInstallResult } from '../types'
 
@@ -64,6 +65,10 @@ export interface MarketplaceEntry {
   /** The index's own topic tag (`security`, `documentation`…), when it has one.
    *  It is what a Persian keyword seed derives from at install time. */
   category?: string
+  /** The skill folders this row publishes, when the index names them. A row
+   *  may point at the repo root and still select only part of its skills
+   *  (`anthropics/skills` does), so the install must carry this list. */
+  skills?: string[]
   repo: string
   repo_path: string
   repo_ref: string
@@ -156,6 +161,10 @@ export async function installPlugin(body: {
    *  keywords when the bundle ships none. */
   category?: string
   description?: string
+  /** The skill folders the row publishes. A row can point at a repo root and
+   *  still select a subset (`anthropics/skills`), so this list is what keeps
+   *  the install from pulling in every skill in the repo. */
+  skills?: string[]
 }): Promise<PluginInstallResult | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: 'the local backend is not ready' }
@@ -305,11 +314,95 @@ function comparableRepo(repo: string): string {
     .replace(/\/+$/, '')
 }
 
+/** Whether two marketplace addresses point at the SAME place.
+ *
+ *  A copied GitHub URL and the short `owner/repo` a marketplace was added with
+ *  are one source: comparing raw strings saved the same catalogue twice (once
+ *  from Settings, once from an install that registered it). Path and ref still
+ *  have to match — two indexes can live in one repo. */
+export function sameMarketplace(
+  a: { repo: string; path?: string; git_ref?: string },
+  b: { repo: string; path?: string; git_ref?: string },
+): boolean {
+  return (
+    comparableRepo(a.repo) === comparableRepo(b.repo) &&
+    (a.path ?? '') === (b.path ?? '') &&
+    (a.git_ref ?? '') === (b.git_ref ?? '')
+  )
+}
+
+/** Whether two repo addresses name the same repository (`owner/repo` vs URL). */
+export function sameRepo(a: string, b: string): boolean {
+  return comparableRepo(a) === comparableRepo(b)
+}
+
+/** The slug a plugin NAME produces — the same `safe_file` the backend writes. */
+export function pluginSlug(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '')
+}
+
+/** The installed bundle that IS this marketplace row, when one exists.
+ *
+ *  Address alone is not enough: a marketplace can point several rows at the
+ *  same source folder (`anthropics/skills` publishes five rows from `./`), so
+ *  matching only the address marked EVERY row installed after one root
+ *  install. The row's name (its slug) distinguishes them; the repo still has
+ *  to match, so a same-named bundle from another marketplace does not hide it.
+ *  Matching ignores the sub-folder and ref on purpose: a root install of a
+ *  single-bundle repo is the same bundle a row points into.
+ */
+export function installedForRow<
+  T extends { name?: string; slug?: string; source_repo?: string },
+>(installed: T[], row: { name: string; repo: string }): T | undefined {
+  const wanted = pluginSlug(row.name)
+  const wantedName = row.name.trim().toLowerCase()
+  return installed.find((p) => {
+    if (!sameRepo(p.source_repo ?? '', row.repo)) return false
+    const name = (p.name ?? '').trim().toLowerCase()
+    return (
+      p.slug === wanted ||
+      pluginSlug(name) === wanted ||
+      name === wantedName
+    )
+  })
+}
+
+/** The installed bundle that came from EXACTLY this install address, when one
+ *  exists. Unlike `installedForRow` the sub-folder and ref matter here: one repo
+ *  can publish several bundles, and installing the root is not the same act as
+ *  installing a row that points into `skills/…`. Used to refuse a second
+ *  install of something already on disk instead of re-downloading it. */
+export function installedFromAddress<
+  T extends { source_repo?: string; source_path?: string; source_ref?: string },
+>(
+  installed: T[],
+  address: { repo: string; repo_path?: string; repo_ref?: string },
+): T | undefined {
+  const repo = address.repo.trim()
+  if (!repo) return undefined
+  return installed.find((p) => {
+    const source = (p.source_repo ?? '').trim()
+    if (!source || !sameRepo(source, repo)) return false
+    return (
+      (p.source_path ?? '') === (address.repo_path ?? '') &&
+      (p.source_ref ?? '') === (address.repo_ref ?? '')
+    )
+  })
+}
+
 /** Every saved marketplace a typed name/address resolves to.
  *
- *  Matching is deliberately broad — label, repo, `repo@ref/path`, and the
- *  install key — because `/plugin marketplace remove` is typed from memory.
- *  Callers report an ambiguous result instead of guessing. */
+ *  Matching is deliberately broad — label, repo, `repo@ref/path`, the install
+ *  key, and the repo's LAST segment — because both
+ *  `/plugin marketplace remove` and `/plugin install plugin@marketplace` are
+ *  typed from memory. The last segment is what makes
+ *  `prompts.chat@prompts.chat` find a source saved as `f/prompts.chat` (the
+ *  index's own name is not stored on older saves). Callers report an ambiguous
+ *  result instead of guessing. */
 export function findMarketplaces<T extends { repo: string; label?: string; path?: string; git_ref?: string }>(
   marketplaces: T[],
   query: string,
@@ -317,6 +410,7 @@ export function findMarketplaces<T extends { repo: string; label?: string; path?
   const q = query.trim().toLowerCase()
   if (!q) return []
   const qRepo = comparableRepo(q)
+  const lastSegment = (repo: string) => comparableRepo(repo).split('/').pop() ?? ''
   return marketplaces.filter((m) => {
     const label = (m.label ?? '').trim().toLowerCase()
     const repo = m.repo.trim().toLowerCase()
@@ -326,9 +420,139 @@ export function findMarketplaces<T extends { repo: string; label?: string; path?
       repo === q ||
       address === q ||
       marketKey(m.repo, m.path, m.git_ref).toLowerCase() === q ||
-      comparableRepo(m.repo) === qRepo
+      comparableRepo(m.repo) === qRepo ||
+      lastSegment(m.repo) === qRepo
     )
   })
+}
+
+/** Split Claude Code's install spelling `plugin@marketplace`.
+ *
+ *  Only the LEFT side decides: a plugin name never holds `/` or `:`, so
+ *  `owner/repo`, `owner/repo@ref` and `git@host:owner/repo` are repo addresses
+ *  and stay on the bundle-install path. The right side may name a SAVED
+ *  marketplace or be a repo address typed in full (`plugin@owner/repo`).
+ *  Returns null for anything that is not this spelling.
+ */
+export function parsePluginInstallSpec(
+  raw: string,
+): { plugin: string; marketplace: string } | null {
+  const spec = raw.trim()
+  const at = spec.indexOf('@')
+  if (at <= 0) return null
+  const plugin = spec.slice(0, at).trim()
+  const marketplace = spec.slice(at + 1).trim()
+  if (!plugin || !marketplace) return null
+  if (/[/:]/.test(plugin)) return null
+  // `git@github.com:owner/repo` is an SSH address, not a scoped install; an
+  // explicit `https://…` marketplace address is fine.
+  if (marketplace.includes(':') && !/^https?:\/\//i.test(marketplace)) return null
+  return { plugin, marketplace }
+}
+
+/** Where a scoped install's row came from: the address the caller saves when
+ *  the marketplace was typed in full instead of already being in the list. */
+export interface ScopedMarketplaceSource {
+  repo: string
+  label?: string
+  path?: string
+  git_ref?: string
+}
+
+export interface ScopedMarketplaceInstall {
+  entry: MarketplaceEntry
+  source: ScopedMarketplaceSource
+  /** False when the user addressed the marketplace by repo but has not saved it. */
+  saved: boolean
+}
+
+/** Resolve `plugin@marketplace` to the marketplace row it names.
+ *
+ *  The marketplace is matched against the saved sources first (label, repo, or
+ *  the repo's last segment — see `findMarketplaces`), then accepted as a repo
+ *  address. Reading the index is the only I/O; the row it returns is already
+ *  the exact `repo`/`repo_path`/`repo_ref` an install takes, so the caller
+ *  never translates addresses by hand.
+ */
+export async function resolvePluginInstall(
+  markets: Array<{ repo: string; label?: string; path?: string; git_ref?: string }>,
+  spec: { plugin: string; marketplace: string },
+): Promise<ScopedMarketplaceInstall | { error: string }> {
+  const matches = findMarketplaces(markets, spec.marketplace)
+  let source: ScopedMarketplaceSource
+  let saved = false
+  if (matches.length > 1) {
+    return {
+      error:
+        `\`${spec.marketplace}\` matches several marketplaces: ` +
+        matches.map((m) => `**${marketplaceLabel(m)}**`).join(', ') +
+        '. Use the exact name.',
+    }
+  }
+  if (matches.length === 1) {
+    const m = matches[0]
+    source = {
+      repo: m.repo,
+      ...(m.label ? { label: m.label } : {}),
+      ...(m.path ? { path: m.path } : {}),
+      ...(m.git_ref ? { git_ref: m.git_ref } : {}),
+    }
+    saved = true
+  } else if (looksLikeRepoAddress(spec.marketplace)) {
+    const parsed = parseMarketplaceAddress(spec.marketplace)
+    if (!parsed.repo) return { error: 'That address has no repo — use `owner/repo`.' }
+    source = {
+      repo: parsed.repo,
+      ...(parsed.path ? { path: parsed.path } : {}),
+      ...(parsed.git_ref ? { git_ref: parsed.git_ref } : {}),
+    }
+  } else {
+    return {
+      error:
+        `No saved marketplace matches \`${spec.marketplace}\`. Add it first with ` +
+        `\`/plugin marketplace add <owner/repo>\`, or pass its repo address: ` +
+        `\`/plugin install ${spec.plugin}@owner/repo\`.`,
+    }
+  }
+  const out = await listMarketplace({
+    repo: source.repo,
+    ...(source.path ? { path: source.path } : {}),
+    ...(source.git_ref ? { git_ref: source.git_ref } : {}),
+  })
+  if ('error' in out) {
+    return { error: `Could not read marketplace \`${source.repo}\`: ${out.error}` }
+  }
+  const label = out.name.trim() || source.label || source.repo
+  source.label = label
+  const wanted = spec.plugin.trim().toLowerCase()
+  const exact = out.plugins.find((p) => p.name.trim().toLowerCase() === wanted)
+  // A one-row catalogue has no ambiguity to resolve: the user named a
+  // marketplace that publishes exactly one plugin, so install that one even
+  // when the index spells its name differently.
+  const entry = exact ?? (out.plugins.length === 1 ? out.plugins[0] : undefined)
+  if (!entry) {
+    return {
+      error:
+        `Marketplace **${label}** lists no plugin named \`${spec.plugin}\`. ` +
+        (out.plugins.length
+          ? `Available: ${out.plugins.map((p) => `\`${p.name}\``).join(', ')}.`
+          : 'Its index lists no plugins.'),
+    }
+  }
+  return { entry, source, saved }
+}
+
+/** Read a repo as a marketplace index, or null when it is not one.
+ *
+ *  Most install sources are plain plugin repos, so "no index" is the ordinary
+ *  answer and must not be shown as an error. */
+export async function readMarketplaceIndex(body: {
+  repo: string
+  path?: string
+  git_ref?: string
+}): Promise<MarketplaceIndex | null> {
+  const out = await listMarketplace(body)
+  return 'error' in out ? null : out
 }
 
 /** How long a dropped install connection is watched before the failure is
@@ -507,7 +731,8 @@ export async function listPluginCommands(): Promise<PluginCommandRow[] | { error
 export interface PluginAgentRow {
   name: string
   description: string
-  /** Tools it may call; empty = the full research set. It can only narrow. */
+  /** Tools it declared in `agents/*.md`. Empty = the kind's default set; a
+   *  non-empty list is the exact set, including `Bash`/`Edit`/`Write`. */
   tools?: string[]
   /** Its system prompt. */
   prompt?: string

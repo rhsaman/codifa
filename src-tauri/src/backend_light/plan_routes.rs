@@ -93,8 +93,26 @@ pub(super) async fn permission_respond(Json(body): Json<Value>) -> Response<Body
         return bad_request("id is required");
     }
     let allowed = body["allowed"].as_bool().unwrap_or(false);
+    // A note typed on the card rides along: the answer is delivered first (the
+    // tool loop resumes on it), then the note becomes the user's NEXT steer so
+    // the model changes course — "no, use /tmp instead" — without the user
+    // having to type it again in the composer.
+    let note = body["note"].as_str().unwrap_or("").trim().to_string();
+    let chat_id = body["chatId"].as_str().unwrap_or("").trim().to_string();
     let ok = crate::agent::deliver_answer(&id, json!({ "allowed": allowed }));
-    Json(json!({ "ok": ok })).into_response()
+    let mut note_delivered = false;
+    if !note.is_empty() && !chat_id.is_empty() {
+        // `false` means no turn is running to consume it — the renderer then
+        // falls back to sending it as a normal message so it is never lost.
+        note_delivered = crate::agent::push_steer(
+            &chat_id,
+            &format!("perm-note-{id}"),
+            &note,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    Json(json!({ "ok": ok, "noteDelivered": note_delivered })).into_response()
 }
 
 /// POST /permission/trust — persist an "Always allow" folder grant.

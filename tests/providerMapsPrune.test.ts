@@ -37,7 +37,7 @@ const KEY = '0123456789abcdef0123456789abcdef'
   },
 )
 
-const { mergeContextMap } = await import('../src/lib/provider-fetch.ts')
+const { mergeContextMap, mergeVisionMap } = await import('../src/lib/provider-fetch.ts')
 const { useStore } = await import('../src/lib/store.ts')
 
 function mk(p: Partial<any> = {}): any {
@@ -107,7 +107,33 @@ console.log('\n۵) مدل‌های removed و خارج از پروایدر هر�
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('\n۶) سقف checkedModels — تازه‌ترین‌ها می‌مانند:')
+console.log('\n۶) نقشهٔ vision فقط مدل‌های کاتالوگ فعلی را نگه می‌دارد:')
+{
+  const p = mk()
+  const out = mergeVisionMap(
+    p,
+    ['gemini-3.6-flash', 'nemotron-3-super'],
+    { 'gemini-3.6-flash': true, 'nemotron-3-super': false },
+    { 'gemini-3.6-flash': false, 'ghost-vision-model': true, 'acme/ghost-vision-model': true },
+  )
+  assert('قابلیت تازهٔ مدل کاتالوگ نوشته شد', out['gemini-3.6-flash'] === true)
+  assert('مدل text-only هم صریح false گرفت', out['nemotron-3-super'] === false)
+  assert('هر دو املای کلید برای مدل کاتالوگ هست', out['acme/gemini-3.6-flash'] === true)
+  assert('کلید مدل حذف‌شده هرس شد', out['ghost-vision-model'] === undefined)
+  assert('کلید qualified مدل حذف‌شده هم رفت', out['acme/ghost-vision-model'] === undefined)
+}
+
+console.log('\n۷) سکوت کاتالوگ = «نامعلوم»، نه text-only:')
+{
+  const p = mk()
+  const out = mergeVisionMap(p, ['mystery-model'], {}, { 'mystery-model': true })
+  assert('مقدار قبلی برای مدلِ بی‌خبر حفظ شد', out['mystery-model'] === true)
+  const fresh = mergeVisionMap(p, ['unknown-new'], {}, undefined)
+  assert('مدل تازهٔ بی‌خبر هیچ کلیدی نمی‌گیرد', fresh['unknown-new'] === undefined)
+  assert('کاتالوگ خالی نقشهٔ قبلی را برمی‌گرداند', JSON.stringify(mergeVisionMap(p, [], {}, { x: false })) === '{"x":false}')
+}
+
+console.log('\n۸) سقف checkedModels — تازه‌ترین‌ها می‌مانند:')
 {
   const { MAX_CHECKED_MODELS } = await import('../src/lib/store.ts')
   const st = useStore.getState()

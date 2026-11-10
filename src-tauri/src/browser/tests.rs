@@ -650,6 +650,9 @@
         assert!(args.contains("--disable-gpu"));
         assert!(args.contains("--enable-unsafe-swiftshader"));
         assert!(args.contains("--use-mock-keychain"));
+        // 2x rasterization is what makes the pushed frames sharp on Retina;
+        // the emulated CSS viewport itself stays 1x.
+        assert!(args.contains("--force-device-scale-factor=2"));
         let shell = std::path::Path::new("/opt/browser/chrome-headless-shell");
         let shell_args = launch_args(shell, 61995, profile, None).join(" ");
         assert!(!shell_args.contains("--disable-gpu"));

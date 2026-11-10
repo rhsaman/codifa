@@ -190,3 +190,108 @@
         assert_eq!(kind_of(&json!({})), "html");
         assert_eq!(kind_of(&json!({"kind": "svg"})), "html");
     }
+
+    #[test]
+    fn plan_documents_are_tagged_and_kept_off_the_list() {
+        let root = temp_root("plan");
+        let saved = save(
+            &root,
+            "chat-a",
+            &json!({
+                "title": "Plan — sub-agent tab",
+                "kind": "md",
+                "content": "# Plan — sub-agent tab\n\n1. rename the row\n2. add the tab",
+            }),
+            true,
+        )
+        .unwrap();
+        let id = saved["id"].as_str().unwrap();
+        mark_plan(&root, "chat-a", id).unwrap();
+
+        // A supporting document from the same turn stays on the page.
+        save(
+            &root,
+            "chat-a",
+            &json!({"title": "Design notes", "kind": "md", "content": "# Design notes\ncolors"}),
+            true,
+        )
+        .unwrap();
+
+        let items = list(&root, "chat-a").unwrap();
+        let items = items["artifacts"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["id"], "design-notes");
+
+        // Hidden from the page, still readable from the transcript card/preview.
+        assert_eq!(
+            read(&root, "chat-a", id).unwrap()["title"],
+            "Plan — sub-agent tab"
+        );
+
+        // The tag survives an update, so a later edit cannot put the plan back.
+        save(
+            &root,
+            "chat-a",
+            &json!({"id": id, "content": "# Plan\n\n1. rename the row"}),
+            false,
+        )
+        .unwrap();
+        let items = list(&root, "chat-a").unwrap();
+        assert_eq!(items["artifacts"].as_array().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_plan_artifacts_stay_off_the_list_without_a_tag() {
+        let root = temp_root("plan-legacy");
+        // Saved before `mark_plan` existed: the title names a plan.
+        save(
+            &root,
+            "chat-a",
+            &json!({
+                "title": "Implementation plan",
+                "kind": "md",
+                "content": "# Implementation Plan\n1. do it",
+            }),
+            true,
+        )
+        .unwrap();
+        // ... or only its first heading does.
+        save(
+            &root,
+            "chat-a",
+            &json!({"title": "Rollout", "kind": "md", "content": "# طرح\n1. ship it"}),
+            true,
+        )
+        .unwrap();
+        // A normal markdown artifact, and an html one that merely says "plan",
+        // are not plan documents and stay on the page.
+        save(
+            &root,
+            "chat-a",
+            &json!({"title": "Report", "kind": "md", "content": "# Report\nnumbers"}),
+            true,
+        )
+        .unwrap();
+        save(
+            &root,
+            "chat-a",
+            &json!({"title": "Plan chart", "kind": "html", "content": "<b>chart</b>"}),
+            true,
+        )
+        .unwrap();
+
+        let items = list(&root, "chat-a").unwrap();
+        let ids: Vec<&str> = items["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&"report"), "{ids:?}");
+        assert!(ids.contains(&"plan-chart"), "{ids:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }

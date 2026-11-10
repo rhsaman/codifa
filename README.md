@@ -310,6 +310,7 @@ is disabled. Google sign-in needs the desktop app; use API keys on a server.
 | `Ctrl+X` then `g`     | Open the git diff panel (tmux-style prefix)        |
 | `Ctrl+X` then `a`     | Open the artifacts panel (tmux-style prefix)       |
 | `Ctrl+X` then `s`     | Open the schedule panel (tmux-style prefix)        |
+| `Ctrl+X` then `p`     | Open the Panel: turn usage, background terminals, agent plan (tmux-style prefix) |
 | `Ctrl+X` then `t`     | Focus the terminal tab in the right pane (spawns one if there is none) |
 | `Ctrl+X` then `u`     | Undo last exchange (tmux-style prefix)             |
 | `Ctrl+X` then `r`     | Redo last undone exchange (tmux-style prefix)      |
@@ -591,6 +592,7 @@ loopback، سندباکس systemd دور آن، و دسترسی از راه SSH 
 | `Ctrl+X` و سپس `g`     | باز کردن پنل Git diff (پیشوندِ سبک tmux)             |
 | `Ctrl+X` و سپس `a`     | باز کردن پنل آرتیفکت‌ها (پیشوندِ سبک tmux)           |
 | `Ctrl+X` و سپس `s`     | باز کردن پنل Schedule (پیشوندِ سبک tmux)             |
+| `Ctrl+X` و سپس `p`     | باز کردن Panel: مصرف نوبت، ترمینال‌های پس‌زمینه و پلن ایجنت (پیشوندِ سبک tmux) |
 | `Ctrl+X` و سپس `t`     | فوکوس تب ترمینال در پنل راست (اگر وجود نداشته باشد ساخته می‌شود) |
 | `Ctrl+X` و سپس `u`     | بازگردانی آخرین تبادل (پیشوندِ سبک tmux)              |
 | `Ctrl+X` و سپس `r`     | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |

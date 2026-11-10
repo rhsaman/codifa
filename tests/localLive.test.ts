@@ -32,7 +32,14 @@ const {
   NOISE_FLOOR_CALIBRATION_FRAMES,
   LOCAL_LIVE_DEFAULTS,
   LIVE_SPEECH_ONSET_FRAMES,
-  chooseCut,
+  stripNonSpeech,
+  stripEllipsis,
+  TURN_LEVEL_HANGOVER_RATIO,
+  selectPreRollStart,
+  isSparseTranscript,
+  TURN_LEVEL_DECAY,
+  collapseRepeatedPhrases,
+  voicedRunMs,
   echoSafeThreshold,
   onsetFramesRequired,
   TTS_ECHO_GATE_MULT,
@@ -76,6 +83,23 @@ function makeSession(reply: Reply = '') {
   priv['captureRate'] = 16000
   return { session, priv, calls, partials, finals, errors }
 }
+
+
+type Priv = Record<string, unknown>
+/** Call a private session method by name (the tests drive the pipeline directly). */
+function call<T = unknown>(session: unknown, name: string, ...args: unknown[]): T {
+  return (session as Record<string, (...a: unknown[]) => T>)[name](...args)
+}
+/** Put speech into the open turn the way capture does. */
+function feed(session: unknown, priv: Priv, samples: Float32Array): void {
+  priv['hasSpeech'] = true
+  call(session, 'pushPcm', samples)
+}
+/** The preview decode currently in flight (null when idle). */
+function previewInFlight(priv: Priv): Promise<void> | null {
+  return (priv['preview'] as { current(): Promise<void> | null }).current()
+}
+const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms))
 
 /** Total number of buffered samples. */
 function buffered(priv: Record<string, unknown>): number {
@@ -212,8 +236,8 @@ console.log('4) outside a turn only the pre-roll is buffered:')
 {
   const { priv, session } = makeSession()
   priv['hasSpeech'] = false
-  // One second of audio while nobody is talking.
-  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(new Float32Array(16000).fill(0.01))
+  // Three seconds of audio while nobody is talking (longer than the pre-roll).
+  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(new Float32Array(48000).fill(0.01))
   const kept = buffered(priv)
   const expected = Math.floor((16000 * LOCAL_LIVE_DEFAULTS.preRollMs) / 1000)
   check('idle capture is trimmed to the pre-roll', kept === expected, { kept, expected })
@@ -232,133 +256,188 @@ console.log('4b) the pre-roll outlasts the onset detector, so word one survives:
   check('pre-roll leaves margin for a soft onset', preRoll >= onsetWindow * 2, { preRoll })
 }
 
-console.log('5) takePcm keeps an overlap tail for the next chunk:')
+console.log('5) a turn keeps its whole audio, the pre-roll buffer stays small:')
 {
   const { priv, session } = makeSession()
-  priv['pcmFrames'] = [new Float32Array(16000)]
-  const taken = (session as unknown as { takePcm: (ms: number) => Float32Array }).takePcm(
-    LOCAL_LIVE_DEFAULTS.overlapMs,
-  )
-  const overlap = Math.floor((16000 * LOCAL_LIVE_DEFAULTS.overlapMs) / 1000)
-  check('everything but the overlap is taken', taken.length === 16000 - overlap, { len: taken.length })
-  check('the overlap stays buffered', buffered(priv) === overlap, { kept: buffered(priv) })
+  feed(session, priv, speechPcm(32000))
+  check('the turn buffer holds everything said', (priv['turnAudioLen'] as number) === 32000, {
+    len: priv['turnAudioLen'],
+  })
+  check('the live pre-roll buffer is not fed during a turn', buffered(priv) === 0, {
+    kept: buffered(priv),
+  })
 }
 
-console.log('6) chunks are cut while the user is still speaking:')
+console.log('6) the preview decodes the WHOLE turn so far and replaces the old text:')
 {
-  const { priv, session, calls, partials } = makeSession('سلام')
-  priv['hasSpeech'] = true
-  // The turn in progress carries its own text on the turn object (a shared
-  // string was cleared by the next turn and lost the utterance).
-  priv['turn'] = { token: priv['turnToken'] as number, text: 'متن قبلی' }
-  // 2 s of audio: a chunk cut leaves the overlap (220 ms) behind and the
-  // silence gate trims the rest to syllables, so a short 500 ms buffer no
-  // longer carries MIN_CHUNK_SPEECH_MS of speech — which a real 1.4 s chunk
-  // always does. Test audio must be long enough to model that.
-  priv['pcmFrames'] = [speechPcm(32000)]
-  ;(session as unknown as { flushChunk: () => void }).flushChunk()
-  await priv['chain']
+  let n = 0
+  const replies = ['سلام', 'سلام، من اینجام']
+  const { priv, session, calls, partials } = makeSession(() => replies[Math.min(n++, 1)])
+  priv['turn'] = { token: priv['turnToken'] as number, text: 'متن قبلی', delivered: false }
+  feed(session, priv, speechPcm(32000))
+  call(session, 'startPreview', Date.now())
+  await previewInFlight(priv)
 
-  const overlap = Math.floor((16000 * LOCAL_LIVE_DEFAULTS.overlapMs) / 1000)
-  check('one chunk was transcribed', calls.length === 1, { calls: calls.length })
+  check('one request was sent', calls.length === 1, { calls: calls.length })
   if (calls.length === 1) {
-    check('chunk is a complete WAV file', calls[0].type === 'audio/wav')
-    check('chunk carries the speech, not just the overlap', calls[0].size > 44 + 16000, {
-      size: calls[0].size,
-      overlap,
-    })
+    check('it is a complete WAV file', calls[0].type === 'audio/wav')
+    check('it carries the turn audio', calls[0].size > 44 + 16000, { size: calls[0].size })
     check('language hint is sent', calls[0].lang === 'fa')
-    // Regression: the turn text so far was once fed back as Whisper context and
-    // the model CONTINUED it instead of transcribing the new audio, so the
-    // composer looked frozen ("it types nothing") or repeated itself. The whole
-    // prompt mechanism is gone now: the transcriber only ever gets audio+lang.
   }
-  check('partial text is emitted for the composer', partials[0] === 'متن قبلی سلام', { partials })
-  check('public partialText mirrors the turn', session.partialText === 'متن قبلی سلام', {
+  // Never merged with the old text: the new decode saw the whole turn.
+  check('the preview REPLACES the earlier text', partials[0] === 'سلام', { partials })
+  check('public partialText mirrors the turn', session.partialText === 'سلام', {
     partialText: session.partialText,
   })
+
+  // More speech, second preview: it covers MORE audio and re-hears the words.
+  feed(session, priv, speechPcm(16000))
+  call(session, 'startPreview', Date.now())
+  await previewInFlight(priv)
+  check('the second request carries more audio', calls.length === 2 && calls[1].size > calls[0].size, {
+    sizes: calls.map((c) => c.size),
+  })
+  check('a re-worded preview replaces, it does not append', partials[1] === 'سلام، من اینجام', { partials })
 }
 
 console.log('7) fragments too short to be words are never sent:')
 {
   const { priv, session, calls } = makeSession('x')
-  priv['hasSpeech'] = true
-  priv['pcmFrames'] = [new Float32Array(1000).fill(0.1)]
-  ;(session as unknown as { flushChunk: () => void }).flushChunk()
-  await priv['chain']
-  check('a sub-200ms cut sends nothing', calls.length === 0, { calls: calls.length })
+  feed(session, priv, new Float32Array(1000).fill(0.1))
+  call(session, 'startPreview', Date.now())
+  await previewInFlight(priv)
+  check('a sub-200ms fragment sends nothing', calls.length === 0, { calls: calls.length })
 }
 
-console.log('7b) chunks are cut on silence, never through the middle of a word:')
+console.log('7b) one decode at a time: the next one starts when the last has landed:')
 {
-  // A clock-based cut lands inside a word about half the time. The provider
-  // then transcribes each half separately — «میر» / «میروم» — and because the
-  // halves are different tokens the overlap merge cannot rejoin them, so both
-  // survive in the user's sentence.
-  const rate = 16000
-  const n = (ms: number) => Math.floor((rate * ms) / 1000)
-  // Loud, then a genuine 120 ms gap centred on the target cut, then loud.
-  const pcm = new Float32Array(n(1000))
-  pcm.fill(0.2)
-  const gapStart = n(500) - n(60)
-  for (let i = gapStart; i < gapStart + n(120); i++) pcm[i] = 0
-
-  const target = n(500)
-  const cut = chooseCut(pcm, rate, target)
-  check('the cut lands inside the quiet gap', cut >= gapStart && cut <= gapStart + n(120), {
-    cut,
-    gapStart,
-    gapEnd: gapStart + n(120),
+  let n = 0
+  let release!: (t: string) => void
+  const gate = new Promise<string>((resolve) => {
+    release = resolve
   })
-  check('the cut moved away from the noisy target', cut !== target, { cut, target })
+  const { priv, session, calls, partials } = makeSession(() => (++n === 1 ? gate : 'متن دوم'))
+  feed(session, priv, speechPcm(32000))
+  const spacing = LOCAL_LIVE_DEFAULTS.chunkMs
+  const maxTurn = LOCAL_LIVE_DEFAULTS.maxChunkMs
+  priv['previewStartedAt'] = 0
+  priv['lastSpeechAt'] = 5000
+  call(session, 'tickPreview', 5000, spacing, maxTurn)
+  await tick()
+  check('the first tick starts a decode', calls.length === 1, { calls: calls.length })
 
-  // Continuous sound has nowhere quiet to cut: the target must win, otherwise
-  // the cut would wander to an arbitrary place inside a sustained vowel.
-  const loud = new Float32Array(n(1000)).fill(0.2)
-  check('a fully loud buffer keeps the target cut', chooseCut(loud, rate, n(500)) === n(500))
-  check('an empty buffer cuts at zero', chooseCut(new Float32Array(0), rate, 100) === 0)
+  priv['lastSpeechAt'] = 9000
+  call(session, 'tickPreview', 9000, spacing, maxTurn)
+  await tick()
+  check('a tick while one is running starts nothing', calls.length === 1, { calls: calls.length })
+
+  release('متن اول')
+  await previewInFlight(priv)
+  priv['lastSpeechAt'] = 12000
+  call(session, 'tickPreview', 12000, spacing, maxTurn)
+  await previewInFlight(priv)
+  check('the next tick after it landed starts the next decode', calls.length === 2, { calls: calls.length })
+  check('the latest decode is what is shown', partials[partials.length - 1] === 'متن دوم', { partials })
+
+  priv['speechStartAt'] = 4000
+  call(session, 'tickPreview', 16000, spacing, maxTurn)
+  await tick()
+  check('no new speech since the last decode: no request', calls.length === 2, { calls: calls.length })
 }
 
-console.log('8) a late chunk is kept for its own turn, never shown to the next:')
+console.log('7c) hesitation sounds, keyboard and tags are not transcribed:')
 {
-  const { priv, session, calls, partials } = makeSession('سلام')
-  priv['hasSpeech'] = true
-  priv['pcmFrames'] = [speechPcm(32000)]
-  ;(session as unknown as { flushChunk: () => void }).flushChunk()
+  check('a hum token is dropped', stripNonSpeech('ممم') === '')
+  check('persian hesitation with diacritics and dots', stripNonSpeech('اِممم...') === '')
+  check('latin hesitation sounds', stripNonSpeech('emmmm') === '' && stripNonSpeech('Hmmm.') === '' && stripNonSpeech('uhh') === '')
+  check('only hesitations in a row', stripNonSpeech('امم ممم اه') === '')
+  check('hesitations inside a sentence are removed, words stay', stripNonSpeech('من فکر می‌کنم ممم که درسته') === 'من فکر می‌کنم که درسته', {
+    got: stripNonSpeech('من فکر می‌کنم ممم که درسته'),
+  })
+  check('sound-effect tags are removed', stripNonSpeech('[موسیقی]') === '' && stripNonSpeech('(typing sounds) سلام') === 'سلام')
+  check('real short words survive', stripNonSpeech('هم') === 'هم' && stripNonSpeech('ام') === 'ام' && stripNonSpeech('نه') === 'نه')
+  check('code-like text survives', stripNonSpeech('تابع foo() رو صدا بزن') === 'تابع foo() رو صدا بزن')
+  // Server-log regression: a drawn-out hum came back as «ایییم.» and was typed.
+  check('elongated persian hum with a tail m', stripNonSpeech('ایییم.') === '' && stripNonSpeech('آییییم') === '' && stripNonSpeech('اییی') === '')
+  check('words that merely start with ای survive', stripNonSpeech('ایم') === 'ایم' && stripNonSpeech('ایران') === 'ایران')
+  check('whisper cut-off ellipsis is stripped', stripEllipsis('... کردم و نمایش بده') === 'کردم و نمایش بده' && stripEllipsis('وقتی من از...') === 'وقتی من از' && stripEllipsis('سلام…') === 'سلام', {
+    a: stripEllipsis('... کردم و نمایش بده'),
+    b: stripEllipsis('وقتی من از...'),
+  })
+  check('a normal sentence keeps its final period', stripEllipsis('سلام.') === 'سلام.')
+  check('a repeated multi-word phrase is kept once', collapseRepeatedPhrases('و وقتی از اینها بیشتر می‌شه، از اینها بیشتر می‌شه.') === 'و وقتی از اینها بیشتر می‌شه.', {
+    got: collapseRepeatedPhrases('و وقتی از اینها بیشتر می‌شه، از اینها بیشتر می‌شه.'),
+  })
+  check('a single repeated word is left alone', collapseRepeatedPhrases('سلام سلام خوبی چطوری') === 'سلام سلام خوبی چطوری')
+  check('non-repeating text is untouched', collapseRepeatedPhrases('من میخوام این کار رو انجام بدم') === 'من میخوام این کار رو انجام بدم')
+  check('sanitize drops the hum with ellipsis', sanitizeLocalTranscript('ایییم...') === '')
+  check('sanitize drops a hum-only transcript', sanitizeLocalTranscript('ممم', 'fa') === '')
+  check('sanitize keeps the words around a hum', sanitizeLocalTranscript('سلام امم خوبی', 'fa') === 'سلام خوبی', {
+    got: sanitizeLocalTranscript('سلام امم خوبی', 'fa'),
+  })
+
+  // A held hum is voiced and loud, but its energy envelope is flat: it never
+  // reaches the server at all.
+  const hum = new Float32Array(48000)
+  for (let i = 0; i < hum.length; i++) hum[i] = 0.1 * Math.sin((2 * Math.PI * 120 * i) / 16000)
+  const h = makeSession('ممم')
+  feed(h.session, h.priv, hum)
+  call(h.session, 'startPreview', Date.now())
+  await previewInFlight(h.priv)
+  check('a flat hum is not sent for decoding', h.calls.length === 0, { calls: h.calls.length })
+
+  check('a short word still has syllable-length sound', voicedRunMs(speechPcm(16000), 16000) >= 120)
+  // A keyboard burst: a few sharp clicks, far shorter than a word.
+  const keys = new Float32Array(32000)
+  for (const at of [2000, 6000, 11000, 15000, 22000]) {
+    for (let i = 0; i < 240; i++) keys[at + i] = 0.5 * Math.sin(i / 3) * (1 - i / 240)
+  }
+  const k = makeSession('تق تق')
+  feed(k.session, k.priv, keys)
+  call(k.session, 'startPreview', Date.now())
+  await previewInFlight(k.priv)
+  check('keyboard clicks are not sent for decoding', k.calls.length === 0, { calls: k.calls.length })
+}
+
+console.log('8) a late preview is kept for its own turn, never shown to the next:')
+{
+  let release!: (t: string) => void
+  const gate = new Promise<string>((resolve) => {
+    release = resolve
+  })
+  const { priv, session, calls, partials } = makeSession(() => gate)
+  feed(session, priv, speechPcm(32000))
+  call(session, 'startPreview', Date.now())
   const firstTurn = priv['turn'] as { token: number; text: string }
-  // New turn starts before the previous chunk resolves.
+  await tick()
+  // A new turn starts before the previous preview resolves.
   priv['turnToken'] = (priv['turnToken'] as number) + 1
-  priv['turn'] = { token: priv['turnToken'] as number, text: '' }
-  await priv['chain']
-  // The chunk belongs to the turn that was capturing: its text is exactly what
-  // that turn is about to deliver, so it must still be transcribed and merged
-  // into ITS OWN turn object. Discarding it here was the "I speak and nothing
-  // is typed" bug (beginTurn had already cleared the shared text).
-  check('the late chunk is still transcribed', calls.length === 1, { calls: calls.length })
-  check('it merges into its own turn', firstTurn.text === 'سلام', { text: firstTurn.text })
+  priv['turn'] = { token: priv['turnToken'] as number, text: '', delivered: false }
+  release('سلام')
+  await previewInFlight(priv)
+  check('the late preview was still decoded', calls.length === 1, { calls: calls.length })
+  check('it lands in its own turn', firstTurn.text === 'سلام', { text: firstTurn.text })
   check('the next turn stays empty', (priv['turn'] as { text: string }).text === '', {
     text: (priv['turn'] as { text: string }).text,
   })
   check('no partial is shown for the finished turn', partials.length === 0, { partials })
 }
 
-console.log('9) finishing a turn drains every chunk and delivers once:')
+console.log('9) finishing a turn decodes it once and delivers once:')
 {
   const { priv, session, calls, partials, finals } = makeSession('سلام دنیا')
-  priv['hasSpeech'] = true
-  priv['pcmFrames'] = [speechPcm(32000)]
-  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+  feed(session, priv, speechPcm(32000))
+  await call<Promise<void>>(session, 'finishTurn')
 
-  check('the tail was transcribed', calls.length === 1, { calls: calls.length })
+  check('the whole turn was decoded in one request', calls.length === 1, { calls: calls.length })
   check('the progressive preview is cleared', partials[partials.length - 1] === '', { partials })
-  check('the merged transcript is delivered once', finals.length === 1 && finals[0] === 'سلام دنیا', { finals })
+  check('the transcript is delivered once', finals.length === 1 && finals[0] === 'سلام دنیا', { finals })
   check('turn state resets', (priv['turn'] as { text: string }).text === '' && priv['hasSpeech'] === false && buffered(priv) === 0, {
     turnText: (priv['turn'] as { text: string }).text,
     hasSpeech: priv['hasSpeech'],
     buffered: buffered(priv),
   })
-  // A second finishTurn with no speech must be a no-op, not an empty message.
-  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+  await call<Promise<void>>(session, 'finishTurn')
   check('no turn is finalized while idle', finals.length === 1, { finals })
 }
 
@@ -367,14 +446,12 @@ console.log('10) hallucinations and error pages never become messages:')
   // Six floor (see isHallucinatedTranscript): fifty repeats is the Whisper
   // noise loop, three-to-five is a real verbal repeat.
   const noise = makeSession('خب خب خب خب خب خب')
-  noise.priv['hasSpeech'] = true
-  noise.priv['pcmFrames'] = [speechPcm(8000)]
+  feed(noise.session, noise.priv, speechPcm(16000))
   await (noise.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   check('a repeated-word hallucination is dropped', noise.finals.length === 0, { finals: noise.finals })
 
   const junk = makeSession('<html><body>gateway error</body></html>')
-  junk.priv['hasSpeech'] = true
-  junk.priv['pcmFrames'] = [speechPcm(8000)]
+  feed(junk.session, junk.priv, speechPcm(16000))
   await (junk.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   check('an HTML error page is dropped', junk.finals.length === 0, { finals: junk.finals })
 }
@@ -384,8 +461,7 @@ console.log('11) a failing provider surfaces an error without breaking the loop:
   const failing = makeSession(() => {
     throw new Error('provider down')
   })
-  failing.priv['hasSpeech'] = true
-  failing.priv['pcmFrames'] = [speechPcm(8000)]
+  feed(failing.session, failing.priv, speechPcm(16000))
   let threw = false
   try {
     await (failing.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
@@ -395,20 +471,18 @@ console.log('11) a failing provider surfaces an error without breaking the loop:
   check('finishTurn does not reject', !threw)
   check('the error is reported', failing.errors.length === 1, { errors: failing.errors })
   check('nothing is delivered', failing.finals.length === 0)
-  check('the queue is drained', failing.priv['pending'] === 0, { pending: failing.priv['pending'] })
+  check('no request is left in flight', failing.priv['activeRequests'] === 0, {
+    active: failing.priv['activeRequests'],
+  })
   check('the session can start a new turn', (await (async () => {
-    failing.priv['hasSpeech'] = true
-    failing.priv['pcmFrames'] = [speechPcm(8000)]
+    feed(failing.session, failing.priv, speechPcm(16000))
     await (failing.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
     return failing.errors.length === 2
   })()))
 }
 
-console.log('12) chunks are requested in parallel, not one round-trip at a time:')
+console.log('12) previews never overlap, however often the monitor ticks:')
 {
-  // Regression: the old chain awaited the previous chunk's round-trip before
-  // even SENDING the next one, so the partial transcript fell seconds behind
-  // the voice whenever the provider RTT exceeded the chunk interval.
   let inFlight = 0
   let peakInFlight = 0
   const releases: Array<() => void> = []
@@ -423,34 +497,20 @@ console.log('12) chunks are requested in parallel, not one round-trip at a time:
     },
     onUserText: () => {},
   })
-  const priv = session as unknown as Record<string, unknown>
-  priv['hasSpeech'] = true
+  const priv = session as unknown as Priv
   priv['capturing'] = true
   priv['captureRate'] = 16000
-  // Queue several chunks without letting any of them resolve. The buffer must
-  // be long enough that a cut still holds MIN_CHUNK_SPEECH_MS of speech.
-  for (let i = 0; i < 4; i++) {
-    priv['pcmFrames'] = [speechPcm(32000)]
-    ;(session as unknown as { flushChunk: () => void }).flushChunk()
-  }
-  await new Promise((r) => setTimeout(r, 0))
-  check('more than one request is in flight at once', peakInFlight > 1, { peakInFlight })
-  check(
-    'in-flight requests stay bounded by maxInflight',
-    peakInFlight <= LOCAL_LIVE_DEFAULTS.maxInflight,
-    { peakInFlight, max: LOCAL_LIVE_DEFAULTS.maxInflight },
-  )
-  // Release slots as new requests appear until the queue drains: a chunk that
-  // was waiting for a free slot only starts its request after each release.
-  for (let i = 0; i < 25 && (priv['pending'] as number) > 0; i++) {
-    for (const release of releases.splice(0)) release()
-    await new Promise((r) => setTimeout(r, 0))
-  }
-  await priv['chain']
-  check('the queue drains completely', priv['pending'] === 0, { pending: priv['pending'] })
-  check('no request is left in flight', priv['activeRequests'] === 0, {
-    activeRequests: priv['activeRequests'],
+  feed(session, priv, speechPcm(32000))
+  for (let i = 0; i < 6; i++) call(session, 'startPreview', Date.now() + i)
+  await tick()
+  check('exactly one request is in flight', peakInFlight === 1 && releases.length === 1, {
+    peakInFlight,
+    releases: releases.length,
   })
+  for (const release of releases.splice(0)) release()
+  await previewInFlight(priv)
+  check('the guard is free again after it landed', previewInFlight(priv) === null)
+  check('no request is left in flight', priv['activeRequests'] === 0, { active: priv['activeRequests'] })
 }
 
 console.log('13) a hanging provider delays a turn, it never freezes live voice:')
@@ -465,8 +525,7 @@ console.log('13) a hanging provider delays a turn, it never freezes live voice:'
   const priv = session as unknown as Record<string, unknown>
   priv['capturing'] = true
   priv['captureRate'] = 16000
-  priv['hasSpeech'] = true
-  priv['pcmFrames'] = [speechPcm(8000)]
+  feed(session, priv, speechPcm(16000))
   const started = Date.now()
   const done = (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   await Promise.race([
@@ -601,17 +660,18 @@ console.log('16) the agent\'s own voice cannot interrupt it, but the user can:')
 
 console.log('16b) a barge-in turn does not inherit the agent\'s voice:')
 {
-  // The pre-roll buffered before the onset is, during playback, the agent's
-  // own voice through the speakers. Seeding the turn buffer with it used to
-  // transcribe the agent's sentence INTO the user's interrupting message.
+  // The audio buffered before the onset is, during playback, mostly the agent's
+  // own voice through the speakers. Keeping ALL of it transcribed the agent's
+  // sentence INTO the user's interrupting message, but dropping all of it lost
+  // the user's first syllables (the onset frames). Only the onset window is kept.
   const { priv, session } = makeSession()
   priv['ttsSpeaking'] = true
-  priv['pcmFrames'] = [new Float32Array(8000).fill(0.02)] // agent bleed
+  priv['pcmFrames'] = Array.from({ length: 20 }, () => new Float32Array(1600).fill(0.02)) // 2 s of agent bleed
   ;(session as unknown as { beginTurn: (now: number) => void }).beginTurn(1000)
-  check('the bleed pre-roll is not part of the turn', priv['turnAudioLen'] === 0, {
+  check('only the onset window of the buffer is kept', (priv['turnAudioLen'] as number) > 0 && (priv['turnAudioLen'] as number) <= 11200, {
     turnAudioLen: priv['turnAudioLen'],
   })
-  check('the buffered capture is dropped too', buffered(priv) === 0, { kept: buffered(priv) })
+  check('the older agent audio is dropped', buffered(priv) <= 11200, { kept: buffered(priv) })
   check('a barge-in turn is a fresh turn', priv['hasSpeech'] === true)
 
   // Normal (agent silent) turns keep the pre-roll: the first syllable survives.
@@ -746,14 +806,13 @@ console.log('17d) a still-valid speculative snapshot is still reused:')
   )
 }
 
-console.log('17e) a late chunk reply cannot ghost a second message after delivery:')
+console.log('17e) a late preview reply cannot ghost a second message after delivery:')
 {
-  // Regression: a preview chunk cut before the turn ended could resolve AFTER
-  // the delivery. Its merge fired onPartial again, and the chat mirror — whose
-  // preview bubble the delivery had just released — created a FRESH user
-  // message out of it: the user's last words appeared twice, the second one
-  // never actually sent and never answered («۰۰ تومن میخوام.»). A finalized
-  // turn must drop every reply that lands after its delivery.
+  // Regression: a preview decode started before the turn ended could resolve
+  // AFTER the delivery. Its onPartial made the chat mirror — whose preview
+  // bubble the delivery had just released — create a FRESH user message out of
+  // it: the user's last words appeared twice, the second never sent. A
+  // finalized turn must drop every reply that lands after its delivery.
   let replies = 0
   let release!: (t: string) => void
   const gate = new Promise<string>((resolve) => {
@@ -761,15 +820,14 @@ console.log('17e) a late chunk reply cannot ghost a second message after deliver
   })
   const { priv, session, partials, finals } = makeSession(() => {
     replies++
-    // Call 1 = the preview chunk cut below: its reply is held back until the
-    // turn has delivered. Call 2 = the turn-end single-clip decode: at once.
+    // Call 1 = the preview below: held back until the turn has delivered.
+    // Call 2 = the turn-end single-clip decode: at once.
     return replies === 1 ? gate : 'متن کامل نهایی'
   })
-  priv['hasSpeech'] = true
-  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(speechPcm(16000))
-  ;(session as unknown as { flushChunk: () => void }).flushChunk()
-  await new Promise((r) => setTimeout(r, 0))
-  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+  feed(session, priv, speechPcm(32000))
+  call(session, 'startPreview', Date.now())
+  await tick()
+  await call<Promise<void>>(session, 'finishTurn')
 
   check('the turn delivered exactly once', finals.length === 1 && finals[0] === 'متن کامل نهایی', {
     finals,
@@ -777,20 +835,14 @@ console.log('17e) a late chunk reply cannot ghost a second message after deliver
   check('the turn is marked delivered', (priv['turn'] as { delivered?: boolean }).delivered === true)
 
   release('۰۰ تومن میخوام.')
-  await priv['chain']
-  await new Promise((r) => setTimeout(r, 10))
+  await tick(10)
 
   check(
-    'the late chunk reply never reaches the transcript',
+    'the late preview reply never reaches the transcript',
     !(partials as string[]).includes('۰۰ تومن میخوام.'),
     { partials },
   )
   check('no second delivery after the late reply', finals.length === 1, { finals })
-  check(
-    'chunk cadence suits a serial local server',
-    LOCAL_LIVE_DEFAULTS.chunkMs >= 2500,
-    { chunkMs: LOCAL_LIVE_DEFAULTS.chunkMs },
-  )
 }
 
 console.log('18) a failed full-clip decode still delivers the preview:')
@@ -837,10 +889,10 @@ console.log('19) a turn too long for one ASR window keeps the chunk transcript:'
 
 console.log('20) dictate mode: only an explicit stop ends the turn:')
 {
-  // Regression: in dictate mode the 800 ms silence timeout of live voice must
-  // NOT close the turn — a natural pause while dictating would have finalized
-  // and sent half a sentence. Only tickChunks' dictate branch keeps cutting
-  // through it, and only finishDictation (mic button / Space) delivers.
+  // Regression: in dictate mode the silence timeout of live voice must NOT close
+  // the turn — a natural pause while dictating would have finalized and sent
+  // half a sentence. Previews keep refreshing through it, and only
+  // finishDictation (mic button / Space) delivers.
   const finals: string[] = []
   const partials: string[] = []
   const calls: { size: number }[] = []
@@ -858,59 +910,41 @@ console.log('20) dictate mode: only an explicit stop ends the turn:')
       partials.push(t)
     },
   })
-  const priv = session as unknown as Record<string, unknown>
+  const priv = session as unknown as Priv
   priv['capturing'] = true
   priv['captureRate'] = 16000
-  priv['hasSpeech'] = true
-  // As in test 12: a 2 s buffer — a short one would be dropped by the
-  // silence-trim gate (MIN_CHUNK_SPEECH_MS) before any request is queued.
-  priv['pcmFrames'] = [speechPcm(32000)]
-  // Simulate speech that started long ago: past maxChunkMs the live engine
-  // would force-close the turn; dictate must keep it open instead.
-  priv['speechStartAt'] = Date.now() - LOCAL_LIVE_DEFAULTS.maxChunkMs - 5000
-  priv['lastFlushAt'] = Date.now() - LOCAL_LIVE_DEFAULTS.chunkMs - 5
-  const ticks = session as unknown as {
-    tickChunks: (now: number, chunkMs: number, maxChunkMs: number) => void
-  }
-  ticks.tickChunks(Date.now(), LOCAL_LIVE_DEFAULTS.chunkMs, LOCAL_LIVE_DEFAULTS.maxChunkMs)
-  // The chunk request starts on the next microtask (inflight semaphore).
-  await new Promise((r) => setTimeout(r, 0))
-  check('a long pause never closes a dictate turn', finals.length === 0, {
-    finals: finals.length,
-  })
-  check('chunks keep cutting through the pause', calls.length === 1, {
-    calls: calls.length,
-  })
-  check('the streamed preview reaches the composer', partials[partials.length - 1] === 'متن دیکته', {
-    partials,
-  })
+  feed(session, priv, speechPcm(32000))
+  // Speech that started long ago: past maxChunkMs the live engine would
+  // force-close the turn; dictate must keep it open instead.
+  const now = Date.now()
+  priv['speechStartAt'] = now - LOCAL_LIVE_DEFAULTS.maxChunkMs - 5000
+  priv['previewStartedAt'] = now - LOCAL_LIVE_DEFAULTS.chunkMs - 5
+  priv['lastSpeechAt'] = now
+  call(session, 'tickPreview', now, LOCAL_LIVE_DEFAULTS.chunkMs, LOCAL_LIVE_DEFAULTS.maxChunkMs)
+  await previewInFlight(priv)
+  check('a long turn never closes in dictate', finals.length === 0, { finals: finals.length })
+  check('the preview keeps refreshing', calls.length === 1, { calls: calls.length })
+  check('the preview reaches the composer', partials[partials.length - 1] === 'متن دیکته', { partials })
 
-  // Mic button pressed: flush the tail, drain, deliver, tear down.
-  await (session as unknown as { finishDictation: () => Promise<void> }).finishDictation()
-  check('an explicit stop delivers the final text',
-    finals.length === 1 && finals[0] === 'متن دیکته',
-    { finals },
-  )
-  check('the preview is cleared on stop', partials[partials.length - 1] === '', {
-    partials,
-  })
+  await call<Promise<void>>(session, 'finishDictation')
+  check('an explicit stop delivers the final text', finals.length === 1 && finals[0] === 'متن دیکته', { finals })
+  check('the preview is cleared on stop', partials[partials.length - 1] === '', { partials })
   check('the engine is torn down after delivery', priv['stopped'] === true, {})
 
-  // A second press (or Space) must be a no-op, not a duplicate message.
-  await (session as unknown as { finishDictation: () => Promise<void> }).finishDictation()
-  check('a repeated stop does not duplicate the text', finals.length === 1, {
-    finals: finals.length,
-  })
+  await call<Promise<void>>(session, 'finishDictation')
+  check('a repeated stop does not duplicate the text', finals.length === 1, { finals: finals.length })
 }
 
-console.log('21) multi-chunk dictate accumulates (the "only the first chunk" regression):')
+console.log('21) dictate past 30 s keeps the earlier windows (the "only the first part" regression):')
 {
-  // The composer showed ONLY the first chunk's words while the server returned
-  // full text for every chunk. The engine contract this pins: chunks 2+ must
-  // APPEND to the turn (mergeTranscripts) — the turn and the preview may never
-  // reset to an earlier chunk's words, and no chunk may be dropped silently.
-  let call = 0
-  const perChunk = ['سلام خوبی', 'این تکه دوم است و اضافه میشود', 'و تکه سوم پایانی']
+  // The composer once showed only the first part of a long dictation. The turn
+  // buffer is recycled every 30 s (a checkpoint decodes the full window); the
+  // preview and the final must still carry those earlier windows.
+  let call_ = 0
+  // A 30 s window holds real speech: a two-word reply for it would be dropped
+  // by the hum guard (isSparseTranscript), exactly as it should be.
+  const FIRST = 'پنجره اول که یه متن طولانی دیکته شده و چند جمله پشت هم داره تا کلیپ سی ثانیه‌ای واقعی باشه و فقط چند کلمه نباشه'
+  const replies = [FIRST, 'ادامه متن']
   const calls: { size: number }[] = []
   const partials: string[] = []
   const finals: string[] = []
@@ -919,7 +953,7 @@ console.log('21) multi-chunk dictate accumulates (the "only the first chunk" reg
     dictate: true,
     transcribe: async (blob) => {
       calls.push({ size: blob.size })
-      return perChunk[Math.min(call++, perChunk.length - 1)]
+      return replies[Math.min(call_++, replies.length - 1)]
     },
     onUserText: (t) => {
       finals.push(t)
@@ -928,41 +962,30 @@ console.log('21) multi-chunk dictate accumulates (the "only the first chunk" reg
       partials.push(t)
     },
   })
-  const priv = session as unknown as Record<string, unknown>
+  const priv = session as unknown as Priv
   priv['capturing'] = true
   priv['captureRate'] = 16000
-  // An open turn is required, or finishDictation (+ finishTurn) returns early.
   priv['hasSpeech'] = true
-  priv['turn'] = { token: priv['turnToken'] as number, text: '' }
-  // Three 1 s speech buffers cut back-to-back, exactly what the monitor does
-  // while the user keeps talking past chunkMs. Overlap is deliberately NOT
-  // simulated: appending on a no-overlap match is the weaker guarantee — if
-  // the merge can lose words here, it can lose them anywhere.
-  for (let i = 0; i < 3; i++) {
-    priv['pcmFrames'] = [speechPcm(16000)]
-    ;(session as unknown as { flushChunk: () => void }).flushChunk()
-    // The request resolves on the next microtask chain link.
-    await new Promise((r) => setTimeout(r, 0))
-  }
-  await new Promise((r) => setTimeout(r, 30))
-  check('at least the three chunks left for the transcriber', calls.length >= 3, {
-    calls: calls.length,
+  priv['turn'] = { token: priv['turnToken'] as number, text: '', delivered: false }
+  // 31 s in one frame crosses the 30 s window: a checkpoint decodes it.
+  call(session, 'pushPcm', speechPcm(16000 * 31))
+  await (priv['checkpointP'] as Promise<void>)
+  check('the checkpoint kept the first window', priv['dictateWholePrefix'] === FIRST, {
+    prefix: priv['dictateWholePrefix'],
   })
+  check('the turn buffer restarted empty', priv['turnAudioLen'] === 0, { len: priv['turnAudioLen'] })
+
+  call(session, 'pushPcm', speechPcm(32000))
+  call(session, 'startPreview', Date.now())
+  await previewInFlight(priv)
   const last = partials[partials.length - 1] ?? ''
-  check(
-    'the preview holds chunk 1, 2 AND 3',
-    last.includes('سلام خوبی') && last.includes('تکه دوم') && last.includes('پایانی'),
-    { last, partials },
-  )
-  // finishDictation must be AWAITED: delivery happens after the drain (macro-
-  // tasks), exactly like the existing dictate test above.
-  await (session as unknown as { finishDictation: () => Promise<void> }).finishDictation()
-  const delivered = finals[finals.length - 1] ?? ''
-  check(
-    'the delivered final keeps every chunk',
-    delivered.includes('سلام خوبی') && delivered.includes('پایانی'),
-    { finals },
-  )
+  check('the preview holds the earlier window AND the new speech', last === `${FIRST} ادامه متن`, {
+    last,
+    partials,
+  })
+
+  await call<Promise<void>>(session, 'finishDictation')
+  check('the delivered final keeps both parts', finals[finals.length - 1] === `${FIRST} ادامه متن`, { finals })
 }
 
 console.log('22) a mid-dictation edit appends only the newly spoken words:')
@@ -1027,6 +1050,53 @@ console.log('23) one loud transient must not deafen the VAD for the session:')
     peak,
   })
   check('the decay is per-frame bounded', PEAK_RMS_DECAY > 0.9 && PEAK_RMS_DECAY < 1)
+}
+
+console.log('24) quieter voices do not hold an open turn open:')
+{
+  // Server-log regression: a turn that began with the user's «سلام چطوری؟»
+  // stayed open for 30 s while people around the room kept talking, and every
+  // word of it was transcribed. Background voices are several times quieter at
+  // the mic than the user, so inside a turn the keep-alive bar follows the
+  // user's own level.
+  const userLevel = 0.06
+  const roomVoice = 0.012
+  check('a room voice is below the turn-relative bar', roomVoice < userLevel * TURN_LEVEL_HANGOVER_RATIO, {
+    bar: userLevel * TURN_LEVEL_HANGOVER_RATIO,
+  })
+  check('the user soft syllable is still above it', 0.03 >= userLevel * TURN_LEVEL_HANGOVER_RATIO)
+  // The reference decays, so a user who got quieter is not locked out forever.
+  check('the reference decays', TURN_LEVEL_DECAY < 1 && userLevel * TURN_LEVEL_DECAY ** 30 < userLevel * 0.5)
+}
+
+console.log('25) the lead-in keeps a soft first word but not earlier room talk:')
+{
+  const rate = 16000
+  const mk = (parts: Array<[number, number]>) => {
+    const out: number[] = []
+    for (const [ms, amp] of parts) for (let i = 0; i < (rate * ms) / 1000; i++) out.push(amp * (i % 2 ? 1 : -1))
+    return new Float32Array(out)
+  }
+  // 400 ms room talk | 500 ms pause | 400 ms soft first word | 500 ms loud onset.
+  const clip = mk([[400, 0.012], [500, 0.001], [400, 0.02], [500, 0.08]])
+  const from = selectPreRollStart(clip, rate)
+  check('the soft first word is kept', from <= rate * 0.9, { fromMs: (from / rate) * 1000 })
+  check('room talk before the pause is dropped', from >= rate * 0.4, { fromMs: (from / rate) * 1000 })
+  // No pause before the first word: everything up to the pre-roll limit stays.
+  const all = mk([[900, 0.03], [500, 0.08]])
+  check('a continuous lead-in is kept whole', selectPreRollStart(all, rate) === 0)
+  check('a short buffer is untouched', selectPreRollStart(mk([[500, 0.05]]), rate) === 0)
+}
+
+console.log('26) a long hum that whisper turned into one word is dropped:')
+{
+  // Server-log regression: ~16 s of «ممممم» came back as «میدونم.» and was sent.
+  check('one word for 16 s of sound is not speech', isSparseTranscript('میدونم.', 16000))
+  check('two words for 10 s of sound is not speech', isSparseTranscript('بله میدونم', 10000))
+  check('a short answer is never judged', !isSparseTranscript('میدونم.', 1500))
+  check('a one-word answer in a short clip survives', !isSparseTranscript('نه', 2000))
+  check('normal speech passes', !isSparseTranscript('بعدش کارات که تموم شد سایت دیجیکالا رو برام باز کنم', 5000))
+  check('slow but real speech passes', !isSparseTranscript('من میخوام یه چیزی بگم', 8000))
 }
 
 if (failed > 0) {

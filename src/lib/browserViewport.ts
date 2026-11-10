@@ -16,13 +16,44 @@ export const VIEWPORT_LIMITS = {
 export const DEFAULT_VIEWPORT_SIZE = { width: 1280, height: 800 } as const
 
 /** Slider bounds for the horizontal width bar (usable drag range).
- *  Numeric inputs still accept the full VIEWPORT_LIMITS range. */
+ *  The right end is 4K UHD (3840); numeric inputs still accept the full
+ *  VIEWPORT_LIMITS range. */
 export const WIDTH_SLIDER_MIN = 320
-export const WIDTH_SLIDER_MAX = 1920
+export const WIDTH_SLIDER_MAX = 3840
 export const WIDTH_RULER_STEP = 10
 
-/** Chrome DevTools-style graduated ticks: common responsive breakpoints. */
-export const WIDTH_RULER_TICKS: number[] = [320, 375, 425, 768, 1024, 1440, 1920]
+/** Chrome DevTools-style graduated ticks: common responsive breakpoints,
+ *  through QHD (2560) up to 4K UHD (3840). */
+export const WIDTH_RULER_TICKS: number[] = [320, 375, 425, 768, 1024, 1440, 1920, 2560, 3840]
+
+/** Minimum distance (px) between two tick LABELS before they overlap. */
+export const RULER_LABEL_MIN_GAP = 34
+
+/** Which ticks get a printed label at this track width. All ticks keep their
+ *  mark, but a 320→3840 scale squeezes the small breakpoints (320/375/425)
+ *  into a few pixels on a narrow panel; labelling every one of them printed
+ *  overlapping numbers. Greedy left-to-right thinning keeps the scale legible,
+ *  and the widest tick is always labelled so the 4K end is anchored. */
+export function visibleRulerTicks(
+  trackW: number,
+  min: number = WIDTH_SLIDER_MIN,
+  max: number = WIDTH_SLIDER_MAX,
+  ticks: number[] = widthRulerTicks(min, max),
+  minGap: number = RULER_LABEL_MIN_GAP,
+): number[] {
+  if (!Number.isFinite(trackW) || trackW <= 0) return ticks
+  const x = (w: number): number => (rulerPctForWidth(w, min, max) / 100) * trackW
+  const kept: number[] = []
+  for (const w of ticks) {
+    if (kept.length === 0 || x(w) - x(kept[kept.length - 1]) >= minGap) kept.push(w)
+  }
+  const last = ticks[ticks.length - 1]
+  if (last !== undefined && kept[kept.length - 1] !== last) {
+    while (kept.length > 1 && x(last) - x(kept[kept.length - 1]) < minGap) kept.pop()
+    kept.push(last)
+  }
+  return kept
+}
 
 /** Tick widths for the ruler bar (Chrome breakpoints inside min/max). */
 export function widthRulerTicks(
@@ -63,34 +94,35 @@ export function rulerLabelForWidth(width: number): string {
   if (width <= 800) return "Tablet"
   if (width <= 1100) return "Laptop"
   if (width <= 1500) return "Laptop L"
-  return "Desktop"
+  if (width <= 2000) return "Desktop"
+  if (width <= 2800) return "QHD"
+  if (width <= 3600) return "Ultrawide"
+  return "4K"
 }
 
-/** Target width for fit-to-pane: follow the pane down, never exceed the cap. Pure (never mutates the cap). */
-export function fitWidthTarget(paneW: number, capW: number, minW: number = VIEWPORT_LIMITS.minWidth): number {
-  if (!Number.isFinite(paneW) || paneW <= 0) return capW
-  return Math.max(minW, Math.min(capW, Math.round(paneW)))
-}
-
-/**
- * The fit cap after a status poll reports `w`x`h`.
- *
- * A poll that echoes the size WE just applied is our own resize coming back,
- * so the cap must stay put. Only a genuine external resize (agent / CDP)
- * becomes the new cap. Regression this guards: a fit-shrunk width used to
- * overwrite the cap, and once cap === current width the fit target never
- * differed again — the panel froze at one size and the ruler did nothing.
- *
- * `own` is the last size this panel applied (null before the first apply).
- */
-export function capAfterPoll(
-  own: { w: number; h: number } | null,
-  w: number,
-  h: number,
-  capW: number,
+/** Target width for fit-to-pane: the pane's content width, clamped to the
+ *  backend's safe range. Follow mode means FOLLOW — there is deliberately no
+ *  manual cap here: a stale cap (e.g. 320 from an earlier fixed-size choice)
+ *  pinned the page at that width and made the Fit toggle look dead. */
+export function fitWidthTarget(
+  paneW: number,
+  minW: number = VIEWPORT_LIMITS.minWidth,
+  maxW: number = VIEWPORT_LIMITS.maxWidth,
 ): number {
-  if (own && own.w === w && own.h === h) return capW
-  return w
+  if (!Number.isFinite(paneW) || paneW <= 0) return DEFAULT_VIEWPORT_SIZE.width
+  return Math.max(minW, Math.min(maxW, Math.round(paneW)))
+}
+
+/** Target height for fit-to-pane. Auto-fit follows BOTH axes: a width-only
+ *  fit left a fixed 800px page in a taller panel, so the frame was letterboxed
+ *  with empty bands above/below it. Clamped to the backend's safe range. */
+export function fitHeightTarget(
+  paneH: number,
+  minH: number = VIEWPORT_LIMITS.minHeight,
+  maxH: number = VIEWPORT_LIMITS.maxHeight,
+): number {
+  if (!Number.isFinite(paneH) || paneH <= 0) return DEFAULT_VIEWPORT_SIZE.height
+  return Math.max(minH, Math.min(maxH, Math.round(paneH)))
 }
 
 /** On-screen zoom for the emulated frame: never upscale past 1:1, shrink to

@@ -1,21 +1,29 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { ensureSidecar, noteSidecarFailure } from "../lib/api";
-import { browserFitKey, clearBrowserFit, loadBrowserFit, saveBrowserFit } from "../lib/browserPanelMemory";
+import { DEFAULT_FIT_TO_PANE, browserFitKey, clearBrowserFit, loadBrowserFit, saveBrowserFit } from "../lib/browserPanelMemory";
 import {
   DEFAULT_VIEWPORT_SIZE,
   WIDTH_RULER_STEP,
   WIDTH_SLIDER_MAX,
   WIDTH_SLIDER_MIN,
-  capAfterPoll,
   clampViewportSize,
+  fitHeightTarget,
   fitWidthTarget,
   frameZoom,
   rulerLabelForWidth,
   rulerPctForWidth,
   rulerWidthForPct,
   shouldSyncViewportDrafts,
+  visibleRulerTicks,
   widthRulerTicks,
 } from "../lib/browserViewport";
+
+/** Upper bound for one input round trip (type/click/key/move/scroll). The
+ *  backend bounds its own CDP calls, but a stuck request must never keep the
+ *  ordered input chain busy forever — after this the chain moves on and the
+ *  next click/keystroke is delivered. */
+const INPUT_TIMEOUT_MS = 10_000;
 
 /** Pointer position as percentages inside a bounding box — pure so the
  *  letterboxed-frame mapping can be unit-tested without a DOM. */
@@ -37,6 +45,22 @@ export function backendError(body: unknown): string | null {
   if (typeof body !== "object" || body === null) return null;
   const b = body as { ok?: unknown; error?: unknown };
   return b.ok === false ? String(b.error || "request failed") : null;
+}
+
+/** The stage's CONTENT box (excludes its padding), in CSS px. The emulated
+ *  viewport must match the area the page is actually drawn in: measuring
+ *  `clientWidth` (which includes padding) made the page 24px wider than the
+ *  frame, so the frame got clamped and clicks drifted. */
+function stageContentSize(host: HTMLElement): { w: number; h: number } {
+  const cs = getComputedStyle(host);
+  const padX =
+    (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+  const padY =
+    (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  return {
+    w: Math.max(0, Math.round(host.clientWidth - padX)),
+    h: Math.max(0, Math.round(host.clientHeight - padY)),
+  };
 }
 
 /** Live view of the shared in-app virtual browser (headless Chromium).
@@ -122,14 +146,17 @@ export function BrowserPanel({
   // input strings so typing never fights the applied size.
   const [draftW, setDraftW] = useState<string>(String(DEFAULT_VIEWPORT_SIZE.width));
   const [draftH, setDraftH] = useState<string>(String(DEFAULT_VIEWPORT_SIZE.height));
-  // Fit-to-pane: the viewport width follows the pane width, capped at the
-  // last manually applied width — like Chrome shrinking the layout viewport
-  // when the pane narrows and growing it back up to the set size. OFF by
-  // default, so a size the user picked STICKS: the panel then shows exactly
-  // the width the ruler/backend holds instead of silently re-fitting to the
-  // pane. Seeded from the per-tab memory (this component is remounted per
-  // viewer tab, key=tab id), so a chat switch restores the user's own choice.
-  const [fitToPane, setFitToPane] = useState<boolean>(fitMemory ? fitMemory.fitToPane : false);
+  // Fit-to-pane: the viewport follows the pane on both axes — like Chrome's
+  // Responsive mode, where dragging the pane reflows the PAGE instead of only
+  // scaling the rendered frame, and the page fills the panel vertically so no
+  // empty bands remain above/below. ON by default: a splitter drag must
+  // reflow the page, which is what the old OFF default broke. The toolbar
+  // toggle is the ONLY way to switch modes: auto-fit follows the pane; fixed
+  // pins the current width and shows the ruler (the tool for picking one).
+  // The choice is seeded from the per-tab memory (this component is remounted
+  // per viewer tab, key=tab id), so a chat switch restores what the user left
+  // behind.
+  const [fitToPane, setFitToPane] = useState<boolean>(fitMemory ? fitMemory.fitToPane : DEFAULT_FIT_TO_PANE);
   // Pane (stage) box in CSS px. Drives BOTH the fit-to-pane width and the
   // on-screen zoom of the frame, so a splitter drag or a window resize
   // rescales the frame immediately.
@@ -146,10 +173,11 @@ export function BrowserPanel({
   const [cookieText, setCookieText] = useState<string>("");
   const [cookieBusy, setCookieBusy] = useState<boolean>(false);
   const [cookieMsg, setCookieMsg] = useState<string>("");
-  const capWRef = useRef<number>(fitMemory && fitMemory.capW > 0 ? fitMemory.capW : DEFAULT_VIEWPORT_SIZE.width);
-  // Last size WE applied (manual or fit). A status poll that echoes this back
-  // is our own resize, not an external one, so it must not touch the cap.
-  const appliedRef = useRef<{ w: number; h: number } | null>(null);
+  // How many viewport POSTs are in flight. A status poll that lands while one
+  // is still on the wire reports the OLD size; adopting it would make the
+  // frame jump back (and, in the cap era, permanently pin the page at a stale
+  // width). Polls are ignored for sizing until the apply settles.
+  const resizeInFlight = useRef<number>(0);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fitTimer = useRef<number | null>(null);
   // True once this instance ran the mount half of the fit effect; later runs
@@ -170,6 +198,11 @@ export function BrowserPanel({
   const rulerDragRef = useRef<boolean>(false);
   const rulerPendingRef = useRef<number | null>(null);
   const rulerTimerRef = useRef<number | null>(null);
+  // The graduated track is INSET from the ruler's edges (see CSS): measuring
+  // it keeps the pointer math and the tick positions on the same scale, and
+  // its width decides which labels are printed without overlapping.
+  const rulerTrackRef = useRef<HTMLDivElement | null>(null);
+  const [rulerW, setRulerW] = useState(0);
 
   function syncDrafts(w: number, h: number): void {
     setDraftW(String(w));
@@ -187,11 +220,13 @@ export function BrowserPanel({
   // POST/GET helper against the sidecar. Throws on transport errors AND on
   // business errors ({ok:false}) so callers can surface a single error line.
   // `strict=false` is for polling endpoints where "not running" is an
-  // expected state, not an error to show. Every /browser/* call carries
+  // expected state, not an error to show. `timeoutMs` bounds an INPUT request:
+  // one wedged round trip must never hold the ordered input chain (and with it
+  // every later click and keystroke) hostage. Every /browser/* call carries
   // this tab's chat id so each chat drives its own isolated Chromium
   // (backend _sessions key); the component remounts per chat (key=tab id)
   // so the closure value is stable for the session lifetime.
-  async function sidecarFetch(path: string, init?: RequestInit, strict = true): Promise<any> {
+  async function sidecarFetch(path: string, init?: RequestInit, strict = true, timeoutMs = 0): Promise<any> {
     const base = await ensureSidecar();
     if (!base) throw new Error("the app's local backend is not ready yet");
     let url = `${base}${path}`;
@@ -215,14 +250,22 @@ export function BrowserPanel({
     }
     let res: Response;
     try {
+      // `AbortSignal.timeout` turns a wedged request into a rejection, so the
+      // input chain (and its busy flags) always drain. An explicit caller
+      // signal wins.
+      const signal =
+        timeoutMs > 0 && !bodyInit?.signal ? AbortSignal.timeout(timeoutMs) : undefined;
       res = await fetch(url, {
         headers: { "Content-Type": "application/json" },
         ...bodyInit,
+        ...(signal ? { signal } : {}),
       });
     } catch (err) {
       // A NETWORK failure may mean the cached sidecar died: force the next
-      // ensureSidecar to re-probe /health instead of trusting its 2s TTL.
-      noteSidecarFailure();
+      // ensureSidecar to re-probe /health instead of trusting its 2s TTL. A
+      // timeout/abort is OUR bound firing, not evidence the backend is dead.
+      const name = (err as { name?: string } | null)?.name;
+      if (name !== "TimeoutError" && name !== "AbortError") noteSidecarFailure();
       throw err;
     }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
@@ -254,13 +297,11 @@ export function BrowserPanel({
         const w = st.viewport.width;
         const h = st.viewport.height;
         const prev = sizeRef.current;
-        if (w !== prev.w || h !== prev.h) {
-          // Only a GENUINE external resize (agent/CDP) becomes the new cap.
-          // A poll echoing our own apply must not touch it: a fit-shrunk
-          // width would otherwise collapse the cap, and once cap === current
-          // width the fit target never differs again — the panel freezes at
-          // one size and the ruler appears to do nothing.
-          capWRef.current = capAfterPoll(appliedRef.current, w, h, capWRef.current);
+        // Ignore the polled size while one of OUR viewport POSTs is on the
+        // wire: the backend still reports the old size until it lands, and
+        // adopting that stale value makes the frame bounce — or, worse, looks
+        // like an external resize and fights the fit that is in progress.
+        if (resizeInFlight.current === 0 && (w !== prev.w || h !== prev.h)) {
           setViewport({ w, h });
           // Follow external resizes (agent/CDP) in the manual inputs too —
           // but never clobber the drafts while the user is typing.
@@ -522,10 +563,12 @@ export function BrowserPanel({
     enqueueInput(async () => {
       try {
         await drainType();
-        await sidecarFetch("/browser/click", {
-          method: "POST",
-          body: JSON.stringify({ x, y }),
-        });
+        await sidecarFetch(
+          "/browser/click",
+          { method: "POST", body: JSON.stringify({ x, y }) },
+          true,
+          INPUT_TIMEOUT_MS,
+        );
         // The click's effect shows up as a pushed frame the moment the page
         // repaints — nothing to fetch here.
       } catch (err) {
@@ -536,10 +579,12 @@ export function BrowserPanel({
 
   async function pressKey(key: string): Promise<void> {
     if (!active) return;
-    await sidecarFetch("/browser/key", {
-      method: "POST",
-      body: JSON.stringify({ key }),
-    });
+    await sidecarFetch(
+      "/browser/key",
+      { method: "POST", body: JSON.stringify({ key }) },
+      true,
+      INPUT_TIMEOUT_MS,
+    );
   }
 
   /** Queue one input step so keyboard + click actions run strictly in order,
@@ -557,10 +602,12 @@ export function BrowserPanel({
     const text = typeBuf.current;
     typeBuf.current = "";
     if (!text) return Promise.resolve();
-    return sidecarFetch("/browser/type", {
-      method: "POST",
-      body: JSON.stringify({ text }),
-    }).catch(() => {
+    return sidecarFetch(
+      "/browser/type",
+      { method: "POST", body: JSON.stringify({ text }) },
+      true,
+      INPUT_TIMEOUT_MS,
+    ).catch(() => {
       // Keystroke forwarding is best-effort; transient failures are ignored.
     });
   }
@@ -582,10 +629,12 @@ export function BrowserPanel({
     typePumping.current = true;
     enqueueInput(async () => {
       try {
-        await sidecarFetch("/browser/type", {
-          method: "POST",
-          body: JSON.stringify({ text }),
-        });
+        await sidecarFetch(
+          "/browser/type",
+          { method: "POST", body: JSON.stringify({ text }) },
+          true,
+          INPUT_TIMEOUT_MS,
+        );
       } catch (err) {
         // A failed type request used to vanish: the characters were lost and a
         // typed password silently came out shorter. Say so in the status bar.
@@ -593,9 +642,12 @@ export function BrowserPanel({
           "Some typed characters were not delivered: " +
             (err instanceof Error ? err.message : String(err)),
         );
+      } finally {
+        // The pump flag must clear even on a timeout/throw, or every later
+        // keystroke would sit in the buffer forever.
+        typePumping.current = false;
+        if (typeBuf.current) pumpType();
       }
-      typePumping.current = false;
-      if (typeBuf.current) pumpType();
     });
   }
 
@@ -663,10 +715,12 @@ export function BrowserPanel({
         }
         wheelPending.current = 0;
         try {
-          await sidecarFetch("/browser/scroll", {
-            method: "POST",
-            body: JSON.stringify({ dx: 0, dy }),
-          });
+          await sidecarFetch(
+            "/browser/scroll",
+            { method: "POST", body: JSON.stringify({ dx: 0, dy }) },
+            true,
+            INPUT_TIMEOUT_MS,
+          );
         } catch {
           // Wheel scroll is best-effort; ignore transient failures.
         }
@@ -688,10 +742,12 @@ export function BrowserPanel({
       return;
     }
     moveBusy.current = true;
-    void sidecarFetch("/browser/move", {
-      method: "POST",
-      body: JSON.stringify({ x: p.x, y: p.y }),
-    })
+    void sidecarFetch(
+      "/browser/move",
+      { method: "POST", body: JSON.stringify({ x: p.x, y: p.y }) },
+      true,
+      INPUT_TIMEOUT_MS,
+    )
       .catch(() => {
         // Hover is best-effort; transient failures are ignored.
       })
@@ -703,51 +759,50 @@ export function BrowserPanel({
       });
   }
 
-  // Resize the shared viewport to an explicit size (manual inputs / ruler).
-  // Manual resizes become the new fit-to-pane cap; fit-to-pane follow calls
-  // pass updateCap=false so shrinking never destroys the cap.
-  async function applySize(rawW: number, rawH: number, updateCap = true): Promise<void> {
+  // Resize the shared viewport to an explicit size (manual ruler / tick).
+  // A manual width does NOT flip the mode: the ruler only appears in fixed
+  // mode, so the page simply keeps the width picked here. Auto-fit governs
+  // what happens on the next PANE resize (it re-fits then); the toolbar
+  // toggle is the only way to switch modes.
+  async function applySize(rawW: number, rawH: number, manual = true): Promise<void> {
     if (!active) return;
     const { width, height } = clampViewportSize(rawW, rawH);
     setError("");
+    if (manual) {
+      // A pending debounced pane fit must not undo the choice.
+      if (fitTimer.current) window.clearTimeout(fitTimer.current);
+      fitTimer.current = null;
+      if (!rulerDragRef.current) setRulerHover(null);
+    }
+    // Sync the refs immediately: the viewport effect runs after render, and a
+    // poll in between would misread our own resize as an external one.
+    sizeRef.current = { w: width, h: height };
+    setViewport({ w: width, h: height });
+    syncDrafts(width, height);
+    resizeInFlight.current += 1;
     try {
       await sidecarFetch("/browser/viewport", {
         method: "POST",
         body: JSON.stringify({ width, height }),
       });
-      if (updateCap) {
-        // A manual size (ruler / numeric inputs) becomes the new CAP, but the
-        // pane keeps driving the width below it. Follow mode is deliberately
-        // NOT switched off here: the panel must stay responsive when the user
-        // drags the splitter or resizes the window, which is exactly what the
-        // old setFitToPane(false) broke — after one ruler touch the width was
-        // frozen forever. The toolbar's Responsive button still toggles it.
-        capWRef.current = width;
-        // A pending debounced pane fit must not undo the choice the user just
-        // made (a ruler drag fires applySize while a fit may still be queued).
-        if (fitTimer.current) window.clearTimeout(fitTimer.current);
-        fitTimer.current = null;
-      }
-      // Sync the refs immediately: the viewport effect runs after render, and
-      // a poll in between would misread our own resize as an external one.
-      appliedRef.current = { w: width, h: height };
-      sizeRef.current = { w: width, h: height };
-      setViewport({ w: width, h: height });
-      syncDrafts(width, height);
-      // The frame is what the user is waiting on after a resize: fetch it
-      // immediately and let the status sync ride along in parallel instead of
-      // adding a full round trip in front of the shot (the fit toggle and the
-      // ruler both felt a beat late because of it).
-      await Promise.all([refreshShot(), refreshStatus()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      resizeInFlight.current = Math.max(0, resizeInFlight.current - 1);
     }
+    // The frame is what the user is waiting on after a resize: fetch it
+    // immediately and let the status sync ride along in parallel instead of
+    // adding a full round trip in front of the shot (the fit toggle and the
+    // ruler both felt a beat late because of it).
+    await Promise.all([refreshShot(), refreshStatus()]);
   }
 
-  // Fit-to-pane: when the pane narrows the viewport width follows it (down
-  // only, capped at the last manual width); when the pane widens again the
-  // width grows back up to that cap. Height is never touched here. The cap
-  // itself is preserved (updateCap=false) so shrinking never destroys it.
+  // Fit-to-pane: the viewport follows the pane on BOTH axes. Width reflows
+  // the page horizontally; height fills the panel vertically, because a
+  // width-only fit left the fixed 800px page letterboxed inside a taller pane
+  // (empty bands above and below the frame). No manual cap: a stale cap was
+  // what pinned the page at a small width after a fixed-size experiment, so
+  // turning follow mode back on appeared to do nothing.
   useEffect(() => {
     const host = stageRef.current;
     if (!host || typeof ResizeObserver === "undefined") return;
@@ -759,25 +814,36 @@ export function BrowserPanel({
       if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
       setPane((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
     };
-    const readPane = (): { w: number; h: number } => ({
-      w: Math.round(host.clientWidth),
-      h: Math.round(host.clientHeight),
-    });
+    // CONTENT box, not clientWidth: the stage's 12px padding is not page
+    // area. Including it made the emulated page 24px wider than the visible
+    // frame, so the CSS max-width clamp squeezed the image and click mapping
+    // drifted. One helper keeps the initial measure and the observer equal.
+    const readPane = (): { w: number; h: number } => stageContentSize(host);
+    // Apply the pane box right now (no debounce). Used when auto-fit is
+    // switched ON, so the page reflows the moment the toggle is pressed
+    // instead of waiting for a pane resize.
+    const applyFitNow = (w: number, h: number): void => {
+      if (!fitToPane || !active || w <= 0) return;
+      const cur = sizeRef.current;
+      const targetW = fitWidthTarget(w);
+      const targetH = h > 0 ? fitHeightTarget(h) : cur.h;
+      if (targetW !== cur.w || targetH !== cur.h) {
+        void applySize(targetW, targetH, false);
+      }
+    };
     // One handler for both triggers: the observer (splitter drag) and the
-    // window resize. Reading clientWidth keeps it consistent with the initial
+    // window resize. Reading the live box keeps it consistent with the initial
     // measurement, and the window listener covers embeddings where the
     // observer does not fire.
     const onResize = (): void => {
       const { w, h } = readPane();
       measure(w, h);
-      if (!fitToPane || !active) return;
+      if (!fitToPane || !active || w <= 0) return;
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
       fitTimer.current = window.setTimeout(() => {
         fitTimer.current = null;
-        const cur = sizeRef.current;
-        const target = fitWidthTarget(w, capWRef.current);
-        if (target !== cur.w) void applySize(target, cur.h, false);
-      }, 400);
+        applyFitNow(w, h);
+      }, 150);
     };
     const ro = new ResizeObserver(onResize);
     ro.observe(host);
@@ -793,7 +859,12 @@ export function BrowserPanel({
       mountFitApplied.current = true;
       measure(readPane().w, readPane().h);
     } else {
-      onResize();
+      // Toggling auto-fit ON applies the pane width IMMEDIATELY; the observer
+      // then keeps following later layout changes. (The debounce is only for
+      // drags, where applying on every pixel would flood the backend.)
+      const { w, h } = readPane();
+      measure(w, h);
+      applyFitNow(w, h);
     }
     return () => {
       ro.disconnect();
@@ -810,15 +881,18 @@ export function BrowserPanel({
   // "it auto-fits again" the user sees. Runs once the session reports active
   // (the pane has a real size by then).
   useEffect(() => {
-    saveBrowserFit(fitKey, { fitToPane, capW: capWRef.current });
+    saveBrowserFit(fitKey, { fitToPane });
     if (!fitToPane || !active) return;
     const host = stageRef.current;
     if (!host) return;
-    const paneW = Math.round(host.clientWidth);
+    const { w: paneW, h: paneH } = stageContentSize(host);
     if (paneW <= 0) return;
     const cur = sizeRef.current;
-    const target = fitWidthTarget(paneW, capWRef.current);
-    if (target !== cur.w) void applySize(target, cur.h, false);
+    const targetW = fitWidthTarget(paneW);
+    const targetH = paneH > 0 ? fitHeightTarget(paneH) : cur.h;
+    if (targetW !== cur.w || targetH !== cur.h) {
+      void applySize(targetW, targetH, false);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, fitToPane, fitKey]);
 
@@ -837,6 +911,18 @@ export function BrowserPanel({
     return () => window.removeEventListener("mouseup", up);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
+
+  // Measure the ruler's inset track: label thinning depends on its width, and
+  // the ruler only mounts in follow mode, so re-observe whenever it appears.
+  useEffect(() => {
+    const el = rulerTrackRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const measure = (): void => setRulerW(Math.round(el.clientWidth));
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [active, fitToPane]);
 
   // Forward hover as a virtual cursor move (coalesced, ~60ms cadence) and
   // show the cursor overlay: the page reacts like a real pointer, the real
@@ -865,7 +951,6 @@ export function BrowserPanel({
       // The session is gone, so its sizing intent is stale: drop the memory
       // so a fresh launch starts from the backend's own default viewport.
       clearBrowserFit(fitKey);
-      capWRef.current = DEFAULT_VIEWPORT_SIZE.width;
       setActive(false);
       setImage("");
       setError("");
@@ -1033,6 +1118,11 @@ export function BrowserPanel({
     }
   }
 
+  // Only the labels that fit at the current track width (marks stay on all
+  // ticks): the 320→3840 scale otherwise prints 320/375/425 on top of each
+  // other in a narrow panel.
+  const rulerLabels = new Set(visibleRulerTicks(rulerW));
+
   return (
     <div className="browser-panel">
       {/* Chrome-style toolbar: history + ONE omnibox + session controls */}
@@ -1069,16 +1159,23 @@ export function BrowserPanel({
         </button>
         <button
           type="button"
+          // AUTO-FIT toggle: highlighted while the page follows the panel
+          // width, dim while the width is pinned. The ruler is the fixed-size
+          // tool, so it appears only in the dim (fixed) state: in auto-fit the
+          // width IS the pane, and the ruler would be redundant.
           className={"browser-tool-btn" + (fitToPane ? " browser-tool-btn--on" : "")}
           title={
             fitToPane
-              ? "Following the panel width — click to keep a fixed size"
-              : "Fixed size — click to fit the panel width"
+              ? "Auto fit: the page follows the panel width — click to keep a fixed size"
+              : "Fixed size: the page keeps its current width — click to fit the panel width"
           }
-          aria-label="Fit to panel"
+          aria-label="Auto fit"
           aria-pressed={fitToPane}
           disabled={!active}
-          onClick={() => setFitToPane((v) => !v)}
+          onClick={() => {
+            setRulerHover(null);
+            setFitToPane((v) => !v);
+          }}
         >
           <FitIcon />
         </button>
@@ -1169,10 +1266,17 @@ export function BrowserPanel({
         aria-hidden="true"
       />
 
-      {/* Width ruler — full-width Chrome DevTools-style graduated bar below
-          the toolbar. Hover shows "Laptop - 1024px", drag/keyboard resizes. */}
+      {/* Width ruler — Chrome DevTools-style graduated bar below the toolbar.
+          Shown only in FIXED mode: that is when the width is a manual choice
+          the user needs to pick. In auto-fit the width IS the pane, so the
+          ruler is redundant and hidden. It stays mounted and is hidden with
+          CSS so its inset track can be measured the instant fixed mode turns
+          on. Picking a width never changes the mode. */}
       <div
-        className="browser-width-ruler browser-width-ruler--full"
+        className={
+          "browser-width-ruler browser-width-ruler--full" +
+          (fitToPane ? " browser-width-ruler--hidden" : "")
+        }
         role="slider"
         aria-label="Viewport width ruler"
         aria-valuemin={WIDTH_SLIDER_MIN}
@@ -1188,7 +1292,9 @@ export function BrowserPanel({
           const t = e.target as HTMLElement | null;
           if (t?.closest?.(".browser-ruler-tick")) return;
           rulerDragRef.current = true;
-          const rect = e.currentTarget.getBoundingClientRect();
+          // Measure the INSET track, not the ruler box: its edges are
+          // padding, so using the outer rect shifted every picked width.
+          const rect = (rulerTrackRef.current ?? e.currentTarget).getBoundingClientRect();
           const pct = rect.width ? ((e.clientX - rect.left) / rect.width) * 100 : 0;
           const v = rulerWidthForPct(pct);
           rulerPendingRef.current = v;
@@ -1197,7 +1303,7 @@ export function BrowserPanel({
         }}
         onMouseMove={(e) => {
           if (!active) return;
-          const rect = e.currentTarget.getBoundingClientRect();
+          const rect = (rulerTrackRef.current ?? e.currentTarget).getBoundingClientRect();
           const pct = rect.width ? ((e.clientX - rect.left) / rect.width) * 100 : 0;
           const v = rulerWidthForPct(pct);
           const target = e.target as HTMLElement | null;
@@ -1243,35 +1349,39 @@ export function BrowserPanel({
           }
         }}
       >
-        {widthRulerTicks().map((w) => (
-          <span
-            key={w}
-            className="browser-ruler-tick"
-            style={{ left: `${rulerPctForWidth(w)}%` }}
-            title={`${rulerLabelForWidth(w)} - ${w}px`}
-            onMouseEnter={() => setRulerHover(w)}
-            onFocus={() => setRulerHover(w)}
-            onClick={() => {
-              if (active) void applySize(w, sizeRef.current.h);
-            }}
-          >
-            <span className="browser-ruler-tick-label" aria-hidden="true">{w}</span>
-          </span>
-        ))}
-        <div
-          className="browser-ruler-thumb"
-          style={{ left: `${rulerPctForWidth(viewport.w)}%` }}
-          aria-hidden="true"
-        />
-        {rulerHover !== null && (
-          <span
-            className="browser-ruler-tip"
-            style={{ left: `${rulerPctForWidth(rulerHover)}%` }}
+        <div className="browser-ruler-track" ref={rulerTrackRef}>
+          {widthRulerTicks().map((w) => (
+            <span
+              key={w}
+              className="browser-ruler-tick"
+              style={{ left: `${rulerPctForWidth(w)}%` }}
+              title={`${rulerLabelForWidth(w)} - ${w}px`}
+              onMouseEnter={() => setRulerHover(w)}
+              onFocus={() => setRulerHover(w)}
+              onClick={() => {
+                if (active) void applySize(w, sizeRef.current.h);
+              }}
+            >
+              {rulerLabels.has(w) && (
+                <span className="browser-ruler-tick-label" aria-hidden="true">{w}</span>
+              )}
+            </span>
+          ))}
+          <div
+            className="browser-ruler-thumb"
+            style={{ left: `${rulerPctForWidth(viewport.w)}%` }}
             aria-hidden="true"
-          >
-            {`${rulerLabelForWidth(rulerHover)} - ${rulerHover}px`}
-          </span>
-        )}
+          />
+          {rulerHover !== null && (
+            <span
+              className="browser-ruler-tip"
+              style={{ "--browser-tip-x": `${rulerPctForWidth(rulerHover)}%` } as CSSProperties}
+              aria-hidden="true"
+            >
+              {`${rulerLabelForWidth(rulerHover)} - ${rulerHover}px`}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Stage: focusable, forwards keys + virtual cursor to the page */}

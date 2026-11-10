@@ -280,21 +280,30 @@ pub fn save(root: &Path, chat_id: &str, body: &Value, create: bool) -> Result<Va
         }
     }
 
-    let record = json!({
-        "id": id,
-        "title": title,
-        "kind": kind,
-        "version": version,
-        "file": file,
-        "updated_at": now_secs(),
-        // The OWNER chat id, not the folder name: the folder is the sanitized
-        // spelling (`chat_dir`), and the Artifacts page must jump back to the
-        // real chat. Older records lack the field — `list` falls back to the
-        // folder name for them.
-        "chat_id": chat_id,
-        "versions": versions,
-        "assets": assets,
-    });
+    let record = {
+        let mut record = json!({
+            "id": id,
+            "title": title,
+            "kind": kind,
+            "version": version,
+            "file": file,
+            "updated_at": now_secs(),
+            // The OWNER chat id, not the folder name: the folder is the sanitized
+            // spelling (`chat_dir`), and the Artifacts page must jump back to the
+            // real chat. Older records lack the field — `list` falls back to the
+            // folder name for them.
+            "chat_id": chat_id,
+            "versions": versions,
+            "assets": assets,
+        });
+        // A plan document stays tagged across updates: plan mode marks it once
+        // (see `mark_plan`) and a later edit must not put it back on the
+        // Artifacts page.
+        if index["plan"].as_bool().unwrap_or(false) {
+            record["plan"] = json!(true);
+        }
+        record
+    };
     fs::write(dir.join(INDEX), record.to_string()).map_err(|e| e.to_string())?;
     Ok(json!({
         "ok": true,
@@ -306,6 +315,23 @@ pub fn save(root: &Path, chat_id: &str, body: &Value, create: bool) -> Result<Va
         "content": content,
         "assets": assets,
     }))
+}
+
+/// Tag one saved artifact as a PLAN document rather than an artifact.
+///
+/// Plan mode is read-only, so a planner may save the plan through the
+/// `artifact` tool. That body is the Plan tab's document, not something the
+/// agent "built", so the Artifacts page must not list it. The transcript card
+/// keeps working (the body rides on the chat segment); only the list hides it.
+pub fn mark_plan(root: &Path, chat_id: &str, id: &str) -> Result<(), String> {
+    let dir = chat_dir(root, chat_id).join(crate::skills::safe_file(id, "artifact"));
+    let path = dir.join(INDEX);
+    if !path.is_file() {
+        return Err(format!("artifact not found: {id}"));
+    }
+    let mut index = read_index(&dir);
+    index["plan"] = json!(true);
+    fs::write(path, index.to_string()).map_err(|e| e.to_string())
 }
 
 /// Latest saved body of one artifact, for the preview tab after a restart.
@@ -340,11 +366,44 @@ pub fn delete(root: &Path, chat_id: &str, id: &str) -> Result<Value, String> {
     Ok(json!({ "ok": true, "id": slug, "chat_id": chat_id, "note": "deleted" }))
 }
 
+/// Whether one saved record is a PLAN document rather than an artifact.
+///
+/// Plan mode may save the plan as a markdown artifact (see `mark_plan`), and
+/// such a document belongs to the Plan tab. Records written before the tag
+/// existed are recognised here by the same rule the plan save uses: a markdown
+/// document whose title or first heading names a plan.
+fn is_plan_artifact(dir: &Path, index: &Value) -> bool {
+    if index["plan"].as_bool().unwrap_or(false) {
+        return true;
+    }
+    if index["kind"].as_str() != Some("md") {
+        return false;
+    }
+    let title = index["title"].as_str().unwrap_or("");
+    if crate::plans::looks_like_plan_name(title) {
+        return true;
+    }
+    let Some(file) = index["file"].as_str() else {
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(dir.join(file)) else {
+        return false;
+    };
+    let heading = content
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix('#'))
+        .map(|h| h.trim_start_matches('#').trim())
+        .unwrap_or("");
+    crate::plans::looks_like_plan_name(heading)
+}
+
 /// Every saved artifact, newest first — the Artifacts page's list.
 ///
 /// An empty `chat_id` walks every chat folder (the page groups by chat); a
 /// non-empty one lists just that chat. Only `index.json` is read, never the
-/// bodies: a page listing generated documents must not load them all.
+/// bodies: a page listing generated documents must not load them all. The one
+/// exception is a legacy markdown record without the `plan` tag, whose latest
+/// body is checked so an old plan document stays off the page too.
 pub fn list(root: &Path, chat_id: &str) -> Result<Value, String> {
     let base = artifacts_root(root);
     let dirs: Vec<PathBuf> = if chat_id.trim().is_empty() {
@@ -372,6 +431,11 @@ pub fn list(root: &Path, chat_id: &str) -> Result<Value, String> {
             let (Some(id), Some(_)) = (index["id"].as_str(), index["file"].as_str()) else {
                 continue;
             };
+            // A plan is the Plan tab's document, not something the agent
+            // built: the page lists artifacts only.
+            if is_plan_artifact(&path, &index) {
+                continue;
+            }
             let folder = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())

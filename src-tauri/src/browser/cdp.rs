@@ -1,5 +1,19 @@
 use super::*;
 
+/// Params for `Page.startScreencast` (JPEG at the emulated size). The browser
+/// runs with `--force-device-scale-factor=2`, so Chromium captures at 2x the
+/// CSS viewport; `maxWidth`/`maxHeight` bound that physical size instead of
+/// silently capping it at 1x.
+fn screencast_params() -> Value {
+    json!({
+        "format": "jpeg",
+        "quality": SCREENSHOT_QUALITY,
+        "maxWidth": SCREENCAST_MAX,
+        "maxHeight": SCREENCAST_MAX,
+        "everyNthFrame": 1,
+    })
+}
+
 /// Browser-level CDP connection: one WebSocket, one `sessionId` per tab.
 ///
 /// The socket is split into read/write halves so the driver can race incoming
@@ -399,18 +413,23 @@ pub(super) async fn run_batch(
                 // long-poll then renders on every page repaint with no capture
                 // round trip at all.
                 if !screencast_on.contains(&session) {
-                    let _ = cdp
-                        .send(
-                            "Page.startScreencast",
-                            json!({
-                                "format": "jpeg",
-                                "quality": SCREENSHOT_QUALITY,
-                                "maxWidth": 4096,
-                                "maxHeight": 4096,
-                                "everyNthFrame": 1,
-                            }),
-                        )
-                        .await;
+                    // The screencast surface is fixed when it STARTS: starting
+                    // it before the first override made every frame the whole
+                    // 1280x800 headless window with the page drawn in a corner
+                    // and black padding around it (the panel then showed a
+                    // shrunken page floating in a dark stage). Apply the tab's
+                    // emulated size FIRST so the frames are exactly the page.
+                    let held = cdp.applied_vp.get(&session).copied();
+                    if held != Some(batch.viewport) {
+                        let _ = cdp
+                            .send(
+                                "Emulation.setDeviceMetricsOverride",
+                                viewport_override(batch.viewport.0, batch.viewport.1),
+                            )
+                            .await;
+                        cdp.applied_vp.insert(session.clone(), batch.viewport);
+                    }
+                    let _ = cdp.send("Page.startScreencast", screencast_params()).await;
                     screencast_on.insert(session.clone());
                 }
                 // Only the DISPLAYED page may push frames. While a popup is on
@@ -451,6 +470,13 @@ pub(super) async fn run_batch(
                 prepended = true;
             }
         }
+        // Remember what the session held BEFORE this batch: a changed override
+        // must also restart the screencast (see below).
+        let session_before = cdp.session.clone();
+        let vp_before = session_before
+            .as_ref()
+            .and_then(|s| cdp.applied_vp.get(s))
+            .copied();
         calls.extend(batch.commands.iter().cloned());
         let mut out = Vec::with_capacity(calls.len());
         let mut failure = None;
@@ -486,6 +512,22 @@ pub(super) async fn run_batch(
                         ) {
                             cdp.applied_vp.insert(s, (w as u32, h as u32));
                         }
+                    }
+                }
+                // The screencast captures the surface it was STARTED with; an
+                // override alone leaves the pushed frames at the previous size
+                // (the page in a corner of the window, black padding around
+                // it). Restart it after a real size change so every frame is
+                // exactly the emulated page.
+                if let Some(session) = session_before.as_ref() {
+                    let vp_after = cdp.applied_vp.get(session).copied();
+                    if vp_before.is_some()
+                        && vp_after.is_some()
+                        && vp_before != vp_after
+                        && screencast_on.contains(session)
+                    {
+                        let _ = cdp.send("Page.stopScreencast", json!({})).await;
+                        let _ = cdp.send("Page.startScreencast", screencast_params()).await;
                     }
                 }
                 flush_frames(cdp, sessions);

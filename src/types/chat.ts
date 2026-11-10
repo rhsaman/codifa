@@ -59,6 +59,11 @@ export interface ToolActivity {
    *  branch's sub-agent events under ITS OWN explore card instead of dumping
    *  every branch into one card. */
   branch?: number
+  /** The sub-agent's own narration ("now opening the profile…"), folded from
+   *  branch-tagged text events. UI-only: it never enters the parent model's
+   *  history, and the chat card shows the latest line while the side panel
+   *  keeps the full log. */
+  narration?: string
   /** Nested sub-agent tool calls when this is an explore card. */
   children?: ToolActivity[]
   /** Which model executed this specific tool call. Empty/absent = the main
@@ -217,6 +222,8 @@ export interface ChatMessage {
    *  the one worth showing: it cost the turn an index line, not its schemas. */
   mcpLoaded?: string[]
   skills?: string[]
+  /** Plugin slugs attached to this turn (one unit: its skills + connectors). */
+  plugins?: string[]
   usage?: TokenUsage
   error?: boolean
   retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; branch?: number; fallback?: boolean; reconnecting?: boolean; startedAt?: number; /** Rendered as a compact line in the message footer, never as the transcript-end banner. */ inline?: boolean; /** A plain STATUS row (no ladder): compact progress, an interrupted reply. Shares the footer slot so every notice lives in one place. */ status?: boolean; /** Determinate 0-100 for a measurable status (compaction). Drives the footer progress bar; absent means indeterminate. */ percent?: number; attempts?: number } | null
@@ -283,6 +290,7 @@ export interface QueuedMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   mcpServers?: Record<string, McpServerConfig>
   skills?: string[]
+  plugins?: string[]
   kind: 'steer' | 'queue'
   createdAt: number
   sent?: boolean

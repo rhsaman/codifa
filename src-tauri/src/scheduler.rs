@@ -391,7 +391,7 @@ fn plugin_context_block(data_root: &Path, slugs: &[String]) -> String {
             .unwrap_or(slug);
         let mut block = format!(
             "- plugin {slug} ({label}): its MCP connectors are loaded and its skills \
-             are attached to this run — load_skill only to re-read one."
+             are attached to this run — load_plugin only to re-read one."
         );
         let scripts = crate::plugins::list_scripts(data_root, slug);
         if !scripts.is_empty() {
@@ -805,6 +805,15 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     let subagent_models = string_map(&settings, "subagentModels");
     let subagent_thinking = string_map(&settings, "subagentThinking");
     let tool_fallbacks = string_list_map(&settings, "toolFallbacks");
+    // Settings → Sub-agents. A scheduled run is a top-level turn, so it can
+    // delegate like an interactive one: the custom rows travel with the
+    // request and `delegation_schemas` advertises the ones this run can reach
+    // (`allow_browser` below gates the browser profiles per task).
+    let custom_subagents = settings
+        .get("customSubagents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let providers_map = settings
         .get("providers")
         .and_then(Value::as_array)
@@ -924,6 +933,9 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // A scheduled run has no listener, so it is never spoken.
         system_suffix: String::new(),
         skills: task_skills,
+        // The bundle's skills are already attached above; a scheduled run has
+        // no interactive plugin session, so no active-plugin note is emitted.
+        plugins: Vec::new(),
         context_window: 0,
         chat_id: format!("schedule-{sid}"),
         mcp_servers: if task_mcp.is_empty() {
@@ -935,6 +947,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // back to it, so a scheduled run starts with every connector on the
         // index and loads one only if that run actually calls `use_mcp`.
         mcp_active: Vec::new(),
+        // Settings → Sub-agents, same list the interactive turn sends. This
+        // run is the top-level turn of its chat; it is not a sub-agent itself.
+        custom_subagents,
+        subagent_kind: None,
         subagent_models,
         providers: providers_map,
         data_root: data_root.to_string_lossy().to_string(),
@@ -958,6 +974,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // the profile is chosen by an explicit delegation tool name, which only
         // an interactive turn's model emits.
         subagent_tools: Vec::new(),
+        // A scheduled parent is not a profile: its explores keep the builtin
+        // read-only research set.
+        subagent_profile: false,
+        subagent_focus: String::new(),
         // Headless: there is nobody to ask, so no out-of-workspace grant can be
         // given. The workspace, the OS temp roots and `~/.codifa` stay open.
         allow_outside: false,
@@ -1023,6 +1043,8 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // retried down that tool's list, for that call only.
         tool_fallbacks,
         images: Vec::new(),
+        // A scheduled run has no composer: its task text is the whole prompt.
+        attachments: Vec::new(),
         // The user's "Results per search" (Settings → Web Providers) governs a
         // scheduled run exactly like an interactive one; a hardcoded default
         // here made every headless web_search ignore the setting.

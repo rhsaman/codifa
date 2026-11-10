@@ -99,6 +99,62 @@
     }
 
     #[test]
+    fn a_plain_bundle_repo_browses_as_a_one_row_catalogue() {
+        // `/plugin install <repo>` registers every successful source as a
+        // marketplace, so browsing that source must work even when the repo
+        // ships no index: the repo itself is the only row.
+        let dir = fixture("plain-catalogue");
+        put(&dir, "plugin.json", r#"{"name":"Cinecode","description":"makes films"}"#);
+        put(
+            &dir,
+            "SKILL.md",
+            "---\nname: cinecode\ndescription: makes films\n---\nbody",
+        );
+        let got = read_index(dir.to_str().unwrap(), "", "").unwrap();
+        assert_eq!(got["count"], 1);
+        let row = &got["plugins"][0];
+        assert_eq!(row["name"], "Cinecode");
+        assert_eq!(row["description"], "makes films");
+        assert_eq!(row["repo"], dir.to_str().unwrap());
+        assert_eq!(row["repo_path"], "");
+
+        // A repo holding several bundles has no unambiguous row: it keeps the
+        // "no index" error instead of advertising a root install that fails.
+        let many = fixture("plain-many");
+        put(&many, "a/plugin.json", r#"{"name":"A"}"#);
+        put(&many, "b/plugin.json", r#"{"name":"B"}"#);
+        let err = read_index(many.to_str().unwrap(), "", "").unwrap_err();
+        assert!(err.contains("no marketplace index"), "{err}");
+    }
+
+    #[test]
+    fn a_plugin_repo_that_also_carries_an_index_reports_it() {
+        // The install result tells the UI whether the source is ALSO a
+        // catalogue. It comes from the same tree walk, so a plain plugin repo
+        // (no index) costs nothing extra and must report null.
+        let dir = fixture("plugin-and-index");
+        put(&dir, "plugins/p/plugin.json", r#"{"name":"P"}"#);
+        put(
+            &dir,
+            "plugins/p/skills/s/SKILL.md",
+            "---\nname: s\ndescription: d\n---\nbody",
+        );
+        put(
+            &dir,
+            ".claude-plugin/marketplace.json",
+            r#"{"name":"M","plugins":[{"name":"P","source":"./plugins/p"}]}"#,
+        );
+        let got = read_plugin(dir.to_str().unwrap(), "", "").unwrap();
+        assert_eq!(got["marketplace"], ".claude-plugin/marketplace.json");
+
+        let plain = fixture("plugin-no-index");
+        put(&plain, "plugin.json", r#"{"name":"Plain"}"#);
+        put(&plain, "skills/s/SKILL.md", "---\nname: s\n---\nbody");
+        let got = read_plugin(plain.to_str().unwrap(), "", "").unwrap();
+        assert!(got["marketplace"].is_null(), "{got}");
+    }
+
+    #[test]
     fn claudes_index_file_name_is_found_too() {
         // Claude hides its index in `.claude-plugin/`, exactly like its
         // manifest — a marketplace written for Claude must open unchanged.
@@ -382,24 +438,6 @@
         assert!(got["mcp"].as_object().is_none_or(|m| m.is_empty()));
     }
 
-    #[test]
-    fn skill_pick_uses_the_hint_and_refuses_to_guess() {
-        let dir = fixture("pick");
-        put(&dir, "skills/one/SKILL.md", "---\nname: One Skill\n---\nBody one.");
-        put(&dir, "skills/two/SKILL.md", "---\nname: Two Skill\n---\nBody two.");
-        let err = read_skill(dir.to_str().unwrap(), "", "", "").unwrap_err();
-        assert!(err.contains("skills/one/SKILL.md"), "{err}");
-        let picked = read_skill(dir.to_str().unwrap(), "", "", "two").unwrap();
-        assert_eq!(picked["name"], "Two Skill");
-        assert_eq!(picked["content"], "Body two.");
-
-        let single = fixture("pick-single");
-        put(&single, "only/SKILL.md", "---\nname: Solo\n---\nBody.");
-        assert_eq!(
-            read_skill(single.to_str().unwrap(), "", "", "").unwrap()["name"],
-            "Solo"
-        );
-    }
 
     #[test]
     fn a_bundle_without_a_skill_is_an_explicit_error() {

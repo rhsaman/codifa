@@ -216,11 +216,49 @@ console.log("۷-ه) تب browser چت‌محور است و تب git ورک‌ا�
   for (const t of s.tabs.filter((t) => t.kind === "browser" || t.kind === "review")) useViewerTabs.getState().closeViewer(t.id)
 }
 
+console.log("۷-و) artifact چت‌محور است و درخت split فقط برگ‌های چت فعال را نشان می‌دهد:")
+{
+  const vt = () => useViewerTabs.getState()
+  for (const t of vt().tabs.filter((x) => x.kind === "artifact" || x.kind === "plan")) vt().closeViewer(t.id)
+  vt().openArtifact("chat-a", { id: "plan-a", title: "Plan — A", kind: "md", body: "# Plan A\nsteps" })
+  vt().openArtifact("chat-b", { id: "doc-b", title: "Document B", kind: "md", body: "# B" })
+  vt().openPlan("chat-a")
+  const WS = workspaceKey("")
+  const scopeA = { wsKey: WS, chatId: "chat-a" }
+  const scopeB = { wsKey: WS, chatId: "chat-b" }
+  const visA = visibleTabs(vt().tabs, scopeA)
+  const visB = visibleTabs(vt().tabs, scopeB)
+  check(
+    "artifact چت a در چت b دیده نمی‌شود",
+    visA.some((t) => t.id === "artifact:chat-a:plan-a") &&
+      !visB.some((t) => t.id === "artifact:chat-a:plan-a"),
+    visB.map((t) => t.id),
+  )
+  check(
+    "artifact چت b در چت a دیده نمی‌شود",
+    visB.some((t) => t.id === "artifact:chat-b:doc-b") &&
+      !visA.some((t) => t.id === "artifact:chat-b:doc-b"),
+    visA.map((t) => t.id),
+  )
+  const { visibleViewerTree } = await import("../src/lib/viewerTabs")
+  const { buildFromList, collectChatIds } = await import("../src/lib/chatTree")
+  // A split with chat A's plan artifact + chat B's document: each chat sees
+  // only its own leaf, so switching chats cannot keep painting the other plan.
+  const tree = buildFromList(["artifact:chat-a:plan-a", "artifact:chat-b:doc-b"], "row")
+  const treeA = visibleViewerTree(tree, vt().tabs, scopeA)
+  const treeB = visibleViewerTree(tree, vt().tabs, scopeB)
+  check("درخت چت a فقط برگ خودش را دارد", !!treeA && collectChatIds(treeA).join() === "artifact:chat-a:plan-a", treeA)
+  check("درخت چت b فقط برگ خودش را دارد", !!treeB && collectChatIds(treeB).join() === "artifact:chat-b:doc-b", treeB)
+  const planTree = buildFromList(["plan:chat-a", "artifact:chat-a:plan-a"], "row")
+  check("درخت چت b هیچ برگ چت a را نگه نمی‌دارد", visibleViewerTree(planTree, vt().tabs, scopeB) === null)
+  for (const t of vt().tabs.filter((x) => x.kind === "artifact" || x.kind === "plan")) vt().closeViewer(t.id)
+}
+
 console.log("۷-ج) browserViewport — سایز دستی مثل کروم (بدون نام دستگاه):")
 {
   const { clampViewportSize, WIDTH_SLIDER_MIN, WIDTH_SLIDER_MAX, DEFAULT_VIEWPORT_SIZE, VIEWPORT_LIMITS } = await import("../src/lib/browserViewport")
   check("پیش‌فرض ۱۲۸۰×۸۰۰", DEFAULT_VIEWPORT_SIZE.width === 1280 && DEFAULT_VIEWPORT_SIZE.height === 800)
-  check("اسلایدر افقی عرض دارد", WIDTH_SLIDER_MIN === 320 && WIDTH_SLIDER_MAX === 1920)
+  check("اسلایدر افقی عرض دارد", WIDTH_SLIDER_MIN === 320 && WIDTH_SLIDER_MAX === 3840)
   check("سایز معتبر دست‌نخورده می‌ماند", JSON.stringify(clampViewportSize(1024, 700)) === JSON.stringify({ width: 1024, height: 700 }))
   const clamped = clampViewportSize(10, 999999)
   check("کلمپ پایین/بالا", clamped.width === VIEWPORT_LIMITS.minWidth && clamped.height === VIEWPORT_LIMITS.maxHeight, clamped)
@@ -242,13 +280,17 @@ console.log("۷-د) BrowserPanel — فقط یک اینپوت (بدون اینپ
   check("تیک‌های خط‌کش تولتیپ اندازه و اسم دارند", html.includes("Mobile S - 320px") && html.includes("Laptop - 1024px"))
   const { rulerLabelForWidth, rulerPctForWidth, rulerWidthForPct, widthRulerTicks } = await import("../src/lib/browserViewport")
   check("لیبل خط‌کش مثل کروم است", rulerLabelForWidth(1024) === "Laptop" && rulerLabelForWidth(320) === "Mobile S" && rulerLabelForWidth(1920) === "Desktop")
-  check("تبدیل عرض به درصد خط‌کش", rulerPctForWidth(320) === 0 && rulerPctForWidth(1920) === 100)
-  check("تبدیل درصد به عرض با اسنپ", rulerWidthForPct(0) === 320 && rulerWidthForPct(100) === 1920)
+  check("خط‌کش تا 4K می‌رود", rulerLabelForWidth(2560) === "QHD" && rulerLabelForWidth(3840) === "4K")
+  check("تبدیل عرض به درصد خط‌کش", rulerPctForWidth(320) === 0 && rulerPctForWidth(3840) === 100)
+  check("تبدیل درصد به عرض با اسنپ", rulerWidthForPct(0) === 320 && rulerWidthForPct(100) === 3840)
   check("تیک‌های خط‌کش مرتب و کامل‌اند", JSON.stringify(widthRulerTicks().slice(0, 3)) === JSON.stringify([320, 375, 425]))
+  check("تیک 4K در خط‌کش هست", widthRulerTicks().includes(3840))
   check("about:blank در آدرس‌بار نیست", !html.includes("about:blank"))
   check("فقط یک خط‌کش تمام‌عرض زیر تولبار است", (html.match(/browser-width-ruler--full/g) ?? []).length === 1)
+  check("خط‌کش در حالت auto-fit پنهان است", html.includes("browser-width-ruler--hidden"))
+  check("دکمه auto fit در حالت follow روشن است", html.includes('aria-label="Auto fit"') && html.includes('aria-pressed="true"'))
   check("همه بریک‌پوینت‌ها تولتیپ اسم و اندازه دارند", html.includes("Tablet - 768px") && html.includes("Laptop L - 1440px"))
-  check("تعداد تیک‌های خط‌کش ۷ است", (html.match(/browser-ruler-tick-label/g) ?? []).length === 7)
+  check("تعداد تیک‌های خط‌کش ۹ است", (html.match(/browser-ruler-tick-label/g) ?? []).length === 9)
   check("دراپ‌داون‌های Device/Zoom حذف شدند", !html.includes('aria-label="Device"') && !html.includes('aria-label="Zoom"') && !html.includes("Fit to window"))
   check("دکمه ✓ حذف شد (اعمال با Enter)", !html.includes('aria-label="Apply viewport size"'))
   check("استیج فوکوس‌پذیر است (کیبورد صفحه)", html.includes('tabindex="0"'))
@@ -272,14 +314,14 @@ console.log("۷-د) BrowserPanel — فقط یک اینپوت (بدون اینپ
   check("موس مجازی همیشه فعال است (بدون آیکون toggle)", !html.includes('aria-label="Virtual mouse"'))
   check("دکمهٔ ✕ کنار Stop حذف شد (بستن از تب)", !html.includes("Close viewer"))
   const { fitWidthTarget, shouldSyncViewportDrafts } = await import("../src/lib/browserViewport")
-  check("fit سقف را نگه می‌دارد (pane باریک)", fitWidthTarget(500, 1280) === 500)
-  check("fit از سقف بالاتر نمی‌رود (pane پهن)", fitWidthTarget(2000, 1280) === 1280)
-  check("fit با pane نامعتبر سقف را برمی‌گرداند", fitWidthTarget(0, 1280) === 1280)
+  check("fit به عرض pane پایین می‌آید (pane باریک)", fitWidthTarget(500) === 500)
+  check("fit به عرض pane بالا می‌رود (pane پهن)", fitWidthTarget(2000) === 2000)
+  check("fit با pane نامعتبر پیش‌فرض را برمی‌گرداند", fitWidthTarget(0) === 1280)
   check("درفت حین تایپ رونویسی نمی‌شود", shouldSyncViewportDrafts(1280, 800, 1024, 800, true) === false)
   check("تغییر واقعی درفت را همگام می‌کند", shouldSyncViewportDrafts(1280, 800, 1024, 800, false) === true)
   check("بدون تغییر درفت دست نمی‌خورد", shouldSyncViewportDrafts(1280, 800, 1280, 800, false) === false)
   check("بدون تغییر حین تایپ هم دست نمی‌خورد", shouldSyncViewportDrafts(1280, 800, 1280, 800, true) === false)
-  check("fit با pane نامعتبر سقف را نگه می‌دارد", fitWidthTarget(NaN, 1280) === 1280)
+  check("fit با pane نامعتبر پیش‌فرض را نگه می‌دارد", fitWidthTarget(NaN) === 1280)
 }
 
 console.log("۷-و) isProbablyUrl — سرچ در برابر آدرس (مثل کروم، اول گوگل):")
@@ -420,6 +462,48 @@ console.log("۱۳) latestPlanDoc — پلن هدردار بر فهرست بدو�
   // هیچ سند هدرداری نیست → همان فهرست، به‌عنوان آخرین راه حل.
   const only = latestPlanDoc([{ id: "h2", messages: [{ planDoc: { title: "", body: "- یک\n- دو" } }] }] as any, "h2")
   check("بدون سند هدردار، فهرست قدم‌ها برمی‌گردد", only?.body === "- یک\n- دو", only?.body)
+}
+
+console.log("۱۴) planFromArtifact — پلن ذخیره‌شده در artifact پلن واقعی است، نه خلاصه:")
+{
+  const { latestPlanDoc, planDisplay, planFromArtifact } = await import("../src/lib/planDoc")
+  const summary = "## خلاصه\nپلن در artifact ذخیره شد."
+  const artifactSeg = {
+    kind: "artifact",
+    id: "a1",
+    title: "Plan — sub-agent tab",
+    artifactKind: "md",
+    content: BODY,
+    version: 1,
+  }
+  const msg = {
+    mode: "plan",
+    planDoc: { title: "خلاصه", body: summary },
+    content: summary,
+    segments: [artifactSeg, { kind: "text", text: summary }],
+  } as any
+  check("پلن از artifact بازیابی شد", planFromArtifact(msg)?.body === BODY, planFromArtifact(msg))
+  check(
+    "latestPlanDoc به artifact مقدم است",
+    latestPlanDoc([{ id: "art1", messages: [msg] }] as any, "art1")?.body === BODY,
+  )
+  const d = planDisplay(msg)
+  check("کارت پلن، سند artifact را نشان می‌دهد", d.planDoc?.body === BODY, d.planDoc?.body)
+  check(
+    "کارت artifact از استریم حذف نمی‌شود",
+    (d.segments ?? []).some((s) => s.kind === "artifact"),
+  )
+  const unrelated = {
+    ...msg,
+    segments: [
+      {
+        ...artifactSeg,
+        title: "Design notes",
+        content: "# Design notes\ncolors and spacing",
+      },
+    ],
+  } as any
+  check("artifact غیرپلن پلن را بازنویسی نمی‌کند", planFromArtifact(unrelated) === null)
 }
 
 if (failed > 0) {

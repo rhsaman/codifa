@@ -123,6 +123,7 @@ export { shortArg } from './toolcall/groups'
 export { shouldShowSideBySide } from './toolcall/diff'
 export { subArgSummary } from './toolcall/groups'
 export { tickListeners } from './toolcall/naming'
+export { subagentDisplayName } from './toolcall/naming'
 export { toolIcon } from './toolcall/naming'
 export { toolLabel } from './toolcall/naming'
 export { useDiffPreview } from './toolcall/diff'
@@ -134,7 +135,7 @@ import { DiffPreview, DiffView, applyReverseDiff, useDiffPreview } from './toolc
 import { fmtTime } from './toolcall/editGroup'
 import { DownloadProgressBar, LiveTerminalTail, ToolCascade, ToolPathSpan, ToolSubRow } from './toolcall/groups'
 import { StatusIcon } from './toolcall/icons'
-import { canonicalTool, isSubagentCard, toolLabel, useRunningClock } from './toolcall/naming'
+import { canonicalTool, isSubagentCard, subagentDisplayName, toolLabel, useRunningClock } from './toolcall/naming'
 import { MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, resultRows } from './toolcall/results'
 
 export const ToolCallView = memo(function ToolCallView({
@@ -160,13 +161,14 @@ export const ToolCallView = memo(function ToolCallView({
   const root = useStore((s) => s.root);
   // چت فعال از store — fallback وقتی caller (ChatMessage) chatId را پاس نمی‌دهد.
   const activeChatId = useStore((s) => s.activeChatId);
+  const subagentRows = useStore((s) => s.customSubagents);
   // Sub-agent (explore) cards are collapsible and start collapsed: the nested
   // read/grep/glob sub-list is noisy, so it stays hidden until clicked.
   const [collapsed, setCollapsed] = useState(isSubagentCard(activity));
   // Explore cards fold their report; terminal cards fold their output — both
   // toggle in place instead of hijacking clicks to the side panel.
   const collapsible =
-    (activity.tool === "explore" &&
+    (isSubagentCard(activity) &&
       ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary))) ||
     activity.tool === "run_terminal";
 
@@ -205,15 +207,20 @@ export const ToolCallView = memo(function ToolCallView({
         : null,
     [activity.status, activity.tool, activity.liveTail],
   );
-  /** The skill a `load_skill` call loaded. The label only says "Load Skill", and
-   *  the raw `name` arg chip is stripped as redundant (REDUNDANT_ARG_KEYS), so
-   *  without this the head never states WHICH skill the turn pulled in. */
-  const skillName =
-    canonicalTool(activity.tool) === "load_skill"
-      ? String(
-          activity.args?.name ?? activity.args?.file ?? activity.args?.query ?? "",
-        )
-      : "";
+  /** The plugin/skill a load call pulled in. The label only says "Load Plugin",
+   *  and the raw `slug` arg chip is stripped as redundant
+   *  (REDUNDANT_ARG_KEYS), so without this the head never states WHICH plugin
+   *  the turn loaded. */
+  const skillName = isSkillTool(activity.tool)
+    ? String(
+        activity.args?.slug ??
+          activity.args?.skill ??
+          activity.args?.name ??
+          activity.args?.file ??
+          activity.args?.query ??
+          "",
+      )
+    : "";
 
   const revert = async () => {
     if (!root) return;
@@ -246,7 +253,7 @@ export const ToolCallView = memo(function ToolCallView({
   return (
     <div
       className={`tool-card ${activity.status}${
-        activity.tool === "explore" ? " explore" : ""
+        isSubagentCard(activity) ? " explore" : ""
       }`}
     >
       <div
@@ -296,6 +303,8 @@ export const ToolCallView = memo(function ToolCallView({
                 </span>
               </span>
             </>
+          ) : isSubagentCard(activity) ? (
+            subagentDisplayName(activity.tool, subagentRows)
           ) : (
             toolLabel(activity.tool)
           )}
@@ -379,7 +388,7 @@ export const ToolCallView = memo(function ToolCallView({
             )}
           </span>
         )}
-        {activity.tool === "explore" &&
+        {isSubagentCard(activity) &&
           activity.children &&
           activity.children.length > 0 && (
             <span className="tool-badge tool-sub-count">
@@ -462,7 +471,7 @@ export const ToolCallView = memo(function ToolCallView({
       </div>
 
       {collapsed &&
-        activity.tool === "explore" &&
+        isSubagentCard(activity) &&
         activity.children &&
         activity.children.length > 0 && (
           <ToolCascade activities={activity.children} />
@@ -475,7 +484,7 @@ export const ToolCallView = memo(function ToolCallView({
               load that only repeats the head label, so the body stays empty. */}
           {activity.summary &&
             !isWrite &&
-            canonicalTool(activity.tool) !== "load_skill" && (
+            !isSkillTool(activity.tool) && (
               <div className="tool-summary">{fixZwsp(activity.summary)}</div>
             )}
           {/* A `read` result IS the file window: it is a code dump, not a
@@ -493,8 +502,7 @@ export const ToolCallView = memo(function ToolCallView({
               · <name>" and the backend summary repeats the tool name, so the
               card body used to be empty while the prose leaked out as file
               chips. Clamp it like terminal output — the body can be long. */}
-          {canonicalTool(activity.tool) === "load_skill" &&
-            activity.resultText && (
+          {isSkillTool(activity.tool) && activity.resultText && (
               <pre
                 className="trace-expand-val trace-expand-pre trace-terminal-output"
                 dir="auto"
@@ -502,7 +510,7 @@ export const ToolCallView = memo(function ToolCallView({
                 {activity.resultText}
               </pre>
             )}
-          {activity.tool === "explore" &&
+          {isSubagentCard(activity) &&
             activity.children &&
             activity.children.length > 0 && (
               <div className="tool-sub-list">

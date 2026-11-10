@@ -776,6 +776,48 @@
   color: var(--text-dim);
 }
 
+/* The note box is COLLAPSED by default: an always-open textarea pushed the two
+   real answers off-screen and read like a form to fill in before answering. */
+.perm-note-box {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.perm-note-box > summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  user-select: none;
+  list-style: none;
+}
+
+.perm-note-box > summary::-webkit-details-marker {
+  display: none;
+}
+
+.perm-note-box > summary:hover {
+  color: var(--text);
+}
+
+.perm-note-input {
+  margin-top: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 48px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.perm-note-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .perm-buttons {
   display: flex;
   justify-content: flex-end;

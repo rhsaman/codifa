@@ -16,17 +16,37 @@ pub(super) async fn chat_stream_entry(
 }
 
 /// POST /chat/steer — deliver a message to a running turn for this chat.
-/// Body: `{chat_id, id, prompt, ...}`. Answers `{ok: true}` when the message was
-/// queued (a turn is running) and `{ok: false}` when nothing was running, so the
-/// renderer re-sends it as the next turn instead of losing it.
+/// Body: `{chat_id, id, prompt, attachments, images, ...}`. Answers
+/// `{ok: true}` when the message was queued (a turn is running) and
+/// `{ok: false}` when nothing was running / nothing was sendable, so the
+/// renderer re-sends it as the next turn instead of losing it. `prompt` may be
+/// empty when the composer carried images or file attachments — that is how a
+/// mid-turn picture-only steer works.
 pub(super) async fn chat_steer(Json(body): Json<Value>) -> Response<Body> {
     let chat_id = body.get("chat_id").and_then(Value::as_str).unwrap_or_default().trim();
     let id = body.get("id").and_then(Value::as_str).unwrap_or_default().trim();
-    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or_default().trim();
-    if chat_id.is_empty() || id.is_empty() || prompt.is_empty() {
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or_default();
+    let attachments: Vec<String> = body
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Keep the raw entries: the agent resolves paths / `{path, dataUrl}` only
+    // after it knows a turn is actually running (it reads files on disk).
+    let images: Vec<Value> = body
+        .get("images")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if chat_id.is_empty() || id.is_empty() {
         return Json(json!({"ok": false})).into_response();
     }
-    let ok = agent::push_steer(chat_id, id, prompt);
+    let ok = agent::push_steer(chat_id, id, prompt, attachments, images);
     Json(json!({"ok": ok})).into_response()
 }
 

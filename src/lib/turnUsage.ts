@@ -19,6 +19,18 @@ export interface TurnUsage {
    *  actually loaded it. Enabled-but-never-loaded is the common case and the one
    *  worth seeing: the connector cost the turn an index line, not its schemas. */
   mcp: TurnMcp[]
+  /** Plugins the turn actually pulled in through `load_plugin` (or ran a script
+   *  from through `plugin run`). A plugin load is how the agent gets a whole
+   *  toolbox, so it must show up in "This turn's tools" even when the plugin
+   *  owns no skill/connector row of its own. */
+  plugins: TurnPlugin[]
+}
+
+/** One plugin the turn loaded. `name` is the slug from the tool call; the panel
+ *  resolves it to the display name through the installed plugin list. */
+export interface TurnPlugin {
+  name: string
+  used: boolean
 }
 
 /** One connector as the turn saw it. */
@@ -77,7 +89,22 @@ function loadedSkills(
   out: Map<string, string>,
 ): void {
   for (const a of list ?? []) {
-    if (isSkillTool(a.tool)) {
+    // `load_plugin` is the plugin-first loader: `slug` loads the whole toolbox,
+    // `slug` + `skill` narrows to ONE skill body. Only the NAMED skill counts as
+    // usage (the plugin row is handled by `loadedPlugins`), and its `file` is an
+    // extra reference file INSIDE that skill — never a skill name, which is why
+    // it must not fall through to the generic arm below.
+    if (a.tool === 'load_plugin') {
+      const skill = a.args?.skill
+      if (
+        a.status !== 'error' &&
+        a.status !== 'denied' &&
+        typeof skill === 'string' &&
+        skill.trim()
+      ) {
+        out.set(skillKey(skill.trim()), skill.trim())
+      }
+    } else if (isSkillTool(a.tool)) {
       const raw = a.args?.name ?? a.args?.file
       if (typeof raw === 'string' && raw.trim()) {
         const name = raw.trim()
@@ -90,13 +117,41 @@ function loadedSkills(
   }
 }
 
-/** Skills + connectors of one turn. Pure, so a test can call it directly. */
+/** Plugins a turn loaded (or ran a script from), keyed by slug. A failed or
+ *  denied load is NOT usage: the toolbox never reached the model. Sub-agent
+ *  calls live under `children`; a plugin loaded there still belongs to the
+ *  turn. */
+function loadedPlugins(
+  list: ToolActivity[] | undefined,
+  out: Map<string, string>,
+): void {
+  for (const a of list ?? []) {
+    if (a.status !== 'error' && a.status !== 'denied') {
+      const action = String(a.args?.action ?? '').trim().toLowerCase()
+      const raw = a.args?.slug
+      const isLoad = a.tool === 'load_plugin'
+      const isRun = a.tool === 'plugin' && action === 'run'
+      if ((isLoad || isRun) && typeof raw === 'string' && raw.trim()) {
+        const slug = raw.trim()
+        out.set(slug.toLowerCase(), slug)
+      }
+    }
+    loadedPlugins(a.children, out)
+  }
+}
+
+/** Skills + connectors + loaded plugins of one turn. Pure, so a test can call
+ *  it directly. */
 export function turnUsage(messages: ChatMessage[]): TurnUsage {
   const start = turnStart(messages)
-  if (start === -1) return { skills: [], mcp: [] }
+  if (start === -1) return { skills: [], mcp: [], plugins: [] }
   const turn = messages[start]
   const loaded = new Map<string, string>()
-  for (const m of messages.slice(start + 1)) loadedSkills(m.toolActivity, loaded)
+  const plugins = new Map<string, string>()
+  for (const m of messages.slice(start + 1)) {
+    loadedSkills(m.toolActivity, loaded)
+    loadedPlugins(m.toolActivity, plugins)
+  }
 
   const skills: TurnSkill[] = []
   const seen = new Set<string>()
@@ -112,7 +167,11 @@ export function turnUsage(messages: ChatMessage[]): TurnUsage {
     seen.add(key)
     skills.push({ name, used: true })
   }
-  return { skills, mcp: enabledConnectors(turn, loadedMcp(messages.slice(start + 1))) }
+  return {
+    skills,
+    mcp: enabledConnectors(turn, loadedMcp(messages.slice(start + 1))),
+    plugins: [...plugins.values()].map((name) => ({ name, used: true })),
+  }
 }
 
 /** Connectors the turn loaded on demand. The `mcp_loaded` event on the turn's
@@ -163,7 +222,23 @@ export function skillOwner(name: string, catalog: SkillRow[]): string {
   return row?.plugin ?? ''
 }
 
-/** Plugins behind the turn's skills and connectors, in first-seen order. */
+/** Display name of an installed plugin from its slug (or name). Falls back to
+ *  the slug when the list has not loaded yet or the plugin was uninstalled
+ *  mid-turn, so the row never disappears. */
+export function pluginDisplayName(slug: string, plugins: PluginInfo[]): string {
+  const key = slug.trim().toLowerCase()
+  if (!key) return ''
+  const row = plugins.find(
+    (p) => p.slug?.trim().toLowerCase() === key || p.name?.trim().toLowerCase() === key,
+  )
+  return row?.name || row?.slug || slug
+}
+
+/** Plugins behind the turn's skills and connectors, plus the ones the agent
+ *  loaded directly through `load_plugin` / `plugin run`, in first-seen order.
+ *  The loaded ones come first: they are what the turn actually ran with, and
+ *  without them a plugin with no skill/connector of its own (the common case
+ *  for a toolbox like `instagram-api-less`) never appeared on the card. */
 export function usagePlugins(
   usage: TurnUsage,
   catalog: SkillRow[],
@@ -173,6 +248,7 @@ export function usagePlugins(
   const add = (name: string) => {
     if (name && !out.includes(name)) out.push(name)
   }
+  for (const p of usage.plugins ?? []) add(pluginDisplayName(p.name, plugins))
   for (const s of usage.skills) add(skillOwner(s.name, catalog))
   for (const connector of usage.mcp) {
     for (const p of plugins) {

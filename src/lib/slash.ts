@@ -65,7 +65,7 @@ export const SUBCOMMANDS: Record<string, SubCommand[]> = {
     // Second, not last: the popup clips below ~7 rows, and a search row at the
     // bottom was below the fold — it read as "not in the menu".
     { name: 'search', hint: 'Find the best plugin for a request', arg: 'free' },
-    { name: 'install', hint: 'Install a bundle from a repo', arg: 'url', rest: 'free' },
+    { name: 'install', hint: 'Install from a repo, or plugin@marketplace', arg: 'url', rest: 'free' },
     { name: 'create', hint: 'Create a bundle from a description', arg: 'free' },
     { name: 'update', hint: 'Edit a bundle (skills, commands, agents, hooks, scripts)', arg: 'name' },
     { name: 'on', hint: 'Switch a bundle on', arg: 'name' },

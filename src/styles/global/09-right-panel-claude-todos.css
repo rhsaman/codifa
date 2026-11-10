@@ -60,17 +60,15 @@
   width: auto;
   max-width: none;
   margin: 0;
-  border: 1px solid var(--hairline);
-  border-radius: 14px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 7%, var(--bg-panel)),
-      var(--bg-panel));
-  box-shadow: var(--shadow-card);
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
 }
 
 .sidebar-panel.todos-docked .sidebar-panel-head {
   padding: 9px 12px;
-  border-bottom: 1px solid var(--hairline);
+  border-bottom: none;
 }
 
 .sidebar-panel.todos-docked .sidebar-panel-count {
@@ -90,17 +88,15 @@
   width: auto;
   max-width: none;
   margin: 0;
-  border: 1px solid var(--hairline);
-  border-radius: 14px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 4%, var(--bg-panel)),
-      var(--bg-panel));
-  box-shadow: var(--shadow-card);
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
 }
 
 .sidebar-panel.terminals-docked .sidebar-panel-head {
   padding: 9px 12px;
-  border-bottom: 1px solid var(--hairline);
+  border-bottom: none;
 }
 
 /* شمارندهٔ «N in background» — خنثی و کم‌رنگ، برخلاف قرص رنگی تودوها:
@@ -259,17 +255,15 @@
   width: auto;
   max-width: none;
   margin: 0;
-  border: 1px solid var(--hairline);
-  border-radius: 14px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 4%, var(--bg-panel)),
-      var(--bg-panel));
-  box-shadow: var(--shadow-card);
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
 }
 
 .sidebar-panel.usage-docked .sidebar-panel-head {
   padding: 9px 12px;
-  border-bottom: 1px solid var(--hairline);
+  border-bottom: none;
 }
 
 .sidebar-panel.usage-docked .sidebar-panel-count {
@@ -2281,13 +2275,71 @@ mark.trace-hit-active {
   display: flex;
 }
 
+/* Empty chat area (a workspace with no chats, or every tab closed): one quiet
+   centered action instead of a blank pane. */
+.chat-empty-state {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.chat-empty-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  margin-bottom: 2px;
+}
+
+.chat-empty-state h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat-empty-state p {
+  margin: 0;
+  max-width: 340px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.chat-empty-new {
+  margin-top: 6px;
+  padding: 8px 16px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.chat-empty-new:hover {
+  background: color-mix(in srgb, var(--accent) 20%, var(--bg-input));
+  border-color: var(--accent);
+}
+
 .viewer-group {
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   min-width: 320px;
-  /* May take nearly the whole window — the drag clamp (clampSplitWidth) and
-     the chat group's own min-width keep a usable chat strip beside it. */
+  /* May take nearly the whole editor area — the drag clamp (clampSplitWidth,
+     fed the REAL container width) and the chat group's own min-width keep a
+     usable chat strip beside it. */
   max-width: calc(100% - 320px);
   overflow: hidden;
   position: relative;
@@ -2295,14 +2347,27 @@ mark.trace-hit-active {
   min-height: 0;
   background: var(--bg-alt);
   box-shadow: none;
-  /* Animated open/close (width + fade) in BOTH directions: the pane mounts
-     collapsed and expands next frame, and stays mounted through the close
-     transition (App.tsx). `.closing` zeroes the min-width so the collapse
-     can actually reach 0. */
+  /* Smooth width change when SWITCHING pages: each page remembers its own
+     width, so hopping Todos -> Review animates the pane instead of snapping.
+     A drag strips this (body.coder-resizing) so the edge tracks the cursor
+     1:1 instead of lagging behind it. Open/close keeps the longer 0.3s below.
+
+     `max-width` MUST be animated too: App.tsx rides the target width inline
+     as max-width so the stylesheet cap cannot freeze the first part of a
+     close, and an un-transitioned max-width clamps a SHRINK to its new value
+     on the very first frame — the pane then snaps and only a GROW animates.
+     Same duration/easing as width, so the two move as one edge. */
   transition:
-    flex-basis 0.3s cubic-bezier(0.4, 0, 0.2, 1),
-    width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    flex-basis 0.24s cubic-bezier(0.4, 0, 0.2, 1),
+    width 0.24s cubic-bezier(0.4, 0, 0.2, 1),
+    max-width 0.24s cubic-bezier(0.4, 0, 0.2, 1),
     opacity 0.24s ease;
+}
+
+/* Dragging must be instant: any transition here makes the handle lag the
+   cursor and feel rubbery. App.tsx toggles this class for the drag only. */
+body.coder-resizing .viewer-group {
+  transition: none !important;
 }
 
 .viewer-group.closing {

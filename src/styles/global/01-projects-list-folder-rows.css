@@ -367,7 +367,7 @@ body.coder-resizing .terminal-panel {
   flex: 0 0 auto;
   /* Left gutter clears the traffic lights with breathing room — wider
      than the cluster's own 2px gap so the lights read as a separate
-     group. */
+     group. Right gutter keeps the trailing buttons off the window edge. */
   padding: 0 8px 0 88px;
   overflow: hidden;
 }
@@ -662,6 +662,19 @@ body.coder-resizing .terminal-panel {
   background: color-mix(in srgb, var(--accent) 13%, transparent);
   color: var(--text);
   font-weight: 600;
+}
+
+/* Keyboard focus in the chat list (j/k): one calm ring, matching the other
+   sidebar rows. Only :focus-visible, so a mouse click never leaves a ring. */
+.chat-item:focus-visible {
+  outline: none;
+  background: var(--bg-hover);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.chat-item.active:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .chat-item-icon {
@@ -1124,9 +1137,46 @@ body.coder-resizing .terminal-panel {
    right-click menu, which teleports the menu mid-click so menu items never
    receive the click. The old .chat-item scale had exactly this bug. */
 
-/* Ghost controls on folder rows: the + reads as a quiet dot until hovered —
-   the row stays lean (workspace actions live on the right-click menu and
-   inside the opened folder). */
+/* Active workspace (the project whose tabs/windows the chat area shows) gets
+   a quiet tinted row; pin/color icons still carry identity. */
+.sidebar-folder.active .sidebar-group-head {
+  background: color-mix(in srgb, var(--ws, var(--accent)) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent);
+}
+
+.sidebar-folder.active .sidebar-group-toggle {
+  color: var(--text);
+}
+
+/* Keyboard selection (Ctrl+X W → j/k): a filled row, not an outline. The
+   row wrapper receives the DOM focus, and the global :focus-visible ring on
+   it read as a bright double border around the whole workspace. Suppress
+   that and paint the selection on the row body instead — inset, so it never
+   spills into the neighbouring rows. The wrapper is square, so BOTH parts of
+   the global ring (outline and its 3px box-shadow halo) must be cleared —
+   resetting only the outline leaves a square halo around the rounded row. */
+.sidebar-ws-list > .sidebar-folder:focus,
+.sidebar-ws-list > .sidebar-folder:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.sidebar-folder.kbd-focus .sidebar-group-head {
+  background: color-mix(in srgb, var(--ws, var(--accent)) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 15%, transparent);
+  transition:
+    background 0.12s,
+    box-shadow 0.12s;
+}
+
+/* When the selected row is also the active workspace, keep the workspace
+   colour visible in the fill instead of letting the neutral focus wash win. */
+.sidebar-folder.active.kbd-focus .sidebar-group-head {
+  background: color-mix(in srgb, var(--ws, var(--accent)) 18%, transparent);
+}
+
+/* Folder row actions live on the right-click menu: drag-to-reorder is retired so
+   the always-current pinned/recency order never snaps back after a drag. */
 .sidebar-folder .sidebar-group-btn {
   border-color: transparent;
   background: transparent;
@@ -2365,16 +2415,21 @@ body.coder-resizing .terminal-panel {
 /* macOS frameless window with the sidebar hidden: the traffic lights now
    overlay this bar's corner — clear their zone (three buttons + gutter) so
    no control sits behind the window buttons. */
-/* macOS frameless window strip cluster: sidebar toggle + workspace +
-   direction live at the window's top-left (right after the traffic lights)
-   in BOTH sidebar states — inside the sidebar's drag strip while the
-   sidebar is open, inline at the app bar's solo corner when it is closed —
-   so opening the sidebar never pushes them right. */
+/* macOS frameless window strip cluster: the cluster rides the sidebar's
+   TRAILING corner. The traffic lights are OS-pinned and do not move — the
+   strip keeps its 88px left gutter for them — while the buttons stack
+   leading→trailing as: update · settings · hamburger. */
 .window-strip-cluster {
   display: inline-flex;
   align-items: center;
   gap: 2px;
   min-width: 0;
+  margin-left: auto;
+  /* Pinned to the sidebar's trailing edge, hugging the hamburger into the
+     corner. row-reverse turns the DOM order (update, settings, toggle) into
+     the visual order update · settings · hamburger. */
+  flex-direction: row-reverse;
+  padding-right: 4px;
 }
 
 /* While the sidebar is open the cluster renders inside the sidebar's strip;

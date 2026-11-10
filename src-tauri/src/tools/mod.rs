@@ -12,6 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Largest file the EDITORS will rewrite in memory. Reads are NOT bounded by
+/// it: `read` streams windows and documents are windowed by extracted text.
 pub const MAX_READ_BYTES: usize = 2_000_000;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const MAX_FILES: usize = 10_000;
@@ -52,15 +54,6 @@ const TERMINAL_TAIL_BYTES: usize = 4096;
 /// stack.
 const MAX_WALK_DEPTH: usize = 64;
 
-/// How many skill names a miss/ambiguity message may print. A store can hold
-/// hundreds of skills, so echoing all of them would spend a transcript's worth
-/// of tokens on a failed lookup.
-const SKILL_LIST_MAX: usize = 30;
-
-/// How many search hits `load_skill query=` lists before asking the model to
-/// name one.
-const SKILL_SEARCH_MAX: usize = 8;
-
 const MAX_GREP_ALTERNATIVES: usize = 3;
 
 /// Identifiers are what `find_symbol` takes; anything else is grep-only.
@@ -100,7 +93,6 @@ mod outline;
 mod paths;
 mod read;
 mod search;
-mod skill_search;
 mod terminal;
 mod write;
 
@@ -125,7 +117,6 @@ use outline::*;
 use paths::*;
 use read::*;
 use search::*;
-use skill_search::*;
 use write::*;
 
 pub use diff::unified_diff;
@@ -143,5 +134,5 @@ pub use write::{edit_file, write_file};
 pub(crate) use hints::levers_fired;
 #[allow(unused_imports)] // used by agent tests under cfg(test)
 pub(crate) use paths::tool_dirs;
-pub(crate) use read::{read_windows_of, read_extended_spans, POST_EDIT_STALE_NOTE};
+pub(crate) use read::{read_windows_of, read_extended_spans, DIR_LIST_LIMIT, POST_EDIT_STALE_NOTE};
 pub(crate) use outline::reset_outline_claims;

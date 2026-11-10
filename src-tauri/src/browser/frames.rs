@@ -117,6 +117,20 @@ pub async fn frame(chat_id: &str, after: u64) -> Value {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let target = tab.target_id.clone();
+    // Chromium PAUSES screencast frames for a background tab. With one
+    // Chromium shared by every chat, opening a second chat's browser made the
+    // first chat's tab background — and a navigation there pushed NO frame, so
+    // its panel kept rendering the previous page until a resize forced a
+    // capture. The polled tab is the one on screen: bring it to the front
+    // (idempotent when it already is) so repaints keep reaching the panel.
+    let target_for_activate = target.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = cdp_browser_batch(vec![(
+            "Target.activateTarget",
+            json!({"targetId": target_for_activate}),
+        )]);
+    })
+    .await;
     if peek_frame(&target).is_none() {
         // Nothing cached yet — a fresh panel (or the first moment after
         // attach, before the first push). One forced capture seeds the cache

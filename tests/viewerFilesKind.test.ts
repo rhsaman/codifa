@@ -1,14 +1,14 @@
-// The 'files' viewer kind: persistence whitelist + the open action.
+// The file explorer lives in the SIDEBAR (its Files view), not in a pane tab.
 //
-// Three things are locked here:
-//   * BOTH kind whitelists in loadPersisted accept the new kinds — 'explore'
-//     was missing from them since it was introduced, so an explore tab was
-//     silently dropped on every restart. A kind the store can create but not
-//     reload is worse than no persistence at all.
-//   * openFiles creates exactly ONE global explorer tab and focuses the pane.
-//     The explorer is deliberately NOT chat-scoped: a per-chat tab made the
-//     rail show one files icon per chat, and activating it pushed the chat's
-//     open file tab out of the rail.
+// Locked here:
+//   * the old 'files' viewer kind is gone: a 'files' tab persisted by an older
+//     build is dropped on load (the explorer would otherwise show up twice),
+//     while the other kinds — 'explore' included — still survive a restart and
+//     an unknown kind is still rejected;
+//   * openFiles / focusFilesFilter / revealFile create NO tab and do not touch
+//     the pane: they switch the sidebar to its Files view and open the sidebar
+//     when it was collapsed;
+//   * the filter / reveal signals still reach the panel through their counters.
 //
 // Persistence is driven through the REAL load path (seeding localStorage before
 // the module loads): zustand hydrates its initial state at import time, so a
@@ -40,7 +40,7 @@ const disk = new Map<string, string>([
     JSON.stringify({
       tabs: [
         { id: 'explore:c1', kind: 'explore', chatId: 'c1', title: 'Explore', createdAt: 100 },
-        // The global explorer id carries no chat scope.
+        // Persisted by an older build, when the explorer was a pane tab.
         { id: 'files', kind: 'files', title: 'Files', createdAt: 150 },
         // A kind that never existed must still be rejected on load, so the
         // whitelist is not accidentally widened into "accept anything".
@@ -77,80 +77,106 @@ const disk = new Map<string, string>([
   head: { appendChild: () => {} },
 }
 
-const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs } = await import('../src/lib/viewerTabs')
+const { useViewerTabs } = await import('../src/lib/viewerTabs')
+const { useSidebarView } = await import('../src/lib/sidebarView')
+const { useStore } = await import('../src/lib/store')
 
-console.log('1) loadPersisted keeps the new kinds (and still rejects unknown ones):')
+console.log('1) loadPersisted drops the legacy files tab (and still rejects unknown kinds):')
 {
-  const tabs = useViewerTabs.getState().tabs
-  const kinds = tabs.map((t) => t.kind)
-  check('the files tab survives a restart', kinds.includes('files'), kinds)
-  check('the explore tab survives too (was silently dropped before)', kinds.includes('explore'), kinds)
+  const kinds = useViewerTabs.getState().tabs.map((t) => t.kind as string)
+  check('a persisted files tab is dropped', !kinds.includes('files'), kinds)
+  check('the explore tab still survives a restart', kinds.includes('explore'), kinds)
   check('an unknown kind is still rejected', !kinds.includes('bogus'), kinds)
-  const files = tabs.find((t) => t.kind === 'files')
-  check('the files tab is global (no chat scope)', files?.chatId === undefined, files)
-  check('the files tab keeps its id', files?.id === 'files', files?.id)
 }
 
-console.log('2) id and title follow the shared rules:')
-{
-  check("viewerTabId keeps files global (no chat suffix)", viewerTabId('files', 'c1') === 'files', viewerTabId('files', 'c1'))
-  check(
-    'the files tab shows the shared kind label',
-    viewerTabTitle({ kind: 'files', title: 'Files' }) === 'Files',
-    viewerTabTitle({ kind: 'files', title: 'Files' }),
-  )
-}
-
-console.log('3) visibility is global:')
-{
-  const tabs = useViewerTabs.getState().tabs
-  const mine = visibleTabs(tabs, { wsKey: 'w1', chatId: 'c1' }).map((t) => t.kind)
-  check('the owning chat sees the files tab', mine.includes('files'), mine)
-  const other = visibleTabs(tabs, { wsKey: 'w2', chatId: 'c2' }).map((t) => t.kind)
-  check('another chat sees the SAME single files tab', other.includes('files'), other)
-  check(
-    'no second files tab appears for another chat',
-    tabs.filter((t) => t.kind === 'files').length === 1,
-    tabs,
-  )
-}
-
-console.log('4) openFiles creates one GLOBAL tab and reveals the pane:')
+console.log('2) openFiles shows the explorer in the sidebar and creates no tab:')
 {
   useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false } as any)
+  useSidebarView.setState({ view: 'chats' })
+  useStore.setState({ sidebarOpen: false } as any)
+
   useViewerTabs.getState().openFiles()
   const s = useViewerTabs.getState() as any
-  const created = s.tabs.filter((t: any) => t.kind === 'files')
-  check('exactly one files tab was created', created.length === 1, s.tabs)
-  check('it is named Files', created[0]?.title === 'Files', created[0])
-  check('it is NOT owned by a chat', created[0]?.chatId === undefined, created[0])
-  check('it became the active tab', s.activeId === 'files', s.activeId)
-  check('the pane was revealed', s.paneOpen === true)
-  check('the page opened as an ordinary tab (no pane mode to exit)', !('panelMode' in s))
+  check('the sidebar switched to its Files view', useSidebarView.getState().view === 'files')
+  check('a collapsed sidebar was opened', useStore.getState().sidebarOpen === true)
+  check('no tab was created', s.tabs.length === 0, s.tabs)
+  check('the right pane was NOT revealed', s.paneOpen === false)
+  check('the choice is persisted for the next launch', disk.get('coder:sidebarView') === 'files')
 
   useViewerTabs.getState().openFiles()
-  const again = useViewerTabs.getState() as any
+  check('asking again is harmless', useSidebarView.getState().view === 'files' && useViewerTabs.getState().tabs.length === 0)
+}
+
+console.log('3) the filter and reveal requests reach the panel through their counters:')
+{
+  useSidebarView.setState({ view: 'chats' })
+  useStore.setState({ sidebarOpen: false } as any)
+  const before = (useViewerTabs.getState() as any).filesFilterFocusAt as number
+
+  useViewerTabs.getState().focusFilesFilter()
+  const after = (useViewerTabs.getState() as any).filesFilterFocusAt as number
+  check('the filter counter was bumped', after === before + 1, { before, after })
+  check('focusing the filter shows the explorer', useSidebarView.getState().view === 'files')
+  check('focusing the filter opens a collapsed sidebar', useStore.getState().sidebarOpen === true)
+
+  useSidebarView.setState({ view: 'chats' })
+  useViewerTabs.getState().revealFile('src/App.tsx')
+  const reveal = (useViewerTabs.getState() as any).filesReveal as { path: string; at: number } | null
+  check('the reveal request carries the file path', reveal?.path === 'src/App.tsx', reveal)
+  check('revealing a file shows the explorer', useSidebarView.getState().view === 'files')
+  check('revealing creates no tab either', useViewerTabs.getState().tabs.length === 0)
+
+  const firstAt = reveal?.at ?? 0
+  useViewerTabs.getState().revealFile('src/App.tsx')
+  const again = (useViewerTabs.getState() as any).filesReveal as { at: number } | null
+  check('asking twice for the same file re-fires', (again?.at ?? 0) > firstAt, { firstAt, again })
+}
+
+console.log('4) Ctrl+X E from an OPEN FILE lands on that file row, not the filter:')
+{
+  useSidebarView.setState({ view: 'chats' })
+  useStore.setState({ sidebarOpen: false } as any)
+  useViewerTabs.setState({ tabs: [], activeId: null } as any)
+  useViewerTabs.getState().openFile('src/lib/fileTree.ts', undefined, '/repo')
+  const before = (useViewerTabs.getState() as any).filesFilterFocusAt as number
+
+  useViewerTabs.getState().focusFilesFilter()
+  const reveal = (useViewerTabs.getState() as any).filesReveal as
+    | { path: string; focus?: boolean; at: number }
+    | null
+  check('the open file was revealed in the explorer', reveal?.path === 'src/lib/fileTree.ts', reveal)
+  check('the reveal asks the panel to FOCUS the row', reveal?.focus === true, reveal)
   check(
-    'reopening does not stack a second tab',
-    again.tabs.filter((t: any) => t.kind === 'files').length === 1,
-    again.tabs,
+    'the filter counter did NOT change (the box must not open)',
+    ((useViewerTabs.getState() as any).filesFilterFocusAt as number) === before,
+  )
+  check('the explorer is showing', useSidebarView.getState().view === 'files')
+  check('the sidebar was opened', useStore.getState().sidebarOpen === true)
+
+  // A file OUTSIDE the workspace root has no explorer row: the shortcut must
+  // fall back to the filter instead of probing for a row that cannot exist.
+  useViewerTabs.setState({ tabs: [], activeId: null } as any)
+  useViewerTabs.getState().openFile('/tmp/outside.txt', undefined, '/repo')
+  const beforeOutside = (useViewerTabs.getState() as any).filesFilterFocusAt as number
+  const beforeReveal = (useViewerTabs.getState() as any).filesReveal
+  useViewerTabs.getState().focusFilesFilter()
+  check(
+    'a file outside the root leaves the reveal request alone',
+    (useViewerTabs.getState() as any).filesReveal?.at === beforeReveal?.at,
+  )
+  check(
+    'and falls back to the filter',
+    ((useViewerTabs.getState() as any).filesFilterFocusAt as number) === beforeOutside + 1,
   )
 
-  // The whole point of the global id: another chat's open file tab must
-  // survive the explorer being activated.
-  useViewerTabs.setState({
-    tabs: [
-      { id: 'files', kind: 'files', title: 'Files', createdAt: 1 },
-      { id: 'file:c2:a.ts', kind: 'file', chatId: 'c2', title: 'a.ts', createdAt: 2 },
-    ],
-    activeId: 'file:c2:a.ts',
-  } as any)
-  useViewerTabs.getState().openFiles()
-  const after = useViewerTabs.getState() as any
+  // No file tab on screen (e.g. a terminal page): the filter is still the
+  // entry point.
+  useViewerTabs.setState({ tabs: [], activeId: null } as any)
+  const beforeFilter = (useViewerTabs.getState() as any).filesFilterFocusAt as number
+  useViewerTabs.getState().focusFilesFilter()
   check(
-    "another chat's file tab is not closed by activating the explorer",
-    after.tabs.some((t: any) => t.id === 'file:c2:a.ts'),
-    after.tabs,
+    'without a file the filter counter is bumped',
+    ((useViewerTabs.getState() as any).filesFilterFocusAt as number) === beforeFilter + 1,
   )
 }
 
@@ -159,3 +185,4 @@ if (failures > 0) {
   process.exit(1)
 }
 console.log('\nall checks passed')
+process.exit(0)

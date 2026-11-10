@@ -370,7 +370,7 @@ export function renderSegments(
       flush();
       wrapTrace();
       flushEdits();
-      nodes.push(<ArtifactCard key={i} segment={seg} />);
+      nodes.push(<ArtifactCard key={i} segment={seg} messageId={message.id} />);
       return;
     }
     if (seg.kind === "text") {
@@ -909,7 +909,7 @@ export const ChatMessageView = memo(
 
       {!isUser && docPaths.length > 0 && <DocFileChips paths={docPaths} />}
 
-      {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
+      {!isUser && planDoc && <PlanDocCard planDoc={planDoc} messageId={message.id} />}
 
 
       {!isUser && (

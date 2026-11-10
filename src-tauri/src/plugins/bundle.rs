@@ -65,8 +65,14 @@ pub fn list_plugins_summary(root: &Path) -> String {
         let name = p["name"].as_str().unwrap_or(slug);
         let enabled = if p["enabled"].as_bool().unwrap_or(false) { "on" } else { "off" };
         let skills = p["skills"].as_array().map(|a| a.len()).unwrap_or(0);
+        let description = p["description"].as_str().unwrap_or("").trim();
         out.push_str(&format!(
-            "- {slug} — {name} [{enabled}] — {skills} skill(s); connectors: {}; scripts: {}\n",
+            "- {slug} — {name} [{enabled}] — {}; {skills} skill(s); connectors: {}; scripts: {}\n",
+            if description.is_empty() {
+                "(no description — the agent cannot match this plugin; add one)"
+            } else {
+                description
+            },
             name_list(&p["mcp"]),
             name_list(&p["scripts"]),
         ));
@@ -102,7 +108,25 @@ pub fn plugin_detail(root: &Path, slug: &str) -> Result<Value, String> {
 
 /// Create a plugin. Fails on an existing slug so an accidental create can never
 /// overwrite a bundle the user already has (that is `update_plugin`'s job).
+///
+/// The plugin is the ONLY unit the agent discovers, so an agent-facing create
+/// must carry BOTH halves of the contract: a top-level `description` (the
+/// trigger the model matches a request against) and at least one part inside
+/// the toolbox. A nameless or empty bundle would be installed and then be
+/// impossible to find or use.
 pub fn create_plugin(root: &Path, body: &Value) -> Result<Value, String> {
+    create_plugin_impl(root, body, true)
+}
+
+/// The same writer for internal producers (migrations, the built-in seeder, a
+/// marketplace row). They may create a container first and fill it afterwards,
+/// so the toolbox half is not required; the description is still derived from
+/// whatever parts the call carries, so the result is findable.
+pub(super) fn create_plugin_relaxed(root: &Path, body: &Value) -> Result<Value, String> {
+    create_plugin_impl(root, body, false)
+}
+
+fn create_plugin_impl(root: &Path, body: &Value, strict: bool) -> Result<Value, String> {
     let name = body["name"].as_str().unwrap_or("").trim().to_string();
     if name.is_empty() {
         return Err("plugin name is required".into());
@@ -112,6 +136,29 @@ pub fn create_plugin(root: &Path, body: &Value) -> Result<Value, String> {
         return Err(format!(
             "plugin \"{slug}\" already exists — edit it with action=update"
         ));
+    }
+    let mut body = body.clone();
+    if strict {
+        let description = body["description"].as_str().unwrap_or("").trim();
+        if description.is_empty() {
+            return Err(format!(
+                "plugin {slug:?} needs a top-level `description` — one short English line \
+                 saying WHEN the plugin applies. The agent discovers plugins by that line; \
+                 a bundle without one is invisible."
+            ));
+        }
+        if !has_toolbox(&body) {
+            return Err(format!(
+                "plugin {slug:?} carries nothing to use. Give it at least one of: `skills`, \
+                 `mcp` connectors, `scripts`, `commands`, `agents` or `hooks` — the plugin is \
+                 the toolbox the agent loads as one unit."
+            ));
+        }
+    } else {
+        lift_description(root, &slug, false, &mut body);
+        if body["description"].as_str().unwrap_or("").trim().is_empty() {
+            body["description"] = json!(derived_description(&body));
+        }
     }
     let now = now_secs();
     let mut manifest = json!({
@@ -126,14 +173,74 @@ pub fn create_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     if let Some(src) = body[SOURCE].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         manifest[SOURCE] = json!(src);
     }
-    copy_source_args(&mut manifest, body);
+    copy_source_args(&mut manifest, &body);
     write_manifest(root, &slug, &manifest)?;
-    apply_parts(root, &slug, body)?;
+    apply_parts(root, &slug, &body)?;
     Ok(plugin_view(root, &slug))
+}
+
+/// True when a create/update call actually carries a toolbox part.
+fn has_toolbox(body: &Value) -> bool {
+    body["skills"].as_array().is_some_and(|a| !a.is_empty())
+        || body["mcp"].as_object().is_some_and(|m| !m.is_empty())
+        || body["scripts"].as_array().is_some_and(|a| !a.is_empty())
+        || body[COMMANDS].as_array().is_some_and(|a| !a.is_empty())
+        || body[crate::subagents::AGENTS]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        || match &body["hooks"] {
+            Value::Object(m) => !m.is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            _ => false,
+        }
+}
+
+/// A findable line derived from the parts when the caller supplied none.
+pub(super) fn derived_description(body: &Value) -> String {
+    if let Some(first) = body["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|s| s["description"].as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        return first.to_string();
+    }
+    if let Some(names) = body["mcp"].as_object().map(|m| {
+        m.keys().cloned().collect::<Vec<_>>().join(", ")
+    }) {
+        if !names.is_empty() {
+            return format!("MCP connector(s): {names}");
+        }
+    }
+    for (key, label) in [
+        (COMMANDS, "Slash commands"),
+        ("scripts", "Runnable scripts"),
+        (crate::subagents::AGENTS, "Sub-agents"),
+    ] {
+        if let Some(names) = body[key].as_array().map(|a| {
+            a.iter()
+                .filter_map(|r| r["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }) {
+            if !names.is_empty() {
+                return format!("{label}: {names}");
+            }
+        }
+    }
+    if has_toolbox(body) {
+        return "Lifecycle hooks for this plugin".to_string();
+    }
+    String::new()
 }
 
 /// Patch an existing plugin: only the fields present in `body` change, so a
 /// call that adds one skill never wipes the description or the connectors.
+///
+/// An explicit EMPTY description is refused: clearing it would make the plugin
+/// unfindable, which is the one thing the plugin-unit model cannot tolerate.
 pub fn update_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     let slug = plugin_ref(body);
     let Some(mut manifest) = read_manifest(root, &slug) else {
@@ -141,11 +248,39 @@ pub fn update_plugin(root: &Path, body: &Value) -> Result<Value, String> {
             "plugin not found: {slug}. Create it first with action=create."
         ));
     };
+    if body.get("description").is_some()
+        && body["description"].as_str().unwrap_or("").trim().is_empty()
+    {
+        return Err(format!(
+            "plugin {slug:?} needs a non-empty `description` — the agent discovers plugins by \
+             that line. Send the new description instead of clearing it."
+        ));
+    }
     for key in ["name", "description", "version"] {
         if let Some(v) = body.get(key).and_then(Value::as_str) {
             if !v.trim().is_empty() {
                 manifest[key] = json!(v);
             }
+        }
+    }
+    // A legacy bundle with no description gets one from its own skills before
+    // the update lands, so an edit never leaves it invisible.
+    if manifest["description"].as_str().unwrap_or("").trim().is_empty() {
+        let mut probe = body.clone();
+        lift_description(root, &slug, true, &mut probe);
+        if probe["description"].as_str().unwrap_or("").trim().is_empty() {
+            probe["description"] = json!(derived_description(body));
+        }
+        if probe["description"].as_str().unwrap_or("").trim().is_empty() {
+            probe["description"] = json!(derived_description(&plugin_view(root, &slug)));
+        }
+        if !probe["description"].as_str().unwrap_or("").trim().is_empty() {
+            manifest["description"] = probe["description"].clone();
+        } else {
+            return Err(format!(
+                "plugin {slug:?} has no top-level `description`. Send one with this update — \
+                 the agent cannot discover a plugin without it."
+            ));
         }
     }
     if let Some(v) = body["enabled"].as_bool() {
@@ -319,7 +454,7 @@ pub(super) fn install_connectors_as_bundle(root: &Path, body: &Value) -> Result<
 /// Create or update a bundle from a NAME and the parts it carries.
 ///
 /// The single entry point every producer goes through — a boot migration, a
-/// built-in seed, the agent's `create_skill`/`create_mcp` — so exactly one place
+/// built-in seed, the agent's `plugin action=create/update` — so exactly one place
 /// decides a slug and writes a manifest. `parts` is the `plugin.json`-shaped
 /// content minus the address arguments (`skills`, `mcp`, `scripts`,
 /// `description`, `enabled`).
@@ -357,11 +492,15 @@ pub fn save_skill_into_bundle(
     bundle_slug: &str,
     skill: Value,
 ) -> Result<Value, String> {
-    install_bundle(
-        root,
-        bundle_name,
-        json!({ "slug": plugin_slug(bundle_name, bundle_slug), "skills": [skill] }),
-    )
+    let slug = plugin_slug(bundle_name, bundle_slug);
+    let mut parts = json!({ "slug": slug, "skills": [skill] });
+    // The library's own line is the only trigger for ~24 shipped skills. Write
+    // it WITH the first skill so a fresh install is discoverable on its FIRST
+    // boot, not only after the next boot's refresh.
+    if slug == builtin_bundle_slug() {
+        parts["description"] = json!(BUILTIN_BUNDLE_DESCRIPTION);
+    }
+    install_bundle(root, bundle_name, parts)
 }
 
 /// Fold the per-skill bundles an older seeder made into the single builtin one.
@@ -444,33 +583,31 @@ pub fn fold_builtin_skills_into_one(root: &Path) -> usize {
     count
 }
 
-/// Lift a library's first description up to its own manifest.
+/// Give the built-in library its canonical catalog line.
 ///
-/// The folders were MOVED, not re-written through the skill writer, so nothing
-/// filled the bundle-level description the card renders. The manifest is patched
-/// only when the lift has something to say: a bundle that already shows one keeps
-/// it.
+/// The built-in bundle is ONE container for every shipped skill, so its own
+/// description is the trigger the agent matches — the catalog names only the
+/// first few skills and hides the rest behind "+N more". This used to lift the
+/// FIRST skill's description, which advertised the whole library as whichever
+/// skill sorted first (in practice "UI/UX design intelligence") and hid the
+/// live-test harness, browser automation, writing and research skills. The line
+/// is a curated constant now; patch only when the stored text differs so boot
+/// stays idempotent.
 pub(crate) fn refresh_builtin_bundle_view(root: &Path) {
-    let Ok(kids) = fs::read_dir(plugin_dir(root, &builtin_bundle_slug()).join("skills")) else {
+    let slug = builtin_bundle_slug();
+    if !plugin_dir(root, &slug).join(MANIFEST).is_file() {
         return;
-    };
-    let mut description = String::new();
-    for kid in kids.flatten() {
-        let Ok(raw) = fs::read_to_string(kid.path().join("skill.md")) else {
-            continue;
-        };
-        let (_, _, desc) = crate::skills::parse_frontmatter_pub(&raw);
-        if description.is_empty() && !desc.trim().is_empty() {
-            description = desc.trim().to_string();
-        }
     }
-    if description.is_empty() {
+    let current = read_manifest(root, &slug)
+        .and_then(|m| m["description"].as_str().map(|d| d.trim().to_string()))
+        .unwrap_or_default();
+    if current == BUILTIN_BUNDLE_DESCRIPTION {
         return;
     }
     let patch = json!({
-        "slug": builtin_bundle_slug(),
+        "slug": slug,
         "name": BUILTIN_BUNDLE_NAME,
-        "description": description,
+        "description": BUILTIN_BUNDLE_DESCRIPTION,
     });
     let _ = update_plugin(root, &patch);
 }
@@ -523,10 +660,13 @@ pub(super) fn write_bundle_payload(root: &Path, payload: &Value) -> Result<Value
     let existed = plugin_dir(root, &slug).join(MANIFEST).is_file();
     let mut payload = payload.clone();
     lift_description(root, &slug, existed, &mut payload);
+    if payload["description"].as_str().unwrap_or("").trim().is_empty() {
+        payload["description"] = json!(derived_description(&payload));
+    }
     let view = if existed {
         update_plugin(root, &payload)?
     } else {
-        create_plugin(root, &payload)?
+        create_plugin_relaxed(root, &payload)?
     };
     Ok(json!({
         "installed": if existed { "updated" } else { "created" },

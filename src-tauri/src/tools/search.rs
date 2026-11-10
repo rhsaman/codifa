@@ -297,8 +297,8 @@ pub fn grep_scope_in(
         // A literal miss is often a SPELLING mismatch, not a wrong idea: the
         // model greps `script.json` and the code says `script_json`. Trace,
         // Oct 30: that exact refinement cost a second round-trip — the model
-        // re-grepped with `script\.json|fa_keywords`, then again with
-        // `script\.json|script_json|ScriptJson`. Run the convention variants
+        // re-grepped with a two-name alternation, then again with all three
+        // spellings. Run the convention variants
         // ONCE here, in the same call, and label them so the model knows the
         // literal itself has no hit. Fires only on a single identifier-ish
         // token (no regex metachars, no `|`), never replaces a real hit.

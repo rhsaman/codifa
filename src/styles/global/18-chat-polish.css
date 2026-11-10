@@ -61,6 +61,131 @@
   border-color: color-mix(in srgb, var(--text) 30%, var(--border));
 }
 
+/* ── Composer, Claude-app style ── */
+.composer-inner {
+  border-color: color-mix(in srgb, var(--text) 10%, transparent);
+  border-radius: 22px;
+  box-shadow: 0 2px 14px -6px rgba(0, 0, 0, 0.35);
+}
+.composer-input::placeholder {
+  color: color-mix(in srgb, var(--text-dim) 75%, transparent);
+}
+.composer-inner .icon-btn.plus-btn {
+  border: 0;
+  background: transparent;
+  border-radius: 10px;
+  color: var(--text-dim);
+}
+.composer-inner .icon-btn.plus-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* footer status strip: sans-serif, no dividers, no glow */
+.composer-footer .composer-footer-right {
+  font-family: inherit;
+}
+.composer-footer .composer-footer-right > * + * {
+  border-left: 0;
+  margin-left: 0;
+  padding-left: 0;
+}
+.composer-footer .mode-select.icon-only .mode-btn,
+.composer-footer .thinking-pill-btn,
+.composer-footer .pm-select-btn {
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 9px;
+}
+.composer-footer .mode-select.icon-only .mode-btn:hover,
+.composer-footer .thinking-pill-btn:hover,
+.composer-footer .pm-select-btn:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+.composer-footer .mode-btn-label {
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.composer-footer .mode-btn-dot {
+  width: 6px;
+  height: 6px;
+  box-shadow: none;
+}
+
+/* ── Sub-agent (explore) card ── */
+.tool-card.explore {
+  border-radius: 14px;
+  border-color: color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.tool-card.explore.running {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.tool-card.explore.done {
+  border-color: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.tool-card.explore .explore-card-open {
+  padding: 11px 14px;
+  gap: 10px;
+}
+.tool-card.explore .explore-card-open:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.tool-card.explore .trace-pill.trace-pill-sub {
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  color: var(--text);
+}
+.tool-card.explore .trace-pill.trace-pill-sub.running {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.tool-card.explore .trace-head-desc {
+  font-size: 13px;
+  opacity: 1;
+}
+.tool-card.explore .explore-card-count {
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 0;
+  background: none;
+  opacity: 0.8;
+}
+.tool-card.explore .trace-time,
+.tool-card.explore .explore-card-arrow {
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+.tool-card.explore .explore-card-status .status-ok {
+  color: var(--success);
+}
+.tool-card.explore .explore-tool-chips {
+  padding: 0 14px 12px;
+  gap: 6px;
+}
+.tool-card.explore .explore-tool-chip {
+  border: 0;
+  padding: 2px 9px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text-dim);
+}
+.tool-card.explore .explore-tool-chip:hover {
+  background: color-mix(in srgb, var(--text) 13%, transparent);
+  color: var(--text);
+}
+.tool-card.explore .explore-tool-n {
+  font-family: inherit;
+}
+.tool-card.explore .explore-narration {
+  margin: 0 14px 10px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .trace-head,
   .trace-row-head,

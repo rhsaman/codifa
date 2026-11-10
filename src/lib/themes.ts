@@ -16,16 +16,16 @@ export const THEMES: Theme[] = [
     name: 'Ember',
     blurb: 'claude.ai dark',
     vars: {
-      '--bg': '#1a1816',
-      '--bg-alt': '#1a1816',
-      '--bg-panel': '#1f1c18',
-      '--bg-input': '#2d2820',
-      '--bg-hover': '#2a2620',
-      '--border': '#2b2621',
-      '--text': '#d2cfca',
-      '--text-dim': '#b0aea5',
+      '--bg': '#181818',
+      '--bg-alt': '#181818',
+      '--bg-panel': '#252525',
+      '--bg-input': '#2a2a2a',
+      '--bg-hover': '#303030',
+      '--border': '#343434',
+      '--text': '#ececec',
+      '--text-dim': '#a1a1a1',
       '--accent': '#d97757',
-      '--accent-dim': '#2d2820',
+      '--accent-dim': '#2e2e2e',
       '--on-accent': '#141413',
       '--danger': '#f85149',
       '--success': '#3fb950',
@@ -296,21 +296,21 @@ export const THEMES: Theme[] = [
       '--accent': '#bd93f9',
       '--accent-dim': '#44475a',
       '--on-accent': '#282a36',
-      '--danger': '#ff5555',
-      '--success': '#50fa7b',
+      '--danger': '#ee6b6b',
+      '--success': '#62d98a',
       '--link': '#8be9fd',
-      '--thinking': '#f1fa8c',
-      '--provider-openrouter': '#f1fa8c',
-      '--provider-google': '#50fa7b',
+      '--thinking': '#e3e68f',
+      '--provider-openrouter': '#e3e68f',
+      '--provider-google': '#62d98a',
       '--provider-nvidia': '#8be9fd',
       '--provider-cloudflare': '#bd93f9',
       '--provider-ollama': '#ffb86c',
       '--provider-custom': '#f8f8f2',
     },
     workspaceColors: [
-      '#ff5555', // red
-      '#f1fa8c', // yellow
-      '#50fa7b', // green
+      '#ee6b6b', // red
+      '#e3e68f', // yellow
+      '#62d98a', // green
       '#8be9fd', // cyan
       '#bd93f9', // purple
       '#ff79c6', // pink
@@ -448,21 +448,21 @@ export const THEMES: Theme[] = [
       '--accent': '#66d9ef',
       '--accent-dim': '#49483e',
       '--on-accent': '#272822',
-      '--danger': '#f92672',
-      '--success': '#a6e22e',
+      '--danger': '#ec4a85',
+      '--success': '#97cc3f',
       '--link': '#66d9ef',
-      '--thinking': '#e6db74',
-      '--provider-openrouter': '#e6db74',
-      '--provider-google': '#a6e22e',
+      '--thinking': '#d8cf80',
+      '--provider-openrouter': '#d8cf80',
+      '--provider-google': '#97cc3f',
       '--provider-nvidia': '#66d9ef',
       '--provider-cloudflare': '#ae81ff',
       '--provider-ollama': '#f8f8f2',
       '--provider-custom': '#75715e',
     },
     workspaceColors: [
-      '#f92672', // red
-      '#e6db74', // yellow
-      '#a6e22e', // green
+      '#ec4a85', // red
+      '#d8cf80', // yellow
+      '#97cc3f', // green
       '#66d9ef', // cyan
       '#ae81ff', // purple
       '#fd971f', // orange
@@ -551,18 +551,18 @@ export const THEMES: Theme[] = [
     name: 'Onyx',
     blurb: 'OpenAI Codex app — near-black, neutral, white primary',
     vars: {
-      '--bg': '#0d0d0d',
-      '--bg-alt': '#0d0d0d',
-      '--bg-panel': '#1a1a1a',
-      '--bg-input': '#202020',
-      '--bg-hover': '#262626',
-      '--border': '#2e2e2e',
-      '--text': '#c7c7c7',
+      '--bg': '#121212',
+      '--bg-alt': '#121212',
+      '--bg-panel': '#1b1b1b',
+      '--bg-input': '#222222',
+      '--bg-hover': '#292929',
+      '--border': '#313131',
+      '--text': '#c4c4c4',
       '--text-dim': '#9b9b9b',
-      '--accent': '#ffffff',
-      '--accent-dim': '#333333',
-      '--on-accent': '#0d0d0d',
-      '--danger': '#ff6b6b',
+      '--accent': '#e2e2e2',
+      '--accent-dim': '#363636',
+      '--on-accent': '#121212',
+      '--danger': '#f27a7a',
       '--success': '#3fb27f',
       '--link': '#7fb0ff',
       '--thinking': '#c9c9c9',
@@ -574,7 +574,7 @@ export const THEMES: Theme[] = [
       '--provider-custom': '#a8a8a8',
     },
     workspaceColors: [
-      '#ededed', // white
+      '#e2e2e2', // white
       '#9b9b9b', // gray
       '#ff6b6b', // red
       '#e0b48a', // orange
@@ -582,6 +582,197 @@ export const THEMES: Theme[] = [
       '#3fb27f', // green
       '#7fb0ff', // blue
       '#c9b8e8', // lilac
+    ],
+  },
+  {
+    id: 'github-dimmed',
+    name: 'GitHub Dimmed',
+    blurb: 'github dark dimmed — soft slate, low glare',
+    vars: {
+      '--bg': '#22272e',
+      '--bg-alt': '#22272e',
+      '--bg-panel': '#2d333b',
+      '--bg-input': '#373e47',
+      '--bg-hover': '#3d444e',
+      '--border': '#444c56',
+      '--text': '#adbac7',
+      '--text-dim': '#909dab',
+      '--accent': '#539bf5',
+      '--accent-dim': '#373e47',
+      '--on-accent': '#1c2128',
+      '--danger': '#e5534b',
+      '--success': '#57ab5a',
+      '--link': '#6cb6ff',
+      '--thinking': '#c69026',
+      '--provider-openrouter': '#c69026',
+      '--provider-google': '#57ab5a',
+      '--provider-nvidia': '#4cc2b3',
+      '--provider-cloudflare': '#539bf5',
+      '--provider-ollama': '#e0823d',
+      '--provider-custom': '#adbac7',
+    },
+    workspaceColors: [
+      '#e5534b', // red
+      '#c69026', // yellow
+      '#57ab5a', // green
+      '#4cc2b3', // teal
+      '#539bf5', // blue
+      '#b083f0', // purple
+      '#e0823d', // orange
+      '#adbac7', // light
+    ],
+  },
+  {
+    id: 'solarized-dark',
+    name: 'Solarized Dark',
+    blurb: 'solarized dark — teal-tinted, designed for low eye strain',
+    vars: {
+      '--bg': '#002b36',
+      '--bg-alt': '#002b36',
+      '--bg-panel': '#073642',
+      '--bg-input': '#0b3f4c',
+      '--bg-hover': '#0f4a58',
+      '--border': '#1c5160',
+      '--text': '#93a1a1',
+      '--text-dim': '#839496',
+      '--accent': '#268bd2',
+      '--accent-dim': '#0f4a58',
+      '--on-accent': '#fdf6e3',
+      '--danger': '#dc322f',
+      '--success': '#859900',
+      '--link': '#2aa198',
+      '--thinking': '#b58900',
+      '--provider-openrouter': '#b58900',
+      '--provider-google': '#859900',
+      '--provider-nvidia': '#2aa198',
+      '--provider-cloudflare': '#268bd2',
+      '--provider-ollama': '#cb4b16',
+      '--provider-custom': '#93a1a1',
+    },
+    workspaceColors: [
+      '#dc322f', // red
+      '#b58900', // yellow
+      '#859900', // green
+      '#2aa198', // cyan
+      '#268bd2', // blue
+      '#6c71c4', // violet
+      '#cb4b16', // orange
+      '#93a1a1', // light
+    ],
+  },
+  {
+    id: 'ayu-mirage',
+    name: 'Ayu Mirage',
+    blurb: 'ayu mirage — muted blue-grey with warm accent',
+    vars: {
+      '--bg': '#1f2430',
+      '--bg-alt': '#1f2430',
+      '--bg-panel': '#252b38',
+      '--bg-input': '#2d3342',
+      '--bg-hover': '#33415e',
+      '--border': '#3a4258',
+      '--text': '#cccac2',
+      '--text-dim': '#a0a3ad',
+      '--accent': '#ffcc66',
+      '--accent-dim': '#33415e',
+      '--on-accent': '#1f2430',
+      '--danger': '#f28779',
+      '--success': '#87d96c',
+      '--link': '#73d0ff',
+      '--thinking': '#ffad66',
+      '--provider-openrouter': '#ffad66',
+      '--provider-google': '#87d96c',
+      '--provider-nvidia': '#95e6cb',
+      '--provider-cloudflare': '#73d0ff',
+      '--provider-ollama': '#f29e74',
+      '--provider-custom': '#cccac2',
+    },
+    workspaceColors: [
+      '#f28779', // red
+      '#ffcc66', // yellow
+      '#87d96c', // green
+      '#95e6cb', // teal
+      '#73d0ff', // blue
+      '#dfbfff', // purple
+      '#ffad66', // orange
+      '#cccac2', // light
+    ],
+  },
+  {
+    id: 'palenight',
+    name: 'Palenight',
+    blurb: 'material palenight — soft violet-grey',
+    vars: {
+      '--bg': '#292d3e',
+      '--bg-alt': '#292d3e',
+      '--bg-panel': '#32364a',
+      '--bg-input': '#3a3f58',
+      '--bg-hover': '#444a66',
+      '--border': '#464c69',
+      '--text': '#a6accd',
+      '--text-dim': '#8f95b8',
+      '--accent': '#82aaff',
+      '--accent-dim': '#444a66',
+      '--on-accent': '#1e2132',
+      '--danger': '#f07178',
+      '--success': '#b6d98a',
+      '--link': '#89ddff',
+      '--thinking': '#ffcb6b',
+      '--provider-openrouter': '#ffcb6b',
+      '--provider-google': '#b6d98a',
+      '--provider-nvidia': '#7fd1c0',
+      '--provider-cloudflare': '#82aaff',
+      '--provider-ollama': '#f78c6c',
+      '--provider-custom': '#a6accd',
+    },
+    workspaceColors: [
+      '#f07178', // red
+      '#ffcb6b', // yellow
+      '#b6d98a', // green
+      '#7fd1c0', // teal
+      '#82aaff', // blue
+      '#c792ea', // purple
+      '#f78c6c', // orange
+      '#a6accd', // light
+    ],
+  },
+  {
+    id: 'solarized-light',
+    name: 'Solarized Light',
+    blurb: 'solarized light (light) — warm paper, no white glare',
+    vars: {
+      '--bg': '#fdf6e3',
+      '--bg-alt': '#fdf6e3',
+      '--bg-panel': '#eee8d5',
+      '--bg-input': '#e6dfc8',
+      '--bg-hover': '#ddd6c0',
+      '--border': '#d3ccb4',
+      '--text': '#3f535a',
+      '--text-dim': '#586e75',
+      '--accent': '#1f78b8',
+      '--accent-dim': '#ddd6c0',
+      '--on-accent': '#fdf6e3',
+      '--danger': '#c42b28',
+      '--success': '#5f7a00',
+      '--diff-text': '#3a4a50',
+      '--link': '#1a6f8a',
+      '--thinking': '#8a6500',
+      '--provider-openrouter': '#cb4b16',
+      '--provider-google': '#b58900',
+      '--provider-nvidia': '#1f8a82',
+      '--provider-cloudflare': '#1f78b8',
+      '--provider-ollama': '#d33682',
+      '--provider-custom': '#586e75',
+    },
+    workspaceColors: [
+      '#c42b28', // red
+      '#cb4b16', // orange
+      '#b58900', // yellow
+      '#5f7a00', // green
+      '#1f8a82', // cyan
+      '#1f78b8', // blue
+      '#6c71c4', // violet
+      '#d33682', // magenta
     ],
   },
 ]

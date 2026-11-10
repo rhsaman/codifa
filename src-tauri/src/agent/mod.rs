@@ -58,6 +58,10 @@ use shell_safety::*;
 use steer::*;
 use subagent::*;
 use trust::*;
+// The `batch` executor resolves each op's name through this same table, so a
+// foreign name (`run_command`, `shell`, `read_file`) means its Codifa tool
+// INSIDE a batch exactly as it does at the top level.
+pub(crate) use trust::canonical_tool_name;
 use types::*;
 use vision::*;
 

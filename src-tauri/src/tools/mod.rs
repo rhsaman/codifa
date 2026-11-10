@@ -122,6 +122,9 @@ use write::*;
 pub use diff::unified_diff;
 #[allow(unused_imports)] // original tools API surface, preserved verbatim
 pub use dispatch::{dispatch, dispatch_with_data_root, dispatch_bounded, dispatch_bounded_with};
+/// The batch whitelist, shared with the agent's batching levers so a round is
+/// judged against the SAME set the executor accepts (one list, no drift).
+pub(crate) use dispatch::BATCH_TOOLS;
 pub use outline::{find_symbol, find_symbol_in};
 #[allow(unused_imports)] // original tools API surface, preserved verbatim
 pub use paths::{absolute_target, resolve_safe, is_inside_root, PathAccess, path_access, lookup_paths, writer_gate_paths};

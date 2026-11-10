@@ -578,7 +578,7 @@ user what to do instead.",
 /// times, burning the whole tool budget. The alias resolves ONLY when the
 /// canonical name is really advertised, so the model is never handed a tool
 /// that does not exist in this run.
-pub(super) fn canonical_tool_name(name: &str, advertised: &[String]) -> Option<String> {
+pub(crate) fn canonical_tool_name(name: &str, advertised: &[String]) -> Option<String> {
     let norm = |s: &str| s.trim().to_lowercase().replace(['-', ' '], "_");
     let n = norm(name);
     // 1) Case / dash / underscore-insensitive match on a real advertised name.

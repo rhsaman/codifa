@@ -3395,6 +3395,55 @@
     /// every `run_terminal` round — 39 full round-trips, each re-sending the whole
     /// conversation, with nothing said. What makes a shell round a chain is
     /// MUTATION, not the shell.
+    /// Traced (`mwab8nku`): 125 of 125 tool rows were a single `batch` call, and
+    /// BOTH batching levers returned early on it because `batch` is in neither
+    /// whitelist — the hint fired 0 times in 129 rounds. The wrapper must be
+    /// judged by the ops it carries.
+    #[test]
+    fn a_one_op_batch_counts_as_the_lone_call_it_is() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let batch_of = |ops: Value| {
+            vec![(
+                "c1".to_string(),
+                "batch".to_string(),
+                json!({ "ops": ops }).to_string(),
+            )]
+        };
+        // ONE op is the shape the levers exist for: a whole round-trip on a
+        // single lookup.
+        let lone = batch_of(json!([{ "tool": "grep", "args": { "pattern": "x" } }]));
+        assert!(
+            single_call_is_serial("agent", &lone, root),
+            "a one-op batch is a lone call and must grow the streak"
+        );
+        assert!(
+            single_call_hint("agent", &lone, 1, root).is_some(),
+            "a one-op batch must receive the batching hint"
+        );
+        // A one-op MUTATING batch is still the serial shape that counts.
+        let edit = batch_of(json!([{ "tool": "edit_file", "args": {} }]));
+        assert!(single_call_is_serial("agent", &edit, root));
+        // Several ops IS the behaviour the hint asks for — stay silent.
+        let many = batch_of(json!([
+            { "tool": "grep", "args": { "pattern": "x" } },
+            { "tool": "read", "args": { "filePath": "a.txt" } },
+            { "tool": "edit_file", "args": {} }
+        ]));
+        assert!(!single_call_is_serial("agent", &many, root));
+        assert!(single_call_hint("agent", &many, 3, root).is_none());
+        // An EMPTY batch carries no work at all: the executor already answers it
+        // with an error, so the hint must not also claim a call happened.
+        let empty = batch_of(json!([]));
+        assert!(!single_call_is_serial("agent", &empty, root));
+        // A batch op named with a foreign alias is judged as its Codifa tool,
+        // exactly like the executor resolves it.
+        let aliased = batch_of(json!([{ "tool": "run_command", "args": { "command": "git log -3" } }]));
+        assert!(
+            single_call_is_serial("agent", &aliased, root),
+            "`run_command` is `run_terminal` — a read-only command shares the batch"
+        );
+    }
+
     #[test]
     fn a_lone_read_only_shell_round_is_told_it_runs_concurrently() {
         let root = env!("CARGO_MANIFEST_DIR");

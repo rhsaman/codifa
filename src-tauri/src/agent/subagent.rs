@@ -890,12 +890,50 @@ pub(super) fn shell_read_is_batchable(raw_args: &str, root: &str) -> bool {
     !cmd.trim().is_empty() && is_shell_read_only(cmd, root)
 }
 
+/// Expand a lone `batch` call into the ops it actually carries.
+///
+/// `batch` is the tool the model actually prefers — traced (`mwab8nku`): 125 of
+/// 125 tool rows were `batch`, averaging 2.4 ops. Both levers keyed on the CALL
+/// name and `batch` is in neither whitelist, so `single_call_hint` and
+/// `single_call_is_serial` returned early on EVERY one of those rounds: the
+/// lever fired 0 times in 129 rounds while 121 of them were "lone" by call
+/// count. Looking THROUGH the wrapper is the fix, and it is the honest measure:
+/// a batch carrying ONE op really is a lone call, while a batch carrying several
+/// is already the batching the hint would have asked for.
+///
+/// Op names are resolved through the same alias table the executor uses, so a
+/// `run_command` op is judged as `run_terminal` (see `canonical_tool_name`).
+fn expand_batch(calls: &[(String, String, String)]) -> Option<Vec<(String, String, String)>> {
+    if calls.len() != 1 || calls[0].1 != "batch" {
+        return None;
+    }
+    let args: Value = serde_json::from_str(&calls[0].2).ok()?;
+    let ops = args["ops"].as_array()?;
+    let advertised: Vec<String> = crate::tools::BATCH_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    Some(
+        ops.iter()
+            .map(|op| {
+                let raw = op["tool"].as_str().unwrap_or_default().trim();
+                let name = canonical_tool_name(raw, &advertised)
+                    .unwrap_or_else(|| raw.to_string());
+                (String::new(), name, op["args"].to_string())
+            })
+            .collect(),
+    )
+}
+
 pub(super) fn single_call_hint(
     mode: &str,
     calls: &[(String, String, String)],
     lone_rounds: usize,
     root: &str,
 ) -> Option<Cow<'static, str>> {
+    // Measure a lone `batch` by the ops it carries, not by the wrapper.
+    let expanded = expand_batch(calls);
+    let calls = expanded.as_deref().unwrap_or(calls);
     if calls.len() != 1 {
         return None;
     }
@@ -1026,7 +1064,13 @@ pub(super) fn single_call_hint(
 /// is nothing to batch, so counting it would grow the streak while the hint
 /// stays silent and the field would report waste that was never addressable.
 pub(super) fn single_call_is_serial(mode: &str, calls: &[(String, String, String)], root: &str) -> bool {
-    if mode == "subagent" || calls.len() != 1 {
+    if mode == "subagent" {
+        return false;
+    }
+    // Same look-through as `single_call_hint`: a one-op `batch` is a lone call.
+    let expanded = expand_batch(calls);
+    let calls = expanded.as_deref().unwrap_or(calls);
+    if calls.len() != 1 {
         return false;
     }
     // A shell round is a CHAIN only when it MUTATES. A read-only command shares

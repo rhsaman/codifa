@@ -103,6 +103,30 @@
     }
 
     #[test]
+    fn batch_resolves_a_foreign_tool_name_instead_of_refusing_the_round() {
+        // A top-level call is alias-resolved at the turn's call boundary, but an
+        // op inside a batch skipped that step — so the model's habitual
+        // `{"tool":"run_command"}` was refused here while the SAME name worked
+        // one level up. Traced (`mwab8nku`): 14 such ops across 4 rounds, each
+        // refused round costing a full retry.
+        let root = std::env::temp_dir().join(format!("codifa-batch-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.to_str().unwrap();
+        let args = json!({
+            "ops": [
+                {"tool": "run_command", "args": {"command": "echo hello-alias"}},
+                {"tool": "shell", "args": {"command": "echo second-alias"}}
+            ]
+        });
+        let out = dispatch_bounded(base, "batch", &args, None, None).unwrap();
+        assert!(!out.contains("is not a batch tool"), "both names must resolve: {out}");
+        assert!(out.contains("hello-alias"), "the resolved command really ran: {out}");
+        assert!(out.contains("second-alias"), "and so did the second one: {out}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn batch_refuses_nested_unknown_and_over_cap_ops_without_dying() {
         let root = std::env::temp_dir().join(format!("codifa-batch-guard-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -123,8 +147,7 @@
         .unwrap();
         assert!(out.contains("ERROR:"), "the failed read is inline: {out}");
         assert!(out.contains("nested batch is not allowed"), "{out}");
-        assert!(out.contains("is not a batch tool"), "{out}");
-        // Over the op cap: a plain error naming the cap.
+        assert!(out.contains("is not a batch tool"), "{out}");        // Over the op cap: a plain error naming the cap.
         let mut ops = Vec::new();
         for _ in 0..11 {
             ops.push(json!({"tool": "current_time", "args": {}}));

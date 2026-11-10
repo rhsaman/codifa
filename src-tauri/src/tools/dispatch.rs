@@ -976,7 +976,16 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             }
             let mut out = String::new();
             for (i, op) in ops.iter().enumerate() {
-                let tool = op["tool"].as_str().unwrap_or_default().trim().to_string();
+                let raw_tool = op["tool"].as_str().unwrap_or_default().trim().to_string();
+                // A top-level call is alias-resolved before dispatch (see
+                // `canonical_tool_name` at the turn's call boundary), but an
+                // op inside a batch skipped that step — so the model's habitual
+                // `{"tool": "run_command"}` was refused here while the SAME
+                // name worked one level up. Traced (`mwab8nku`): 14 ops across 4
+                // rounds came back "run_command is not a batch tool", and each
+                // refused round cost a full retry. Resolving through the same
+                // table removes the whole class.
+                let tool = batch_tool_name(&raw_tool).unwrap_or_else(|| raw_tool.clone());
                 let label = format!("[{}/{}] {}", i + 1, ops.len(), tool);
                 if let Some(reason) = op["refused"].as_str() {
                     out.push_str(&format!("\n=== {label} → REFUSED ===\n{reason}\n"));
@@ -1047,7 +1056,7 @@ pub(super) fn plugin_detached_path_warning(store: &Path, view: &Value) -> String
 /// same reason (one shared page / a wire round-trip per call). The DELEGATION
 /// tools stay out: their results are turn-shaping decisions the model should
 /// make on its own round.
-pub(super) const BATCH_TOOLS: &[&str] = &[
+pub(crate) const BATCH_TOOLS: &[&str] = &[
     "read",
     "grep",
     "update_plan",
@@ -1069,6 +1078,16 @@ pub(super) const BATCH_TOOLS: &[&str] = &[
 /// a single result from growing unbounded (each sub-result keeps its own
 /// tool's normal cap).
 pub(super) const BATCH_MAX_OPS: usize = 10;
+
+/// Resolve an op's tool name through the SAME alias table a top-level call
+/// uses, narrowed to what a batch can actually run.
+///
+/// Returns `None` for a name with no Codifa equivalent, which falls through to
+/// the existing "not a batch tool" refusal naming the allowed set.
+fn batch_tool_name(name: &str) -> Option<String> {
+    let advertised: Vec<String> = BATCH_TOOLS.iter().map(|s| (*s).to_string()).collect();
+    crate::agent::canonical_tool_name(name, &advertised)
+}
 
 /// Activity Monitor for the agent: per-process RSS/CPU via `ps` (read-only,
 /// available in every mode so the agent can diagnose memory/CPU issues).

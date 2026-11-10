@@ -126,6 +126,55 @@
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A stringified `ops` array is a REAL batch, not a malformed one.
+    ///
+    /// Several providers double-encode nested JSON: the model means an array but
+    /// the wire carries it as a string. Traced (`mwam7hcn`, `mwanphb7`): 11 such
+    /// calls were refused with "batch needs ops" while the ops inside were valid,
+    /// and every refusal burned the whole round (~26K prompt tokens) on a retry.
+    #[test]
+    fn batch_accepts_a_stringified_ops_array_instead_of_burning_the_round() {
+        let root = std::env::temp_dir().join(format!("codifa-batch-strops-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.to_str().unwrap();
+        let inner = json!([
+            {"tool": "run_terminal", "args": {"command": "echo from-string-ops"}},
+            {"tool": "read", "args": {"filePath": "missing-string-ops.txt"}}
+        ])
+        .to_string();
+        let out = dispatch_bounded(base, "batch", &json!({"ops": inner}), None, None).unwrap();
+        assert!(!out.contains("ops must be"), "the string form is parsed, not refused: {out}");
+        assert!(out.contains("from-string-ops"), "the op really ran: {out}");
+        assert!(out.contains("[1/2]") && out.contains("[2/2]"), "both ops kept: {out}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The tolerant reader is shared with the caps gate, so a shape the gate
+    /// could not see is exactly the shape that used to bypass mode caps.
+    #[test]
+    fn batch_ops_reads_every_shape_the_model_emits() {
+        // Array form.
+        let a = batch_ops(&json!({"ops": [{"tool": "read", "args": {}}]})).unwrap();
+        assert_eq!(a.len(), 1);
+        // Stringified array.
+        let s = batch_ops(&json!({"ops": "[{\"tool\":\"read\",\"args\":{}}]"})).unwrap();
+        assert_eq!(s.len(), 1);
+        // Fenced stringified array (a model that thinks in prose).
+        let f = batch_ops(&json!({"ops": "```json\n[{\"tool\":\"read\",\"args\":{}}]\n```"}))
+            .unwrap();
+        assert_eq!(f.len(), 1);
+        // An op that is itself a stringified object.
+        let o = batch_ops(&json!({"ops": ["{\"tool\":\"read\",\"args\":{}}"]})).unwrap();
+        assert_eq!(o[0]["tool"].as_str(), Some("read"));
+        // Everything unusable collapses into ONE actionable message.
+        for bad in [json!({}), json!({"ops": []}), json!({"ops": "not json"}), json!({"ops": [1, 2]})] {
+            let err = batch_ops(&bad).unwrap_err();
+            assert!(err.contains("ops"), "{err}");
+            assert!(err.contains("non-empty") || err.contains("NON-empty"), "actionable: {err}");
+        }
+    }
+
     #[test]
     fn batch_refuses_nested_unknown_and_over_cap_ops_without_dying() {
         let root = std::env::temp_dir().join(format!("codifa-batch-guard-{}", std::process::id()));

@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::llm::{http_client, stream_chat, InterruptSignal, LlmConfig, StreamAcc, StreamSignal};
+use crate::llm::{http_client, stream_chat, LlmConfig, StreamAcc, StreamSignal};
 use crate::tools;
 
 /// Test-only view of the turn registry, so the browser reaper's policy can be

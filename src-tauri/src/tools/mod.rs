@@ -125,6 +125,10 @@ pub use dispatch::{dispatch, dispatch_with_data_root, dispatch_bounded, dispatch
 /// The batch whitelist, shared with the agent's batching levers so a round is
 /// judged against the SAME set the executor accepts (one list, no drift).
 pub(crate) use dispatch::BATCH_TOOLS;
+/// The ONE `ops` reader, shared by the executor and the turn's caps gate.
+pub(crate) use dispatch::batch_ops;
+/// The op-side alias resolution, so a gate and the executor agree on the name.
+pub(crate) use dispatch::batch_tool_name;
 pub use outline::{find_symbol, find_symbol_in};
 #[allow(unused_imports)] // original tools API surface, preserved verbatim
 pub use paths::{absolute_target, resolve_safe, is_inside_root, PathAccess, path_access, lookup_paths, writer_gate_paths};

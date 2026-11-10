@@ -4,6 +4,7 @@ import { injectThemeStyles } from './lib/themes'
 import { installTauriBridge, recordDroppedPaths } from './lib/tauriBridge'
 import { installWebBridge } from './lib/webBridge'
 import { installInputSuppression } from './lib/inputSuppress'
+import { installPaneAnimationGuard } from './lib/paneAnimation'
 import { installOverlayScrollbars } from './lib/useDiffScrollbars'
 import './styles/global.css'
 import './styles/right-panel.css'
@@ -19,6 +20,12 @@ installOverlayScrollbars()
 // spell-check from rewriting what is typed into the app (Settings → General →
 // Keyboard suggestions drives the actual on/off sweep).
 installInputSuppression()
+
+// Open/close of the sidebar and the right pane animates WIDTH, which reflows
+// every mounted chat window per frame; the guard freezes the heavy bodies'
+// width for the slide so the text re-wraps once instead of sixty times a
+// second (full rationale in lib/paneAnimation.ts).
+installPaneAnimationGuard()
 
 // macOS frameless window: the traffic lights overlay the sidebar, so CSS
 // needs a platform hook to reserve their drag strip (`.mac` selectors).

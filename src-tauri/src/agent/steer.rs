@@ -64,35 +64,6 @@ pub(super) fn steer_inbox() -> &'static std::sync::Mutex<std::collections::HashM
     INBOX.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Per-chat "a steer just landed" flags.
-///
-/// The inbox alone is not enough: it is only read BETWEEN model calls, so a
-/// steer typed while a request was already streaming had to wait for that whole
-/// request to finish — exactly the "steer behaves like a queue message" report.
-/// `push_steer` raises this flag and the live stream polls it, so an in-flight
-/// request is dropped at once and re-issued with the steer appended.
-pub(super) fn steer_flags(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<InterruptSignal>>>
-{
-    static FLAGS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<InterruptSignal>>>,
-    > = std::sync::OnceLock::new();
-    FLAGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Ids of the steers currently waiting for this chat (non-destructive peek).
-/// Used to tell the renderer WHICH bubbles the interrupt concerns; the actual
-/// delivery stays with `deliver_steers`, which drains the inbox at the top of
-/// the next step.
-pub(super) fn pending_steer_ids(chat_id: &str) -> Vec<String> {
-    steer_inbox()
-        .lock()
-        .unwrap()
-        .get(chat_id)
-        .map(|v| v.iter().map(|s| s.id.clone()).collect())
-        .unwrap_or_default()
-}
-
 /// Monotonic id for a user-answer gate (`ask_user` / `confirm_action`).
 pub(super) fn next_gate_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -191,6 +162,13 @@ pub(super) async fn await_answer(
 /// Returns false when no turn is running — the caller should tell the renderer
 /// so it re-sends the message as a normal next turn.
 ///
+/// DELIVERY POLICY: a steer NEVER cuts in-flight work. It is queued here and
+/// delivered at the NEXT step boundary (top of the loop in `run_turn`, or right
+/// after the model's final answer) — the current model call and the tool batch
+/// it produced always run to completion first. Interrupting the stream or
+/// skipping the batch's remaining calls used to leave the agent's work
+/// half-done; the Stop button remains the path for aborting NOW.
+///
 /// `images` arrives as the renderer's loose entries (path string or
 /// `{path, dataUrl}`) and is resolved HERE so the inline copy wins and a temp
 /// file that disappears before the next step cannot lose the picture.
@@ -225,11 +203,6 @@ pub fn push_steer(
         .entry(chat_id.to_string())
         .or_default()
         .push(steer);
-    // Wake the in-flight stream: it drops the current request and re-issues it
-    // with this steer appended, instead of letting the model finish first.
-    if let Some(signal) = steer_flags().lock().unwrap().get(chat_id) {
-        signal.raise();
-    }
     true
 }
 
@@ -347,37 +320,24 @@ pub(super) fn drop_steers(chat_id: &str, emit: &mut (dyn FnMut(&AgentEvent) + Se
 }
 
 /// RAII marker for a running turn: registers the chat for `/chat/steer` and
-/// guarantees the inbox + flag are cleared however `run_turn` exits (normal
-/// return, early `return Ok(())`, or a panic unwinding the task).
+/// guarantees the inbox is cleared however `run_turn` exits (normal return,
+/// early `return Ok(())`, or a panic unwinding the task).
+///
+/// The inbox wipe on Drop is the LAST-resort cleanup: every exit path reports
+/// still-queued steers with `drop_steers` BEFORE returning, so the renderer is
+/// told to re-send them as the next turn. A steer that lands in the tiny window
+/// after that final report is the only one the wipe ever erases.
 pub(super) struct SteerGuard {
     chat_id: String,
-    /// Live "a steer arrived" signal handed to the in-flight model stream.
-    pub(super) flag: std::sync::Arc<InterruptSignal>,
 }
 
 impl SteerGuard {
     pub(super) fn new(chat_id: &str) -> Self {
-        let flag = std::sync::Arc::new(InterruptSignal::new());
         if !chat_id.trim().is_empty() {
             running_turns().lock().unwrap().insert(chat_id.to_string());
-            steer_flags()
-                .lock()
-                .unwrap()
-                .insert(chat_id.to_string(), flag.clone());
         }
-        SteerGuard { chat_id: chat_id.to_string(), flag }
-    }
-
-    /// A guard that owns nothing.
-    ///
-    /// The explore sub-agent runs `run_turn` with the PARENT's chat id (traces
-    /// and plan writes are keyed by it). Registering that id a second time made
-    /// the sub-turn's Drop un-register the still-running parent and wipe its
-    /// steer inbox, so a steer typed while explore worked was lost.
-    pub(super) fn inert() -> Self {
         SteerGuard {
-            chat_id: String::new(),
-            flag: std::sync::Arc::new(InterruptSignal::new()),
+            chat_id: chat_id.to_string(),
         }
     }
 }
@@ -386,111 +346,8 @@ impl Drop for SteerGuard {
     fn drop(&mut self) {
         if !self.chat_id.trim().is_empty() {
             running_turns().lock().unwrap().remove(&self.chat_id);
-            steer_flags().lock().unwrap().remove(&self.chat_id);
         }
         // A steer nobody consumed must not leak into the next turn of this chat.
         steer_inbox().lock().unwrap().remove(&self.chat_id);
     }
-}
-
-/// Child cancel flag for a delegation that ALSO trips when the parent turn is
-/// steered.
-///
-/// `run_subagent` blocks the parent until the child returns, and the child's
-/// own `SteerGuard` is inert (it must not unregister the parent), so the child
-/// never sees the parent's steer signal. A steer typed during a long
-/// explore/browser delegation therefore waited for the whole child run — the
-/// stuck "Steering the running agent…" bubble. A watcher turns a parent steer
-/// into a child cancel, so the delegation unwinds and the parent delivers the
-/// steer at the top of its next step.
-pub(super) struct SteerAwareCancel {
-    /// The flag handed to `run_subagent` and on to the child turn.
-    pub(super) flag: CancelFlag,
-    /// Generation of the parent steer signal when this delegation started.
-    base: u64,
-    /// The parent signal, kept for `steered()` after the child returns.
-    parent: Arc<InterruptSignal>,
-    /// Aborted on Drop so a finished delegation leaves no watcher behind.
-    watcher: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl SteerAwareCancel {
-    pub(super) fn new(parent_cancel: &CancelFlag, parent_steer: &Arc<InterruptSignal>) -> Self {
-        let flag: CancelFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let base = parent_steer.generation();
-        let watch_flag = flag.clone();
-        let watch_stop = parent_cancel.clone();
-        let watch_steer = parent_steer.clone();
-        let watcher = tokio::spawn(async move {
-            loop {
-                // Stop reaches the child exactly as it did before this helper
-                // existed; only the steer leg is new.
-                if watch_stop.load(Ordering::Relaxed) {
-                    watch_flag.store(true, Ordering::Relaxed);
-                    return;
-                }
-                tokio::select! {
-                    // `wait_for` registers interest before re-checking the
-                    // counter, so a steer landing between the check above and
-                    // this wait is still seen.
-                    _ = watch_steer.wait_for(base) => {
-                        watch_flag.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    // Stop has no event of its own; the same 200 ms tick the
-                    // model stream uses keeps it responsive without a spin.
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-                }
-            }
-        });
-        SteerAwareCancel {
-            flag,
-            base,
-            parent: parent_steer.clone(),
-            watcher: Some(watcher),
-        }
-    }
-
-    /// Did a steer land since this delegation started? Read AFTER the child
-    /// returns, so the parent can tell the model why the report was cut short
-    /// instead of letting it retry work the user already superseded.
-    pub(super) fn steered(&self) -> bool {
-        self.parent.interrupted_since(self.base)
-    }
-}
-
-impl Drop for SteerAwareCancel {
-    fn drop(&mut self) {
-        if let Some(w) = self.watcher.take() {
-            w.abort();
-        }
-    }
-}
-
-/// Prefix a delegation result that a mid-turn steer cut short.
-///
-/// Without this the model sees an empty/failed child report and may retry the
-/// very work the user just replaced. The steer itself is appended as the next
-/// user message by `deliver_steers`, so the note only has to stop the retry.
-pub(super) fn steered_tool_result(result: String) -> String {
-    const NOTE: &str = "Stopped because the user sent a new instruction while this ran. \
-Do NOT retry this delegation: read the user's new message and follow it instead.";
-    if result.trim().is_empty() {
-        NOTE.to_string()
-    } else {
-        format!("{NOTE}\n\n{result}")
-    }
-}
-
-/// Result for a tool call that was never STARTED because a steer landed while
-/// an earlier call in the same step was still running.
-///
-/// The call must still be answered: its id is in the assistant message's
-/// `tool_calls`, and a request that omits a result for one is rejected by every
-/// provider. The note also stops the model from replaying work the user just
-/// superseded.
-pub(super) fn steered_skip_result() -> String {
-    "Skipped because the user sent a new instruction while this step was running. \
-Do NOT retry this call: read the user's new message and follow it instead."
-        .to_string()
 }

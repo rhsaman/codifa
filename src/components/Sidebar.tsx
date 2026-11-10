@@ -12,6 +12,7 @@ import { focusChatInput, focusChatInputSoon } from "../lib/chatFocus";
 import { menuLeft, menuTop } from "../lib/tabBar";
 import { WindowStripCluster } from "./WindowStripCluster";
 import { useSidebarView, type SidebarView } from "../lib/sidebarView";
+import { clampSidebarWidth } from "../lib/sidebarLayout";
 
 // The explorer is only parsed once the Files view is first shown.
 const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
@@ -338,11 +339,12 @@ export function Sidebar() {
   // Sidebar width lives HERE (the shell owns the aside); the content only
   // receives the drag handler. Previously the width sat below the shell,
   // which produced a nested .sidebar whose fixed var() width clipped the
-  // resizable one.
+  // resizable one. The limits are shared with the window-strip cluster: below
+  // SIDEBAR_MIN_WIDTH the persona switch + icon cluster would be cut.
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const saved = localStorage.getItem("coder:sidebarWidth");
     const n = saved ? parseInt(saved, 10) : 264;
-    return Number.isFinite(n) ? Math.max(180, Math.min(480, n)) : 264;
+    return clampSidebarWidth(Number.isFinite(n) ? n : 264);
   });
   const sidebarDrag = useRef<{ startX: number; startW: number } | null>(null);
   // Track the per-drag listeners so we can clean them up if the component
@@ -365,13 +367,8 @@ export function Sidebar() {
     document.body.classList.add("coder-resizing");
     const onMove = (ev: MouseEvent) => {
       if (!sidebarDrag.current) return;
-      const w = Math.max(
-        180,
-        Math.min(
-          480,
-          sidebarDrag.current.startW +
-          (ev.clientX - sidebarDrag.current.startX),
-        ),
+      const w = clampSidebarWidth(
+        sidebarDrag.current.startW + (ev.clientX - sidebarDrag.current.startX),
       );
       setSidebarWidth(w);
       localStorage.setItem("coder:sidebarWidth", String(w));

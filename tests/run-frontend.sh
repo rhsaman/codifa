@@ -70,6 +70,7 @@ chmod +x "$WORK/one.sh"
 JOBS_LIST="$WORK/jobs.txt"
 cat > "$JOBS_LIST" <<'EOF'
 sections|tests/sections.test.ts|-
+sidebarClusterFit|tests/sidebarClusterFit.test.ts|-
 dragReorder|tests/dragReorder.test.ts|--packages=external
 browserViewport|tests/browserViewport.test.ts|--packages=external --external:electron
 mcpTools|tests/mcpTools.test.ts|--packages=external --external:electron
@@ -179,6 +180,7 @@ manualContext|tests/manualContext.test.ts|--packages=external --external:electro
 gitApiError|tests/gitApiError.test.ts|--packages=external --external:electron
 reviewDiff|tests/reviewDiff.test.ts|--packages=external --external:electron
 reviewStats|tests/reviewStats.test.ts|--packages=external --external:electron
+callFileDiff|tests/callFileDiff.test.ts|--packages=external --external:electron
 reviewAccordion|tests/reviewAccordion.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 diffSearch|tests/diffSearch.test.ts|-
 uncommitted|tests/uncommitted.test.ts|--packages=external --external:electron

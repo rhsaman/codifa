@@ -120,6 +120,72 @@ console.log("4) multi-part sections render and gate the joint submit:")
     html.includes('class="btn ask-send" disabled'),
     html.slice(html.indexOf("ask-send") - 60, html.indexOf("ask-send") + 40),
   )
+  check("every section offers writing its own answer", (html.match(/ask-option-own/g) ?? []).length === 2)
+}
+
+console.log("4b) flat card own-answer tick gates the text field:")
+{
+  const flat = { id: "ask-flat", question: "Which boxes?", options: ["One", "Two"], selected: [] }
+  const html = renderToStaticMarkup(el(AskUserCard as any, { req: flat, inline: true, live: false }))
+  check("flat card offers writing its own answer", html.includes("ask-option-own"))
+  check("flat answer field hidden until the tick", !html.includes("ask-input"))
+
+  const ticked = { ...flat, own: true, freeText: "just the blue ones" }
+  const tickedHtml = renderToStaticMarkup(el(AskUserCard as any, { req: ticked, inline: true, live: false }))
+  check("ticked flat card reveals the answer field", tickedHtml.includes("ask-input"))
+  check("ticked flat card renders the typed answer", tickedHtml.includes("just the blue ones"))
+  check(
+    "ticked own answer unlocks apply",
+    !tickedHtml.includes('class="btn ask-send" disabled'),
+  )
+}
+
+console.log("5) own answer per section:")
+{
+  const secs = [{ title: "Chart", options: ["Bar", "Line"] }, { title: "Range", options: ["Day", "Week"] }]
+  check(
+    "own answer alone satisfies a section",
+    canSubmitSections(secs, [[0], []], [false, true], ["", "Last 3 days"]) === true,
+  )
+  check(
+    "ticked but empty own answer does not count",
+    canSubmitSections(secs, [[0], []], [false, true], ["", "  "]) === false,
+  )
+  check(
+    "unticked text is ignored",
+    canSubmitSections(secs, [[0], []], [false, false], ["", "Last 3 days"]) === false,
+  )
+  check(
+    "own answer is sent as that section's answer",
+    joinSectionAnswer(secs, [[0], []], [false, true], ["", "Last 3 days"]) === "Chart: Bar\nRange: Last 3 days",
+    joinSectionAnswer(secs, [[0], []], [false, true], ["", "Last 3 days"]),
+  )
+  check(
+    "options and own answer can combine",
+    joinSectionAnswer(secs, [[0], [1]], [true, false], ["stacked", ""]) === "Chart: Bar, stacked\nRange: Week",
+  )
+  check(
+    "no own-answer arguments keeps the old behavior",
+    joinSectionAnswer(secs, [[0], [1]], undefined, undefined) === "Chart: Bar\nRange: Week",
+  )
+
+  const ownReq = {
+    id: "ask-own",
+    question: "Report setup",
+    options: [],
+    sections: secs,
+    secSelected: [[0], []],
+    secOwn: [false, true],
+    secFreeText: ["", "Last 3 days"],
+  }
+  const ownHtml = renderToStaticMarkup(el(AskUserCard as any, { req: ownReq, inline: true, live: false }))
+  check("ticked section reveals its own input", ownHtml.includes("ask-section-input"))
+  check("own answer text is rendered", ownHtml.includes("Last 3 days"))
+  check(
+    "ticked own answer unlocks apply",
+    !ownHtml.includes('class="btn ask-send" disabled'),
+    ownHtml.slice(ownHtml.indexOf("ask-send") - 60, ownHtml.indexOf("ask-send") + 40),
+  )
 }
 
 if (failed > 0) {

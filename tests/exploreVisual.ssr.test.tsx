@@ -1,4 +1,7 @@
-// Temporary visual smoke test for the explore card states (running → done).
+// Visual smoke test for the sub-agent card states (running → done).
+// The chat card IS a ToolGroupView now (user request): the group carries the
+// running/done state, the agent-name pill gets the running accent, and the
+// elapsed time comes from the delegation call itself.
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -62,17 +65,20 @@ const done = renderToString(
 )
 
 const checks: Array<[string, boolean]> = [
-  ['running: spinner rendered', running.includes('explore-card-status running') && running.includes('spinner')],
-  ['running: progress rail rendered', running.includes('explore-card-progress')],
+  // SSR class order: `tool-group ${open ? "open" : ""} ${state}` — collapsed
+  // runs leave a double space, so match with \s*.
+  ['running: group renders in running state', /class="tool-group\s+running"/.test(running)],
+  ['running: name pill gets the running accent', running.includes('trace-pill trace-pill-sub running')],
   ['running: NO check glyph', !running.includes('status-ok')],
-  ['running: chips rendered', running.includes('explore-tool-n') && running.includes('Read File')],
-  ['running: title rendered', running.includes('Find the auth flow')],
+  ['running: inner tool pills rendered', running.includes('Read File') && running.includes('Search Files')],
+  ['running: title (description) as head caption', running.includes('Find the auth flow')],
   ['running: live clock in card', running.includes('trace-time')],
-  ['done: check glyph rendered', done.includes('status-ok') && done.includes('explore-card-status done')],
-  ['done: NO spinner', !done.includes('spinner')],
+  ['done: group settles to done state', /class="tool-group\s+done"/.test(done)],
+  ['done: name pill without running accent', /trace-pill trace-pill-sub"[^>]*>Explore</.test(done)],
+  ['done: NO running group state', !/class="tool-group\s+running"/.test(done)],
   ['done: NO progress rail', !done.includes('explore-card-progress')],
-  ['done: calls badge', done.includes('1 calls')],
-  ['done: title rendered', done.includes('Map the settings store')],
+  ['done: elapsed time from the delegation call', done.includes('4.1s')],
+  ['done: title (description) as head caption', done.includes('Map the settings store')],
 ]
 
 let failed = 0

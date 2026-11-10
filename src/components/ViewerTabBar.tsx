@@ -645,11 +645,21 @@ export function ViewerDockBar() {
   const allTabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
   const scope = useViewerScope();
+  // Git is a CODE-mode surface: the chat persona (general-purpose agent) hides
+  // the dock icon, skips its status polling, and the pane body falls off the
+  // Git page (the same review filter ViewerContent applies) — the persona
+  // switch owns this, not the pane. An already-open Git tab stays in state and
+  // comes back when the workspace switches back to Code; it is never destroyed.
+  const gitVisible =
+    useStore((s) => s.workspaceRunModes[s.activeWorkspaceKey]) === "code";
+  const dockTabs = gitVisible
+    ? allTabs
+    : allTabs.filter((t) => t.kind !== "review");
   // Same rule the pane body uses: the pressed dock button mirrors the page
   // that is actually painted right now. No shown tab → the body paints the
   // Panel fallback page, so the Panel icon must read as active instead of
   // leaving the whole dock blank.
-  const shownTab = allTabs.find((t) => t.id === shownViewerTabId(allTabs, activeId, scope));
+  const shownTab = dockTabs.find((t) => t.id === shownViewerTabId(dockTabs, activeId, scope));
   const shownKind = shownTab?.kind ?? FALLBACK_VIEWER_KIND;
   const vt = () => useViewerTabs.getState();
   // Finished-but-unread schedule runs: the Inbox icon carries the count. A run
@@ -661,10 +671,13 @@ export function ViewerDockBar() {
   const dockRoot = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
   );
-  const changedCount = useUncommittedCount(dockRoot);
+  const changedCount = useUncommittedCount(gitVisible ? dockRoot : null);
   const dock: Array<{ kind: ViewerKind; title: string; icon: React.ReactNode; badge?: number; onPress: () => void }> = [
     { kind: "todos", title: "Panel", icon: <TodosIcon />, onPress: () => vt().openTodos(scope.chatId) },
-    { kind: "review", title: "Git diff", icon: <ReviewIcon />, badge: changedCount, onPress: () => vt().openGitDiff(scope.chatId) },
+    // No Git entry in chat mode — see gitVisible above.
+    ...(gitVisible
+      ? [{ kind: "review" as ViewerKind, title: "Git diff", icon: <ReviewIcon />, badge: changedCount, onPress: () => vt().openGitDiff(scope.chatId) }]
+      : []),
     { kind: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onPress: () => vt().openArtifacts() },
     { kind: "schedule", title: "Schedule", icon: <ScheduleIcon />, onPress: () => vt().openSchedule() },
     { kind: "inbox", title: "Inbox", icon: <InboxIcon />, badge: inboxUnseen, onPress: () => vt().openInbox() },

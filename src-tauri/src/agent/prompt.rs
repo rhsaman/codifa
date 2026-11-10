@@ -64,6 +64,85 @@ pub(super) fn cache_read_tuple(acc: &StreamAcc) -> u64 {
 /// mode has no write to govern, so `ask`/`plan`/`chat` are not billed its text.
 pub(super) const CODING_RULES: &str = include_str!("../../prompts/coding-rules.md");
 
+/// Persona of a CODE turn: the engineering agent this app was built around.
+/// Rides the volatile tail (see `default_system_prompt`), never the body, so the
+/// cached prefix stays shared with a chat turn.
+const CODE_PERSONA: &str = "\nPERSONA: you are a SOFTWARE-ENGINEERING agent working inside the user's codebase \
+— you read it, plan changes to it, write them and verify them. Docstrings and comments in \
+any code you write must be English.\n";
+
+/// Persona of a CHAT turn: the general-purpose agent — the ALL-ROUNDER, and the
+/// DEFAULT persona. The self-description leads with everything a personal
+/// assistant does here and treats code as one job among many. Two failure modes
+/// drove this wording: a pasted coding-agent identity made a writing or research
+/// request come back as engineering ceremony, and asked "what can you do" the
+/// agent recited a coder's résumé (code sections first) although every tool it
+/// names — web search, image/video generation, scheduled jobs, memory — is
+/// real; the ORDER was the lie, not the list.
+const CHAT_PERSONA: &str = "\nPERSONA: you are the GENERAL-PURPOSE agent of this app — an all-rounder, \
+not a coding assistant. Your work is whatever the user brings: answering and explaining, \
+writing and editing any text (email, report, article, documentation, translation, rewrite), \
+web research with sources, data analysis with charts, and acting on this machine — files, \
+shell, generating and editing images and video, scheduled (cron-like) jobs, and a memory you \
+can save to and search across sessions. Code work is ONE capability among many, never the \
+default: do not assume a task is a coding task and never dress a non-coding answer in \
+engineering ceremony. Asked what you can do, introduce yourself as this all-rounder — \
+answers, writing, research, data, media, machine work — and mention code as one item in that \
+list, never first.\n";
+
+/// Build-mode write discipline for a CODE turn: the edit is the artifact.
+const CODE_WRITE_RULE: &str = "You may write and edit files here. The edit_file/write_file call IS the \
+artifact: never paste whole files or large code blocks into your reply — after the edits, \
+say concisely what changed (file, function, short diff-level description) and stop. Scale \
+the report to the size of the change: a one-line fix gets one line, not a write-up. ";
+
+/// Build-mode discipline for a CHAT turn: the deliverable is often the TEXT
+/// itself, so pasting it back is the answer — not a report about a file.
+const CHAT_WRITE_RULE: &str = "You may write and edit files here. When the deliverable IS text — a document, a \
+message, a report, a table — put that text in your reply: it is the answer, not a summary of \
+it. When you changed an existing file, say concisely what changed and stop; never paste a \
+whole file only to prove an edit landed. ";
+
+/// Ask-mode rule for a CODE turn (the shared tail below carries the output shape).
+const CODE_ASK_RULE: &str = "This turn is ASK mode: read-only AND short. Answer the question itself in the \
+first sentence, in plain words, in 2-4 short lines — no preamble, no headings, no numbered \
+steps, no checklist, and never paste an explore report or raw tool output. Expand ONLY when \
+the user asks for more (\"explain more\", \"why\", \"step by step\", \"جزئیات\"): then go deeper \
+but stay simple — short sentences, one concrete example, exact file:line. You cannot write \
+or edit anything here, but READING IS OPEN: files through `explore`, and the shell for any \
+inspection (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck) — only a command \
+that would change the workspace is refused. Describe a needed change as file + the exact old \
+text -> new text and say that Build mode applies it. ";
+
+/// Ask-mode rule for a CHAT turn: no code-change instructions, because the
+/// question may have nothing to do with the workspace at all.
+const CHAT_ASK_RULE: &str = "This turn is ASK mode: read-only AND short. Answer the question itself in the \
+first sentence, in plain words, in 2-4 short lines — no preamble, no headings, no numbered \
+steps, no checklist, and never paste a research report or raw tool output. Expand ONLY when \
+the user asks for more (\"explain more\", \"why\", \"step by step\", \"جزئیات\"): then go deeper \
+but stay simple — short sentences, one concrete example. You cannot write or edit anything \
+here, but READING IS OPEN: files, and the shell for any inspection (du/df/ps/lsof, git \
+status/diff/log) — only a command that would change the workspace is refused. ";
+
+/// Output-shape tail shared by both ask personas: a chart beats an ASCII dump,
+/// and a real fork belongs in `ask_user`, not in a bulleted question.
+const ASK_TAIL: &str = "Rich output the app renders natively: numeric comparisons or data worth seeing at a glance -> a ```chart fenced block whose body is exactly this JSON: {\"type\":\"bar\"|\"line\"|\"pie\",\"title\":\"...\",\"unit\":\"...\",\"labels\":[\"...\"],\"series\":[{\"name\":\"...\",\"values\":[...]}]} (2-6 labels, numeric values, labels in the user's language) - it draws a real chart, better than an ASCII dump or a table. A genuine open choice that changes what you do next -> the ask_user tool with 2-5 SHORT options (the app shows a pick-one card), not a bulleted \"which one?\" question.";
+
+/// Plan-mode rule for a CHAT turn: a work plan for any task, not a code-diff
+/// plan — naming a file per step would be noise for research or writing work.
+const CHAT_PLAN_RULE: &str = "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
+anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
+commit, package installs), so describe the work instead of doing it — inspection is \
+otherwise wide open (du/df/ps/lsof, git status/diff/log). The deliverable is a plan the USER \
+can understand, not a note to yourself: one '## Plan' heading, then one line per step, in \
+the user's language — say in plain words WHAT that step does and WHY it is needed, written \
+so that someone who did not read this chat understands what will happen. A bare jargon line \
+is a failed step. No essay, no restating the request, no code blocks, no prose between \
+steps; keep the whole plan under ~25 lines — a longer plan means the steps are too fine, so \
+merge them. END the plan with a short summary section (a '## ' heading in the user's \
+language): 2-4 plain sentences saying what will be done overall and what the user gets when \
+it is finished. Name the mode each out-of-scope item belongs to instead of expanding on it.";
+
 /// The main agent's system prompt.
 ///
 /// Everything before the FINAL sentence must stay byte-identical across turns:
@@ -77,7 +156,10 @@ pub(super) const CODING_RULES: &str = include_str!("../../prompts/coding-rules.m
 /// while the very next ask->ask turn of the same size hit 94.6%. Keeping the
 /// constant text first and the volatile tail last makes the switch cost the
 /// tail only.
-pub(super) fn default_system_prompt(mode: &str, root: &str) -> String {
+pub(super) fn default_system_prompt(run_mode: &str, mode: &str, root: &str) -> String {
+    // The upper-level persona: `code` is the engineering agent; ANYTHING else
+    // (an absent field from an older client, `chat`) is the general-purpose one.
+    let code = run_mode == "code";
     // The mode-specific rule rides in the VOLATILE TAIL (next to `root`/`mode`),
     // not in the body above: the body is the cached prefix, so a byte that
     // differed between modes would re-bill the whole prompt on every switch.
@@ -89,7 +171,15 @@ pub(super) fn default_system_prompt(mode: &str, root: &str) -> String {
     //
     // Built as its own string so both writable-intent branches below share one
     // byte-identical text: a second copy would drift.
-    let coding_rules = format!("CODING RULES — apply to every write, edit and review:\n{CODING_RULES}\n");
+    // A CHAT turn carries no coding rules at all: it writes documents, not code,
+    // and a rule it cannot act on is billed text that shapes the wrong answer.
+    let coding_rules = if code {
+        format!("CODING RULES — apply to every write, edit and review:\n{CODING_RULES}\n")
+    } else {
+        String::new()
+    };
+    let persona = if code { CODE_PERSONA } else { CHAT_PERSONA };
+    let write_rule = if code { CODE_WRITE_RULE } else { CHAT_WRITE_RULE };
     let mode_rule = if caps_for_mode(mode).write_files {
         // Build (and any unknown writable mode): the edit IS the artifact, so the
         // reply is a short report OF it. The rule has to live here — the
@@ -103,11 +193,7 @@ imperative in the user's language, then keep it current (mark each item complete
 next in_progress as you finish it, and pass \"progress\" 0-100 on a long step). Never send \
 update_plan alone while more work follows — put it in the SAME step as your next tool calls. \
 Skip it only for a trivial single-step change.\n\
-{coding_rules}You may write and edit files here. The edit_file/write_file call IS the \
-artifact: never paste whole files or large code blocks into your reply — after the edits, \
-say concisely what changed (file, function, short diff-level description) and stop. Scale \
-the report to the size of the change: a one-line fix gets one line, not a write-up. If the \
-user also asked a question, answer it directly and briefly. Rich output the app renders natively: numeric comparisons -> a ```chart fenced block with a JSON body {{\"type\":\"bar\"|\"line\"|\"pie\",\"title\",\"unit\",\"labels\",\"series\":[{{\"name\",\"values\"}}]}} (2-6 labels); report long-step percent via update_plan's optional \"progress\" (0-100); a genuine fork -> ask_user with 2-5 short options."
+{coding_rules}{write_rule}Rich output the app renders natively: numeric comparisons -> a ```chart fenced block with a JSON body {{\"type\":\"bar\"|\"line\"|\"pie\",\"title\",\"unit\",\"labels\",\"series\":[{{\"name\",\"values\"}}]}} (2-6 labels); report long-step percent via update_plan's optional \"progress\" (0-100); a genuine fork -> ask_user with 2-5 short options."
         )
     } else if mode == "ask" || mode == "chat" {
         // Ask is the mentoring mode: the user wants an ANSWER, not a report.
@@ -115,17 +201,11 @@ user also asked a question, answer it directly and briefly. Rich output the app 
         // work from its full report") pulled long, structured dumps into the
         // reply: a one-line question got an audit. Brevity is the default here;
         // depth is opt-in.
-        "This turn is ASK mode: read-only AND short. Answer the question itself in the \
-first sentence, in plain words, in 2-4 short lines — no preamble, no headings, no numbered \
-steps, no checklist, and never paste an explore report or raw tool output. Define a \
-technical term in a clause right where it appears. Expand ONLY when the user asks for more \
-(\"explain more\", \"why\", \"step by step\", \"جزئیات\"): then go deeper but stay simple — \
-short sentences, one concrete example, exact file:line. You cannot write or edit anything \
-here, but READING IS OPEN: files through `explore`, and the shell for any inspection \
-(du/df/ps/lsof, git status/diff/log, builds, tests, typecheck) — only a command that would \
-change the workspace is refused. Describe a needed change as file + the exact old text -> \
-new text and say that Build mode applies it. Rich output the app renders natively: numeric comparisons or data worth seeing at a glance -> a ```chart fenced block whose body is exactly this JSON: {\"type\":\"bar\"|\"line\"|\"pie\",\"title\":\"...\",\"unit\":\"...\",\"labels\":[\"...\"],\"series\":[{\"name\":\"...\",\"values\":[...]}]} (2-6 labels, numeric values, labels in the user's language) - it draws a real chart, better than an ASCII dump or a table. A genuine open choice that changes what you do next -> the ask_user tool with 2-5 SHORT options (the app shows a pick-one card), not a bulleted \"which one?\" question."
-            .to_string()
+        // Same shape for both personas, different SUBJECT: a code ask describes a
+        // change, a chat ask just answers — it may have nothing to do with the
+        // workspace at all.
+        let ask_rule = if code { CODE_ASK_RULE } else { CHAT_ASK_RULE };
+        format!("{ask_rule}{ASK_TAIL}")
     } else if mode == "plan" {
         // Plan's whole deliverable IS prose, so an unbounded plan sprawls exactly
         // the way ask's answers did. Its shape rule belongs here, next to the
@@ -136,8 +216,15 @@ new text and say that Build mode applies it. Rich output the app renders nativel
         // writing that change against the house rules is the point of planning
         // it — a step that hard-codes a path has to be caught in the plan, not
         // after the edit.
-        format!(
-            "{coding_rules}This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
+        // A chat plan is a plan of WORK, not a plan of edits: it never names a
+        // file per step, and it must still carry the shared body + persona, so it
+        // becomes the mode rule instead of returning early (an early return here
+        // dropped the whole cached body, persona included).
+        if !code {
+            CHAT_PLAN_RULE.to_string()
+        } else {
+            format!(
+                "{coding_rules}This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
 anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
 commit, package installs), so describe changes instead of applying them — inspection is \
 otherwise wide open (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck). The \
@@ -151,17 +238,20 @@ the steps are too fine, so merge them. END the plan with a short summary section
 heading in the user's language): 2-4 plain sentences saying what will be done overall and \
 what the user gets when it is finished. Name the mode each out-of-scope item belongs to \
 instead of expanding on it."
-        )
-    } else {
+            )
+        }
+    } else if code {
         "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
 anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
 commit, package installs); every read-only command still runs. Answer with the concrete \
 change instead — which file, which line, the exact old text -> new text — and tell the user \
 to switch to Build mode to apply it."
             .to_string()
+    } else {
+        CHAT_PLAN_RULE.to_string()
     };
     format!(
-        "You are Codifa, a coding agent inside the user's desktop IDE. \
+        "You are Codifa, an agent inside the user's desktop app. \
 PICK THE CHEAPEST TOOL for the job — and the gap GROWS with the turn: measured \
 on real traces, an early step re-sends the whole conversation for ~7.7K \
 uncached tokens, but by round 20 that same step costs ~79K, while ONE `explore` \
@@ -250,12 +340,11 @@ listed there, it is finished — do NOT redo it, do NOT re-verify it, and do NOT
 re-implement it from scratch. Say what is already done and continue from what \
 is actually left. Redoing finished work is a bug, not thoroughness. \
 Reply in the user's language. \
-Docstrings and comments in code must be English. \
 CODE FENCES (```) are for CODE ONLY: never put prose, tables, price levels, \
 lists or any other non-code text inside a code fence — write that data as a \
 markdown table or plain lines instead, even when column alignment tempts you \
 to fence it; a fence around Persian text renders as scrambled LTR code. \
-Workspace root: {root}. Mode: {mode}. {mode_rule}"
+Workspace root: {root}. Mode: {mode}. Run mode: {run_mode}. {persona}{mode_rule}"
     )
 }
 

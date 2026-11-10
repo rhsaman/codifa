@@ -417,6 +417,8 @@ fn entry_reasoning(entry: &Value) -> Option<bool> {
 ///   * models.dev / generic: `modalities.input: ["text", "image"]`
 ///   * flat provider payloads: `input_modalities: [...]`
 ///   * explicit flags: `supports_vision`, `supports_image_input`, `vision`
+///   * a capability OBJECT: `capabilities.vision` (9router and other
+///     OpenAI-compatible gateways nest the flags next to `tools`/`pdf`)
 ///
 /// A `modality` string (`"text+image->text"`) is the older OpenRouter shape and
 /// is read for `image` too.
@@ -450,6 +452,17 @@ fn entry_vision(entry: &Value) -> Option<bool> {
         .and_then(Value::as_str)
     {
         return Some(modality.to_ascii_lowercase().contains("image"));
+    }
+    // Nested capability flags. 9router's `/v1/models` answered
+    // `capabilities: { vision: true, tools: true, … }` for a model the app then
+    // treated as UNKNOWN, so every screenshot took the slow Vision slot instead
+    // of travelling inline. A payload that describes other capabilities but not
+    // vision stays `None` (unknown), never "text-only".
+    if let Some(v) = first_bool(
+        entry.get("capabilities").unwrap_or(&Value::Null),
+        &["vision", "supports_vision", "image_input", "accepts_images"],
+    ) {
+        return Some(v);
     }
     first_bool(
         entry,

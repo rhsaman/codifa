@@ -5,7 +5,7 @@ pub(super) const FIND_SYMBOL_BODY_LINES: usize = 40;
 pub(super) const FIND_SYMBOL_MAX_USAGES: usize = 25;
 
 /// Keywords that START a declaration an outline reports, across the languages
-/// this IDE edits (Rust, TypeScript/JS, Python, Go, Java/C#, shell, Ruby).
+/// this app edits (Rust, TypeScript/JS, Python, Go, Java/C#, shell, Ruby).
 pub(super) const OUTLINE_KEYWORDS: [&str; 15] = [
     "fn", "def", "class", "struct", "enum", "trait", "interface", "impl", "type", "function",
     "func", "mod", "macro_rules", "sub", "procedure",

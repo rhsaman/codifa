@@ -215,20 +215,27 @@ console.log('۳) نتیجه fetch کهنه پخش نمی‌شود:')
   stopTts()
 }
 
-console.log('۴) per-sentence queue + natural gap + progressive stream:')
+console.log('۴) first chunk solo, the rest packed + natural gap:')
 {
-  // Sentences are NOT merged into batches: the Persian G2P strips punctuation,
-  // so merged batches hid sentence boundaries and the backend pacing landed
-  // mid-sentence. Each sentence is its own request.
+  // Every synthesis request pays a fixed cost (the reference voice is
+  // re-processed per diffusion step), so AFTER the first sentence — kept solo
+  // so speech starts as soon as one sentence is ready — short sentences are
+  // packed into chunks of up to 200 chars. Only chunks that END a sentence are
+  // glued, so the packed chunk still breaks at a real boundary.
   MockAudio.instances = []
   seenTexts.length = 0
   ttsCall = 0
   const longFa = 'جمله اول برای تست سرعت شروع پخش است. جمله دوم هم به همین اندازه طولانی است تا بچ دوم ساخته شود. جمله سوم مکث طبیعی بین جمله‌ها را بررسی می‌کند.'
   await playTts(longFa, opts, 40)
-  check('requests stay per-sentence (no merged batches)', seenTexts.length === 3, seenTexts)
   check('first request is one sentence (fast first audio)', (seenTexts[0] ?? '').length <= 130, seenTexts[0])
+  check('the tail sentences pack into ONE chunk (2 requests total)', seenTexts.length === 2, seenTexts)
+  check(
+    'the packed chunk stays under 200 chars and ends a sentence',
+    (seenTexts[1] ?? '').length <= 200 && /[.!?…؟]$/.test(seenTexts[1] ?? ''),
+    seenTexts[1],
+  )
   const gap = MockAudio.instances.length >= 2 ? MockAudio.instances[1].playedAt - MockAudio.instances[0].playedAt : -1
-  check('natural pause between sentences', gap >= 300, gap)
+  check('natural pause between chunks', gap >= 300, gap)
   stopTts()
 }
 

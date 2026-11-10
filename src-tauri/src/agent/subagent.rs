@@ -403,20 +403,30 @@ pub(super) fn delegation_display_name(parent: &AgentRequest, tool: &str) -> Stri
 /// (`ls`, `git status`, builds) on top. Each wipe threw away the read coverage
 /// recorded one call earlier, which is why the coverage guard fired 6 times in a
 /// corpus that re-asked 137 already-served windows.
+/// One batch op that writes the workspace (see [`mutates_workspace`]).
+///
+/// The name is resolved through the executor's alias table first: a `run_command`
+/// op runs as `run_terminal`, so matching the raw name would let a writing shell
+/// command keep a stale file body alive.
+fn batch_writes(op: &Value) -> bool {
+    let raw = op["tool"].as_str().unwrap_or_default().trim().to_ascii_lowercase();
+    let tool = crate::tools::batch_tool_name(&raw).unwrap_or(raw);
+    matches!(tool.as_str(), "write_file" | "edit_file" | "run_terminal")
+}
+
 pub(super) fn mutates_workspace(name: &str, _args: &Value) -> bool {
     match name {
         "write_file" | "edit_file" | "artifact" => true,
         // A batch carries the step's writers too: one write/edit/terminal op
         // inside it invalidates the file-body cache exactly like the same
         // call on its own would (conservative — a terminal op is a writer).
-        "batch" => _args["ops"].as_array().is_some_and(|ops| {
-            ops.iter().any(|op| {
-                matches!(
-                    op["tool"].as_str().unwrap_or_default(),
-                    "write_file" | "edit_file" | "run_terminal"
-                )
-            })
-        }),
+        // Parsed through `tools::batch_ops` like the executor: a shape this
+        // reader did not recognise (a stringified ops array) counted as ZERO
+        // writers, i.e. a stale body could outlive a batch that rewrote it.
+        // Unparseable is treated as a WRITER — the safe direction.
+        "batch" => crate::tools::batch_ops(_args)
+            .map(|ops| ops.iter().any(batch_writes))
+            .unwrap_or(true),
         // A terminal command runs arbitrary `sh -c`: the workspace-file guard
         // refuses the workspace READ/dump forms, but a build, a test or a script
         // can still rewrite a file (`cargo` into `target/`, a generator into
@@ -481,39 +491,55 @@ pub(super) fn read_window_span(offset: usize, limit: usize) -> (usize, usize) {
     (offset, offset.saturating_add(limit))
 }
 
-/// The workspace file a WRITER targets, in the same spelling the reader side
-/// records (`filePath`/`path`) — the two must agree character-for-character or
-/// the same-file check below never fires.
-/// The file a WRITER call targets, as the model spelled it.
+/// The files a WRITER call targets, as the model spelled them.
 ///
-/// A batch may name its file ONLY per entry (`edits: [{path, …}]`, the shape the
-/// schema advertises) and leave the top level `path` absent. Reading just
+/// A batch may name its file ONLY per entry and leave the top level `path`
+/// absent: `edit_file` uses `edits: [{path, …}]`, `write_file` uses
+/// `files: [{path, content}]` — both advertised by the schema. Reading just
 /// `path`/`filePath` then answered `None`, so the pre-edit snapshot and the
 /// post-edit diff were both taken from an EMPTY path — which resolves to the
 /// workspace ROOT, fails to read as text, and yields `""` on both sides. The
-/// unified diff came out empty, no `diff` event reached the UI, and the edit
-/// card showed a bare "Edited" with no diff while the model got no
-/// `applied change` block at all (traced: every `edits[]`-shaped edit).
-pub(super) fn writer_target_path(name: &str, args: &Value) -> Option<String> {
+/// unified diff came out empty, no `diff` event reached the UI, and the card
+/// showed no filename and no diff while the model got no `applied change`
+/// block at all (traced: every `edits[]`- and `files[]`-shaped write).
+///
+/// ALL entry paths are collected (first-appearance order, deduplicated): a
+/// batch legitimately names DIFFERENT files per entry, and a snapshot/diff
+/// for only the first entry left every later file of the same call with no
+/// diff event, no Review row and no `applied change` for the model.
+pub(super) fn writer_target_paths(name: &str, args: &Value) -> Vec<String> {
     if !matches!(name, "edit_file" | "write_file") {
-        return None;
+        return Vec::new();
     }
-    let named = args["path"]
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: Option<&str>| {
+        if let Some(p) = p.filter(|p| !p.trim().is_empty()) {
+            if !out.iter().any(|s| s == p) {
+                out.push(p.to_string());
+            }
+        }
+    };
+    push(args["path"]
         .as_str()
-        .or_else(|| args["filePath"].as_str())
-        .map(str::to_string)
-        .filter(|p| !p.trim().is_empty());
-    if named.is_some() {
-        return named;
+        .or_else(|| args["filePath"].as_str()));
+    // The schema's batch shapes: one path per entry either way. A top-level
+    // `path` plus per-entry paths is also legal (edit_file inherits the top
+    // level for entries without one) — the tool applies each entry to its own
+    // file, so every named file belongs in the snapshot.
+    for key in ["edits", "files"] {
+        if let Some(items) = args[key].as_array() {
+            for e in items {
+                push(e["path"].as_str());
+            }
+        }
     }
-    // The schema's batch shape: one path per entry. The FIRST entry is the file
-    // the diff is computed against; a multi-file batch is applied per file by
-    // `edit_file` itself, and this snapshot covers the entry it reports first.
-    args["edits"]
-        .as_array()
-        .and_then(|edits| edits.iter().find_map(|e| e["path"].as_str()))
-        .map(str::to_string)
-        .filter(|p| !p.trim().is_empty())
+    out
+}
+
+/// The FIRST file a writer call targets — enough for callers that only need
+/// "some" target (the stale-source note), not the full per-file set.
+pub(super) fn writer_target_path(name: &str, args: &Value) -> Option<String> {
+    writer_target_paths(name, args).into_iter().next()
 }
 
 /// True when EVERY window of a `read` call is already inside a span served
@@ -919,7 +945,11 @@ fn expand_batch(calls: &[(String, String, String)]) -> Option<Vec<(String, Strin
         return None;
     }
     let args: Value = serde_json::from_str(&calls[0].2).ok()?;
-    let ops = args["ops"].as_array()?;
+    // `crate::tools::batch_ops` and NOT a bare `args["ops"].as_array()`: the
+    // executor accepts a stringified ops array, so a parser that only knew the
+    // array form made a real multi-op round look like a zero-op one — the
+    // batching levers then stayed silent on exactly the rounds that DID batch.
+    let ops = crate::tools::batch_ops(&args).ok()?;
     let advertised: Vec<String> = crate::tools::BATCH_TOOLS
         .iter()
         .map(|s| (*s).to_string())
@@ -2129,6 +2159,9 @@ pub(super) async fn run_subagent(
         api_keys: sub_keys,
         root: parent.root.clone(),
         mode: "subagent".into(),
+        // A child runs the same persona as the turn that spawned it: an explore
+        // child of a chat turn must not turn into a coding agent.
+        run_mode: parent.run_mode.clone(),
         prompt,
         history: Vec::new(),
         system_prompt: match profile.as_ref().and_then(|p| p["prompt"].as_str()) {
@@ -2191,6 +2224,15 @@ pub(super) async fn run_subagent(
         // while the user's own Computer Use switch is on for this turn. Off ⇒
         // the sub-agent degrades to research: same run, narrower reach.
         allow_computer: parent.allow_computer && kind == "computer",
+        // The chat's desktop grant narrows the same way: only a `computer`
+        // child may use it (the child skips the popup gate by MODE anyway;
+        // this keeps the request honest about what was granted).
+        allow_computer_chat: parent.allow_computer_chat && kind == "computer",
+        // The model-confirmation grant is parent-only: a child cannot call
+        // `confirm_action`, and the SSH grant is irrelevant (children never
+        // reach the SSH gate).
+        allow_confirm_chat: false,
+        allow_ssh_hosts: Vec::new(),
         // Likewise the browser: a `browser` sub-agent drives a page only when
         // the parent turn already has Browser Use on.
         allow_browser: parent.allow_browser && kind == "browser",
@@ -2759,8 +2801,12 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                 }
                 // Tell the renderer straight away, so the user sees WHICH model
                 // stopped working instead of watching a silent 90s of retries.
+                // The badge reports the attempt that is about to START (this
+                // move is immediate): re-emitting the failed attempt froze the
+                // counter, so a long fallback list and a wrap back to the first
+                // model looked like no auto-retry step had happened at all.
                 emit(&AgentEvent::Retry {
-                    attempt,
+                    attempt: attempt + 1,
                     max_attempts,
                     delay_secs: 0,
                     reason: format!("{} — trying the next model", last.0),
@@ -2782,14 +2828,16 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         // Same ladder, same events, same banner as a main-model retry: the
         // renderer must not be able to tell a sub-agent hiccup from a main
         // agent one. `agent` is what labels WHICH model the user should change,
-        // `tool` names the tool that owns the retry.
+        // `tool` names the tool that owns the retry. `attempt + 1` is the
+        // attempt the countdown is for — the auto-retry step must visibly move
+        // on a wrap back to the first model, not repeat the number that failed.
         let reason = if wrapped {
             format!("{} — every model failed, starting over from the first", last.0)
         } else {
             last.0.clone()
         };
         emit(&AgentEvent::Retry {
-            attempt,
+            attempt: attempt + 1,
             max_attempts,
             delay_secs: SUBAGENT_RETRY_BACKOFF_MS / 1000,
             reason: reason.clone(),

@@ -67,7 +67,7 @@ function check(name: string, cond: boolean, extra?: unknown) {
 }
 
 console.log('1) all five capability cards render:')
-check('intro names every feature', html.includes('voice input (STT)') && html.includes('video generation') && html.includes('live voice'))
+check('verbose intro paragraph is gone', !flat.includes('Speech calls hit') && !flat.includes('nothing on-device'))
 check('STT card', html.includes('Speech to Text (STT)'))
 check('TTS card', html.includes('Text to Speech (TTS)'))
 check('Image card', html.includes('Image Generation'))
@@ -77,15 +77,13 @@ check('Live voice card', html.includes('Live voice'))
 console.log('2) fallback lists share one chrome:')
 check('column captions on all four lists', (html.match(/voice-fallback-head/g) ?? []).length === 4)
 check('captions say Provider / Model / Voice', html.includes('>Provider<') && html.includes('>Model<') && html.includes('>Voice<'))
-check('ladder hint on all four lists', (flat.match(/Tried in order when the primary fails — top first\./g) ?? []).length === 4)
+check('primary-first hint on all four lists', (flat.match(/Row 1 is the primary/g) ?? []).length === 4)
 check('add buttons for every list', flat.includes('+ Add STT fallback') && flat.includes('+ Add TTS fallback') && flat.includes('+ Add image fallback') && flat.includes('+ Add video fallback'))
 
-console.log('3) hints are English:')
-check('STT language hint', flat.includes('mis-detects the language on short clips'))
-check('image endpoints hint', flat.includes('OpenAI-compatible endpoints'))
-check('media folder hint', flat.includes('~/.codifa/media'))
-check('video formats hint', flat.includes('Sora format') && flat.includes('ffmpeg (downloaded automatically'))
-check('realtime vs chunked hint', flat.includes('full-duplex realtime'))
+console.log('3) explanation text moved out of sight (tooltips), hints are English:')
+check('STT language tooltip', flat.includes('mis-detects the language on short clips'))
+check('image/video paragraphs are gone', !flat.includes('OpenAI-compatible endpoints') && !flat.includes('~/.codifa/media') && !flat.includes('ffmpeg (downloaded automatically'))
+check('realtime vs chunked lives in a tooltip', flat.includes('full-duplex realtime'))
 
 console.log('4) no Persian UI text outside the language picker:')
 const persian = (html.match(/[\u0600-\u06FF]+/g) ?? []).filter(

@@ -333,4 +333,73 @@ console.log('10) decoding is pinned so the same clip cannot flip a word:')
   )
 }
 
+console.log('11) chain failure names every rung that was tried:')
+{
+  const { sttRungLabel, sttChainError } = await import('../src/lib/stt')
+
+  check(
+    'the label pairs the kind with the host (gateways are all "custom")',
+    sttRungLabel({ kind: 'custom', baseUrl: 'http://127.0.0.1:8000', model: 'whisper-1' }) ===
+      'custom@127.0.0.1:8000 (whisper-1)',
+    { got: sttRungLabel({ kind: 'custom', baseUrl: 'http://127.0.0.1:8000', model: 'whisper-1' }) },
+  )
+  check(
+    'a malformed base URL stays verbatim instead of throwing',
+    sttRungLabel({ kind: 'custom', baseUrl: 'not a url' }) === 'custom@not a url',
+  )
+  check(
+    'a rung without a host or model still reads as a rung',
+    sttRungLabel({ kind: 'google' }) === 'google@?',
+  )
+
+  // The whole chain failing used to surface ONLY the last rung's error, so a
+  // dead primary plus a broken fallback read as "the fallback never ran".
+  const chains = [
+    { kind: 'custom', baseUrl: 'http://127.0.0.1:8000', model: 'whisper-1' },
+    { kind: 'custom', baseUrl: 'http://localhost:20128/v1', model: 'groq/whisper-large-v3' },
+  ]
+  const errors = new Map<number, unknown>([
+    [0, new Error('remote transcription failed: connection refused')],
+    [1, new Error("request Content-Type isn't multipart/form-data")],
+  ])
+  const joined = sttChainError(chains, errors, errors.get(1)) as Error
+  check('a multi-rung failure is an Error', joined instanceof Error)
+  check(
+    'the message says ALL providers failed',
+    typeof joined?.message === 'string' && joined.message.startsWith('all 2 STT providers failed'),
+    { got: joined?.message },
+  )
+  check(
+    'the message carries rung 0 (the primary) with its own error',
+    joined.message.includes('custom@127.0.0.1:8000 (whisper-1): remote transcription failed: connection refused'),
+    { got: joined?.message },
+  )
+  check(
+    'the message carries rung 1 (the fallback) with its own error',
+    joined.message.includes("custom@localhost:20128 (groq/whisper-large-v3): request Content-Type isn't multipart/form-data"),
+    { got: joined?.message },
+  )
+
+  // A single-rung chain must not grow a prefix: the provider's own error IS
+  // the whole story there.
+  const single = sttChainError(
+    [{ kind: 'custom', baseUrl: 'http://x/v1', model: 'whisper-1' }],
+    new Map([[0, new Error('boom')]]),
+    new Error('boom'),
+  ) as Error
+  check('a single-rung failure passes the original error through', single.message === 'boom')
+
+  // A rung the hedge never launched still gets named instead of vanishing.
+  const partial = sttChainError(
+    chains,
+    new Map<number, unknown>([[1, new Error('second failed')]]),
+    new Error('second failed'),
+  ) as Error
+  check(
+    'an unlaunched rung is reported as not tried',
+    partial.message.includes('custom@127.0.0.1:8000 (whisper-1): not tried'),
+    { got: partial?.message },
+  )
+}
+
 console.log('\nall stt checks passed')

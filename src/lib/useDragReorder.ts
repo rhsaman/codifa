@@ -34,6 +34,12 @@ export function useDragReorder(
   listId: string,
   length: number,
   onReorder: (from: number, insertAt: number) => void,
+  /** `plainText: false` skips the `text/plain` fallback payload. Lists whose
+   *  rows can be dragged over surfaces that treat ANY text/plain drag as their
+   *  own external drag (the chat-window split panes read text/plain as "drag a
+   *  chat in here") must opt out, or those surfaces light up with drop zones
+   *  for a drag they should ignore. */
+  opts?: { plainText?: boolean },
 ) {
   /** Index of the row being dragged, or null. */
   const [dragIndex, setDragIndex] = useState<number | null>(null)
@@ -82,7 +88,7 @@ export function useDragReorder(
       onDragStart: (e: DragEvent) => {
         try {
           e.dataTransfer.setData(`application/x-codifa-reorder/${listId}`, String(index))
-          e.dataTransfer.setData('text/plain', listId)
+          if (opts?.plainText !== false) e.dataTransfer.setData('text/plain', listId)
         } catch {
           /* drag unsupported */
         }
@@ -112,7 +118,7 @@ export function useDragReorder(
         slotsRef.current = null
       },
     }),
-    [listId],
+    [listId, opts?.plainText],
   )
 
   /** Spread on every row (the `[data-drag-row]` element): drop targeting

@@ -359,6 +359,12 @@ pub fn openai_images_parse(body: &Value) -> Result<ImagePayload, String> {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .map_err(|e| format!("image b64_json decode failed: {e}"))?;
+        // A 200 whose payload decodes to NOTHING is a dead upstream, not an
+        // image: counting it as success would save a 0-byte file and the
+        // fallback ladder would never be walked.
+        if bytes.is_empty() {
+            return Err("image b64_json decoded to zero bytes".to_string());
+        }
         return Ok(ImagePayload::Bytes(bytes, "image/png"));
     }
     if let Some(url) = first.get("url").and_then(Value::as_str) {
@@ -410,6 +416,12 @@ pub fn gemini_image_parse(body: &Value) -> Result<ImagePayload, String> {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(b64.trim())
                     .map_err(|e| format!("gemini inlineData decode failed: {e}"))?;
+                // Empty inline bytes are a dead upstream (a 200 with no
+                // picture), not an image: rejecting here is what sends the
+                // ladder on to the next rung instead of saving a 0-byte file.
+                if bytes.is_empty() {
+                    return Err("gemini inlineData decoded to zero bytes".to_string());
+                }
                 let static_mime: &'static str = match mime.as_str() {
                     "image/jpeg" | "image/jpg" => "image/jpeg",
                     "image/webp" => "image/webp",
@@ -600,6 +612,12 @@ pub fn openrouter_image_parse(body: &Value) -> Result<ImagePayload, String> {
                     continue;
                 }
                 if let Some((bytes, mime)) = parse_data_url(url) {
+                    // A data URL that decodes to nothing is the gateway's own
+                    // "upstream died" answer: skip it so the next image (or the
+                    // no-image error below) is what decides this rung.
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     let static_mime: &'static str = match mime.as_str() {
                         "image/jpeg" | "image/jpg" => "image/jpeg",
                         "image/webp" => "image/webp",
@@ -959,8 +977,8 @@ fn head(text: &str) -> String {
 }
 
 async fn payload_bytes(payload: ImagePayload, keys: &[String]) -> Result<(Vec<u8>, &'static str), String> {
-    match payload {
-        ImagePayload::Bytes(b, mime) => Ok((b, mime)),
+    let (bytes, mime) = match payload {
+        ImagePayload::Bytes(b, mime) => (b, mime),
         ImagePayload::Url(url) => {
             let (bytes, mime) = get_bytes(&url, keys, false, Duration::from_secs(IMAGE_TIMEOUT_SECS)).await?;
             let static_mime: &'static str = if mime.starts_with("image/jpeg") {
@@ -970,9 +988,16 @@ async fn payload_bytes(payload: ImagePayload, keys: &[String]) -> Result<(Vec<u8
             } else {
                 "image/png"
             };
-            Ok((bytes, static_mime))
+            (bytes, static_mime)
         }
+    };
+    // A signed URL that downloads to NOTHING is a provider failure, not a
+    // picture: the fallback ladder must see the rung as failed. (Same rule as
+    // the TTS chain's empty-audio check.)
+    if bytes.is_empty() {
+        return Err("provider returned an empty image (0 bytes)".to_string());
     }
+    Ok((bytes, mime))
 }
 
 /// Build a PNG mask for `POST /images/edits` from a rectangle: opaque black
@@ -1499,6 +1524,11 @@ pub async fn generate_video(
     };
 
     let ext = ext_for_mime(&mime, "mp4");
+    // A completed job that hands back zero bytes is a provider failure, not a
+    // clip: failing the rung is what walks the fallback ladder.
+    if video_bytes.is_empty() {
+        return Err("provider returned an empty video (0 bytes)".to_string());
+    }
     let rel = output_to_virtual(chat_id, output, || new_media_path("clip", ext, chrono::Utc::now()));
     let (rel, len) = save_media(data_root, chat_id, &rel, &video_bytes)?;
     Ok(GeneratedMedia {

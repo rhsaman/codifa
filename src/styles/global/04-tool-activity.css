@@ -2321,6 +2321,29 @@
   min-width: 0;
 }
 
+/* The STT language setting: one inline row — label beside the select — so the
+   slot's language costs a single line. The why-it-matters note lives in the
+   row's title tooltip instead of a wrapped hint paragraph. */
+.voice-lang-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  min-width: 0;
+}
+
+.voice-lang-row .field-label {
+  flex: 0 0 auto;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.voice-lang-row select {
+  flex: 0 1 240px;
+  width: 240px;
+  min-width: 0;
+}
+
 @media (max-width: 900px) {
   .voice-fields-row {
     flex-wrap: wrap;
@@ -2427,6 +2450,19 @@
   max-width: 100%;
 }
 
+/* Rung 1 of a media try-order list is the slot's PRIMARY: same card as the
+   fallbacks (it drags like one), with the Tools chains' extra breathing room
+   below so the default rung reads as the anchor of the list. */
+.voice-fallback-card-own {
+  margin-bottom: 3px;
+}
+
+/* Where the primary's remove button would sit: an empty fixed-width cell that
+   keeps rung 1's columns lined up with the removable rows below. */
+.voice-fallback-card .voice-remove-spacer {
+  flex: 0 0 32px;
+}
+
 .voice-fallback-card select,
 .voice-fallback-card input {
   width: 100%;
@@ -2508,6 +2544,9 @@
     width: auto;
     min-width: 0;
     padding: 0 10px;
+  }
+  .voice-fallback-card .voice-remove-spacer {
+    display: none;
   }
   .voice-fallback-head {
     display: none;

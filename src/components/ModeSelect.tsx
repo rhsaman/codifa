@@ -97,10 +97,9 @@ export function ModeSelect({
               }}
             >
               <span className="mode-select-icon"><ModeIcon icon={m.icon} /></span>
-              <span className="mode-menu-text">
-                <span className="mode-menu-label">{m.label}</span>
-                <span className="mode-menu-desc">{m.description}</span>
-              </span>
+              {/* Icon + name only: the long mode blurbs are gone (user ask) —
+                  the popup reads as a compact picker now. */}
+              <span className="mode-menu-label">{m.label}</span>
             </button>
           ))}
         </div>

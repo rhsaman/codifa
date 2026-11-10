@@ -144,6 +144,47 @@ console.log('۷) buildReviewTurn: net diff of the turn replaces the sum of every
   check('without a net diff the edits are summed', legacy?.adds === 2 && legacy?.dels === 2, legacy)
 }
 
+console.log('۸) per-file diffs: هر فایلِ یک فراخوانی چندفایلی به مسیر خودش کتاب می‌شود:')
+{
+  // One edit_file call naming a DIFFERENT file per entry — the backend emits
+  // one diff event per touched file, folded into `diffs`. Booking the whole
+  // aggregate under the first path (the old behavior) misattributed every
+  // later file's +N/-M in the Review panel.
+  const perFile = [
+    { path: 'a.ts', diff: diffOc },          // +2 -0
+    { path: 'b.ts', diff: diffOpenai },      // +4 -0
+  ]
+  const call: ToolActivity =
+    ({ tool: "edit_file", args: { edits: perFile.map((e) => ({ path: e.path })) }, diffs: perFile, diff: perFile.map((e) => e.diff).join(""), status: "done" }) as any
+
+  const t = aggregateTurnStats([call])
+  check('aggregateTurnStats sums per file: +6', t.adds === 6, t)
+
+  const turn = buildReviewTurn('m', [call], '/p')
+  check('two review rows, one per file', turn?.files.length === 2, turn?.files)
+  check('a.ts carries only its own +2', turn?.files[0]?.path === 'a.ts' && turn?.files[0]?.adds === 2, turn?.files[0])
+  check('b.ts carries only its own +4', turn?.files[1]?.path === 'b.ts' && turn?.files[1]?.adds === 4, turn?.files[1])
+  check('header totals match the rows', turn?.adds === 6 && turn?.dels === 0, turn)
+
+  // A file outside the workspace is dropped by path — not the whole call,
+  // which the old first-target filter would have done.
+  const withOutside = [
+    { path: 'a.ts', diff: diffOc },
+    { path: '/tmp/other.py', diff: diffOpenai },
+  ]
+  const call2: ToolActivity =
+    ({ tool: "edit_file", args: { edits: withOutside.map((e) => ({ path: e.path })) }, diffs: withOutside, diff: withOutside.map((e) => e.diff).join(""), status: "done" }) as any
+  const turn2 = buildReviewTurn('m', [call2], '/p')
+  check('outside file dropped per path', turn2?.files.length === 1 && turn2.files[0].path === 'a.ts', turn2?.files)
+  check('kept file keeps its stats', turn2?.adds === 2, turn2)
+
+  // Cards without `diffs` (older transcripts) keep the aggregate attribution.
+  const legacyCard: ToolActivity =
+    ({ tool: "edit_file", args: { path: 'a.ts' }, diff: diffOc, status: "done" }) as any
+  const turn3 = buildReviewTurn('m', [legacyCard], '/p')
+  check('legacy aggregate card still lists', turn3?.files.length === 1 && turn3.files[0].adds === 2, turn3)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد`)
   process.exit(1)

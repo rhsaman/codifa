@@ -35,10 +35,14 @@
     padding-inline: 10px;
   }
 
+  /* The 3-zone grid collapses back to a wrapping flex row: the zones then
+     stack (center pair first reading order) instead of clipping. */
   .composer-footer {
+    display: flex;
     flex-wrap: wrap;
     row-gap: 4px;
     padding-inline: 2px;
+    justify-content: center;
   }
 
   .composer-footer .pm-select-btn {

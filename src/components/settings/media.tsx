@@ -222,13 +222,36 @@ export function MediaProviderSelect({
   )
 }
 
-/** The Settings → Media Providers fallback ladder: an ordered list of
- *  provider+model targets tried when the slot's primary fails. One row per
- *  rung; TTS rows add a voice column. Shared by STT/TTS/Image/Video so the
- *  four lists behave and read the same. */
+/** Row-by-row equality across the voice column too, so a TTS reorder that
+ *  leaves one side untouched does not rewrite (and re-persist) it. `sameRows`
+ *  above is the Tools shape; TTS rungs carry a voice on top of it. */
+function sameMediaRows(
+  a: Array<{ providerId: string; model: string; voice?: string }>,
+  b: Array<{ providerId: string; model: string; voice?: string }>,
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (r, i) =>
+        r.providerId === b[i].providerId &&
+        r.model === b[i].model &&
+        (r.voice ?? '') === (b[i].voice ?? ''),
+    )
+  )
+}
+
+/** The Settings → Media Providers try-order list: row 1 is the slot's PRIMARY
+ *  provider+model and every row below it is a fallback tried in order when the
+ *  primary fails. The list order IS the try order, which is why row 1 carries
+ *  the same grip as the rest — dragging a fallback to the top makes it the
+ *  primary and drops the old primary into the ladder, exactly like the Tools
+ *  chains. One row per rung; TTS rows add a voice column. Shared by
+ *  STT/TTS/Image/Video so the four lists behave and read the same. */
 export function MediaFallbackList<R extends { providerId: string; model: string; voice?: string }>({
   label,
   addLabel,
+  primary,
+  onPrimaryChange,
   rows,
   onChange,
   withVoice = false,
@@ -238,6 +261,13 @@ export function MediaFallbackList<R extends { providerId: string; model: string;
   label: string
   /** Text after "+ Add" on the trailing button ("STT fallback"), singular. */
   addLabel: string
+  /** The slot's primary target — rendered as row 1. An empty provider id
+   *  means the feature is off ("Not selected"). */
+  primary: { providerId: string; model: string; voice?: string }
+  /** Writes the primary slot back: fired when an edit or a dropped rung lands
+   *  a DIFFERENT target on row 1. TTS carries the voice along; STT's language
+   *  is slot-level and never moves with a row. */
+  onPrimaryChange: (p: { providerId: string; model: string; voice?: string }) => void
   rows: R[]
   onChange: (rows: R[]) => void
   withVoice?: boolean
@@ -248,24 +278,54 @@ export function MediaFallbackList<R extends { providerId: string; model: string;
   // Same non-local filter the dropdown shows: a new rung starts on a provider
   // it can actually route through.
   const firstRoutable = providers.find((p) => p.kind !== 'ollama')?.id ?? ''
+  // ONE list drives both the slot's primary and its fallbacks, so row 1 can be
+  // moved like any other rung. Writing back is the inverse: whatever ends up
+  // in row 1 is the primary, the rest is the fallback list. (The store's
+  // normalizers drop provider-less rows, so an "off" primary dragged into the
+  // ladder quietly vanishes there instead of becoming an unroutable rung.)
+  const chain: Array<{ providerId: string; model: string; voice?: string }> = [
+    withVoice
+      ? { ...primary, voice: primary.voice ?? '' }
+      : { providerId: primary.providerId, model: primary.model },
+    ...rows,
+  ]
+  const commit = (next: Array<{ providerId: string; model: string; voice?: string }>) => {
+    const head = next[0]
+    if (
+      head &&
+      (head.providerId !== primary.providerId ||
+        head.model !== primary.model ||
+        (withVoice && (head.voice ?? '') !== (primary.voice ?? '')))
+    ) {
+      onPrimaryChange({
+        providerId: head.providerId,
+        model: head.model,
+        ...(withVoice ? { voice: head.voice ?? '' } : {}),
+      })
+    }
+    const rest = next.slice(1) as R[]
+    if (!sameMediaRows(rest, rows)) onChange(rest)
+  }
   const patch = (i: number, partial: Partial<{ providerId: string; model: string; voice: string }>) =>
-    onChange(rows.map((r, j) => (j === i ? ({ ...r, ...partial } as R) : r)))
+    commit(chain.map((r, j) => (j === i ? { ...r, ...partial } : r)))
   const add = () => {
     const row = { providerId: firstRoutable, model: '', ...(withVoice ? { voice: '' } : {}) }
     onChange([...rows, row as R])
   }
-  // Drag-to-reorder: "tried in order" is the row order, so the grip at each
-  // card's start rewrites it — no arrows needed. Tab-bar drag feel: rows
-  // slide into their previewed slots while dragging.
+  // Drag-to-reorder: the try order IS the row order, so the grip at each
+  // card's start rewrites it — no arrows needed, and row 1 (the primary) is
+  // just wherever the drop lands. Tab-bar drag feel: rows slide into their
+  // previewed slots while dragging.
   const { dragIndex, shiftStyle, handleProps, rowProps } = useDragReorder(
     `media-${label}`,
-    rows.length,
-    (from, insertAt) => onChange(moveAt(rows, from, insertAt)),
+    chain.length,
+    (from, insertAt) => commit(moveAt(chain, from, insertAt)),
   )
   return (
     <div className="voice-fallbacks">
-      <label className="field-label">{label}</label>
-      <div className="hint">Tried in order when the primary fails — top first. Drag a row to reorder.</div>
+      <div className="hint">
+        Row 1 is the primary — the rows below are tried in order when it fails. Drag to reorder.
+      </div>
       <div className="voice-fallback-head" aria-hidden="true">
         <span className="voice-col-drag" />
         <span className="voice-col-provider">Provider</span>
@@ -273,57 +333,68 @@ export function MediaFallbackList<R extends { providerId: string; model: string;
         {withVoice && <span className="voice-col-voice">Voice</span>}
         <span className="voice-head-remove" />
       </div>
-      {rows.map((fb, i) => (
-        <div
-          key={i}
-          className={`voice-fallback-card${
-            dragIndex !== null ? ' dnd-shifting' : ''
-          }${dragIndex === i ? ' dnd-dragging' : ''}`}
-          data-drag-row
-          {...rowProps(i)}
-          style={shiftStyle(i)}
-        >
-          <span className="dnd-grip voice-col-drag" title="Drag to reorder" {...handleProps(i)}>
-            <GripDots />
-          </span>
-          <div className="voice-col-provider">
-            <MediaProviderSelect
-              value={fb.providerId}
-              onChange={(id) => patch(i, { providerId: id })}
-              emptyLabel={fb.providerId ? undefined : 'Not selected'}
-            />
-          </div>
-          <div className="voice-col-model">
-            <input
-              value={fb.model}
-              onChange={(e) => patch(i, { model: e.target.value })}
-              dir="ltr"
-              placeholder={modelPlaceholder}
-              aria-label={`${label} row ${i + 1} model`}
-            />
-          </div>
-          {withVoice && (
-            <div className="voice-col-voice">
-              <input
-                value={fb.voice ?? ''}
-                onChange={(e) => patch(i, { voice: e.target.value })}
-                dir="ltr"
-                placeholder={voicePlaceholder}
-                aria-label={`${label} row ${i + 1} voice`}
+      {chain.map((fb, i) => {
+        const isOwn = i === 0
+        const rowName = isOwn ? 'primary' : `row ${i + 1}`
+        return (
+          <div
+            key={isOwn ? 'own' : i}
+            className={`voice-fallback-card${isOwn ? ' voice-fallback-card-own' : ''}${
+              dragIndex !== null ? ' dnd-shifting' : ''
+            }${dragIndex === i ? ' dnd-dragging' : ''}`}
+            data-drag-row
+            {...rowProps(i)}
+            style={shiftStyle(i)}
+          >
+            <span className="dnd-grip voice-col-drag" title="Drag to reorder" {...handleProps(i)}>
+              <GripDots />
+            </span>
+            <div className="voice-col-provider">
+              <MediaProviderSelect
+                value={fb.providerId}
+                onChange={(id) => patch(i, { providerId: id })}
+                emptyLabel={fb.providerId ? undefined : 'Not selected'}
               />
             </div>
-          )}
-          <button
-            type="button"
-            className="btn tiny secondary voice-remove-btn"
-            title="Remove this fallback"
-            aria-label={`Remove ${label} row ${i + 1}`}
-            onClick={() => onChange(rows.filter((_, j) => j !== i))}
-          >
-            ×
-          </button>
-        </div>
-      ))}
+            <div className="voice-col-model">
+              <input
+                value={fb.model}
+                onChange={(e) => patch(i, { model: e.target.value })}
+                dir="ltr"
+                placeholder={modelPlaceholder}
+                aria-label={`${label} ${rowName} model`}
+              />
+            </div>
+            {withVoice && (
+              <div className="voice-col-voice">
+                <input
+                  value={fb.voice ?? ''}
+                  onChange={(e) => patch(i, { voice: e.target.value })}
+                  dir="ltr"
+                  placeholder={voicePlaceholder}
+                  aria-label={`${label} ${rowName} voice`}
+                />
+              </div>
+            )}
+            {/* The primary is the slot's default, not a rung to drop — it has
+                no remove button, and the empty cell keeps the columns lined up
+                with the rows below. */}
+            {!isOwn ? (
+              <button
+                type="button"
+                className="btn tiny secondary voice-remove-btn"
+                title="Remove this fallback"
+                aria-label={`Remove ${label} ${rowName}`}
+                onClick={() => commit(chain.filter((_, j) => j !== i))}
+              >
+                ×
+              </button>
+            ) : (
+              <span className="voice-remove-spacer" aria-hidden="true" />
+            )}
+          </div>
+        )
+      })}
       <button type="button" className="btn tiny secondary voice-add-btn" onClick={add}>
         + Add {addLabel}
       </button>

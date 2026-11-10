@@ -411,12 +411,17 @@ pub async fn run_turn(
     // however we exit (normal return, early return, or a panic unwinding).
     // A sub-agent must NOT register: it reuses the parent's chat id, so its own
     // Drop would un-register the parent turn that is still running.
-    let _steer_guard = if req.mode == "subagent" {
-        SteerGuard::inert()
+    // The steer inbox is keyed by chat id, and a SUB-AGENT runs with the
+    // PARENT's chat id — so the child must never touch it: a steer typed during
+    // a delegation belongs to the PARENT's next step, not to the delegation's
+    // own conversation. An empty key makes every deliver/drop call below a
+    // no-op for the child; the parent delivers after the delegation returns.
+    let steer_chat: &str = if req.mode == "subagent" {
+        ""
     } else {
-        SteerGuard::new(&req.chat_id)
+        req.chat_id.as_str()
     };
-    let steer_flag = _steer_guard.flag.clone();
+    let _steer_guard = SteerGuard::new(steer_chat);
     let root = req.root.clone();
     // Start the workspace's language servers in the background: the first LSP
     // call of a turn otherwise pays for the whole cold start (spawn + load the
@@ -457,7 +462,7 @@ pub async fn run_turn(
     // Assemble the message list: system + history + current user prompt.
     let mut messages: Vec<Value> = Vec::new();
     let mut system = if req.system_prompt.is_empty() {
-        default_system_prompt(&req.mode, &root)
+        default_system_prompt(&req.run_mode, &req.mode, &root)
     } else {
         req.system_prompt.clone()
     };
@@ -919,7 +924,7 @@ it. Put update_plan in the SAME step as your other tool calls, never alone.",
                 emit(&AgentEvent::Error {
                     content: format!("a plugin hook refused this prompt: {}", submit.reason),
                 });
-                drop_steers(&req.chat_id, emit);
+                drop_steers(steer_chat, emit);
                 emit(&AgentEvent::Done { aborted: false });
                 return Ok(());
             }
@@ -1550,7 +1555,7 @@ it. Put update_plan in the SAME step as your other tool calls, never alone.",
         // refines the running work instead of restarting from the steer alone.
         // This fixes "steering made it forget everything and only do the steered
         // message, abandoning the work in progress".
-        deliver_steers(&mut messages, &req.chat_id, emit);
+        deliver_steers(&mut messages, steer_chat, emit);
         // Client disconnect (Stop button closes the SSE stream) flips the
         // cancel flag — bail out instead of burning provider tokens.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1561,7 +1566,7 @@ it. Put update_plan in the SAME step as your other tool calls, never alone.",
             }
             // A steer that arrived together with the Stop still belongs to the
             // user: hand it back so the renderer re-sends it as the next turn.
-            drop_steers(&req.chat_id, emit);
+            drop_steers(steer_chat, emit);
             emit(&AgentEvent::Done { aborted: true });
             return Ok(());
         }
@@ -2075,7 +2080,6 @@ answer the task."
             Some(&schemas),
             &mut sink,
             Some(cancel),
-            Some(steer_flag.as_ref()),
         )
         .await
         {
@@ -2089,7 +2093,7 @@ answer the task."
                     // The user hit Stop mid-stream: hand any queued steer back so
                     // it is re-sent as the next turn instead of being erased by
                     // `SteerGuard::drop`.
-                    drop_steers(&req.chat_id, emit);
+                    drop_steers(steer_chat, emit);
                     emit(&AgentEvent::Done { aborted: true });
                     return Ok(());
                 }
@@ -2184,38 +2188,12 @@ the Vision model's description instead.\n"
                 // Emit BEFORE `done`: a steer that landed during the failed call
                 // must survive as the next turn, and the renderer marks those
                 // bubbles pending while processing `done`.
-                drop_steers(&req.chat_id, emit);
+                drop_steers(steer_chat, emit);
                 run_stop_hooks(&hooks, emit);
                 emit(&AgentEvent::Done { aborted: false });
                 return Ok(());
             }
         };
-        // A steer landed while this request was still streaming: the stream was
-        // dropped mid-flight (see llm.rs) instead of being allowed to finish, so
-        // the steer does NOT wait for the turn. Record what the model already
-        // said — it was produced BEFORE the steer and the model must keep it —
-        // then re-issue from the top of the loop, where `deliver_steers` appends
-        // the steer to this very conversation.
-        if acc.interrupted {
-            let text = acc.text.trim();
-            if !text.is_empty() {
-                messages.push(json!({"role": "assistant", "content": json!(text)}));
-            }
-            let ids = pending_steer_ids(&req.chat_id);
-            if !ids.is_empty() {
-                emit(&AgentEvent::SteerInterrupt { ids });
-            }
-            // NO reset() here. The signal used to be cleared after consuming an
-            // interrupt, which is exactly what lost steers: a second steer
-            // landing between `reset()` and the next `stream_chat` had its raise
-            // wiped, so the agent kept answering and the steer only surfaced at
-            // the end of the turn ("sometimes it steers, sometimes it waits for
-            // the turn"). The stream now stamps itself with the signal's
-            // generation when it starts, so the raise we just consumed is
-            // ignored by the re-issued request by construction — nothing needs
-            // clearing.
-            continue;
-        }
         // The usage payload normalized to ONE vocabulary by its own shape (see
         // `llm::NormalizedUsage`): additive (Anthropic-style) vs subset
         // (OpenAI/DeepSeek/Google-style) is read off the fields the payload
@@ -2366,7 +2344,6 @@ the Vision model's description instead.\n"
                 // (round-elimination must show here as fewer calls, not slower
                 // ones).
                 "duration_ms": stream_started.elapsed().as_millis() as u64,
-                "interrupted": acc.interrupted,
             })),
             ..Default::default()
         });
@@ -2513,22 +2490,15 @@ the Vision model's description instead.\n"
             // the steer until everything had finished. Keep the same turn
             // running: record this answer FIRST (it was produced before the
             // steer) so the model can see what it already said, then continue
-            // with the steer appended above it.
-            if !req.chat_id.trim().is_empty() {
-                let pending = steer_inbox()
-                    .lock()
-                    .unwrap()
-                    .get(&req.chat_id)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
-                if pending {
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": if text.is_empty() { Value::Null } else { json!(text) },
-                    }));
-                    deliver_steers(&mut messages, &req.chat_id, emit);
-                    continue;
-                }
+            // with the steer appended above it. (A sub-agent reads an empty
+            // key here: the parent's inbox belongs to the parent's next step.)
+            if !steer_chat.is_empty() && steer_pending(steer_chat) {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { Value::Null } else { json!(text) },
+                }));
+                deliver_steers(&mut messages, steer_chat, emit);
+                continue;
             }
             // A turn that ends HERE ends because the model answered with no tool
             // call. Quiet by default: the reply (and any chat content) must
@@ -2545,6 +2515,13 @@ the Vision model's description instead.\n"
                     acc.reasoning_len,
                 );
             }
+            // The end-of-turn deliver above ran a moment ago; a steer whose
+            // POST landed in this tiny window would otherwise be erased by
+            // `SteerGuard::drop` with NO event reaching the renderer — the
+            // bubble stayed "steering…" forever because `push_steer` had already
+            // answered ok. Report it like every other terminal exit, so the
+            // post-turn drain re-sends it as the next turn.
+            drop_steers(steer_chat, emit);
             run_stop_hooks(&hooks, emit);
             emit(&AgentEvent::Done { aborted: false });
             return Ok(());
@@ -2680,6 +2657,10 @@ the Vision model's description instead.\n"
                     let mut refused: Option<String> = None;
                     for dest in ssh_destinations(args["command"].as_str().unwrap_or_default()) {
                         if ssh_approved.iter().any(|h| h == &dest)
+                            // "Always in this chat" grants ride the request —
+                            // they live on the chat, not on disk, so they are
+                            // merged here like the turn-local answers.
+                            || req.allow_ssh_hosts.iter().any(|h| h == &dest)
                             || trusted_hosts(&skill_root).iter().any(|h| h == &dest)
                         {
                             continue;
@@ -3017,11 +2998,10 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                 rest.push(call);
             }
         }
-        // A steer that lands while this step's tools run must stop the batch
-        // from STARTING more long work: the next step is where it is delivered.
-        // Delegations already running are cancelled by `SteerAwareCancel`;
-        // this stamp covers the calls that have not started yet.
-        let batch_steer_base = steer_flag.generation();
+        // A steer that lands while this step's tools run stays QUEUED: the whole
+        // batch is one unit of decided work and is never cut or skipped — the
+        // steer is delivered at the top of the next step instead (see
+        // `deliver_steers`). The Stop button is the path that aborts mid-batch.
         if !parallel_batch.is_empty() {
             // Concurrent sub-agents polled in THIS task via join_all — no
             // tokio::spawn, so no Send bound and the turn still blocks until
@@ -3041,33 +3021,18 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                     let name_c = name.clone();
                     let name_t = name.clone();
                     let cancel_c = std::sync::Arc::clone(cancel);
-                    let steer_c = steer_flag.clone();
                     let tx = tx.clone();
                     Box::pin(async move {
                         let tx_ev = tx.clone();
                         let mut sink = move |ev: &AgentEvent| {
                             let _ = tx_ev.send(SubMsg::Ev(ev.clone()));
                         };
-                        // A steer during this delegation must cut the child
-                        // short: the parent is blocked here, so without the
-                        // watcher the steer waits for the whole child run.
-                        let steer_guard = SteerAwareCancel::new(&cancel_c, &steer_c);
-                        let (result, ok) = run_subagent(
-                            &req_c,
-                            &args_c,
-                            branch,
-                            &name_t,
-                            &mut sink,
-                            &steer_guard.flag,
-                        )
-                        .await;
-                        let steered = steer_guard.steered() && steer_pending(&req_c.chat_id);
-                        drop(steer_guard);
-                        let result = if steered && !ok {
-                            steered_tool_result(result)
-                        } else {
-                            result
-                        };
+                        // The delegation runs to completion even when a steer
+                        // lands mid-run: the steer is delivered at the next
+                        // step boundary, never by cutting the child short.
+                        let (result, ok) =
+                            run_subagent(&req_c, &args_c, branch, &name_t, &mut sink, &cancel_c)
+                                .await;
                         // Each explore posts its OWN end marker, so the parent
                         // resolves this card the moment it lands — not after
                         // the slowest sibling in the batch finishes.
@@ -3142,35 +3107,12 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                         req.chat_id
                     );
                 }
-                drop_steers(&req.chat_id, emit);
+                drop_steers(steer_chat, emit);
                 emit(&AgentEvent::Done { aborted: true });
                 return Ok(());
             }
-            if steer_flag.interrupted_since(batch_steer_base) && steer_pending(&req.chat_id) {
-                // The user already superseded this step: do not start another
-                // long delegation. Answer the call anyway — every `tool_calls`
-                // id needs a result or the next request is rejected.
-                finish_tool(
-                    &mut messages,
-                    emit,
-                    &trace,
-                    &id,
-                    &name,
-                    &args,
-                    steered_skip_result(),
-                    false,
-                    req.mode == "subagent",
-                    None,
-                    None,
-                );
-                continue;
-            }
             let req_c = req.subagent_snapshot();
             let mut sink = |ev: &AgentEvent| emit(ev);
-            // Same steer-aware cancel as the parallel arm: a browser/desktop
-            // delegation blocks the parent, so a steer must cut the child short
-            // instead of waiting for the whole run.
-            let steer_guard = SteerAwareCancel::new(cancel, &steer_flag);
             // Boxed for the same reason the parallel arm is: run_turn calls
             // run_subagent, whose child turn calls run_turn again. The Box is
             // the indirection that keeps that cycle from being infinite-sized.
@@ -3180,16 +3122,9 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                 branch,
                 &name,
                 &mut sink,
-                &steer_guard.flag,
+                cancel,
             ))
             .await;
-            let steered = steer_guard.steered() && steer_pending(&req.chat_id);
-            drop(steer_guard);
-            let result = if steered && !ok {
-                steered_tool_result(result)
-            } else {
-                result
-            };
             if !ok && req.headless {
                 let brief: String = result.chars().take(200).collect();
                 eprintln!("[tool] {name} failed: {brief}");
@@ -3215,30 +3150,14 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                 if req.mode != "subagent" {
                     eprintln!("[turn-end] chat={} cancel flag set mid-batch", req.chat_id);
                 }
-                drop_steers(&req.chat_id, emit);
+                drop_steers(steer_chat, emit);
                 emit(&AgentEvent::Done { aborted: true });
                 return Ok(());
             }
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
-            if steer_flag.interrupted_since(batch_steer_base) && steer_pending(&req.chat_id) {
-                // Same rule as the serial delegations above: answer the call
-                // without running it, so the steer is delivered at the next
-                // step instead of after more work the user superseded.
-                finish_tool(
-                    &mut messages,
-                    emit,
-                    &trace,
-                    &id,
-                    &name,
-                    &args,
-                    steered_skip_result(),
-                    false,
-                    req.mode == "subagent",
-                    None,
-                    None,
-                );
-                continue;
-            }
+            // A steer that landed mid-batch stays queued: this call runs like
+            // every sibling (the batch is one unit of decided work), and the
+            // steer is delivered at the top of the next step.
             // The call about to run may CHANGE the workspace (`write_file`,
             // `edit_file`, or a `run_terminal` that really writes), so every body
             // cached by the repeat-guard is now possibly a snapshot of a file
@@ -3266,16 +3185,26 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             // after the call — without it the Review panel answers "No changes
             // in this turn." for every edit. A missing file (brand-new
             // write_file) diffs as pure additions.
-            let pre_edit = if name == "edit_file" || name == "write_file" {
+            let pre_edit: Vec<(String, String)> = if name == "edit_file" || name == "write_file" {
                 // The SAME target resolution the writer itself uses. Reading a
                 // bare `args["path"]` here made every `edits:[{path,…}]` batch
                 // resolve to "" — the workspace root — so both snapshots were
-                // empty and the edit produced no diff anywhere.
-                writer_target_path(name, &args).map(|p| {
-                    crate::tools::read_pre_edit(&root, &p, permit.as_ref()).unwrap_or_default()
-                })
+                // empty and the edit produced no diff anywhere. A batch may
+                // name a DIFFERENT file per entry, so EVERY target is
+                // snapshotted: snapshotting only the first left each later
+                // file of the same call with no diff, no Review row and no
+                // `applied change` for the model.
+                writer_target_paths(name, &args)
+                    .into_iter()
+                    .map(|p| {
+                        let old =
+                            crate::tools::read_pre_edit(&root, &p, permit.as_ref())
+                                .unwrap_or_default();
+                        (p, old)
+                    })
+                    .collect()
             } else {
-                None
+                Vec::new()
             };
             // Structured rows for the tool card. Only the web tools fill it
             // (search hits / fetched page): the card renders those as links,
@@ -3520,10 +3449,23 @@ user to ask for it. Available this turn: `list` and `run`."
                 // the very round the batch exists to save; running a forbidden
                 // op would break the mode's contract.
                 let mut batch_args = args.clone();
-                if let Some(ops) = batch_args["ops"].as_array_mut() {
+                // Parse through the SAME tolerant reader the executor uses
+                // (`tools::batch_ops`): reading `ops` with `as_array_mut` here
+                // and with a bare `as_array` there let a stringified `ops` slip
+                // PAST this gate — the array form was never found, so no op was
+                // marked and the mode's read-only contract was bypassed by
+                // malformed JSON. One parser, one verdict. An unusable shape is
+                // left untouched for the executor to reject with its message.
+                if let Ok(normalized) = tools::batch_ops(&batch_args) {
+                    let mut ops = normalized;
                     for op in ops.iter_mut() {
-                        let tool =
+                        // Resolve the alias FIRST: the executor runs `run_command`
+                        // as `run_terminal`, so gating on the raw name let a
+                        // read-only turn slip a mutating shell op through this
+                        // very gate and only discover it one level down.
+                        let raw =
                             op["tool"].as_str().unwrap_or_default().trim().to_ascii_lowercase();
+                        let tool = tools::batch_tool_name(&raw).unwrap_or(raw);
                         let reason = match tool.as_str() {
                             "write_file" | "edit_file" if !caps.write_files => Some(
                                 "this turn is read-only — writing or editing files needs Build mode"
@@ -3547,6 +3489,9 @@ user to ask for it. Available this turn: `list` and `run`."
                         if let Some(reason) = reason {
                             op["refused"] = json!(reason);
                         }
+                    }
+                    if let Some(obj) = batch_args.as_object_mut() {
+                        obj.insert("ops".into(), json!(ops));
                     }
                 }
                 // Sequential dispatch must NOT park the async worker (terminal
@@ -3602,7 +3547,14 @@ user to ask for it. Available this turn: `list` and `run`."
                 // rest of THIS turn (a click, then a type, then a check is one
                 // task, not three popups). A child turn was already approved at
                 // the delegation boundary.
-                let allowed = if desktop_approved || req.mode == "subagent" {
+                let allowed = if desktop_approved
+                    || req.mode == "subagent"
+                    // "Always in this chat": the renderer re-sends the grant
+                    // every turn, so the conversation never re-prompts. The
+                    // composer switch alone (allow_computer) still asks per
+                    // task — only the explicit chat grant skips the popup.
+                    || req.allow_computer_chat
+                {
                     true
                 } else {
                     let why = crate::computer::permission_reason(&args);
@@ -4010,6 +3962,18 @@ Do NOT perform the action. Keep the work inside the workspace, the OS temp folde
 ~/.codifa, or skip the step and note it in your final output."
                             .to_string(),
                         false,
+                    )
+                } else if req.allow_confirm_chat {
+                    // "Always in this chat": the user pre-approved the model's
+                    // confirmation asks for the rest of THIS conversation, so
+                    // no popup is raised. The grant deliberately covers future
+                    // asks the model phrases differently — that is the point —
+                    // and the Deny path stays one click away on the next card.
+                    (
+                        "The user has pre-approved confirmation asks for this chat \
+(\"Always in this chat\") — proceed with the action without asking again."
+                            .to_string(),
+                        true,
                     )
                 } else {
                 // Blocking permission gate: the action is NOT performed until
@@ -4677,38 +4641,36 @@ call fetch_url again with offset={next} for the rest]",
             // read/grep of the same file, because the plain result said nothing
             // about what changed).
             let mut applied_diff: Option<String> = None;
-            if ok {
-                if let Some(old) = pre_edit {
-                    // Same resolution as the snapshot above (and as
-                    // `writer_target_path`'s own doc comment): an `edits[]` shape
-                    // names its file per entry, so a bare `args["path"]` here read
-                    // "" and the whole diff was skipped.
-                    let p = writer_target_path(name, &args).unwrap_or_default();
-                    // `permit` again: an approved out-of-tree write must produce its
-                    // diff too, and `resolve_safe(.., false, None)` refused exactly
-                    // the paths the user had just said yes to.
-                    if let Ok(target) = crate::tools::resolve_safe(&root, &p, false, permit.as_ref()) {
-                        let newc = std::fs::read_to_string(target).unwrap_or_default();
-                        let diff = crate::tools::unified_diff(&p, &old, &newc);
-                        if !diff.is_empty() {
-                            // Net change since the turn's first snapshot of this
-                            // file; sent BEFORE `Diff`, while the card is still
-                            // "running", so the frontend attaches it to the same card.
-                            let base = turn_base
-                                .entry(p.to_string())
-                                .or_insert_with(|| old.clone());
-                            let net = crate::tools::unified_diff(&p, &*base, &newc);
-                            emit(&AgentEvent::TurnDiff {
-                                path: p.to_string(),
-                                diff: net,
-                            });
-                            emit(&AgentEvent::Diff {
-                                tool: name.clone(),
-                                path: p.to_string(),
-                                diff: diff.clone(),
-                            });
-                            applied_diff = Some(diff);
-                        }
+            // EVERY file the call named gets its own snapshot pair, so a batch
+            // naming a different file per entry emits a diff per file. The loop
+            // runs on failure too: a multi-file write whose LATER entry failed
+            // still changed the earlier ones, and a failed edit leaves old ==
+            // new — the empty diff skips itself below.
+            for (p, old) in &pre_edit {
+                // `permit` again: an approved out-of-tree write must produce its
+                // diff too, and `resolve_safe(.., false, None)` refused exactly
+                // the paths the user had just said yes to.
+                if let Ok(target) = crate::tools::resolve_safe(&root, p, false, permit.as_ref()) {
+                    let newc = std::fs::read_to_string(target).unwrap_or_default();
+                    let diff = crate::tools::unified_diff(p, old, &newc);
+                    if !diff.is_empty() {
+                        // Net change since the turn's first snapshot of this
+                        // file; sent BEFORE `Diff`, while the card is still
+                        // "running", so the frontend attaches it to the same card.
+                        let base = turn_base.entry(p.clone()).or_insert_with(|| old.clone());
+                        let net = crate::tools::unified_diff(p, base, &newc);
+                        emit(&AgentEvent::TurnDiff {
+                            path: p.clone(),
+                            diff: net,
+                        });
+                        emit(&AgentEvent::Diff {
+                            tool: name.clone(),
+                            path: p.clone(),
+                            diff: diff.clone(),
+                        });
+                        applied_diff
+                            .get_or_insert_with(String::new)
+                            .push_str(&diff);
                     }
                 }
             }
@@ -4948,6 +4910,12 @@ call fetch_url again with offset={next} for the rest]",
             // raw blocks still go through (the model may see them after all).
             let mut urls = urls;
             let mut described = false;
+            // How the vision pass resolved, for the trace row below: raw images
+            // are cleared from `urls` BEFORE it is recorded, so the plain
+            // `urls.len()` used to log "0 image(s) sent" on the very turns a
+            // screenshot WAS seen — by the Vision slot.
+            let raw_count = urls.len();
+            let mut vision_note = String::new();
             let vision = model_supports_vision(&req.providers, &req.provider_id, &cfg.model);
             let try_slot =
                 vision == Some(false) || (vision.is_none() && req.mode == "subagent");
@@ -4977,6 +4945,7 @@ call fetch_url again with offset={next} for the rest]",
                         blocks.push(json!({"type": "text", "text": note}));
                         urls.clear();
                         described = true;
+                        vision_note = "described by the Vision slot".into();
                     }
                     VisionOutcome::NotConfigured if vision == Some(false) => {
                         blocks.push(json!({
@@ -4988,6 +4957,7 @@ call fetch_url again with offset={next} for the rest]",
                         }));
                         urls.clear();
                         described = true;
+                        vision_note = "omitted: no Vision model configured".into();
                     }
                     VisionOutcome::Failed { .. } if vision == Some(false) => {
                         blocks.push(json!({
@@ -4999,6 +4969,7 @@ call fetch_url again with offset={next} for the rest]",
                         }));
                         urls.clear();
                         described = true;
+                        vision_note = "omitted: the Vision model failed".into();
                     }
                     // Unknown capability and no usable slot: keep the raw
                     // blocks and let the model try.
@@ -5024,14 +4995,27 @@ call fetch_url again with offset={next} for the rest]",
             }
             // Trace what the vision pass actually pays: a screenshot is re-sent
             // as base64 on every following step of the turn, so the wire size
-            // here is the one number a downscale/codec change has to move.
+            // here is the one number a downscale/codec change has to move. When
+            // the Vision slot described the capture, the raw bytes never reach
+            // the main model — `images` is then 0 and `vision_images` carries
+            // what the slot received, so the row cannot read as if NO model
+            // ever saw the screenshot.
             trace.record(crate::trace::TraceEntry {
                 kind: "images".into(),
-                summary: format!("{} image(s) sent to {}", urls.len(), cfg.provider),
+                summary: if vision_note.is_empty() {
+                    format!("{} image(s) sent to {}", urls.len(), cfg.provider)
+                } else {
+                    format!(
+                        "{raw_count} image(s) {vision_note} — 0 raw sent to {}",
+                        cfg.provider
+                    )
+                },
                 detail: Some(json!({
                     "provider": cfg.provider,
                     "images": urls.len(),
                     "base64_chars": urls.iter().map(String::len).sum::<usize>(),
+                    "vision_images": raw_count,
+                    "vision": vision_note,
                 })),
                 ..Default::default()
             });
@@ -5159,6 +5143,9 @@ stopped instead of spending more rounds on the same mistakes. Check the selected
 tool-call support."
                     .into(),
             });
+            // Terminal exit with no model call left to carry a queued steer:
+            // report it, or `SteerGuard::drop` erases it silently.
+            drop_steers(steer_chat, emit);
             run_stop_hooks(&hooks, emit);
             emit(&AgentEvent::Done { aborted: false });
             return Ok(());
@@ -5204,7 +5191,6 @@ could not verify. Be concise and factual, and answer the task as it was given."
             None,
             &mut sink,
             Some(cancel),
-            Some(steer_flag.as_ref()),
         )
         .await;
         if let Ok(acc) = forced_res {
@@ -5270,7 +5256,7 @@ could not verify. Be concise and factual, and answer the task as it was given."
     // The budget ran out with steers possibly still queued: report them so the
     // renderer can start them as the next turn (this exit has no model call
     // left to carry them, and `SteerGuard::drop` would erase them silently).
-    drop_steers(&req.chat_id, emit);
+    drop_steers(steer_chat, emit);
     emit(&AgentEvent::Done { aborted: false });
     Ok(())
 }

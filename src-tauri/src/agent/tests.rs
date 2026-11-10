@@ -359,6 +359,191 @@
         assert!(denial.contains("do NOT retry"), "{denial}");
     }
 
+    /// Mock upstream for the "Always in this chat" gate tests: the FIRST call
+    /// issues ONE tool call (the caller picks the tool and arguments), any
+    /// later call answers "done". Same SSE shape as the explore mock — one
+    /// complete tool_call frame, then finish_reason=tool_calls.
+    async fn spawn_gate_mock_upstream(
+        tool: &str,
+        args: &str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        // Owned copies: the responder task outlives this function, so borrowed
+        // &str arguments would escape it.
+        let tool = tool.to_string();
+        let args = args.to_string();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let tx = tx.clone();
+                let calls = std::sync::Arc::clone(&calls);
+                let tool = tool.clone();
+                let args = args.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = serde_json::from_slice(&buf[head_end + 4..]).unwrap_or(Value::Null);
+                    let _ = tx.send(body);
+                    let call_idx = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let frame = |payload: String| format!("data: {payload}\n\n");
+                    let resp: String = if call_idx == 0 {
+                        let mut sse = String::new();
+                        sse.push_str(&frame(
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":tool,"arguments":args}}]}}]}).to_string(),
+                        ));
+                        sse.push_str(&frame(
+                            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"input_tokens":5,"output_tokens":3}}).to_string(),
+                        ));
+                        sse.push_str("data: [DONE]\n\n");
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        )
+                    } else {
+                        let mut sse = String::new();
+                        sse.push_str(&frame(
+                            json!({"choices":[{"delta":{"content":"done"}}]}).to_string(),
+                        ));
+                        sse.push_str(&frame(
+                            json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"input_tokens":11,"output_tokens":2}}).to_string(),
+                        ));
+                        sse.push_str("data: [DONE]\n\n");
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Drive ONE gate-scenario turn against the mock and collect the events.
+    /// A 30 s ceiling turns a regressed gate (popup raised and never answered)
+    /// into a failed assertion instead of a hung test.
+    async fn run_gate_turn(extra: Value, tool: &str, args: &str) -> Vec<Value> {
+        let (mock_base, _rx) = spawn_gate_mock_upstream(tool, args).await;
+        let mut req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/parent-model",
+            "base_url": format!("{mock_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": "/tmp/codifa-gate-tests",
+            "mode": "build",
+            "prompt": "go",
+            "history": [],
+            "data_root": "/tmp/codifa-gate-tests-data",
+        });
+        if let (Some(a), Some(b)) = (extra.as_object(), req.as_object_mut()) {
+            for (k, v) in a {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let events: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev_clone = events.clone();
+        let mut emit = move |e: &AgentEvent| {
+            ev_clone.lock().unwrap().push(e.to_json());
+        };
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), run_turn(&req, &mut emit, &cancel)).await;
+        let evs = events.lock().unwrap().clone();
+        evs
+    }
+
+    /// "Always in this chat" on the model's own confirmation ask: the popup
+    /// must not fire and the tool call must answer as approved.
+    #[tokio::test]
+    async fn a_chat_confirm_grant_auto_approves_without_a_popup() {
+        let evs = run_gate_turn(
+            json!({"allow_confirm_chat": true}),
+            "confirm_action",
+            "{\"action\":\"delete the draft report\",\"reason\":\"cleanup\"}",
+        )
+        .await;
+        let perms: Vec<&Value> = evs.iter().filter(|e| e["kind"] == "permission").collect();
+        assert!(perms.is_empty(), "the chat grant must skip the popup: {perms:?}");
+        let tr = evs
+            .iter()
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "confirm_action")
+            .expect("confirm_action must run");
+        assert_eq!(tr["ok"], true, "{tr}");
+        assert!(
+            tr["result"].as_str().unwrap_or_default().contains("pre-approved"),
+            "{tr}"
+        );
+    }
+
+    /// "Always in this chat" for one SSH destination: the run_terminal call
+    /// passes the gate with no popup and really runs (its result is the ssh
+    /// output, not a gate denial).
+    #[tokio::test]
+    async fn a_chat_ssh_grant_skips_the_host_popup() {
+        let evs = run_gate_turn(
+            json!({"allow_ssh_hosts": ["deploy@203.0.113.7"]}),
+            "run_terminal",
+            "{\"command\":\"ssh -o ConnectTimeout=1 -o BatchMode=yes deploy@203.0.113.7 true\"}",
+        )
+        .await;
+        let perms: Vec<&Value> = evs.iter().filter(|e| e["kind"] == "permission").collect();
+        assert!(perms.is_empty(), "the granted host must skip the popup: {perms:?}");
+        let tr = evs
+            .iter()
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "run_terminal")
+            .expect("run_terminal must run");
+        let text = tr["result"].as_str().unwrap_or_default();
+        assert!(!text.contains("DENIED the SSH"), "granted host must not be refused: {tr}");
+    }
+
+    /// "Always in this chat" for desktop control: a direct `computer` call
+    /// must pass the per-task gate with no popup.
+    #[tokio::test]
+    async fn a_chat_desktop_grant_skips_the_task_popup() {
+        let evs = run_gate_turn(
+            json!({"allow_computer": true, "allow_computer_chat": true}),
+            "computer",
+            "{\"action\":\"list_screens\"}",
+        )
+        .await;
+        let perms: Vec<&Value> = evs.iter().filter(|e| e["kind"] == "permission").collect();
+        assert!(perms.is_empty(), "the chat grant must skip the popup: {perms:?}");
+        let tr = evs
+            .iter()
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "computer")
+            .expect("computer must run");
+        assert_eq!(tr["ok"], true, "{tr}");
+    }
+
     /// A bundle root with one enabled pack and one agent profile.
     fn bundle_root(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -500,8 +685,8 @@
             .collect();
         assert_eq!(
             names,
-            vec!["read", "load_plugin"],
-            "only the declared, existing work tool survives — plus the always-on plugin loader"
+            vec!["read", "load_plugin", "batch"],
+            "only the declared, existing work tool survives — plus the always-on plugin loader and the round composer"
         );
 
         // No declaration at all = the builtin explore set, untouched.
@@ -539,14 +724,14 @@
         // Case-only differences already worked and must keep working.
         assert_eq!(
             names(&["Read", "Grep", "Glob"]),
-            vec!["read", "grep", "glob", "load_plugin"]
+            vec!["read", "grep", "glob", "load_plugin", "batch"]
         );
         // These differ by SPELLING; before the alias table they vanished.
         assert_eq!(
             names(&["WebSearch", "WebFetch"]),
-            vec!["web_search", "fetch_url", "load_plugin"]
+            vec!["web_search", "fetch_url", "load_plugin", "batch"]
         );
-        assert_eq!(names(&["LS"]), vec!["glob", "load_plugin"]);
+        assert_eq!(names(&["LS"]), vec!["glob", "load_plugin", "batch"]);
         // `Bash` canonicalizes to `run_terminal`, which the research table does
         // not hold: nothing matches, so the function reports the miss and the
         // caller keeps the table rather than leaving the agent tool-less. (A
@@ -579,13 +764,49 @@
         // The real bundle shape found on this machine.
         assert_eq!(
             names(&["Read", "Grep", "Glob", "Bash"]),
-            vec!["glob", "grep", "load_plugin", "read", "run_terminal"]
+            vec!["batch", "glob", "grep", "load_plugin", "read", "run_terminal"]
         );
         // A write-capable pack keeps its writing tools too.
         assert_eq!(
             names(&["Read", "Bash", "Edit", "Write"]),
-            vec!["edit_file", "load_plugin", "read", "run_terminal", "write_file"]
+            vec!["batch", "edit_file", "load_plugin", "read", "run_terminal", "write_file"]
         );
+    }
+
+    /// A narrowed profile must still be able to COMPOSE its step.
+    ///
+    /// `batch` runs nothing of its own — every op it carries is re-gated by the
+    /// turn's caps — so keeping it widens no reach. Dropping it did real damage:
+    /// a pack declaring "Read, Grep, Bash" lost the only way to issue those three
+    /// in ONE round and spent three, and the batching levers (which read the real
+    /// binding) then had nothing to offer it. Traced (`mwanphb7`, `mwam7hcn`):
+    /// 85% of rounds were single-call.
+    #[test]
+    fn a_narrowed_profile_keeps_the_round_composer() {
+        for declared in [
+            vec!["read"],
+            vec!["Read", "Grep", "Glob", "Bash"],
+            vec!["web_search"],
+        ] {
+            let mut schemas = subagent_schemas();
+            retain_subagent_tools(
+                &mut schemas,
+                &declared.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            let names: Vec<&str> = schemas
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str())
+                .collect();
+            assert!(
+                names.contains(&"batch"),
+                "{declared:?} lost the round composer: {names:?}"
+            );
+            // It must still not invent a work tool the pack never declared.
+            assert!(
+                names.contains(&"load_plugin"),
+                "the plugin loader is always on: {names:?}"
+            );
+        }
     }
 
     /// The universe must never hand a sub-agent the parent's own doors:
@@ -3311,6 +3532,60 @@
         }
     }
 
+    /// A writer call names its file(s) through THREE shapes: one top-level
+    /// `path`, `edits:[{path,…}]`, `files:[{path,content}]` — and a batch
+    /// legitimately names a DIFFERENT file per entry. Resolution used to stop
+    /// at the first entry (and, before that, missed the `files[]` shape
+    /// entirely), so every later file of one call got no pre-edit snapshot,
+    /// no diff event, no Review row and no `applied change` for the model.
+    #[test]
+    fn writer_target_paths_lists_every_file_a_call_names() {
+        // Non-writers name no file at all.
+        assert!(writer_target_paths("grep", &json!({"path": "a.rs"})).is_empty());
+        // Single top-level path, both spellings.
+        assert_eq!(
+            writer_target_paths("write_file", &json!({"path": "a.rs", "content": "x"})),
+            vec!["a.rs"]
+        );
+        assert_eq!(
+            writer_target_paths("edit_file", &json!({"filePath": "a.rs"})),
+            vec!["a.rs"]
+        );
+        // The `files[]` batch shape: one path per entry, ALL of them.
+        assert_eq!(
+            writer_target_paths(
+                "write_file",
+                &json!({"files": [
+                    {"path": "a.rs", "content": "1"},
+                    {"path": "b.rs", "content": "2"}
+                ]})
+            ),
+            vec!["a.rs", "b.rs"]
+        );
+        // The `edits[]` batch shape, different file per entry, first-appearance
+        // order preserved and duplicates collapsed.
+        assert_eq!(
+            writer_target_paths(
+                "edit_file",
+                &json!({"edits": [
+                    {"path": "a.rs", "old_string": "x", "new_string": "y"},
+                    {"path": "b.rs", "old_string": "z", "new_string": "w"},
+                    {"path": "a.rs", "old_string": "y", "new_string": "q"}
+                ]})
+            ),
+            vec!["a.rs", "b.rs"]
+        );
+        // Blank and absent paths are skipped, not turned into "" (which used
+        // to resolve to the workspace ROOT and diff nothing).
+        assert_eq!(
+            writer_target_paths(
+                "write_file",
+                &json!({"files": [{"path": "", "content": "1"}, {"content": "2"}, {"path": "a.rs", "content": "3"}]})
+            ),
+            vec!["a.rs"]
+        );
+    }
+
     #[test]
     fn the_lone_serial_hint_escalates_instead_of_repeating() {
         // A fixed string fired on 16 consecutive rounds of one fresh chat and the
@@ -5038,6 +5313,7 @@
             api_keys: vec!["pk".into()],
             root: "/tmp/x".into(),
             mode: "build".into(),
+            run_mode: "code".into(),
             prompt: "hi".into(),
             history: Vec::new(),
             system_prompt: String::new(),
@@ -5054,10 +5330,13 @@
             subagent_kind: None,
             data_root: String::new(),
             allow_computer: false,
+            allow_computer_chat: false,
             allow_create: false,
             allow_browser: false,
             allow_outside: false,
             allow_outside_folders: Vec::new(),
+            allow_confirm_chat: false,
+            allow_ssh_hosts: Vec::new(),
             search_plugins: Vec::new(),
             image_provider_id: String::new(),
             image_model: String::new(),
@@ -5934,81 +6213,49 @@
         test_set_turn_running(chat, false);
     }
 
-    #[tokio::test]
-    async fn a_parent_steer_cancels_a_running_delegation() {
-        // `run_subagent` blocks the parent until the child returns, and the
-        // child's own steer guard is inert. Without this watcher a steer typed
-        // during a long browser/explore run waited for the whole child turn —
-        // the stuck "Steering the running agent…" bubble. A parent steer must
-        // become a CHILD cancel so the delegation unwinds promptly.
-        let stop: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let steer = std::sync::Arc::new(InterruptSignal::new());
-        let guard = SteerAwareCancel::new(&stop, &steer);
-        assert!(!guard.flag.load(Ordering::Relaxed));
-        steer.raise();
-        let mut tripped = false;
-        for _ in 0..100 {
-            if guard.flag.load(Ordering::Relaxed) {
-                tripped = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(tripped, "a parent steer must cancel the child delegation");
-        assert!(guard.steered(), "the parent must know the child was steered");
-    }
-
-    #[tokio::test]
-    async fn a_parent_stop_still_cancels_the_delegation_without_reading_as_a_steer() {
-        // Stop reached the child before this helper existed; the watcher must
-        // keep that path intact and must not misreport it as a steer (the model
-        // would then be told to read a new message that does not exist).
-        let stop: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let steer = std::sync::Arc::new(InterruptSignal::new());
-        let guard = SteerAwareCancel::new(&stop, &steer);
-        stop.store(true, Ordering::Relaxed);
-        let mut tripped = false;
-        for _ in 0..100 {
-            if guard.flag.load(Ordering::Relaxed) {
-                tripped = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(tripped, "Stop must still reach the child delegation");
-        assert!(!guard.steered(), "Stop is not a steer");
-    }
-
-    #[tokio::test]
-    async fn a_finished_delegation_leaves_no_watcher_behind() {
-        let stop: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let steer = std::sync::Arc::new(InterruptSignal::new());
-        let guard = SteerAwareCancel::new(&stop, &steer);
-        let child = guard.flag.clone();
-        drop(guard);
-        steer.raise();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            !child.load(Ordering::Relaxed),
-            "a dropped guard must not keep watching the parent"
-        );
+    #[test]
+    fn a_steer_without_a_running_turn_is_rejected_not_queued() {
+        // push_steer answers ok:false when the turn already ended, so the
+        // renderer re-sends the message as a normal next turn instead of
+        // leaving a pending bubble that nothing will ever consume.
+        let chat = "steer-not-running-chat";
+        assert!(!push_steer(chat, "late", "hello", Vec::new(), Vec::new()));
+        assert!(steer_inbox().lock().unwrap().get(chat).is_none());
     }
 
     #[test]
-    fn a_steered_delegation_result_tells_the_model_not_to_retry() {
-        let empty = steered_tool_result(String::new());
-        assert!(empty.contains("Do NOT retry"), "empty result: {empty}");
-        let partial = steered_tool_result("found 3 pages".into());
+    fn the_subagent_key_cannot_consume_the_parents_inbox() {
+        // run_turn passes an EMPTY steer key for mode=="subagent" (the child
+        // shares the parent's chat id). Both delivery operations must no-op on
+        // it, so a steer typed during a delegation survives until the PARENT's
+        // next step — never injected into the delegation's conversation.
+        let chat = "steer-subagent-key-chat";
+        test_set_turn_running(chat, true);
+        assert!(push_steer(chat, "s1", "pivot a little", Vec::new(), Vec::new()));
+        let mut seen: Vec<Value> = Vec::new();
+        let mut messages: Vec<Value> = Vec::new();
+        {
+            let mut emit = |e: &AgentEvent| seen.push(e.to_json());
+            assert_eq!(
+                deliver_steers(&mut messages, "", &mut emit),
+                0,
+                "the child must not deliver the parent's steer"
+            );
+            assert_eq!(drop_steers("", &mut emit), 0);
+        }
+        assert!(messages.is_empty());
+        assert!(seen.is_empty());
         assert!(
-            partial.starts_with("Stopped because the user sent a new instruction"),
-            "partial result: {partial}"
+            steer_pending(chat),
+            "the parent's steer must still be queued for its own next step"
         );
-        assert!(partial.ends_with("found 3 pages"), "partial result: {partial}");
-        // A call that never started is still ANSWERED (the assistant message
-        // already carries its tool_call id) but must not be retried either.
-        let skipped = steered_skip_result();
-        assert!(skipped.contains("Skipped"), "skip result: {skipped}");
-        assert!(skipped.contains("Do NOT retry"), "skip result: {skipped}");
+        // Cleanup as the parent's exit path would.
+        let mut dropped: Vec<Value> = Vec::new();
+        {
+            let mut emit = |e: &AgentEvent| dropped.push(e.to_json());
+            assert_eq!(drop_steers(chat, &mut emit), 1);
+        }
+        test_set_turn_running(chat, false);
     }
 
     #[tokio::test]
@@ -6775,6 +7022,20 @@ done
         let ev = events.lock().unwrap();
         let retries = count_kind(&ev, "retry");
         assert!(retries >= 2, "the ladder must retry a dead slot: {retries}");
+        // Every retry banner names the attempt that is about to START — the
+        // fallback notice included. Re-emitting the attempt that just failed
+        // froze the counter, so walking a list / wrapping to its first model
+        // looked like no auto-retry step had happened.
+        let announced: Vec<u64> = ev
+            .iter()
+            .filter(|e| e["kind"] == "retry")
+            .filter_map(|e| e["attempt"].as_u64())
+            .collect();
+        assert_eq!(announced.first().copied(), Some(2), "{announced:?}");
+        assert!(
+            announced.windows(2).all(|w| w[0] < w[1]),
+            "the auto-retry step must increase on every retry: {announced:?}"
+        );
         assert!(
             ev.iter().any(|e| e["kind"] == "retry_giveup"),
             "an always-failing slot must end in a giveup"
@@ -7649,6 +7910,86 @@ done
             vision_bodies.lock().unwrap().is_empty(),
             "the Vision slot must not preempt a main model whose capability is unknown"
         );
+    }
+
+    /// The sub-agent counterpart: when the capability map KNOWS the sub-agent's
+    /// model reads images, the capture goes inline. Unknown sub-agent capability
+    /// routes to the Vision slot (the test below), but a known `true` must not —
+    /// otherwise every screenshot of every sub-agent pays a second round-trip,
+    /// which is exactly the slow path the capability map exists to avoid.
+    #[tokio::test]
+    async fn a_vision_capable_subagent_model_receives_the_capture_inline() {
+        let (vision_base, vision_rx) =
+            spawn_json_mock_upstream("a red button on a white page").await;
+        let vision_bodies = drain_bodies(vision_rx);
+        let (main_base, main_rx) = spawn_scripted_mock_upstream(vec![vec![
+            text_frame("the screenshot shows a red button"),
+            finish_frame("stop", 11, 2),
+        ]])
+        .await;
+        let main_bodies = drain_bodies(main_rx);
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-live-subagent-vision-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/capture-model",
+            "base_url": format!("{main_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": dir.to_string_lossy(),
+            "mode": "subagent",
+            "subagent_kind": "explore",
+            "prompt": "look at the screenshot and tell me what it shows",
+            "history": [],
+            "images": [PNG_URL],
+            "subagent_models": { "vision": "vision-prov/vision-capture-model" },
+            "providers": {
+                "chat-provider": {
+                    "kind": "custom",
+                    "manualVisionMap": { "main/capture-model": true }
+                },
+                "vision-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{vision_base}/v1"),
+                    "apiKeys": ["sk-vision"]
+                }
+            },
+            "data_root": dir.to_string_lossy()
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut emit = |_e: &AgentEvent| {};
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        let body = main_bodies
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the sub-agent turn must run"));
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["content"].is_array())
+            .map(|m| m["content"].clone())
+            .unwrap_or_else(|| panic!("the sub-agent model must receive image blocks: {body}"));
+        assert!(
+            blocks.as_array().unwrap().iter().any(|b| b["type"] == "image_url"
+                && b["image_url"]["url"] == PNG_URL),
+            "a vision-capable sub-agent's model must get the bytes inline: {body}"
+        );
+        assert!(
+            vision_bodies.lock().unwrap().is_empty(),
+            "a vision-capable sub-agent must not pay the Vision slot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -8687,9 +9028,9 @@ done
         // 58_432 input tokens at a 0.0% cache hit — while the next ask->ask
         // turn of the same size hit 94.6%. See `default_system_prompt`.
         let root = "/Users/someone/projects/a-really-long-workspace-name";
-        let build = default_system_prompt("build", root);
-        let ask = default_system_prompt("ask", root);
-        let plan = default_system_prompt("plan", root);
+        let build = default_system_prompt("code", "build", root);
+        let ask = default_system_prompt("code", "ask", root);
+        let plan = default_system_prompt("code", "plan", root);
 
         // The two prompts differ ONLY after the constant instructional body.
         let shared = build
@@ -8733,9 +9074,9 @@ done
         // long structured dump: the brevity rule lived in the appstate text,
         // which the backend never sends. The rule must ride the prompt the model
         // actually gets, and it must be ASK-only.
-        let ask = default_system_prompt("ask", "/tmp/x");
-        let build = default_system_prompt("build", "/tmp/x");
-        let plan = default_system_prompt("plan", "/tmp/x");
+        let ask = default_system_prompt("code", "ask", "/tmp/x");
+        let build = default_system_prompt("code", "build", "/tmp/x");
+        let plan = default_system_prompt("code", "plan", "/tmp/x");
 
         assert!(ask.contains("ASK mode"), "ask must carry its own rule");
         // Brevity is the default, depth is opt-in.
@@ -8761,9 +9102,9 @@ done
         // only deliverable is prose. Pin all three here so a rule cannot be
         // written in the dead table again.
         let root = "/tmp/ws";
-        let ask = default_system_prompt("ask", root);
-        let build = default_system_prompt("build", root);
-        let plan = default_system_prompt("plan", root);
+        let ask = default_system_prompt("code", "ask", root);
+        let build = default_system_prompt("code", "build", root);
+        let plan = default_system_prompt("code", "plan", root);
 
         // Build: the edit is the artifact, the reply is a short report of it.
         assert!(build.contains("IS the artifact"));
@@ -8800,12 +9141,12 @@ done
         // in `appstate::system_prompts` is display-only. Without it the model
         // ran a 20-call plugin workflow with no update_plan at all, so the right
         // panel had no todos to show.
-        let build = default_system_prompt("build", "/tmp/x");
+        let build = default_system_prompt("code", "build", "/tmp/x");
         assert!(build.contains("CHECKLIST"), "{build}");
         assert!(build.contains("update_plan"), "{build}");
         assert!(build.contains("plugin workflow"), "{build}");
         // Ask stays a short answer: no checklist duty there.
-        assert!(!default_system_prompt("ask", "/tmp/x").contains("CHECKLIST"));
+        assert!(!default_system_prompt("code", "ask", "/tmp/x").contains("CHECKLIST"));
     }
 
     #[test]
@@ -8827,9 +9168,9 @@ done
         // in every mode, so a bare-phrase check would pass on the label alone.
         const HEADER: &str = "CODING RULES — apply to every write, edit and review:";
         let root = "/tmp/x";
-        let build = default_system_prompt("build", root);
+        let build = default_system_prompt("code", "build", root);
         for mode in ["build", "plan"] {
-            let p = default_system_prompt(mode, root);
+            let p = default_system_prompt("code", mode, root);
             assert!(
                 p.contains(HEADER),
                 "{mode} acts on the change — it must carry the coding rules"
@@ -8843,7 +9184,7 @@ done
         // different prompt entirely (`req.system_prompt` is non-empty for
         // them), so asserting on them here would test code that never runs.
         for mode in ["ask"] {
-            let p = default_system_prompt(mode, root);
+            let p = default_system_prompt("code", mode, root);
             assert!(
                 !p.contains(HEADER),
                 "{mode} is read-only — it must not be billed the coding rules"
@@ -8861,7 +9202,7 @@ done
         let body = |p: &str| p.split("Workspace root:").next().unwrap_or_default().to_string();
         assert_eq!(
             body(&build),
-            body(&default_system_prompt("ask", root)),
+            body(&default_system_prompt("code", "ask", root)),
             "the rules must ride in the per-mode tail, not the cached body — \
              otherwise it costs a cache re-bill per switch"
         );
@@ -8869,7 +9210,7 @@ done
         // must share one byte-identical body, or `build` -> `plan` re-bills it.
         assert_eq!(
             body(&build),
-            body(&default_system_prompt("plan", root)),
+            body(&default_system_prompt("code", "plan", root)),
             "build and plan must share the cached body — the rules ride the tail"
         );
     }
@@ -8888,7 +9229,7 @@ done
     fn the_refused_terminal_shapes_are_named_in_every_mode() {
         let root = "/tmp/x";
         for mode in ["build", "plan", "ask"] {
-            let p = default_system_prompt(mode, root);
+            let p = default_system_prompt("code", mode, root);
             assert!(
                 p.contains("`find`/`fd`/`tree`/`rg`/`grep -r`"),
                 "{mode} may not search through the shell — it must see the exact refused shapes"
@@ -8901,6 +9242,59 @@ done
                 "{mode} must also learn which shapes are NOT refused"
             );
         }
+    }
+
+    #[test]
+    fn a_chat_persona_carries_no_coding_rules_in_any_mode() {
+        // The user's rule, pinned: Chat is the general-purpose agent in all three
+        // modes — no coding rulebook, no "docstrings must be English", no
+        // describe-the-change-for-Build. Only Code keeps them, and ONLY in the
+        // volatile tail so the cached body stays shared between personas.
+        let root = "/tmp/ws";
+        for mode in ["ask", "plan", "build"] {
+            let chat = default_system_prompt("chat", mode, root);
+            assert!(
+                !chat.contains("CODING RULES"),
+                "chat/{mode} must not be billed the coding rules"
+            );
+            assert!(
+                !chat.contains("Debugging protocol"),
+                "chat/{mode} must not inline the coding-rules asset"
+            );
+            assert!(
+                !chat.contains("Docstrings and comments in code must be English"),
+                "chat/{mode} must not carry the code-comment rule"
+            );
+            assert!(
+                chat.contains("GENERAL-PURPOSE agent"),
+                "chat/{mode} must state the general-purpose persona"
+            );
+            // The body is shared with Code: switching persona costs the tail only.
+            let body_of = |p: &str| {
+                p.split("Workspace root:").next().unwrap_or_default().to_string()
+            };
+            assert_eq!(
+                body_of(&chat),
+                body_of(&default_system_prompt("code", mode, root)),
+                "chat and code must share the cached body in {mode}"
+            );
+        }
+        // Code keeps the rules where they govern a write or a described write.
+        for mode in ["build", "plan"] {
+            assert!(
+                default_system_prompt("code", mode, root).contains("CODING RULES"),
+                "code/{mode} keeps the rules"
+            );
+        }
+        assert!(default_system_prompt("code", "build", root).contains("SOFTWARE-ENGINEERING agent"));
+    }
+
+    #[test]
+    fn a_missing_run_mode_falls_back_to_the_general_purpose_persona() {
+        // An older UI build sends no `run_mode`; the request default must land on
+        // Chat, never on the engineering persona the user did not choose.
+        assert_eq!(super::default_run_mode(), "chat");
+        assert_eq!(default_run_mode(), "chat");
     }
 
     #[test]

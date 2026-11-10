@@ -1,9 +1,11 @@
 // SSR/store test for the EXPLORE feature: one sub-agent run's calls live in the
-// right-hand panel, never expanded in the chat transcript.
+// chat transcript as a ToolGroupView card (agent name in the header, inner
+// calls as trace rows once the user expands it).
 //
 // ۱) openExplore: یک تب explore می‌سازد و کلیک دوباره همان تب را retarget می‌کند
 //    (یکی به‌ازای هر چت، نه یک تب به‌ازای هر اجرا).
-// ۲) کارت explore در چت: فرزندان فقط در پنل راست رندر می‌شوند، نه داخل چت.
+// ۲) کارت explore در چت: مثل tool group با pill نام ساب‌ایجنت؛ فرزندان فقط با
+//    بازشدن درجا رندر می‌شوند، نه در حالت جمع‌شده.
 // ۳) تب پنل: اجرای از‌دست‌رفته پیام graceful نشان می‌دهد (بدون کرش).
 import "./_globals.ts";
 
@@ -53,7 +55,7 @@ console.log("۱) openExplore → یک تب explore برای همان اجرا:")
   );
 }
 
-console.log("۲) کارت explore در چت: فرزندان فقط در پنل راست، نه در چت:");
+console.log("۲) کارت explore در چت: مثل tool group با pill نام؛ فرزندان فقط با بازشدن درجا:");
 {
   resetViewer();
   const msg = {
@@ -76,21 +78,31 @@ console.log("۲) کارت explore در چت: فرزندان فقط در پنل �
     ] as never,
   };
   const html = renderToString(<ChatMessageView message={msg} />);
-  check("کارت explore رندر شد", html.includes("tool-card explore"), html.slice(0, 300));
-  check("ردیف فرزندان داخل چت رندر نشد", !html.includes("explore-call"));
-  // سر کارت یک <button> بومی است (کلیک‌پذیر و قابل فوکوس با کیبورد) و به
-  // openExplore وصل شده — همان چیزی که واقعاً رندر می‌شود، نه role تکراری.
   check(
-    "سر کارت به‌صورت دکمهٔ بومی رندر شده و به پنل وصل است",
-    html.includes('<button type="button" class="trace-head explore-card-open"'),
+    "کارت با قاب tool-trace و یک گروه tool-group رندر شد",
+    html.includes("tool-trace") && (html.match(/tool-group/g) || []).length === 1,
+    html.slice(0, 300),
+  );
+  check("کارت explore قدیمی رندر نشد", !html.includes("tool-card explore"));
+  check(
+    "ردیف فرزندان در حالت جمع‌شده رندر نشد",
+    !html.includes("explore-call") && !html.includes("trace-row-head"),
+  );
+  // سر گروه یک <button> بومی است (کلیک‌پذیر و قابل فوکوس با کیبورد) و گروه
+  // را درجا باز/بسته می‌کند — همان ساختار گروه ابزار معمولی.
+  check(
+    "سر گروه به‌صورت دکمهٔ بومی رندر شده",
+    /<button[^>]*class="trace-head /.test(html),
     html.slice(0, 300),
   );
   check(
-    "نام و تعداد هر tool call در کارت نمایش داده شد",
-    html.includes("explore-tool-chip") &&
-      html.includes("explore-tool-n") &&
-      html.includes("Read File") &&
-      html.includes("Search Files"),
+    "pill نام ساب‌ایجنت («Explore») اولِ هدر است",
+    /trace-pill trace-pill-sub[^>]*>Explore</.test(html),
+    html.slice(0, 300),
+  );
+  check(
+    "تعداد هر tool call در pills هدر هست",
+    html.includes("Read File") && html.includes("Search Files"),
     html.slice(0, 400),
   );
 }

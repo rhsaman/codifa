@@ -28,6 +28,7 @@ import type {
   ProviderKind,
   QueuedMessage,
   RecentModel,
+  RunMode,
   SearchConsoleConfig,
   SearchPluginConfig,
   SearchPluginKind,
@@ -43,6 +44,7 @@ import type {
   LspStatus,
   Workspace,
 } from '../types'
+import { normalizeRunMode } from '../types'
 import type { LiveVoiceState } from './liveVoiceState'
 
 /** Fixed direction of the app CHROME (Persian-first, the old RTL/LTR toggle
@@ -54,6 +56,17 @@ export const APP_DIR: 'rtl' = 'rtl'
 /** Max persisted inbox seen ids — newest win, so the badge store stays bounded. */
 export const MAX_SCHEDULE_RUNS_SEEN = 500
 
+/** Normalize the persisted per-workspace persona map: unknown values fall back
+ *  to the general-purpose default, unknown keys are dropped. Pure for test. */
+export function normalizeWorkspaceRunModes(raw: unknown): Record<string, RunMode> {
+  const out: Record<string, RunMode> = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key) continue
+    out[key] = normalizeRunMode(value)
+  }
+  return out
+}
 /** Normalize persisted seen ids to a bounded list of non-empty strings. Pure for test. */
 export function normalizeScheduleRunsSeen(raw: unknown): string[] {
   if (!Array.isArray(raw)) return []
@@ -101,6 +114,7 @@ import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
 // every `from './store'` import keeps working.
 import { uid, MAX_COMPACTED_PER_CHAT, capCompactedMessages, FORK_SEED_CHARS_PER_MESSAGE, FORK_SEED_MAX_CHARS, forkSeedMessage, lspStatusLabel, lspStatusFromEvent } from './store/data'
 import { QUEUED_SENT_GRACE_MS, pruneQueued, sanitizeChats } from './store/normalize'
+import { moveAt } from './useDragReorder'
 import { ANTROPIC_SKILLS_MARKETPLACE, COMMUNITY_MARKETPLACE, SUPERPOWERS_MARKETPLACE, AGENTS_MARKETPLACE, DEFAULT_MARKETPLACES, MARKETPLACE_DEFAULTS_VERSION } from './store/markets'
 import { MAX_TOOL_TEXT, MAX_TOOL_ARG, MAX_PERSIST_IMAGE_CHARS, trimPersistImageValue, sanitizeImageDataUrl, trimToolActivity, MODE_LABELS, SEARCH_PLUGIN_LABELS, dedupeByKind, migrateModePrompts, } from './store/sanitize'
 import { dedupeChats, selectLoadedChats } from './store/chats'
@@ -243,12 +257,13 @@ export function defaultCustomSubagents(): CustomSubagent[] {
       id: 'computer',
       name: 'Desktop Operator',
       description:
-        'Controls the machine desktop: native app windows, screenshots, mouse and keyboard. Use only when the work must happen in a real app rather than a page; file creation and export (PPTX/DOCX/XLSX/PDF) is a terminal-script job, and page content and page screenshots belong to the browser agent. The user is asked for permission before this agent runs.',
+        'Controls the machine desktop: native app windows, screenshots, mouse and keyboard. Use only when the work must happen in a real app rather than a page; file creation and export (PPTX/DOCX/XLSX/PDF) is a terminal-script job, and page content and page screenshots belong to the browser agent. Ask it to LOOK and report: it never saves screenshot files or writes folders — describe the screen, not a path. The user is asked for permission before this agent runs.',
       prompt: [
         'You are a desktop sub-agent. You control the machine with the computer tool.',
         '',
         '- THE DESKTOP IS THE LAST RESORT: use it only for an app that has no usable command line.',
         '- File creation, conversion and export (PPTX/DOCX/XLSX/PDF, a deck or report built from data, converting a document) are NOT desktop work: do them with `run_terminal` in ONE call using python-pptx/python-docx/openpyxl or `soffice --headless`. Never drive PowerPoint/Word/Excel menus for work a script can do.',
+        '- SCREENSHOTS NEED NO FILE WORK: the computer tool saves each capture itself and shows it to you. NEVER create folders, save image files or use `run_terminal` to produce a screenshot — even when the task names a path. Look at the screen and report what you see in your answer text.',
         '- Take a screenshot first; act only on what you can see.',
         '- Every changing action (click, type, key, scroll) returns the screen afterwards — do not screenshot again right after.',
         '- Prefer keyboard shortcuts over pixel hunting when one exists.',
@@ -710,8 +725,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated || persistSuspended) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, customSubagents, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
-    const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, customSubagents, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+    const { settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, customSubagents, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, workspaceRunModes, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+    const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, customSubagents, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, workspaceRunModes, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -812,7 +827,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
   // as well — this is the path the quit flush uses, and the active snapshot
   // must match the live top-level fields at that moment.
   persistWorkspaceBuckets(s)
-  const { settings, chats, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+  const { settings, chats, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, workspaceRunModes, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -828,7 +843,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+        const payload = await encryptSettings({ ...settings, root, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, updateFeedUrl, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, workspaceRunModes, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1105,6 +1120,14 @@ interface State {
   /** Height in px (localStorage `coder:terminalHeight`). */
   terminalHeight: number
   workspaceColors: Record<string, string>
+  /** Upper-level persona per WORKSPACE key (`workspaceKeyFor(root)`): `chat` is
+   *  the general-purpose agent, `code` the engineering one. A workspace setting,
+   *  not a per-chat one, so switching a project to Code keeps every chat in it
+   *  in Code. Missing key = the general-purpose default. */
+  workspaceRunModes: Record<string, RunMode>
+  /** The persona the CURRENT workspace runs in (never undefined). */
+  activeRunMode: () => RunMode
+  setRunMode: (key: string, runMode: RunMode) => void
   pinnedWorkspaces: string[]
   /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
   pinnedChats: string[]
@@ -1573,6 +1596,10 @@ interface State {
   clearQueue: (chatId: string) => void
   /** Mark a queued message as consumed (steered into the running agent). */
   markQueuedSent: (chatId: string, id: string) => void
+  /** Drag-reorder: move the UNSENT queued item at `from` to land at `insertAt`
+   *  (positions within the unsent list — exactly what the queue cards render,
+   *  using the shared moveAt math from lib/useDragReorder). */
+  moveQueuedMessage: (chatId: string, from: number, insertAt: number) => void
   /** Add a (provider, model) token delta to the chat-wide cumulative usage
    *  (survives compacts, unlike a single message's per-turn usage). The
    *  provider and model are stored EXPLICITLY so the sidebar shows the exact
@@ -1600,6 +1627,8 @@ interface State {
       freeText?: string
       sections?: { title: string; options: string[] }[]
       secSelected?: number[][]
+      secOwn?: boolean[]
+      secFreeText?: string[]
     } | null,
   ) => void
   /** Set/clear a chat's pending `permission` request. Same rationale as
@@ -1608,6 +1637,20 @@ interface State {
   setChatPendingPermission: (
     chatId: string,
     req: { id: string; action: string; path?: string; reason?: string; scope?: string; folder?: string } | null,
+  ) => void
+  /** Merge an "Always in this chat" grant into a chat's `chatGrants`. Boolean
+   *  patches OR in; `folders`/`hosts` append idempotently (the same folder or
+   *  `user@host` must not duplicate). Persisted with the chat, so the grant
+   *  survives restarts and dies with the chat. */
+  setChatGrant: (
+    chatId: string,
+    patch: {
+      desktop?: boolean
+      outsideAll?: boolean
+      folders?: string[]
+      hosts?: string[]
+      confirm?: boolean
+    },
   ) => void
   markToolReverted: (messageId: string, index: number) => void
   truncateTo: (messageId: string) => boolean
@@ -1767,6 +1810,10 @@ function applyChatBody(body: Chat, prepend = false): void {
         hydrated: true,
         pendingAsk: c.pendingAsk ?? null,
         pendingPermission: c.pendingPermission ?? null,
+        // An "Always in this chat" grant given MID-TURN must not be clobbered
+        // by a history page read from a body written before the click: the
+        // in-memory copy is at least as fresh as the disk one, so it wins.
+        chatGrants: c.chatGrants ?? body.chatGrants ?? null,
         draft: c.draft,
         scrollPos: c.scrollPos ?? body.scrollPos ?? null,
         updatedAt: Math.max(c.updatedAt ?? 0, body.updatedAt ?? 0),
@@ -2453,6 +2500,7 @@ export const useStore = create<State>((set, get) => ({
   backupPath: '',
   updateFeedUrl: '',
   workspaceColors: {},
+  workspaceRunModes: {},
   pinnedWorkspaces: [],
   pinnedChats: [],
   workspaces: [],
@@ -3107,6 +3155,7 @@ export const useStore = create<State>((set, get) => ({
       sidebarOpen: raw.sidebarOpen !== false,
       rightPanelOpen: raw.rightPanelOpen === true,
       workspaceColors: raw.workspaceColors ?? {},
+      workspaceRunModes: normalizeWorkspaceRunModes(raw.workspaceRunModes),
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
       pinnedChats: Array.isArray(raw.pinnedChats) ? raw.pinnedChats : [],
       scheduleRunsSeen: normalizeScheduleRunsSeen((raw as { scheduleRunsSeen?: unknown }).scheduleRunsSeen),
@@ -3557,6 +3606,18 @@ export const useStore = create<State>((set, get) => ({
       },
     }))
     get().persist()
+  },
+
+  setRunMode: (key, runMode) => {
+    // One workspace, one persona: the whole project switches together, and the
+    // write is persisted so the choice survives a restart.
+    set((s) => ({ workspaceRunModes: { ...s.workspaceRunModes, [key]: runMode } }))
+    get().persist()
+  },
+
+  activeRunMode: () => {
+    const s = get()
+    return normalizeRunMode(s.workspaceRunModes[s.activeWorkspaceKey])
   },
 
   removeMode: (id) => {
@@ -4279,6 +4340,13 @@ export const useStore = create<State>((set, get) => ({
         workspaceColors[nextKey] = workspaceColors[key]
       }
       delete workspaceColors[key]
+      // The persona follows the workspace, like its color: a renamed project must
+      // not silently fall back to the general-purpose default.
+      const workspaceRunModes = { ...s.workspaceRunModes }
+      if (workspaceRunModes[key] !== undefined && workspaceRunModes[nextKey] === undefined) {
+        workspaceRunModes[nextKey] = workspaceRunModes[key]
+      }
+      delete workspaceRunModes[key]
       const chats = s.chats.map((c) =>
         workspaceKey(c.root ?? '') === key
           ? { ...c, root: nextRoot || undefined, updatedAt: Date.now() }
@@ -4314,6 +4382,7 @@ export const useStore = create<State>((set, get) => ({
         workspaces,
         chats,
         workspaceColors,
+        workspaceRunModes,
         pinnedWorkspaces: s.pinnedWorkspaces.map((k) => (k === key ? nextKey : k)),
         workspaceViews,
         workspaceLastUsedAt,
@@ -5509,6 +5578,25 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
+  moveQueuedMessage: (chatId, from, insertAt) => {
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        if (c.id !== chatId) return c
+        const queued = c.queued ?? []
+        const unsent = queued.filter((q) => !q.sent)
+        if (from < 0 || from >= unsent.length || unsent.length < 2) return c
+        // Same insertAt math as every drag-reorder list (moveAt compensates
+        // for the dragged row's own removal; a no-op keeps the order).
+        const next = moveAt(unsent, from, insertAt)
+        // Sent items linger only for the sent-grace window; keep them ahead
+        // so the unsent order is exactly the list the queue cards show.
+        const sentPart = queued.filter((q) => q.sent)
+        return { ...c, queued: [...sentPart, ...next] }
+      }),
+    }))
+    get().persist()
+  },
+
   updateMessage: (id, patch) => {
     set((s) => {
       // Only the chat that actually contains the message needs rebuilding, so
@@ -5659,6 +5747,33 @@ export const useStore = create<State>((set, get) => ({
   setChatPendingPermission: (chatId, req) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === chatId ? { ...c, pendingPermission: req } : c)),
+    }))
+  },
+
+  setChatGrant: (chatId, patch) => {
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        if (c.id !== chatId) return c
+        const prev = c.chatGrants ?? {}
+        const folders = [...(prev.folders ?? [])]
+        for (const f of patch.folders ?? []) {
+          if (!folders.includes(f)) folders.push(f)
+        }
+        const hosts = [...(prev.hosts ?? [])]
+        for (const h of patch.hosts ?? []) {
+          if (!hosts.includes(h)) hosts.push(h)
+        }
+        return {
+          ...c,
+          chatGrants: {
+            desktop: (prev.desktop ?? false) || (patch.desktop ?? false),
+            outsideAll: (prev.outsideAll ?? false) || (patch.outsideAll ?? false),
+            confirm: (prev.confirm ?? false) || (patch.confirm ?? false),
+            folders,
+            hosts,
+          },
+        }
+      }),
     }))
   },
 

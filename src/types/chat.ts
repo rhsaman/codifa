@@ -19,6 +19,12 @@ export interface SearchResultItem {
 
 export interface DiffStats { adds: number; dels: number }
 
+/** The change ONE writer call made to ONE of its files. A batch call names a
+ *  different file per entry (`edits:[{path,…}]` / `files:[{path,content}]`),
+ *  and the backend emits one `diff` event per touched file — so the card keeps
+ *  them per file here while `diff` stays the aggregate all consumers render. */
+export interface CallFileDiff { path: string; diff: string; turnDiff?: string }
+
 /** یک فایل در نمای Review به سبک کدکس: مسیر + شمارش + دیف یکپارچه. */
 export interface ReviewFile { path: string; adds: number; dels: number; diff: string }
 
@@ -39,6 +45,11 @@ export interface ToolActivity {
   turnDiff?: string
   /** شمارش +N -M استخراج‌شده از diff (برای هدر Review). */
   diffStats?: DiffStats
+  /** Per-file breakdown of a writer call's changes (backend sends one `diff`
+   *  event per touched file). `diff` above is the concatenation of these, kept
+   *  for every existing single-diff consumer; keyed by path so a replayed
+   *  event never duplicates an entry. */
+  diffs?: CallFileDiff[]
   elapsedMs?: number
   startedAt?: number
   reverted?: boolean
@@ -404,6 +415,16 @@ export interface Chat {
     /** Per-section selection (parallel to `sections`), persisted like
      *  `selected` so the card survives chat switches. */
     secSelected?: number[][]
+    /** Flat card's "write my own answer" flag: a ticked flag reveals that
+     *  card's own answer field and its text counts as the answer on its own. */
+    own?: boolean
+    /** Per-section "write my own answer" flags (parallel to `sections`): a
+     *  ticked flag reveals that section's own answer field and its text counts
+     *  as that section's answer. */
+    secOwn?: boolean[]
+    /** Per-section typed answers (parallel to `sections`), persisted like
+     *  `secSelected` so a half-written answer survives a chat switch. */
+    secFreeText?: string[]
   } | null
   /** A pending `permission` request from a RUNNING agent turn. Same rationale
    *  as `pendingAsk`: lives on the chat so it survives the ChatPanel remount
@@ -430,6 +451,23 @@ export interface Chat {
    *  Intersected with the live enable map on the backend, so a connector the
    *  user switched OFF does not come back through this list. */
   mcpActive?: string[]
+  /** Grants the user gave with "Always in this chat" (همیشه در این چت) on a
+   *  permission card, persisted PER CHAT so the same gate never re-prompts in
+   *  THIS conversation — a fresh chat asks again. Merged into the turn request
+   *  on every send (like `mcpActive`), never into the global composer grants:
+   *  the composer switch and session outside-grants stay chat-agnostic.
+   *  `desktop` skips the per-task desktop popup, `confirm` covers the model's
+   *  own confirm_action/request_permission asks, `folders`/`hosts` are the
+   *  per-folder / per-SSH-host grants, `outsideAll` opens the whole
+   *  outside-workspace space for this chat only. Cleared nowhere automatically:
+   *  it dies with the chat (delete/new chat). */
+  chatGrants?: {
+    desktop?: boolean
+    outsideAll?: boolean
+    folders?: string[]
+    hosts?: string[]
+    confirm?: boolean
+  } | null
   /** Live voice error shown in the transcript banner under messages (never in the composer). */
   liveError?: string | null
   /** TTS playback error shown in the transcript banner under messages (never beside the speaker icon). */

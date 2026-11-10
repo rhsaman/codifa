@@ -50,22 +50,18 @@
   background: color-mix(in srgb, var(--text) 8%, transparent);
 }
 
-/* 3) Composer — the card is one step lighter than the page (as in the Claude
-   app), slightly rounder, and its border brightens while the input has focus. */
+/* 3) Composer — the card shares the SIDEBAR's background (one surface family
+   across the app chrome) with a soft hairline and a fully rounded pill-like
+   radius, as in the reference; the shadow alone lifts it off the transcript. */
 .composer-inner {
-  background: color-mix(in srgb, var(--text) 8%, var(--bg));
-  border-radius: 18px;
+  background: var(--bg-sidebar);
+  border-color: color-mix(in srgb, var(--text) 12%, transparent);
+  border-radius: 28px;
+  box-shadow: 0 2px 14px -6px rgba(0, 0, 0, 0.35);
 }
 
 .composer-inner:focus-within {
-  border-color: color-mix(in srgb, var(--text) 30%, var(--border));
-}
-
-/* ── Composer, Claude-app style ── */
-.composer-inner {
-  border-color: color-mix(in srgb, var(--text) 10%, transparent);
-  border-radius: 22px;
-  box-shadow: 0 2px 14px -6px rgba(0, 0, 0, 0.35);
+  border-color: color-mix(in srgb, var(--text) 18%, transparent);
 }
 .composer-input::placeholder {
   color: color-mix(in srgb, var(--text-dim) 75%, transparent);
@@ -81,14 +77,45 @@
   color: var(--text);
 }
 
-/* footer status strip: sans-serif, no dividers, no glow */
+/* footer status strip: sans-serif, no dividers, no glow — the three zone
+   groups (mode+think LEFT / model+context CENTER / voice RIGHT) all flatten,
+   and the dropdown caret glyphs come off the pills (user ask). */
+.composer-footer .composer-footer-left,
+.composer-footer .composer-footer-center,
 .composer-footer .composer-footer-right {
   font-family: inherit;
 }
+.composer-footer .composer-footer-left > * + *,
+.composer-footer .composer-footer-center > * + *,
 .composer-footer .composer-footer-right > * + * {
   border-left: 0;
   margin-left: 0;
   padding-left: 0;
+}
+.composer-footer .mode-select-caret {
+  display: none;
+}
+/* Voice icons read as bright as the mode/think labels; the model path is
+   the faintest element on the strip (user ask). Recording/live-active still
+   take the accent (higher-specificity state rules in 03). */
+.composer-footer .icon-btn.live-btn,
+.composer-footer .icon-btn.mic-btn {
+  color: var(--text);
+}
+.composer-footer .icon-btn.mic-btn:hover:not(:disabled) {
+  color: var(--text);
+}
+.composer-footer .pm-select-btn {
+  color: color-mix(in srgb, var(--text-dim) 65%, transparent);
+}
+/* The colors actually live on the label/provider spans (03/15) — the button
+   color alone never reached the text, so fainten them here too: the model
+   path is the faintest element on the strip. */
+.composer-footer .pm-select-label {
+  color: color-mix(in srgb, var(--text-dim) 72%, transparent);
+}
+.composer-footer .pm-select-provider {
+  color: color-mix(in srgb, var(--text-dim) 55%, transparent);
 }
 .composer-footer .mode-select.icon-only .mode-btn,
 .composer-footer .thinking-pill-btn,
@@ -109,81 +136,7 @@
   text-transform: none;
 }
 .composer-footer .mode-btn-dot {
-  width: 6px;
-  height: 6px;
-  box-shadow: none;
-}
-
-/* ── Sub-agent (explore) card ── */
-.tool-card.explore {
-  border-radius: 14px;
-  border-color: color-mix(in srgb, var(--text) 10%, transparent);
-  background: color-mix(in srgb, var(--text) 4%, transparent);
-}
-.tool-card.explore.running {
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-  background: color-mix(in srgb, var(--text) 4%, transparent);
-}
-.tool-card.explore.done {
-  border-color: color-mix(in srgb, var(--text) 10%, transparent);
-}
-.tool-card.explore .explore-card-open {
-  padding: 11px 14px;
-  gap: 10px;
-}
-.tool-card.explore .explore-card-open:hover {
-  background: color-mix(in srgb, var(--text) 4%, transparent);
-}
-.tool-card.explore .trace-pill.trace-pill-sub {
-  font-family: inherit;
-  font-weight: 600;
-  font-size: 12px;
-  letter-spacing: 0;
-  text-transform: none;
-  background: color-mix(in srgb, var(--text) 9%, transparent);
-  color: var(--text);
-}
-.tool-card.explore .trace-pill.trace-pill-sub.running {
-  background: color-mix(in srgb, var(--accent) 20%, transparent);
-}
-.tool-card.explore .trace-head-desc {
-  font-size: 13px;
-  opacity: 1;
-}
-.tool-card.explore .explore-card-count {
-  font-family: inherit;
-  font-size: 11.5px;
-  padding: 0;
-  background: none;
-  opacity: 0.8;
-}
-.tool-card.explore .trace-time,
-.tool-card.explore .explore-card-arrow {
-  color: var(--text-dim);
-  opacity: 0.6;
-}
-.tool-card.explore .explore-card-status .status-ok {
-  color: var(--success);
-}
-.tool-card.explore .explore-tool-chips {
-  padding: 0 14px 12px;
-  gap: 6px;
-}
-.tool-card.explore .explore-tool-chip {
-  border: 0;
-  padding: 2px 9px;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  color: var(--text-dim);
-}
-.tool-card.explore .explore-tool-chip:hover {
-  background: color-mix(in srgb, var(--text) 13%, transparent);
-  color: var(--text);
-}
-.tool-card.explore .explore-tool-n {
-  font-family: inherit;
-}
-.tool-card.explore .explore-narration {
-  margin: 0 14px 10px;
+  display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

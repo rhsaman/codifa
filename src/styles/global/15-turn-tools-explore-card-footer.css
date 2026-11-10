@@ -126,66 +126,6 @@
   }
 }
 
-/* ── Explore card: responsive at any chat width ── */
-/* The panel-only `padding: 0` on the chips leaked onto the chat card, so the
-   chips sat flush against (and over) the card border. Restore the card inset. */
-.tool-card.explore .explore-tool-chips {
-  padding: 4px 12px 10px;
-  gap: 6px;
-  min-width: 0;
-}
-
-.tool-card.explore .explore-tool-chip {
-  padding: 2px 9px;
-  min-width: 0;
-  max-width: 100%;
-}
-
-.tool-card.explore .explore-tool-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-card.explore {
-  container-type: inline-size;
-  container-name: explore-card;
-  overflow: hidden;
-}
-
-.tool-card.explore .explore-card-open {
-  min-width: 0;
-}
-
-.tool-card.explore .trace-head-right {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-@container explore-card (max-width: 340px) {
-  .explore-card-arrow {
-    display: none;
-  }
-  .explore-card-open {
-    padding-inline: 10px;
-    gap: 7px;
-  }
-  .explore-card-count {
-    font-size: 10px;
-    padding-inline: 5px;
-  }
-}
-
-@container explore-card (max-width: 260px) {
-  .explore-card-open .trace-pill-sub,
-  .explore-card-open .trace-time {
-    display: none;
-  }
-}
-
 /* ── Message footer: the status line never spills over the token counter ──
    Any inline status row (model name, retry, sub-agent) lets the footer wrap, so
    on narrow panes the model name takes its own row and ellipsizes if still too
@@ -229,6 +169,87 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ── Message footer, narrow panes: the Working/Thinking pill wraps, never overprints ──
+   `.msg-actions` is itself the inline-size container, so an `@container
+   msg-actions` rule can never restyle `.msg-actions` (a container cannot be
+   styled by its own query) — the old wrap rule in 02 never applied. The wrap
+   is therefore unconditional: when status + tools fit on one row nothing
+   changes; when they do not, the tools group drops to its own right-aligned
+   row. The pill text ellipsizes if it alone is wider than the footer. */
+.msg-actions {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.msg-actions-status {
+  max-width: 100%;
+}
+
+.msg-actions-tools {
+  margin-inline-start: auto;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.msg-thinking {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.msg-thinking-inner {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.msg-thinking-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-thinking-dots,
+.msg-thinking-elapsed {
+  flex-shrink: 0;
+}
+
+/* Reasoning indicator: a small brain in front of the label that pulses
+   (opacity + scale only — the old spark's 90° turn read as a glitch on a
+   brain glyph). The row gap is 12px, so the negative end margin pulls the
+   icon to ~6px from the label — it reads as part of the label, not a
+   separate item. */
+.msg-thinking-icon {
+  flex: 0 0 auto;
+  margin-inline-end: -6px;
+  color: var(--accent);
+  animation: msg-thinking-spark 1.6s ease-in-out infinite;
+}
+
+@keyframes msg-thinking-spark {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+}
+
+/* Reduce-motion must NOT freeze it: like the live equaliser ("always moving")
+   and the Working dots, this brain is a status signal, so it only slows
+   down. */
+@media (prefers-reduced-motion: reduce) {
+  .msg-thinking-icon {
+    animation-duration: 3.2s;
+  }
 }
 
 /* ── Agent question card (AskUserCard) ──
@@ -372,6 +393,22 @@
   margin: 0;
 }
 
+/* "Write my own answer" tick that closes a section. */
+.ask-card .ask-option.ask-option-own {
+  margin-top: 8px;
+  color: var(--text-dim);
+}
+
+.ask-card .ask-option.ask-option-own.selected {
+  color: var(--text);
+}
+
+/* Per-section answer field, revealed by the tick above it. */
+.ask-card .ask-section-input {
+  margin-top: 8px;
+  resize: vertical;
+}
+
 .ask-card .ask-input {
   width: 100%;
   box-sizing: border-box;
@@ -491,6 +528,8 @@
   padding: 4px 6px 0;
 }
 
+.composer-footer .composer-footer-left,
+.composer-footer .composer-footer-center,
 .composer-footer .composer-footer-right {
   display: inline-flex;
   align-items: center;
@@ -504,6 +543,8 @@
   font-family: var(--font-mono);
 }
 
+.composer-footer .composer-footer-left > * + *,
+.composer-footer .composer-footer-center > * + *,
 .composer-footer .composer-footer-right > * + * {
   margin-left: 2px;
   padding-left: 2px;
@@ -573,16 +614,10 @@
   box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
-/* effort: reads like a flag — `think max ▾` */
+/* effort: just the level label — the "think " prefix came off (user ask) */
 .composer-footer .thinking-label {
   font-weight: 600;
   color: var(--text);
-}
-
-.composer-footer .thinking-label::before {
-  content: "think ";
-  font-weight: 400;
-  color: var(--text-dim);
 }
 
 .composer-footer .thinking-pill:not(.on) .thinking-label {

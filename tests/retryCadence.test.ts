@@ -207,46 +207,39 @@ console.log('2) the chat panel error ladder matches the transport cadence:')
   )
 }
 
-// The mid-turn steer must interrupt an in-flight model reply, so the panel has
-// to understand the event the backend emits when it drops that reply.
-console.log('3) the steer-interrupt signal is wired end to end:')
+// A mid-turn steer must NEVER cut the in-flight step: the model's current call
+// and the tool batch it produced always run to completion, and the steer is
+// delivered at the next step boundary. Cutting the stream or skipping the
+// batch's remaining calls used to leave the agent's work half-done.
+console.log('3) a steer never cuts the in-flight step (delivered at the next boundary):')
 {
   const fs = await import('node:fs')
-  const typesSrc = await readModuleSrc('src/types')
   const chatSrc = await readModuleSrc('src/components/Chat')
   const llmSrc = await readModuleSrc('src-tauri/src/llm')
   const agentSrc = await readModuleSrc('src-tauri/src/agent')
-  check("the event union knows 'steer_interrupt'", typesSrc.includes("'steer_interrupt'"))
   check(
-    'the panel handles steer_interrupt',
-    chatSrc.includes('event.kind === "steer_interrupt"'),
+    'the stream has no steer cut path left (InterruptSignal removed)',
+    !llmSrc.includes('InterruptSignal') && !llmSrc.includes('acc.interrupted'),
   )
   check(
-    'the stream can actually be dropped mid-flight',
-    llmSrc.includes('tokio::select!') && llmSrc.includes('acc.interrupted = true'),
+    'Stop still races the read loop as an event',
+    llmSrc.includes('wait_cancel(cancel)'),
   )
   check(
-    'steering wakes that select via an event, not a timer',
-    llmSrc.includes('pub struct InterruptSignal') && llmSrc.includes('notify_waiters'),
+    'the agent emits no steer_interrupt event',
+    !agentSrc.includes('SteerInterrupt') && !chatSrc.includes('steer_interrupt'),
+  )
+  check(
+    'the step boundary delivers queued steers into the running conversation',
+    agentSrc.includes('deliver_steers(&mut messages, steer_chat, emit)'),
+  )
+  check(
+    'the tool batch is never skipped because of a steer',
+    !agentSrc.includes('steered_skip_result') && !agentSrc.includes('SteerAwareCancel'),
   )
   check(
     'the agent forwards the reasoning state to the pill',
     agentSrc.includes('emit(&AgentEvent::Thinking { active })'),
-  )
-  // The signal is a monotonic GENERATION, not a clearable bool: a raise that
-  // lands while no stream is parked must not be swallowed by a reset() (that
-  // lost-steer race is why steering only worked sometimes).
-  check(
-    'the stream stamps itself with the signal generation on start',
-    llmSrc.includes('acc.interrupt_base = sig.generation()'),
-  )
-  check(
-    'the stream waits for raises newer than its own stamp',
-    llmSrc.includes('sig.wait_for(acc.interrupt_base)'),
-  )
-  check(
-    'the consumed interrupt is NOT cleared (a reset would lose a second steer)',
-    !agentSrc.includes('steer_flag.reset();'),
   )
 }
 
@@ -270,11 +263,13 @@ console.log('4) a steer no step could carry is handed back, not erased:')
     agentSrc.includes('SteerDropped') && agentSrc.includes('"kind": "steer_dropped"'),
   )
   // Every non-draining exit must call it, or the turn silently swallows the
-  // steer on that particular path only (the intermittent report).
-  const dropCalls = agentSrc.split('drop_steers(&req.chat_id, emit);').length - 1
+  // steer on that particular path only (the intermittent report). The key is
+  // `steer_chat`, not the raw chat id: a sub-agent shares the parent's id and
+  // must never touch its inbox.
+  const dropCalls = agentSrc.split('drop_steers(steer_chat, emit);').length - 1
   check(
     `every turn exit hands steers back (found ${dropCalls} call sites)`,
-    dropCalls >= 4,
+    dropCalls >= 6,
   )
   check(
     'a pending steer is re-sent as the next turn',

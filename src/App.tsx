@@ -1143,11 +1143,35 @@ export default function App() {
                     script handles mousedown-dragging AND double-click
                     toggle-maximize (restore = previous bounds) on every OS. */}
                 <span className="titlebar-drag-spacer" data-tauri-drag-region="deep" aria-hidden="true" />
-                {/* Right-side mount: the model-usage chip is a static child so
-                    it sits LEFT of the wallet chip (portaled here from
-                    ChatPanel right after it). */}
+                {/* Right-side mount, leading→trailing: the static model-usage
+                    chip, then SLOT_BALANCE, then the settings gear. The wallet
+                    chip is portaled here from ChatPanel, and a portal APPENDS
+                    to its container, so the empty anchor below keeps the
+                    wallet's place directly LEFT of the gear. */}
                 <div id="titlebar-right">
                   <UsageChip />
+                  <span id="titlebar-balance-slot" />
+                  <button
+                    className="titlebar-icon-btn titlebar-settings-btn"
+                    aria-label="Open settings (⌘,)"
+                    title="Settings (⌘,)"
+                    onClick={() => useStore.getState().setSettingsOpen(true)}
+                  >
+                    <svg
+                      width="17"
+                      height="17"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden
+                    >
+                      <circle cx="12" cy="12" r="3" />
+                      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                    </svg>
+                  </button>
                 </div>
                 {/* The single side-pane switch (like the reference app): opens
                     the right pane when it's closed. While the pane is OPEN the

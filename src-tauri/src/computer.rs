@@ -243,12 +243,19 @@ fn shot_path() -> Result<std::path::PathBuf, String> {
 }
 
 /// Save a capture and describe the coordinate mapping to the model.
+///
+/// `points_width` is the span of SCREEN POINTS the image covers — the window's
+/// width for a window capture, the display's width for a full-display one. It
+/// must come from the capture box, never from the display: a 1280-point window
+/// on a 2560-point Retina display used to be mapped at 2.0 points per pixel
+/// (the window capture is already downscaled to points), so every click landed
+/// at twice the intended spot.
 fn save_shot(
     img: &image::DynamicImage,
     label: String,
-    display: &Display,
     origin_x: f64,
     origin_y: f64,
+    points_width: f64,
 ) -> Result<Shot, String> {
     let path = shot_path()?;
     img.save(&path)
@@ -256,8 +263,8 @@ fn save_shot(
     // Points spanned by the image. For a whole display this is its own size; for
     // a cropped window it is the window's box, which can hang off the display —
     // so the origin is taken from the capture, not from the display.
-    let points_per_pixel = if img.width() > 0 {
-        (display.width as f64) / (img.width() as f64)
+    let points_per_pixel = if img.width() > 0 && points_width > 0.0 {
+        points_width / (img.width() as f64)
     } else {
         1.0
     };
@@ -406,7 +413,7 @@ fn screenshot(args: &Value) -> Result<Outcome, String> {
         let shot = screen::capture_region(hit.x, hit.y, hit.width, hit.height)?;
         let img = prepare(shot, &display);
         let label = format!("{} — {}", hit.app, if hit.title.is_empty() { "(untitled)" } else { &hit.title });
-        let shot = save_shot(&img, label.clone(), &display, hit.x, hit.y)?;
+        let shot = save_shot(&img, label.clone(), hit.x, hit.y, hit.width)?;
         let text = format!(
             "captured window {label:?} ({}{}) — {}x{} image covering screen ({}, {}) to ({}, {}). \
              Click coordinates: x = {} + image_x × {:.4}, y = {} + image_y × {:.4}.",
@@ -442,7 +449,13 @@ fn screenshot(args: &Value) -> Result<Outcome, String> {
         display.width,
         format_args!("x{}", display.height)
     );
-    let shot = save_shot(&img, label, &display, display.x as f64, display.y as f64)?;
+    let shot = save_shot(
+        &img,
+        label,
+        display.x as f64,
+        display.y as f64,
+        display.width as f64,
+    )?;
     let text = format!(
         "captured display {} ({}x{} points at ({}, {})) — {}x{} image. \
          Click coordinates: x = {} + image_x × {:.4}, y = {} + image_y × {:.4}.",

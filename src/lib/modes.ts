@@ -1,4 +1,4 @@
-import type { AgentMode, AgentModeDef, Settings } from '../types'
+import type { AgentMode, AgentModeDef, RunMode, Settings } from '../types'
 
 /** Built-in modes. Prompts themselves are authoritative on the backend; the
  *  `prompt` here is only the user's per-mode custom prompt from settings.
@@ -48,4 +48,23 @@ export function normalizeMode(id: AgentMode | undefined): AgentMode {
   if (id === 'chat') return 'ask'
   if (id === 'codewriter') return 'build'
   return id || 'ask'
+}
+
+/** Settings key holding the custom prompt of ONE (run mode, mode) pair.
+ *  Composite on purpose: the two personas are different system prompts, so the
+ *  same `build` id must be able to carry two independent user overrides. */
+export function promptKey(runMode: RunMode, mode: AgentMode): string {
+  return `${runMode}:${mode}`
+}
+
+/** The user's custom prompt for a pair. Read order: the composite key first, then
+ *  the bare mode id — a prompt saved before the run-mode split keeps working in
+ *  BOTH personas instead of silently vanishing. */
+export function readModePrompt(
+  prompts: Record<string, string> | undefined,
+  runMode: RunMode,
+  mode: AgentMode,
+): string {
+  const store = prompts ?? {}
+  return store[promptKey(runMode, mode)] ?? store[mode] ?? ''
 }

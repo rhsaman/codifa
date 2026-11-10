@@ -104,7 +104,9 @@ export function dedupeByKind(rows: SearchPluginConfig[]): SearchPluginConfig[] {
   return out
 }
 
-/** Map legacy prompt keys from before the modes registry onto current ids. */
+/** Map legacy prompt keys from before the modes registry onto current ids.
+ *  Composite `runMode:mode` keys pass through untouched — they are per-persona
+ *  overrides, not a legacy spelling of a bare mode id. */
 export function migrateModePrompts(prompts: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = { ...prompts }
   if ('chat' in out && !('ask' in out)) {

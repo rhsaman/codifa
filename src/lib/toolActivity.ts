@@ -1,29 +1,44 @@
-import type { DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
+import type { CallFileDiff, DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
 import { isBrowserTool } from "./mcpTools";
 import { isDelegationTool } from "./subagents";
 
 /**
  * The file a writer call targets, as the model spelled it.
  *
- * `edit_file` accepts TWO shapes: one top-level `path`, or a batch whose paths
- * live PER ENTRY (`edits: [{path, old_string, new_string}]`) with no top-level
- * path at all. Reading only `path`/`filePath` therefore answered "" for every
- * batch edit — and an empty path is what made such an edit render as a bare
- * "Edited" card: no review path, so no diff preview, no +N/-M row, and the diff
- * event (matched on this same path) attached to nothing. Mirrors the backend's
- * `writer_target_path`, so both sides resolve a batch to the same file.
- * Pure and shared, so no component re-implements the fallback.
+ * A writer takes ONE top-level `path`, or a batch whose paths live PER ENTRY —
+ * `edit_file` uses `edits: [{path, old_string, new_string}]`, `write_file` uses
+ * `files: [{path, content}]` — with no top-level path at all. Reading only
+ * `path`/`filePath` therefore answered "" for every batch call, and an empty
+ * path is what made such a card render nameless: no review path, so no diff
+ * preview, no +N/-M row, and the diff event (matched on this same path)
+ * attached to nothing. Mirrors the backend's `writer_target_path`, so both
+ * sides resolve a batch to the same file. Pure and shared, so no component
+ * re-implements the fallback.
  */
 export function editTargetOf(args: Record<string, unknown> | undefined): string {
-  const named = args?.path ?? args?.filePath;
-  if (typeof named === "string" && named.trim()) return named;
-  const edits = args?.edits;
-  if (!Array.isArray(edits)) return "";
-  for (const e of edits) {
-    const p = (e as { path?: unknown } | null)?.path;
-    if (typeof p === "string" && p.trim()) return p;
+  return editTargetsOf(args)[0] ?? "";
+}
+
+/**
+ * EVERY file a writer call names, first-appearance order, deduplicated —
+ * mirrors the backend's `writer_target_paths`. A batch may name a DIFFERENT
+ * file per entry, and the backend now emits one `diff` event PER FILE, so the
+ * ingest must match each event against the call's full target list (matching
+ * only the first entry dropped every later file's diff on the floor) and the
+ * card head must admit the call touched more than the one file it names.
+ */
+export function editTargetsOf(args: Record<string, unknown> | undefined): string[] {
+  const out: string[] = [];
+  const push = (p: unknown) => {
+    if (typeof p === "string" && p.trim() && !out.includes(p)) out.push(p);
+  };
+  push(args?.path ?? args?.filePath);
+  for (const key of ["edits", "files"] as const) {
+    const items = args?.[key];
+    if (!Array.isArray(items)) continue;
+    for (const e of items) push((e as { path?: unknown } | null)?.path);
   }
-  return "";
+  return out;
 }
 
 /** Extract the +N / -M tally from a unified diff string (the `+++` / `---`
@@ -40,6 +55,49 @@ export function diffStatsFromUnified(diff: string): DiffStats {
 }
 
 /**
+ * Fold ONE per-file `diff`/`turn_diff` event into a writer card.
+ *
+ * The backend emits one event PER TOUCHED FILE (a batch call names a different
+ * file per entry), so the card keeps them keyed by path in `diffs` while the
+ * aggregate `diff`/`diffStats` — what every existing single-diff consumer
+ * renders — is recomputed as the concatenation of the per-file diffs. Replaying
+ * the same event (reconnected stream) must not duplicate: an entry whose path
+ * already carries the same diff text is left alone. Pure: returns the card
+ * unchanged when there is nothing new.
+ */
+export function upsertCallFileDiff(
+  a: ToolActivity,
+  path: string,
+  diff: string,
+  turnDiff?: string,
+): ToolActivity {
+  if (!path) return a;
+  const entry: CallFileDiff = { path, diff, ...(turnDiff !== undefined ? { turnDiff } : {}) };
+  const entries = a.diffs ? [...a.diffs] : [];
+  const i = entries.findIndex((e) => e.path === path);
+  if (i >= 0) {
+    const cur = entries[i];
+    const sameDiff = cur.diff === diff;
+    const sameNet = turnDiff === undefined || cur.turnDiff === turnDiff;
+    if (sameDiff && sameNet) return a;
+    entries[i] = { ...cur, diff: entry.diff, ...(turnDiff !== undefined ? { turnDiff } : {}) };
+  } else {
+    entries.push(entry);
+  }
+  const agg = entries.map((e) => e.diff).join("");
+  const nets = entries.filter((e) => typeof e.turnDiff === "string");
+  return {
+    ...a,
+    diffs: entries,
+    diff: agg,
+    diffStats: diffStatsFromUnified(agg),
+    ...(nets.length
+      ? { turnDiff: nets.map((e) => e.turnDiff as string).join("") }
+      : {}),
+  };
+}
+
+/**
  * Turn-level +N / -M tally over the edit_file/write_file activities (the
  * Codex-style Review header). Only the tools buildReviewTurn lists are
  * counted, so the header total always matches the listed files; activities
@@ -53,14 +111,23 @@ export function aggregateTurnStats(
   let dels = 0;
   const walk = (list: ToolActivity[]) => {
     for (const a of list) {
-      if (
-        (a.tool === "edit_file" || a.tool === "write_file") &&
-        a.diff &&
-        (!keep || keep(editTargetOf(a.args)))
-      ) {
-        const s = a.diffStats ?? diffStatsFromUnified(a.diff);
-        adds += s.adds;
-        dels += s.dels;
+      if (a.tool === "edit_file" || a.tool === "write_file") {
+        // Per-file entries when present (a batch call names a different file
+        // per entry), so the `keep` filter and the tally book each file under
+        // its own path instead of the call's first target. Legacy transcripts
+        // without them fall back to the card's aggregate diff, as before.
+        const perFile: { path: string; diff: string }[] = a.diffs
+          ? a.diffs.map((e) => ({ path: e.path, diff: e.diff }))
+          : a.diff
+            ? [{ path: editTargetOf(a.args), diff: a.diff }]
+            : [];
+        for (const { path, diff } of perFile) {
+          if (!diff) continue;
+          if (keep && !keep(path)) continue;
+          const s = diffStatsFromUnified(diff);
+          adds += s.adds;
+          dels += s.dels;
+        }
       }
       if (a.children) walk(a.children);
     }
@@ -162,6 +229,9 @@ function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivi
     summary: incoming.summary ?? existing.summary,
     diff: incoming.diff ?? existing.diff,
     diffStats: incoming.diffStats ?? existing.diffStats,
+    // Per-file entries survive re-emits the same way: a streaming re-emit of
+    // the card must not drop the diffs already folded into it by path.
+    diffs: incoming.diffs ?? existing.diffs,
     turnDiff: incoming.turnDiff ?? existing.turnDiff,
     checkpoint: incoming.checkpoint ?? existing.checkpoint,
     // A re-emitted start event must not wipe the rows a previous result event
@@ -503,6 +573,11 @@ export const TEXT_RESULT_TOOLS = new Set([
   // ask_user answers with "The user answered: ...". Without this the inline
   // card's result (and historical answer) shows empty after submit.
   "ask_user",
+  // A `computer` action answers with the capture it took ("captured display 1
+  // (2560x1440) — image. Click coordinates: …") or what it clicked. Without
+  // this the card showed NO output at all, even though the backend sent the
+  // result — the screenshot pixels ride the separate `{id}-shot` event.
+  "computer",
 ]);
 
 /** Tools whose result is a plain text line/note-list rather than files or a

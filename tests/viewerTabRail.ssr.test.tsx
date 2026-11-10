@@ -140,11 +140,18 @@ console.log("2) markup + CSS keep the strip on top and the dock at the bottom:")
   // The old icon rail is really gone: no fixed rail width, no gutter, no
   // hover-name card.
   check("the vertical rail geometry is gone", !css.includes("--viewer-rail-width") && !css.includes("--viewer-tab-hint"), undefined)
-  check(
-    "the dock block exists and is pinned to the bottom edge",
-    /border-top:\s*1px solid/.test(css.match(/\.viewer-dock\s*\{[^}]*\}/)?.[0] ?? ""),
-    css.match(/\.viewer-dock\s*\{[^}]*\}/)?.[0],
-  )
+  // The dock is the SAME surface as the page above it: no divider, no tint of
+  // its own (the panel draws one unbroken plane — see the .viewer-dock block in
+  // 11-file-viewer-tab-fileviewerpanel.css). The strip-with-a-border design
+  // this check used to assert is retired.
+  {
+    const dockBlock = css.match(/\.viewer-dock\s*\{[^}]*\}/)?.[0] ?? ""
+    check(
+      "the dock block exists and shares the pane surface (no divider above)",
+      dockBlock.length > 0 && /border-top:\s*0/.test(dockBlock) && /background:\s*transparent/.test(dockBlock),
+      dockBlock,
+    )
+  }
   check(
     "dock icons share one uniform glyph size",
     /\.viewer-dock-btn svg\s*\{[^}]*width:\s*19px/.test(css),
@@ -230,12 +237,27 @@ console.log("4) the \"+\" menu opens ONLY the chat-owned pages; the dock owns th
   check("and announces itself as the page menu", addHtml.includes('aria-label="Open a page"'), addHtml)
 
   // The dock carries a FIXED icon per page (T3-Code-style launcher row).
+  // NOTE: zustand hooks read the store's CREATION-TIME state under
+  // renderToStaticMarkup (the getInitialState server snapshot), so a
+  // setState-seeded persona is invisible to SSR. The store boots with no run
+  // modes = the CHAT persona — exactly the gate's Git-hidden state: five
+  // buttons, no Git diff. The CODE-mode row (six buttons, Git diff present) is
+  // locked by the source check below plus the openGitDiff behavior in
+  // tests/viewerTabs.test.ts.
   const dockHtml = renderToStaticMarkup(React.createElement(ViewerDockBar))
   const dockButtons = (dockHtml.match(/viewer-dock-btn/g) ?? []).length
-  check("the dock renders one button per page (6)", dockButtons === 6, dockHtml)
-  for (const title of ["Panel", "Git diff", "Artifacts", "Schedule", "Inbox", "Terminal"]) {
+  check("chat persona hides the Git dock page (5 buttons)", dockButtons === 5 && !dockHtml.includes('aria-label="Git diff"'), dockHtml)
+  for (const title of ["Panel", "Artifacts", "Schedule", "Inbox", "Terminal"]) {
     check(`the dock carries the ${title} page`, dockHtml.includes(`aria-label="${title}"`), title)
   }
+  // CODE mode restores the sixth page — a source check, since SSR cannot see a
+  // setState-seeded persona (note above).
+  const dockSrc = readFileSync("src/components/ViewerTabBar.tsx", "utf8")
+  check(
+    "code persona keeps the Git dock page",
+    dockSrc.includes('title: "Git diff"') && dockSrc.includes("openGitDiff(scope.chatId)") && dockSrc.includes("gitVisible"),
+    "ViewerTabBar.tsx",
+  )
   // The explorer moved to the sidebar's Files view (see tests/sidebarView.test.ts).
   check("the dock no longer carries Files", !dockHtml.includes('aria-label="Files"'), dockHtml)
   check("the dock announces itself as a toolbar", dockHtml.includes('aria-label="Pane pages"'))

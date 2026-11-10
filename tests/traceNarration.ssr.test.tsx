@@ -15,6 +15,9 @@
 //    باید به اولین فعالیتِ ران لنگر شود، نه به نقطهٔ flush — وگرنه هر فراخوانی
 //    جدید وسط narration، کلید والد را عوض می‌کند و ری‌اکت با unmount کردن
 //    زیردرخت، گروهِ بازشده را می‌بندد (state از بین می‌رود)
+//  - کارت ساب‌ایجنت (explore/agent__) دیگر کارت اختصاصی ندارد: همان
+//    ToolGroupView رندر می‌شود با pill نام ساب‌ایجنت در هدر، tallies ابزارهای
+//    داخلی و آخرین خط narration به‌عنوان caption
 // Mock پل الکترون قبل از import کامپوننت.
 ;(globalThis as any).window = {
   addEventListener: () => {},
@@ -392,6 +395,50 @@ console.log('13) باگ «گروه باز حین استریم بسته می‌ش
     `کلید گروه پایدار ماند (${groupOf(card1)?.key} === ${groupOf(card2)?.key})`,
     groupOf(card1)?.key === groupOf(card2)?.key && !!groupOf(card1)?.key,
   )
+}
+
+console.log('14) کارت ساب‌ایجنت دقیقاً مثل tool group رندر می‌شود (pill نام در هدر + pills ابزارهای داخلی + caption):')
+{
+  // کارت delegation دیگر ExploreCard نیست: همان ToolGroupView با قاب
+  // tool-trace؛ نام ساب‌ایجنت pill اولِ هدر، tallies ابزارهای داخلی (children)
+  // pills بعدی، و آخرین خط narration ساب‌ایجنت caption هدر (مثل کپشن گروه).
+  const msg = {
+    id: 'm1',
+    role: 'assistant' as const,
+    content: '',
+    createdAt: Date.now(),
+    segments: [{ kind: 'tool', index: 0 }] as never,
+    toolActivity: [
+      {
+        tool: 'explore',
+        status: 'done' as const,
+        summary: 'ok',
+        args: { description: 'پیدا کردن تعریف store' },
+        elapsedMs: 12000,
+        narration: 'اول layout را می‌خوانم…\nحالا store را باز می‌کنم…',
+        children: [
+          { tool: 'grep', status: 'done' as const, summary: 'ok', args: { pattern: 'useStore' } },
+          { tool: 'grep', status: 'done' as const, summary: 'ok', args: { pattern: 'toolActivity' } },
+          { tool: 'read', status: 'done' as const, summary: 'ok', args: { path: 'src/lib/store.ts' } },
+        ],
+      },
+    ] as never,
+  }
+  const html = renderToString(<ChatMessageView message={msg} />)
+  check('کارت با قاب tool-trace رندر شد', html.includes('tool-trace'))
+  check('یک گروه واحد رندر شد', (html.match(/tool-group/g) || []).length === 1)
+  check('pill نام ساب‌ایجنت («Explore») در هدر است', /trace-pill trace-pill-sub[^>]*>Explore</.test(html))
+  check('کارت explore قدیمی (tool-card explore) رندر نشد', !html.includes('tool-card explore') && !html.includes('explore-card-open'))
+  check('badge «Search Files ×2» برای grepهای داخلی', /Search Files[^<]*<span[^>]*trace-pill-count[^>]*>×(?:<!-- -->)?2</.test(html))
+  check('pill «Read File» برای read داخلی', html.includes('Read File'))
+  check('آخرین خط narration caption هدر است', html.includes('حالا store را باز می‌کنم'))
+  check('خط اول narration در هدر نیست (فقط آخرین کپشن)', !html.includes('اول layout را می‌خوانم'))
+  // توضیح وظیفه وقتی narration هست فقط tooltip پیل نام می‌ماند، نه متن هدر.
+  const plainText = html.replace(/<!--.*?-->/g, '').replace(/<[^>]*>/g, '')
+  check('توضیح وظیفه در متن هدر نیست', !plainText.includes('پیدا کردن تعریف store'))
+  check('توضیح وظیفه در tooltip پیل نام مانده', html.includes('پیدا کردن تعریف store'))
+  check('زمان اجرا از elapsed ساب‌ایجنت می‌آید', html.includes('12.0s'))
+  check('ردیف‌های داخلی فقط وقتی گروه باز است', !html.includes('trace-list'))
 }
 
 if (failed > 0) {

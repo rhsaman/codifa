@@ -1006,7 +1006,12 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openGitDiff: (chatId) =>
+  openGitDiff: (chatId) => {
+    // Git is a CODE-mode surface: the chat persona (general-purpose agent)
+    // offers no git UI, so every opener (dock press, Ctrl+X G shortcut, …)
+    // no-ops here instead of opening a page the persona switch has retired.
+    const wsKey = workspaceKeyForChat((chatId ?? currentChatId()) || undefined)
+    if (useStore.getState().workspaceRunModes[wsKey] !== 'code') return
     set((s) => {
       // One diff tab per WORKSPACE: the uncommitted view replaces it in place.
       // User-gesture open: show the pane. Automatic (stream-driven) opens
@@ -1031,7 +1036,8 @@ export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
       const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
-    }),
+    })
+  },
   openTraces: (chatId, tab, taskId, title) =>
     set((s) => {
       // One trace tab per chat; each sub-agent gets its own filtered tab.

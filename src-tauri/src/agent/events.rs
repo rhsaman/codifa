@@ -124,13 +124,6 @@ pub enum AgentEvent {
     /// the renderer's user-message ids so it can move each bubble inline (right
     /// after the tool call that carried it) and clear its `steerPending` flag.
     SteerApplied { ids: Vec<String> },
-    /// The user steered while a model call was ALREADY streaming. The steer
-    /// cannot be injected into that in-flight request, so the running stream is
-    /// dropped and re-issued immediately with the steer appended — this is what
-    /// removes the "steer waits for the turn to end" wait (it used to look
-    /// exactly like a queue message). Emitted so the renderer can keep the
-    /// bubble pending until `SteerApplied` confirms the injection.
-    SteerInterrupt { ids: Vec<String> },
     /// Emitted when the turn is ending while steers are still sitting in the
     /// inbox — the model errored, the step budget ran out, or the user hit
     /// Stop before a step could carry them.
@@ -382,9 +375,6 @@ impl AgentEvent {
             }
             AgentEvent::SteerApplied { ids } => {
                 json!({"kind": "steer_applied", "ids": ids})
-            }
-            AgentEvent::SteerInterrupt { ids } => {
-                json!({"kind": "steer_interrupt", "ids": ids})
             }
             AgentEvent::SteerDropped { ids } => {
                 json!({"kind": "steer_dropped", "ids": ids})

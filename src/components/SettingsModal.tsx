@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
-import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderHeader, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
+import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderHeader, ProviderKind, RunMode, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import type { MarketplaceSource, PluginInfo } from '../types'
 import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES, setPersistSuspended } from '../lib/store'
 import { SubagentsTab } from './settings/SubagentsTab'
@@ -25,7 +25,7 @@ import { PluginDetail } from './PluginDetail'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateAvailableSkills, invalidateSkillsList, forgetPluginCommands } from '../lib/skills'
 import { api } from '../lib/fs'
-import { allModes } from '../lib/modes'
+import { allModes, promptKey, readModePrompt } from '../lib/modes'
 import { PROVIDER_META, accountScopedBaseUrl, isAccountScoped, providerDisplayName, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 import { THEMES } from '../lib/themes'
@@ -51,6 +51,27 @@ const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .filter((m) => m.builtin)
   .map((m) => m.kind)
 export const NEW_SKILL_KEY = '__new_skill__'
+
+/** The two personas a workspace can run in, with the copy the settings tab
+ *  shows above each block of prompt boxes. */
+const RUN_MODE_SECTIONS: Array<{
+  id: RunMode
+  label: string
+  blurb: string
+}> = [
+  {
+    id: 'chat',
+    label: 'Chat mode — general-purpose agent',
+    blurb:
+      'Answers questions, writes and edits text and documents, researches and analyses. It can use files and the shell, and it carries NO coding rules — writing code is just one of its jobs. This is the default.',
+  },
+  {
+    id: 'code',
+    label: 'Code mode — software-engineering agent',
+    blurb:
+      'Reads, plans and writes this project: the coding rules, the project conventions and the edit-is-the-artifact discipline ride in every mode.',
+  },
+]
 
 /** The drag affordance shared by every reorderable Settings list (Tools
  *  fallback chains, Web Provider engines, Media Provider ladders): six dots
@@ -222,7 +243,14 @@ export function SettingsModal({
   const requiresKey = providerMeta(cfg.kind).requiresKey
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>(() => {
     const d: Record<string, string> = {}
-    for (const m of allModes(settings)) d[m.id] = settings.systemPrompts?.[m.id] ?? ''
+    for (const section of RUN_MODE_SECTIONS) {
+      for (const m of allModes(settings)) {
+        const key = promptKey(section.id, m.id)
+        // Only the composite key is written here; `readModePrompt` already falls
+        // back to a bare-id prompt saved before the run-mode split.
+        d[key] = readModePrompt(settings.systemPrompts, section.id, m.id)
+      }
+    }
     return d
   })
 
@@ -1016,8 +1044,10 @@ export function SettingsModal({
       setCredWarn(true)
       return
     }
-    for (const id of allModes(settings).map((m) => m.id)) {
-      setSystemPrompt(id, (promptDrafts[id] ?? '').trim())
+    for (const section of RUN_MODE_SECTIONS) {
+      for (const id of allModes(settings).map((m) => m.id)) {
+        setSystemPrompt(promptKey(section.id, id), (promptDrafts[promptKey(section.id, id)] ?? '').trim())
+      }
     }
     // Custom modes were removed — purge any legacy saved modes on next save.
     if (settings.modes && settings.modes.length > 0) {
@@ -2035,34 +2065,43 @@ export function SettingsModal({
 
         {tab === 'modes' && (
         <>
-            <div className="field">
-              <label>Modes</label>
-              {modes.map((m) => (
-                  <div className="mode-card" key={m.id}>
-                    <div className="mode-card-head">
-                      <span className="mode-card-icon"><ModeIcon icon={m.icon} /></span>
-                      <span className="mode-card-title">{m.label}</span>
-                      <span className="badge">built-in</span>
+            {/* ONE textarea per (persona, mode) pair: the two personas are two
+                different system prompts, so the same `build` id must carry two
+                independent overrides. */}
+            {RUN_MODE_SECTIONS.map((section) => (
+              <div className="field" key={section.id}>
+                <label>{section.label}</label>
+                <p className="hint">{section.blurb}</p>
+                {modes.map((m) => {
+                  const key = promptKey(section.id, m.id)
+                  return (
+                    <div className="mode-card" key={key}>
+                      <div className="mode-card-head">
+                        <span className="mode-card-icon"><ModeIcon icon={m.icon} /></span>
+                        <span className="mode-card-title">{m.label}</span>
+                        <span className="badge">built-in</span>
+                      </div>
+                      <p className="hint">{m.description}</p>
+                      <label className="field-label">Custom prompt <span className="hint">(appended to the built-in prompt)</span></label>
+                      <textarea
+                        className="system-prompt"
+                        value={promptDrafts[key] ?? ''}
+                        onChange={(e) => setPrompt(key, e.target.value)}
+                        rows={7}
+                        dir="auto"
+                        spellCheck={false}
+                      />
+                      <div className="prompt-actions">
+                        <span className="hint">Changes apply on the next message.</span>
+                        <button className="btn tiny" onClick={() => setPrompt(key, '')}>
+                          Clear
+                        </button>
+                      </div>
                     </div>
-                    <p className="hint">{m.description}</p>
-                    <label className="field-label">Custom prompt <span className="hint">(appended to the built-in prompt)</span></label>
-                    <textarea
-                      className="system-prompt"
-                      value={promptDrafts[m.id] ?? ''}
-                      onChange={(e) => setPrompt(m.id, e.target.value)}
-                      rows={7}
-                      dir="auto"
-                      spellCheck={false}
-                    />
-                    <div className="prompt-actions">
-                      <span className="hint">Changes apply on the next message.</span>
-                      <button className="btn tiny" onClick={() => setPrompt(m.id, '')}>
-                        Clear
-                      </button>
-                    </div>
-                  </div>
-                ))}
-            </div>
+                  )
+                })}
+              </div>
+            ))}
         </>
         )}
 
@@ -2532,15 +2571,6 @@ export function SettingsModal({
         {tab === 'models' && (
         <>
             <div className="field models-tab">
-              <div className="slot-intro">
-                <b>Media Providers</b> — the providers behind the app's media
-                features: voice input (STT), spoken replies (TTS), image and
-                video generation, and live voice. Everything runs on your own
-                providers — nothing on-device. Speech calls hit{' '}
-                <code>{'<base_url>'}/audio/transcriptions</code> (STT) and{' '}
-                <code>{'<base_url>'}/audio/speech</code> (TTS).
-              </div>
-
               <div className="model-card model-card-voice">
                 <div className="model-card-head">
                   <div className="model-card-titles">
@@ -2549,35 +2579,27 @@ export function SettingsModal({
                   </div>
                 </div>
                 <div className="model-card-body">
-                  <div className="voice-section">
-                    <div className="voice-fields-row">
-                      <div className="voice-field">
-                        <label className="field-label">STT provider</label>
-                        <MediaProviderSelect value={sttProviderId} onChange={setSttProviderId} emptyLabel="Not selected" />
-                      </div>
-                      <div className="voice-field">
-                        <label className="field-label">STT model</label>
-                        <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
-                      </div>
-                      <div className="voice-field">
-                        <label className="field-label">STT language</label>
-                        <select value={sttLanguage ?? ''} onChange={(e) => setSttLanguage(e.target.value)} dir="ltr">
-                          {STT_LANGUAGES.map((l) => (
-                            <option key={l.code || 'auto'} value={l.code}>
-                              {l.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-                    <div className="hint">
-                      Without an explicit language, Whisper mis-detects the language on short
-                      clips and Persian words come out garbled.
-                    </div>
+                  <div
+                    className="voice-lang-row"
+                    title="Without an explicit language, Whisper mis-detects the language on short clips."
+                  >
+                    <label className="field-label">STT language</label>
+                    <select value={sttLanguage ?? ''} onChange={(e) => setSttLanguage(e.target.value)} dir="ltr">
+                      {STT_LANGUAGES.map((l) => (
+                        <option key={l.code || 'auto'} value={l.code}>
+                          {l.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                   <MediaFallbackList
-                    label="STT fallbacks"
+                    label="STT models"
                     addLabel="STT fallback"
+                    primary={{ providerId: sttProviderId, model: sttModel }}
+                    onPrimaryChange={(p) => {
+                      setSttProviderId(p.providerId)
+                      setSttModel(p.model)
+                    }}
                     rows={sttFallbacks}
                     onChange={setSttFallbacks}
                     modelPlaceholder="whisper-1"
@@ -2593,26 +2615,15 @@ export function SettingsModal({
                   </div>
                 </div>
                 <div className="model-card-body">
-                  <div className="voice-section">
-                    <div className="voice-fields-row">
-                      <div className="voice-field">
-                        <label className="field-label">TTS provider</label>
-                        <MediaProviderSelect value={ttsProviderId} onChange={setTtsProviderId} emptyLabel="Not selected" />
-                      </div>
-                      <div className="voice-field">
-                        <label className="field-label">TTS model</label>
-                        <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" />
-                      </div>
-                      <div className="voice-field">
-                        <label className="field-label">TTS voice</label>
-                        <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
-                      </div>
-                    </div>
-                  </div>
-
                   <MediaFallbackList
-                    label="TTS fallbacks"
+                    label="TTS models"
                     addLabel="TTS fallback"
+                    primary={{ providerId: ttsProviderId, model: ttsModel, voice: ttsVoice }}
+                    onPrimaryChange={(p) => {
+                      setTtsProviderId(p.providerId)
+                      setTtsModel(p.model)
+                      setTtsVoice(p.voice ?? '')
+                    }}
                     rows={ttsFallbacks}
                     onChange={setTtsFallbacks}
                     withVoice
@@ -2629,29 +2640,14 @@ export function SettingsModal({
                   </div>
                 </div>
                 <div className="model-card-body">
-                  <div className="voice-section">
-                    <div className="voice-fields-row">
-                      <div className="voice-field">
-                        <label className="field-label">Image provider</label>
-                        <MediaProviderSelect value={imageProviderId} onChange={setImageProviderId} emptyLabel="Not selected" />
-                      </div>
-                      <div className="voice-field">
-                        <label className="field-label">Image model</label>
-                        <input value={imageModel} onChange={(e) => setImageModel(e.target.value)} dir="ltr" placeholder="gpt-image-1" />
-                      </div>
-                    </div>
-                    <div className="hint">
-                      OpenAI-compatible endpoints (<code>/images/generations</code>,{' '}
-                      <code>/images/edits</code>), Google Gemini and OpenRouter are supported.
-                      Generated files are saved under <code>~/.codifa/media</code> in the chat's
-                      own folder and deleted with the chat. Ordered fallbacks below are tried
-                      top-first when the primary fails.
-                    </div>
-                  </div>
-
                   <MediaFallbackList
-                    label="Image fallbacks"
+                    label="Image models"
                     addLabel="image fallback"
+                    primary={{ providerId: imageProviderId, model: imageModel }}
+                    onPrimaryChange={(p) => {
+                      setImageProviderId(p.providerId)
+                      setImageModel(p.model)
+                    }}
                     rows={imageFallbacks}
                     onChange={setImageFallbacks}
                     modelPlaceholder="gpt-image-1"
@@ -2667,28 +2663,14 @@ export function SettingsModal({
                   </div>
                 </div>
                 <div className="model-card-body">
-                  <div className="voice-section">
-                    <div className="voice-fields-row">
-                      <div className="voice-field">
-                        <label className="field-label">Video provider</label>
-                        <MediaProviderSelect value={videoProviderId} onChange={setVideoProviderId} emptyLabel="Not selected" />
-                      </div>
-                      <div className="voice-field">
-                        <label className="field-label">Video model</label>
-                        <input value={videoModel} onChange={(e) => setVideoModel(e.target.value)} dir="ltr" placeholder="sora-2" />
-                      </div>
-                    </div>
-                    <div className="hint">
-                      OpenAI-compatible Sora format (<code>/videos</code>), Google Veo (
-                      <code>predictLongRunning</code>) and OpenRouter are supported. Local
-                      trim/merge runs through ffmpeg (downloaded automatically on first use).
-                      Ordered fallbacks below are tried top-first when the primary fails.
-                    </div>
-                  </div>
-
                   <MediaFallbackList
-                    label="Video fallbacks"
+                    label="Video models"
                     addLabel="video fallback"
+                    primary={{ providerId: videoProviderId, model: videoModel }}
+                    onPrimaryChange={(p) => {
+                      setVideoProviderId(p.providerId)
+                      setVideoModel(p.model)
+                    }}
                     rows={videoFallbacks}
                     onChange={setVideoFallbacks}
                     modelPlaceholder="sora-2"
@@ -2706,7 +2688,10 @@ export function SettingsModal({
                 <div className="model-card-body">
                   <div className="voice-section">
                     <div className="voice-fields-row">
-                      <div className="voice-field">
+                      <div
+                        className="voice-field"
+                        title="A selected provider runs full-duplex realtime — any OpenAI-realtime-compatible endpoint, not just OpenAI. Empty = chunked STT + TTS."
+                      >
                         <label className="field-label">Realtime provider (optional)</label>
                         <MediaProviderSelect
                           value={liveProviderId}
@@ -2722,11 +2707,6 @@ export function SettingsModal({
                         <label className="field-label">Realtime voice</label>
                         <input value={liveVoice} onChange={(e) => setLiveVoice(e.target.value)} dir="ltr" placeholder="alloy" />
                       </div>
-                    </div>
-                    <div className="hint">
-                      With a provider selected, live voice runs as full-duplex realtime on that
-                      provider — any OpenAI-realtime-compatible endpoint, not just OpenAI. Leave
-                      empty for the chunked mode, which works with any STT/TTS provider.
                     </div>
                   </div>
                 </div>

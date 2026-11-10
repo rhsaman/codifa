@@ -6,6 +6,7 @@ import { detectDir, prepareContent } from "../lib/bidi";
 import {
   toggleSelected,
   toggleSectionSelected,
+  setSectionAt,
   joinAnswer,
   joinSectionAnswer,
   canSubmit,
@@ -22,6 +23,14 @@ export interface AskCardReq {
   freeText?: string;
   sections?: { title: string; options: string[] }[];
   secSelected?: number[][];
+  /** Per-section "write my own answer" flags (parallel to `sections`): a ticked
+   *  flag reveals that section's text field and counts its text as the answer. */
+  secOwn?: boolean[];
+  /** Per-section typed answers (parallel to `sections`). */
+  secFreeText?: string[];
+  /** Flat card's "write my own answer" flag: a ticked flag reveals the answer
+   *  field so the user's own words can be submitted without picking a preset. */
+  own?: boolean;
 }
 
 export interface AskUserCardProps {
@@ -102,15 +111,36 @@ export function AskUserCard({
       ? req.secSelected
       : sections.map(() => []),
   );
+  const [localSecOwn, setLocalSecOwn] = useState<boolean[]>(() =>
+    req?.secOwn && req.secOwn.length === sections.length
+      ? req.secOwn
+      : sections.map(() => false),
+  );
+  const [localSecFree, setLocalSecFree] = useState<string[]>(() =>
+    req?.secFreeText && req.secFreeText.length === sections.length
+      ? req.secFreeText
+      : sections.map(() => ""),
+  );
+  const [localOwn, setLocalOwn] = useState<boolean>(() => req?.own ?? false);
   const [localFree, setLocalFree] = useState<string>(() => (initialFreeText ?? req?.freeText ?? ""));
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sendingRef = useRef(false);
+  // Answer fields revealed by the "write my own answer" ticks, so the caret
+  // can jump into them the moment a tick turns on.
+  const freeRef = useRef<HTMLTextAreaElement | null>(null);
+  const secFreeRefs = useRef<(HTMLTextAreaElement | null)[]>([]);
 
   const question = (resolvedReq?.question ?? "").toString();
   const options = (resolvedReq?.options ?? []) as string[];
   const fa = detectDir(question) === "rtl";
   const pendingId = resolvedReq?.id ?? "";
+  // A flat card WITH options offers a "write my own answer" tick too: the
+  // answer field stays hidden (and its text ignored) until the tick is on, so
+  // the user can answer in their own words without first picking a preset.
+  const flatOwn = !multiPart && options.length > 0;
+  const flatFreeActive = !multiPart && (!flatOwn || localOwn);
+  const showFreeField = multiPart || flatFreeActive;
 
   useEffect(() => {
     if (req?.selected) setLocalSelected(req.selected);
@@ -119,8 +149,34 @@ export function AskUserCard({
     if (req?.secSelected) setLocalSecSel(req.secSelected);
   }, [JSON.stringify(req?.secSelected)]);
   useEffect(() => {
+    if (req?.secOwn) setLocalSecOwn(req.secOwn);
+  }, [JSON.stringify(req?.secOwn)]);
+  useEffect(() => {
+    if (req?.secFreeText) setLocalSecFree(req.secFreeText);
+  }, [JSON.stringify(req?.secFreeText)]);
+  useEffect(() => {
     if (typeof req?.freeText === "string") setLocalFree(req.freeText);
   }, [req?.freeText]);
+  useEffect(() => {
+    if (typeof req?.own === "boolean") setLocalOwn(req.own);
+  }, [req?.own]);
+
+  // Ticking "write my own answer" reveals its field — put the caret there
+  // right away. Only on a false→true transition, so a card restored with the
+  // tick already on doesn't steal focus on mount.
+  const prevOwn = useRef(localOwn);
+  useEffect(() => {
+    if (flatOwn && localOwn && !prevOwn.current) freeRef.current?.focus();
+    prevOwn.current = localOwn;
+  }, [localOwn, flatOwn]);
+
+  const prevSecOwn = useRef(localSecOwn);
+  useEffect(() => {
+    localSecOwn.forEach((on, si) => {
+      if (on && !prevSecOwn.current?.[si]) secFreeRefs.current[si]?.focus();
+    });
+    prevSecOwn.current = localSecOwn;
+  }, [JSON.stringify(localSecOwn)]);
 
   const answered = activity?.status === "done" || activity?.status === "error";
   // The backend wraps the reply as "The user answered: <text>" — an English
@@ -152,9 +208,32 @@ export function AskUserCard({
     persist({ secSelected: next });
   };
 
+  /** Tick/untick the flat card's "write my own answer" option. */
+  const toggleOwn = () => {
+    if (!isActive && !live) return;
+    const next = !localOwn;
+    setLocalOwn(next);
+    persist({ own: next });
+  };
+
   const changeFree = (v: string) => {
     setLocalFree(v);
     persist({ freeText: v });
+  };
+
+  /** Tick/untick one section's "write my own answer" option. The field below it
+   *  appears only while the flag is on, and only then does its text count. */
+  const toggleSectionOwn = (sec: number) => {
+    if (!isActive && !live) return;
+    const next = setSectionAt(localSecOwn, sec, !localSecOwn[sec], false);
+    setLocalSecOwn(next);
+    persist({ secOwn: next });
+  };
+
+  const changeSectionFree = (sec: number, v: string) => {
+    const next = setSectionAt(localSecFree, sec, v, "");
+    setLocalSecFree(next);
+    persist({ secFreeText: next });
   };
 
   const submit = async () => {
@@ -163,10 +242,10 @@ export function AskUserCard({
     // Flat: labels first, free text last (unchanged behavior).
     const answer = multiPart
       ? [
-          joinSectionAnswer(sections, localSecSel),
+          joinSectionAnswer(sections, localSecSel, localSecOwn, localSecFree),
           localFree.trim(),
         ].filter((part) => part.length > 0).join("\n")
-      : joinAnswer(options, localSelected, localFree);
+      : joinAnswer(options, localSelected, flatFreeActive ? localFree : "");
     if (!answer) return;
     sendingRef.current = true;
     setSending(true);
@@ -188,8 +267,8 @@ export function AskUserCard({
 
   const handleKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     const ready = multiPart
-      ? canSubmitSections(sections, localSecSel)
-      : canSubmit(options, localSelected, localFree);
+      ? canSubmitSections(sections, localSecSel, localSecOwn, localSecFree)
+      : canSubmit(options, localSelected, flatFreeActive ? localFree : "");
     if (e.key === "Enter" && !e.shiftKey && ready) {
       e.preventDefault();
       void submit();
@@ -199,8 +278,8 @@ export function AskUserCard({
   if (!resolvedReq) return null;
 
   const readyToSubmit = multiPart
-    ? canSubmitSections(sections, localSecSel)
-    : canSubmit(options, localSelected, localFree);
+    ? canSubmitSections(sections, localSecSel, localSecOwn, localSecFree)
+    : canSubmit(options, localSelected, flatFreeActive ? localFree : "");
 
   return (
     <div
@@ -254,6 +333,40 @@ export function AskUserCard({
                   );
                 })}
               </div>
+              {/* Own-answer option: the user can answer a facet without
+                  picking any preset option, so the typed text must count as
+                  this section's answer on its own. */}
+              <button
+                type="button"
+                role="checkbox"
+                aria-checked={!!localSecOwn[si]}
+                className={`ask-option ask-option-own${localSecOwn[si] ? " selected" : ""}`}
+                onClick={() => toggleSectionOwn(si)}
+                disabled={!isActive && !live}
+              >
+                <span className="ask-option-mark" aria-hidden>
+                  {localSecOwn[si] ? "☑" : "☐"}
+                </span>
+                <span className="ask-option-text" dir={fa ? "rtl" : "ltr"}>
+                  {fa ? "پاسخ خودم را می‌نویسم…" : "Write my own answer…"}
+                </span>
+              </button>
+              {localSecOwn[si] && (
+                <textarea
+                  className="ask-input ask-section-input"
+                  ref={(el) => {
+                    secFreeRefs.current[si] = el;
+                  }}
+                  rows={2}
+                  dir={detectDir(localSecFree[si] ?? "") === "rtl" || fa ? "rtl" : "ltr"}
+                  value={localSecFree[si] ?? ""}
+                  placeholder={fa ? "پاسخ خود را بنویسید…" : "Type your answer…"}
+                  onChange={(e) => changeSectionFree(si, e.target.value)}
+                  onKeyDown={handleKey}
+                  disabled={!isActive && !live}
+                  aria-label={fa ? `پاسخ شما برای ${sec.title}` : `Your answer for ${sec.title}`}
+                />
+              )}
             </div>
           ))}
         </div>
@@ -281,6 +394,26 @@ export function AskUserCard({
                 </button>
               );
             })}
+            {/* Flat card's own-answer tick, mirroring the per-section one:
+                its text counts as the answer on its own. Hidden once the card
+                is answered — there is nothing left to choose. */}
+            {!answered && (
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={localOwn}
+              className={`ask-option ask-option-own${localOwn ? " selected" : ""}`}
+              onClick={toggleOwn}
+              disabled={!isActive && !live}
+            >
+              <span className="ask-option-mark" aria-hidden>
+                {localOwn ? "☑" : "☐"}
+              </span>
+              <span className="ask-option-text" dir={fa ? "rtl" : "ltr"}>
+                {fa ? "پاسخ خودم را می‌نویسم…" : "Write my own answer…"}
+              </span>
+            </button>
+            )}
           </div>
         )
       )}
@@ -301,9 +434,11 @@ export function AskUserCard({
         ) : null
       ) : (
         <>
+          {showFreeField && (
           <div className="ask-freetext">
             <textarea
               className="ask-input"
+              ref={freeRef}
               rows={2}
               autoFocus={live}
               dir={detectDir(localFree) === "rtl" || fa ? "rtl" : "ltr"}
@@ -322,6 +457,7 @@ export function AskUserCard({
               disabled={!isActive && !live}
             />
           </div>
+          )}
           {error && <div className="ask-error">{error}</div>}
           <div className="ask-footer">
             <button

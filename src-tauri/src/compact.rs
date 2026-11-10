@@ -20,8 +20,8 @@ const COMPACT_TOTAL_BUDGET_SECS: u64 = 180;
 /// How many times the WHOLE model list is walked top to bottom. After the last
 /// fallback fails the walk starts over from the summariser's own model (a
 /// provider that was down a minute ago is often back), still inside the shared
-/// wall-clock budget. A chain of one model is not rotated: its rung already
-/// repeats on its own.
+/// wall-clock budget. A one-model chain is rotated too — a transient failure
+/// must not end a compaction the next pass could complete.
 const COMPACT_MAX_CYCLES: usize = 3;
 
 /// Pause between two passes over the list, so a list of dead rungs is not
@@ -29,6 +29,16 @@ const COMPACT_MAX_CYCLES: usize = 3;
 /// call to the NEXT model immediately (no same-model retries), and this pause
 /// is what separates one full pass from the next.
 const COMPACT_CYCLE_PAUSE_SECS: u64 = 10;
+
+/// Upper bound on ONE summarizer call. Without it the first rung could consume
+/// the whole shared budget while accepting the request and never answering, so
+/// the fallback list was never reached — the exact stall the ladder exists to
+/// avoid. Bounded per rung, a stalled model hands over within 90 s and the
+/// fallbacks still get their turn inside the shared budget.
+const COMPACT_CALL_TIMEOUT_SECS: u64 = 90;
+
+/// Do not start a rung with less than this left: a call needs room to answer.
+const COMPACT_MIN_RUNG_SECS: u64 = 10;
 
 /// One progress tick from a running compaction.
 ///
@@ -526,7 +536,11 @@ pub async fn compact_history_with_progress(
     // After the LAST fallback fails the walk goes back to the top and tries the
     // list again (see COMPACT_MAX_CYCLES), until the shared deadline.
     let chain_len = chain.len();
-    let cycles = if chain_len > 1 { COMPACT_MAX_CYCLES } else { 1 };
+    // Every list is rotated, a one-model list included: after its only rung
+    // fails the walk starts over at that same model. The old `len > 1` guard
+    // meant a single configured model got exactly one try while a list was
+    // retried — a transient 429/5xx ended the compaction for no reason.
+    let cycles = COMPACT_MAX_CYCLES;
     let walk: Vec<&LlmConfig> = (0..cycles).flat_map(|_| chain.iter().copied()).collect();
     let attempts_total = walk.len();
     let mut attempt_no = 0usize;
@@ -546,13 +560,18 @@ pub async fn compact_history_with_progress(
         // the same model again right away can only reproduce the same error,
         // and the walk comes back to this rung on the next pass anyway.
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
+        if remaining < std::time::Duration::from_secs(COMPACT_MIN_RUNG_SECS) {
             break 'rungs;
         }
+        // ONE rung may not eat the whole budget: a provider that takes the
+        // request and stalls hands over to the next model instead of blocking
+        // every fallback behind it.
+        let rung_timeout =
+            std::time::Duration::from_secs(COMPACT_CALL_TIMEOUT_SECS).min(remaining);
         attempt_no += 1;
         progress_tick(on_progress, started, "summarizing", attempt_no, attempts_total, m);
         let rung_err = match
-            tokio::time::timeout(remaining, llm::complete(client, m, SYSTEM, &user_prompt))
+            tokio::time::timeout(rung_timeout, llm::complete(client, m, SYSTEM, &user_prompt))
                 .await
         {
             Ok(Ok(r)) if !r.text.trim().is_empty() => {
@@ -568,7 +587,7 @@ pub async fn compact_history_with_progress(
             }
             Ok(Ok(_)) => "returned an empty summary".to_string(),
             Ok(Err(e)) => e,
-            Err(_) => format!("gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s"),
+            Err(_) => format!("gave no answer within {}s", rung_timeout.as_secs()),
         };
         // Only the FIRST pass is reported: later passes repeat the same models,
         // and listing each one again would bury the reasons in the banner.
@@ -897,6 +916,43 @@ mod tests {
                 assert!(e.contains("also-dead"), "the fallback model must be named too, got: {e}");
             }
         }
+    }
+
+    /// A ONE-MODEL chain is rotated too. The old `len > 1` guard gave a single
+    /// configured model exactly one try, so a transient 500 ended the
+    /// compaction while the walk would have retried the same model one pass
+    /// later. This pins that second pass.
+    #[tokio::test]
+    async fn a_single_model_chain_retries_after_a_transient_failure() {
+        let url = stub_server(vec![
+            (
+                500,
+                r#"{"error":{"message":"temporary overload"}}"#.to_string(),
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"SUMMARY ON RETRY"}}]}"#.to_string(),
+            ),
+        ]);
+        let mut model = cfg("custom", "only-model", &url);
+        model.timeout_secs = 5;
+        let hist: Vec<Value> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &model,
+            &[],
+            &hist,
+            1_000_000,
+            0,
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .expect("a transient failure on a one-model chain must be retried");
+        let outcome = out.expect("the retry answered, so a summary must exist");
+        assert_eq!(outcome.summary, "SUMMARY ON RETRY");
+        assert_eq!(outcome.model, "only-model");
     }
 
     /// A stub that ANSWERS like [`stub_server`] but also CAPTURES the request

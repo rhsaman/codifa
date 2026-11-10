@@ -955,25 +955,11 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
         // `refused` by the loop's caps gate (the only place caps live) and come
         // back as inline refusals without executing.
         "batch" => {
-            let ops = args["ops"]
-                .as_array()
-                .ok_or("batch needs ops: [{tool, args}]")?;
-            if ops.is_empty() {
-                // The failing model retries IMMEDIATELY after this error, so
-                // the message carries a copy-pasteable example: traced 7 Nov
-                // on a weak model, 8 of 29 batch calls arrived with empty ops
-                // and each bare error cost a whole extra round.
-                return Err(
-                    "batch: ops is empty — pass a NON-empty array of {tool, args} pairs, e.g. {\"ops\":[{\"tool\":\"grep\",\"args\":{\"pattern\":\"todo\",\"path\":\".\"}},{\"tool\":\"read\",\"args\":{\"filePath\":\"a.txt\"}}]}; tool one of: read, grep, glob, find_symbol, lsp_*, run_terminal, edit_file, write_file"
-                        .into(),
-                );
-            }
-            if ops.len() > BATCH_MAX_OPS {
-                return Err(format!(
-                    "batch: {} ops exceed the {BATCH_MAX_OPS} cap — split into two batches",
-                    ops.len()
-                ));
-            }
+            // Tolerant parse (see `batch_ops`): the array, a stringified array,
+            // or an `{ops:[…]}` wrapper all mean the same step. The error keeps
+            // its copy-pasteable example because the failing model retries
+            // IMMEDIATELY and needs something to correct against.
+            let ops = batch_ops(args)?;
             let mut out = String::new();
             for (i, op) in ops.iter().enumerate() {
                 let raw_tool = op["tool"].as_str().unwrap_or_default().trim().to_string();
@@ -1077,14 +1063,86 @@ pub(crate) const BATCH_TOOLS: &[&str] = &[
 /// How many tool calls ONE batch may carry. 10-call steps fit; the cap keeps
 /// a single result from growing unbounded (each sub-result keeps its own
 /// tool's normal cap).
-pub(super) const BATCH_MAX_OPS: usize = 10;
+pub(crate) const BATCH_MAX_OPS: usize = 10;
+
+/// The one message every unusable `ops` shape collapses into.
+///
+/// It carries a copy-pasteable example because the failing model retries
+/// IMMEDIATELY: traced (`mwam7hcn`) 19 of 141 `batch` calls were unusable and
+/// each one burned a whole round (≈26K prompt tokens) on the retry. The bare
+/// "needs ops" wording gave the model nothing to correct, so it guessed again.
+fn batch_ops_error() -> String {
+    "batch: ops must be a NON-empty array of {tool, args} pairs, e.g. \
+     {\"ops\":[{\"tool\":\"grep\",\"args\":{\"pattern\":\"todo\",\"path\":\".\"}},\
+     {\"tool\":\"read\",\"args\":{\"filePath\":\"a.txt\"}}]}; tool one of: read, grep, glob, \
+     find_symbol, lsp_*, run_terminal, edit_file, write_file"
+        .into()
+}
+
+/// Decode an `ops` value that arrived as a STRING instead of an array.
+///
+/// Several providers double-encode nested JSON: the model means an array but
+/// the wire carries it as a stringified one. Traced (`mwam7hcn`, `mwanphb7`):
+/// 11 `batch` calls in exactly this shape were refused with "batch needs ops"
+/// while the ops inside were perfectly valid — each refusal cost a retry round.
+/// Markdown fences are tolerated too, since a model that thinks in prose often
+/// wraps its JSON in them.
+fn decode_ops_string(text: &str) -> Option<Vec<Value>> {
+    let mut body = text.trim();
+    if let Some(rest) = body.strip_prefix("```") {
+        // Drop the fence's language tag, then the closing fence.
+        body = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
+        body = body.trim_end_matches("```").trim();
+    }
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    match parsed {
+        Value::Array(ops) => Some(ops),
+        // A string holding `{"ops":[…]}` — unwrap the wrapper, not the string.
+        Value::Object(mut o) => o.remove("ops")?.as_array().cloned(),
+        _ => None,
+    }
+}
+
+/// Read `args["ops"]` as the op array, tolerating the shapes a model really
+/// emits (array, stringified array, one-object `{ops:…}` wrapper, or an op that
+/// is itself a string).
+///
+/// ONE parser for the executor AND the turn's caps gate: when they disagreed
+/// about the shape, a stringified `ops` skipped the caps gate entirely (it read
+/// the array with `as_array_mut`, found nothing) and reached the executor — a
+/// mode's read-only contract could be bypassed by malformed JSON.
+pub(crate) fn batch_ops(args: &Value) -> Result<Vec<Value>, String> {
+    let ops = match args.get("ops") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::String(s)) => decode_ops_string(s).ok_or_else(batch_ops_error)?,
+        _ => return Err(batch_ops_error()),
+    };
+    // An op may be a stringified object for the same double-encoding reason.
+    let ops: Vec<Value> = ops
+        .into_iter()
+        .map(|op| match op {
+            Value::String(s) => serde_json::from_str::<Value>(s.trim()).unwrap_or(Value::String(s)),
+            other => other,
+        })
+        .collect();
+    if ops.is_empty() || !ops.iter().all(Value::is_object) {
+        return Err(batch_ops_error());
+    }
+    if ops.len() > BATCH_MAX_OPS {
+        return Err(format!(
+            "batch: {} ops exceed the {BATCH_MAX_OPS} cap — split into two batches",
+            ops.len()
+        ));
+    }
+    Ok(ops)
+}
 
 /// Resolve an op's tool name through the SAME alias table a top-level call
 /// uses, narrowed to what a batch can actually run.
 ///
 /// Returns `None` for a name with no Codifa equivalent, which falls through to
 /// the existing "not a batch tool" refusal naming the allowed set.
-fn batch_tool_name(name: &str) -> Option<String> {
+pub(crate) fn batch_tool_name(name: &str) -> Option<String> {
     let advertised: Vec<String> = BATCH_TOOLS.iter().map(|s| (*s).to_string()).collect();
     crate::agent::canonical_tool_name(name, &advertised)
 }

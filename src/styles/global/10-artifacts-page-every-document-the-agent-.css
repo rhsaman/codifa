@@ -306,15 +306,15 @@
   --group: var(--link);
 }
 
-/* Row wrapper around the chat tab bar + panel actions: the border runs under
-   the whole row (bar + actions) so the actions sit on the same rule line as
-   the tabs instead of floating above it. */
+/* Row wrapper around the chat tab bar + panel actions. NO bottom border: the
+   tabs float directly on the bar (removed by request — the row read as a ruled
+   toolbar). The drag region stays: dragging the empty stretch between tabs and
+   the actions moves the window (buttons opt out below). */
 .chat-tabs-row {
   flex: 0 0 auto;
   display: flex;
   align-items: flex-end;
   min-width: 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
   /* Frameless window: dragging from the empty stretch between tabs and the
      actions moves the window (buttons opt out below). */
   -webkit-app-region: drag;
@@ -587,13 +587,12 @@
   color: var(--link);
 }
 
-/* Chat tabs: flat floating pills, no shadow. */
+/* Chat tabs: flat floating pills, no shadow, no bottom rule. */
 .tab-bar.chat-tabs {
   gap: 6px;
   padding: 6px 12px;
   align-items: center;
   background: transparent;
-  border-bottom: 1px solid var(--hairline);
   mask-image: none;
 }
 

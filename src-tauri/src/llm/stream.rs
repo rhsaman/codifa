@@ -115,17 +115,6 @@ pub struct StreamAcc {
     /// it here lets the read loop detect a reasoning-only payload without
     /// sniffing the raw JSON.
     pub reasoning_len: usize,
-    /// Raise counter of the interrupt signal when this stream started reading.
-    /// The stream treats the signal as "mine" ONLY when its generation is now
-    /// greater than this stamp, so a raise meant for an earlier window (already
-    /// consumed, or landing before this request) can never cancel a request the
-    /// user never steered. Together with `interrupted` this is what makes a
-    /// mid-turn steer deterministic instead of a coin flip.
-    pub interrupt_base: u64,
-    /// True when the stream was dropped early because a mid-turn steer landed.
-    /// The agent loop then re-issues the same step with the steer appended
-    /// instead of waiting for a model answer the user already superseded.
-    pub interrupted: bool,
 }
 
 /// One live signal from a streaming model call.
@@ -143,75 +132,6 @@ pub enum StreamSignal<'a> {
 
 /// Callback fired for every live stream signal.
 pub type SignalSink<'a> = &'a mut (dyn FnMut(StreamSignal<'_>) + Send + 'a);
-
-/// Event-driven "drop this stream now" signal for mid-turn steers.
-///
-/// The steer inbox is only read BETWEEN model calls, so a steer typed while a
-/// request was already streaming had to wait for that whole request to finish —
-/// exactly the reported "steer behaves like a queued message". `push_steer`
-/// raises this signal and the read loop below selects on it, so the in-flight
-/// request is dropped at once and re-issued with the steer appended.
-///
-/// There is deliberately no timer anywhere in this path: a raise is an event, so
-/// detection is instant, and a merely slow model is never mistaken for failure.
-#[derive(Debug, Default)]
-pub struct InterruptSignal {
-    /// Monotonic raise counter.
-    ///
-    /// A plain bool is NOT enough here. A stream only learns about a raise when
-    /// its read loop is parked on `wait()`, so a raise that lands while no
-    /// stream is parked (the moment between two model calls, when the agent is
-    /// executing a tool, or in the gap right after the previous stream was
-    /// dropped) used to be either swallowed by `reset()` or consumed by the
-    /// WRONG iteration — the reported "sometimes the steer goes through, and
-    /// sometimes it just waits for the whole turn". Counting raises lets each
-    /// stream spot exactly the raises that happened AFTER it started, so a raise
-    /// is never lost and never mis-attributed.
-    generation: AtomicU64,
-    notify: Notify,
-}
-
-impl InterruptSignal {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Raise the signal and wake an in-flight stream waiting on it.
-    /// Returns the new generation (the stamp a consuming stream compares to).
-    pub fn raise(&self) -> u64 {
-        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.notify.notify_waiters();
-        gen
-    }
-
-    /// The raise counter as it stands now. A stream captures this BEFORE it
-    /// starts reading and treats any larger value as "a steer landed on me".
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    /// True when a raise happened after `since`.
-    pub fn interrupted_since(&self, since: u64) -> bool {
-        self.generation() > since
-    }
-
-    /// Resolve once the counter is greater than `since` (immediately when it
-    /// already is), then return the value it reached.
-    pub async fn wait_for(&self, since: u64) -> u64 {
-        loop {
-            // Register interest BEFORE re-checking the counter: a raise landing
-            // between the check and the wait would otherwise be lost forever.
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let now = self.generation();
-            if now > since {
-                return now;
-            }
-            notified.await;
-        }
-    }
-}
 
 /// Message carried by a provider error object. Failures do not all arrive with a
 /// non-2xx status, and every provider words them differently, so the shape — not
@@ -454,12 +374,6 @@ pub(super) fn finish_stream(provider: &str, acc: StreamAcc) -> Result<StreamAcc,
             format!("{provider} reported an error mid-stream: {msg}"),
         ));
     }
-    // A mid-turn steer drops this request on purpose: the agent loop re-issues
-    // the step with the steer appended, so an empty accumulator is the expected
-    // outcome here and not a failure.
-    if acc.interrupted {
-        return Ok(acc);
-    }
     // A 200 stream whose whole CONTENT is a billing/auth refusal (Pollinations
     // does this for a drained account): zero usage plus the wording. Without
     // this the turn "succeeds" and the refusal is stored as the assistant's
@@ -517,7 +431,6 @@ pub async fn stream_chat(
     tools: Option<&[Value]>,
     on_event: SignalSink<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-    steer_interrupt: Option<&InterruptSignal>,
 ) -> Result<StreamAcc, (u16, String)> {
     if cfg.api_keys.is_empty() && !kind_allows_keyless(&cfg.provider) {
         return Err((0, "no api key configured".into()));
@@ -532,9 +445,7 @@ pub async fn stream_chat(
     let body = build_request_body(cfg, messages, tools);
     let mut last_err = String::new();
     for key in key_attempt_order(attempts) {
-        match stream_with_key(client, cfg, &key, &body, on_event, cancel, steer_interrupt)
-            .await
-        {
+        match stream_with_key(client, cfg, &key, &body, on_event, cancel).await {
             Ok(acc) => {
                 mark_key_ok(&key);
                 return Ok(acc);
@@ -561,7 +472,6 @@ pub(super) async fn stream_with_key(
     body: &Value,
     on_event: SignalSink<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-    steer_interrupt: Option<&InterruptSignal>,
 ) -> Result<StreamAcc, (u16, String)> {
     let base = normalize_base(&cfg.provider, &cfg.base_url);
     let (url, header_name, header_value) = match cfg.provider.as_str() {
@@ -602,12 +512,6 @@ pub(super) async fn stream_with_key(
     // "running". A provider that cannot flush HEADERS within this budget will
     // not answer either; the env override covers an exotic queued gateway.
     let header_wait = std::time::Duration::from_secs(header_wait_secs());
-    // Stamp the steer generation BEFORE waiting for headers: a steer that lands
-    // while a black-holed request is parked in `send()` must drop it at once.
-    // The wait below used to race only Stop and the header deadline, so a steer
-    // during a silent request sat on "Steering the running agent…" until the
-    // whole budget (60s by default) expired.
-    let steer_base = steer_interrupt.map(InterruptSignal::generation);
     let resp = loop {
         let send_body = retry_body.as_ref().unwrap_or(body);
         let mut req = client.post(&url).json(send_body);
@@ -626,21 +530,6 @@ pub(super) async fn stream_with_key(
         let resp = tokio::select! {
             biased;
             _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
-            _ = async {
-                match (steer_interrupt, steer_base) {
-                    (Some(sig), Some(base)) => sig.wait_for(base).await,
-                    _ => std::future::pending::<u64>().await,
-                }
-            } => {
-                // A steer landed before the provider flushed headers. This is
-                // NOT a provider failure: return an interrupted accumulator so
-                // the turn re-issues the step with the steer appended (see
-                // `run_turn`), instead of reporting a bogus HTTP error.
-                let mut acc = StreamAcc::default();
-                acc.interrupt_base = steer_base.unwrap_or_default();
-                acc.interrupted = true;
-                return Ok(acc);
-            }
             _ = tokio::time::sleep(header_wait) => {
                 return Err((
                     0u16,
@@ -683,15 +572,6 @@ pub(super) async fn stream_with_key(
     };
 
     let mut acc = StreamAcc::default();
-    // Stamp this request with the signal's generation: only a raise that
-    // happens AFTER this point is meant for THIS stream. Without the stamp a
-    // raise landing between two requests was consumed by the next one (or lost),
-    // which is why a mid-turn steer only went through sometimes. The stamp is
-    // the one captured BEFORE the header wait, so a raise that landed while the
-    // request was parked in `send()` still interrupts the first read.
-    if let Some(base) = steer_base {
-        acc.interrupt_base = base;
-    }
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     // Live thinking state, reported only on a REAL transition: a payload that
@@ -721,23 +601,14 @@ pub(super) async fn stream_with_key(
                 return Err((0u16, "aborted by user".into()));
             }
         }
-        // A mid-turn steer drops this request instantly instead of letting the
-        // model finish an answer the user already superseded. `biased` makes the
-        // interrupt win every tie, so a steer is never delayed by a ready chunk.
-        // Stop and a mid-turn steer are both EVENTS raced against the next chunk,
-        // so neither waits for a silent provider to speak first.
+        // Stop is an EVENT raced against the next chunk, so an abort never
+        // waits for a silent provider to speak first. A mid-turn steer
+        // deliberately does NOT race here: it must not drop the in-flight
+        // request (the model's current call and its tool batch always run to
+        // completion) — it is delivered at the next step boundary instead.
         let chunk = tokio::select! {
             biased;
             _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
-            _ = async {
-                match steer_interrupt {
-                    Some(sig) => sig.wait_for(acc.interrupt_base).await,
-                    None => std::future::pending::<u64>().await,
-                }
-            } => {
-                acc.interrupted = true;
-                return finish_stream(&cfg.provider, acc);
-            }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 return Err((
                     0u16,

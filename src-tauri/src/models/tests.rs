@@ -79,6 +79,44 @@
         assert_eq!(entry_vision(&json!({ "vision": false })), Some(false));
     }
 
+    /// 9router's `/v1/models` nests the capability flags — a shape the app
+    /// ignored, so a vision-capable model stayed UNKNOWN and every sub-agent
+    /// screenshot was routed through the (slow) Vision slot.
+    #[test]
+    fn vision_reads_nested_capability_flags() {
+        let gateway = json!({
+            "id": "cbai/deepseek-v4.1-flash",
+            "capabilities": {
+                "vision": true,
+                "pdf": false,
+                "audioInput": false,
+                "tools": true
+            }
+        });
+        assert_eq!(entry_vision(&gateway), Some(true));
+        // An explicit `false` is a real verdict, not silence.
+        assert_eq!(
+            entry_vision(&json!({ "capabilities": { "vision": false, "tools": true } })),
+            Some(false)
+        );
+        // Capabilities that never mention vision leave it UNKNOWN.
+        assert_eq!(
+            entry_vision(&json!({ "capabilities": { "tools": true, "pdf": false } })),
+            None
+        );
+        // `capabilities.input_modalities` keeps winning over the boolean flag,
+        // since it is the more precise answer.
+        assert_eq!(
+            entry_vision(&json!({
+                "capabilities": {
+                    "input_modalities": ["text", "image"],
+                    "vision": false
+                }
+            })),
+            Some(true)
+        );
+    }
+
     #[test]
     fn models_dev_vision_fills_a_silent_provider_payload() {
         let catalog = json!({

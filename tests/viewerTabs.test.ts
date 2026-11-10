@@ -33,7 +33,7 @@ const memStore = new Map<string, string>()
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).document = { documentElement: { style: { setProperty: () => {} } } }
 
-const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat, syncViewerToChat, shownViewerTabId } = await import('../src/lib/viewerTabs')
+const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat, syncViewerToChat, shownViewerTabId, workspaceKeyForChat } = await import('../src/lib/viewerTabs')
 const { collectChatIds, leafCount } = await import('../src/lib/chatTree')
 const { useStore, normalizeVisibleChats, normalizeChatLayout, workspaceKey } = await import('../src/lib/store')
 
@@ -59,6 +59,16 @@ function chatInWs(root: string): [string, string] {
 
 function scopeOf(chatId: string, wsKey: string) {
   return { wsKey, chatId }
+}
+
+/** The persona gate (see openGitDiff): git surfaces only exist in CODE mode —
+ *  the sections below exercise viewer MECHANICS around the git tab, so flip
+ *  the chat's workspace persona to code before opening it. The gate resolves
+ *  the key with workspaceKeyForChat, so the same helper keeps them in step. */
+function allowGit(chatId: string) {
+  useStore.setState((s) => ({
+    workspaceRunModes: { ...s.workspaceRunModes, [workspaceKeyForChat(chatId)]: 'code' },
+  }))
 }
 
 function resetViewer() {
@@ -282,6 +292,7 @@ console.log('11) viewer multi-window tree — split, focus, close:')
   resetViewer()
   const vt = () => useViewerTabs.getState()
   const [cid, wsA] = chatInWs('/ws-a')
+  allowGit(cid)
   vt().openGitDiff(cid)
   const gitId = `review:${wsA}`
   vt().openTraces(cid, 'all')
@@ -348,6 +359,7 @@ console.log('14) syncViewerToChat — trace follows the chat, workspace tabs sti
   const vt = () => useViewerTabs.getState()
   const [c1, wsA] = chatInWs('/ws-a')
   const [c2] = chatInWs('/ws-a')
+  allowGit(c1)
   vt().openGitDiff(c1)
   vt().openTraces(c1, 'all')
   vt().openTraces(c2, 'all')
@@ -446,6 +458,7 @@ console.log('15) closeAllViewers — closes only the focused scope, keeps histor
   const vt = () => useViewerTabs.getState()
   const [c1, wsA] = chatInWs('/ws-a')
   const [c2] = chatInWs('/ws-a')
+  allowGit(c1)
   vt().openGitDiff(c1)
   vt().openTraces(c1, 'all')
   vt().openTraces(c2, 'all')
@@ -462,6 +475,31 @@ console.log('15) closeAllViewers — closes only the focused scope, keeps histor
     vt().closeAllViewers()
     return vt().tabs.length === 0
   })())
+}
+
+console.log('15b) persona gate — openGitDiff is a no-op in the default CHAT persona:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const [c1] = chatInWs('/ws-a')
+  // Sections 11/14/15 above flipped this workspace to code; 15b needs the
+  // default chat persona, so clear it explicitly.
+  useStore.setState((s) => {
+    const modes = { ...s.workspaceRunModes }
+    delete modes[workspaceKeyForChat(c1)]
+    return { workspaceRunModes: modes }
+  })
+  // No allowGit: the workspace boots with no stored persona = CHAT. Git is a
+  // CODE-mode surface, so the opener must be a FULL no-op — the gate returns
+  // the state untouched (same object), not merely a tab-less result.
+  const before = useViewerTabs.getState()
+  vt().openGitDiff(c1)
+  check('chat persona: openGitDiff is a full no-op', useViewerTabs.getState() === before, useViewerTabs.getState())
+  // Flip the persona to code and the same opener works (mechanics asserted in
+  // sections 11/14/15 above).
+  allowGit(c1)
+  vt().openGitDiff(c1)
+  check('code persona: openGitDiff opens the tab', vt().tabs.some((t) => t.kind === 'review'), vt().tabs.map((t) => t.id))
 }
 
 console.log('16) browser tab carries the url the agent opened (not about:blank):')

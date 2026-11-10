@@ -681,3 +681,51 @@ export function mergeTranscripts(
   if (bNorm && aNorm.includes(` ${bNorm} `)) return a
   return `${a} ${b}`
 }
+
+/** Minimal shape of one STT chain rung (a resolved TranscribeProviderOpts). */
+export interface SttChainRung {
+  kind: string
+  baseUrl?: string
+  model?: string
+}
+
+/**
+ * One STT rung's display label: `kind@host (model)`.
+ *
+ * Most gateways are kind `custom`, so the kind alone says nothing about WHICH
+ * endpoint failed; the host is what the user recognizes from Settings.
+ */
+export function sttRungLabel(opts: SttChainRung): string {
+  let host = (opts.baseUrl ?? '').trim()
+  if (host) {
+    try {
+      host = new URL(host).host
+    } catch {
+      // A malformed base URL stays verbatim — it is still the identifier.
+    }
+  }
+  const model = (opts.model ?? '').trim()
+  return `${opts.kind}@${host || '?'}${model ? ` (${model})` : ''}`
+}
+
+/**
+ * The error a dictation/live turn rejects with when its WHOLE STT chain failed.
+ *
+ * With one rung the original error passes through untouched. With several, the
+ * last error alone made every rung look untried ("the fallback did nothing") —
+ * the message instead names EVERY rung in order with its own failure, so a dead
+ * primary plus a broken fallback reads as exactly that.
+ */
+export function sttChainError(
+  chains: ReadonlyArray<SttChainRung>,
+  errors: ReadonlyMap<number, unknown>,
+  lastError: unknown,
+): unknown {
+  if (chains.length <= 1) return lastError
+  const parts = chains.map((rung, i) => {
+    const e = errors.get(i)
+    const msg = e == null ? 'not tried' : (e instanceof Error ? e.message : String(e)).slice(0, 200)
+    return `${sttRungLabel(rung)}: ${msg}`
+  })
+  return new Error(`all ${chains.length} STT providers failed — ${parts.join(' | ')}`)
+}

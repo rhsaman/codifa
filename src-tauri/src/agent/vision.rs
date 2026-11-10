@@ -154,15 +154,33 @@ pub(super) async fn run_slot_distill(
     // the first model, pausing between passes. A single silent pass was why a
     // dead first rung read as "web/fetch never use the Other model": the
     // distiller gave up and the raw payload went out with no trace of the
-    // configured list.
+    // configured list. A one-model chain is rotated too — a transient failure
+    // must not throw the distiller away.
     const DISTILL_MAX_CYCLES: usize = 3;
     const DISTILL_CYCLE_PAUSE_SECS: u64 = 10;
-    let cycles = if chain.len() > 1 { DISTILL_MAX_CYCLES } else { 1 };
-    for pass in 0..cycles {
+    // The same time bounds as the Vision slot: a summary is a side call, so a
+    // rung that accepts the request and stalls must hand the work to the next
+    // model instead of holding the tool (and the turn) for minutes.
+    const DISTILL_CALL_TIMEOUT_SECS: u64 = 60;
+    const DISTILL_TOTAL_BUDGET_SECS: u64 = 110;
+    const DISTILL_MIN_RUNG_SECS: u64 = 10;
+    let cycles = DISTILL_MAX_CYCLES;
+    let started = std::time::Instant::now();
+    let total_budget = std::time::Duration::from_secs(DISTILL_TOTAL_BUDGET_SECS);
+    'passes: for pass in 0..cycles {
         if pass > 0 {
+            let left = total_budget.saturating_sub(started.elapsed());
+            if left < std::time::Duration::from_secs(DISTILL_CYCLE_PAUSE_SECS) {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(DISTILL_CYCLE_PAUSE_SECS)).await;
         }
         for (m, b, keys, pid, k) in chain.iter() {
+            let left = total_budget.saturating_sub(started.elapsed());
+            if left < std::time::Duration::from_secs(DISTILL_MIN_RUNG_SECS) {
+                break 'passes;
+            }
+            let rung_timeout = DISTILL_CALL_TIMEOUT_SECS.min(left.as_secs().max(1));
             let (reasoning, model_reasoning, auto_think) = crate::llm::reasoning_fields(
                 k,
                 &crate::llm::level_from_source(
@@ -182,7 +200,7 @@ pub(super) async fn run_slot_distill(
                 // A summary is a few hundred tokens; a reasoning model needs room for
                 // its preamble on top of that.
                 max_tokens: Some(1024),
-                timeout_secs: 60,
+                timeout_secs: rung_timeout,
                 reasoning_level: reasoning,
                 model_reasoning,
                 auto_think,
@@ -377,14 +395,44 @@ pub(super) async fn run_vision_slot(
     // the first model (a provider that was down a minute ago is often back),
     // pausing between passes so dead rungs are not hammered — the same ladder
     // semantics every tool slot follows.
+    // A single-rung slot is not exempt from the wrap: after its only model
+    // fails, the walk starts over at that same model, exactly like a
+    // one-model sub-agent ladder. It used to get ONE call (`cycles` collapsed
+    // to 1) while every multi-model list was retried, so a transient vision
+    // failure ended with a missing image for no reason. The total time budget
+    // below — not the pass count — is what keeps this bounded.
     const VISION_MAX_CYCLES: usize = 3;
     const VISION_CYCLE_PAUSE_SECS: u64 = 10;
-    let cycles = if chain.len() > 1 { VISION_MAX_CYCLES } else { 1 };
-    for pass in 0..cycles {
+    // ONE rung may never hold the turn hostage. This is a side call, not the
+    // chat answer: a vision model that accepts the request and then stalls used
+    // to sit on NO_TIMEOUT_SECS (24h) while the ladder never advanced — measured
+    // as a >6-minute desktop sub-agent stall, with every screenshot waiting on
+    // the same dead rung. 60s matches the web distiller; the WHOLE slot pass has
+    // its own ceiling so a long list of dead models cannot multiply it — and
+    // that ceiling stays under the sub-agent idle guard (120s), otherwise the
+    // parent would kill the whole attempt before the slot could report back.
+    const VISION_CALL_TIMEOUT_SECS: u64 = 60;
+    const VISION_TOTAL_BUDGET_SECS: u64 = 110;
+    // Below this much remaining budget a rung cannot plausibly answer, so the
+    // pass ends instead of paying another guaranteed timeout.
+    const VISION_MIN_RUNG_SECS: u64 = 10;
+    let cycles = VISION_MAX_CYCLES;
+    let started = std::time::Instant::now();
+    let total_budget = std::time::Duration::from_secs(VISION_TOTAL_BUDGET_SECS);
+    'passes: for pass in 0..cycles {
         if pass > 0 {
+            let left = total_budget.saturating_sub(started.elapsed());
+            if left < std::time::Duration::from_secs(VISION_CYCLE_PAUSE_SECS) {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(VISION_CYCLE_PAUSE_SECS)).await;
         }
         for (c_model, c_base, c_keys, c_provider_id, c_kind) in chain.iter() {
+            let left = total_budget.saturating_sub(started.elapsed());
+            if left < std::time::Duration::from_secs(VISION_MIN_RUNG_SECS) {
+                break 'passes;
+            }
+            let rung_timeout = VISION_CALL_TIMEOUT_SECS.min(left.as_secs().max(1));
             let (v_reasoning, v_model_reasoning, v_auto_think) = crate::llm::reasoning_fields(
                 c_kind,
                 // A side call defaults to no reasoning (never inherits the main level).
@@ -404,7 +452,7 @@ pub(super) async fn run_vision_slot(
                 api_keys: c_keys.clone(),
                 temperature: Some(0.2),
                 max_tokens: Some(2048),
-                timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+                timeout_secs: rung_timeout,
                 reasoning_level: v_reasoning,
                 model_reasoning: v_model_reasoning,
                 auto_think: v_auto_think,

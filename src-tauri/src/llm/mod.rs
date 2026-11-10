@@ -10,10 +10,8 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
 
 /// Resolved per-call LLM configuration (mirrors llm.py's build_chat_model args).
 #[derive(Debug, Clone)]

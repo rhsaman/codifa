@@ -51,7 +51,6 @@ import {
   isEditActivity,
   isSubagentCard,
 } from "./ToolCallView";
-import { ExploreCard, exploreToolCounts } from "./ExploreCard";
 import { AskUserCard } from "./AskUserCard";
 import { MessageImages } from "./MessageImages";
 import "highlight.js/styles/github-dark.min.css";
@@ -426,21 +425,24 @@ export function renderSegments(
       pendingEdit.push({ activity, index: seg.index });
       return;
     }
-    // Explore/sub-agent runs never expand inside the chat: each one renders as
-    // the compact ExploreCard (run title + one chip per tool with its call
-    // count); clicking it opens that run's tool group in the right-hand panel
-    // (user request — parallel runs each get their own independent card).
+    // اجرای ساب‌ایجنت دقیقاً مثل یک tool group رندر می‌شود — همان ToolGroupView،
+    // همان قاب tool-trace و بازشدن درجا با TraceRowهای فراخوانی‌های داخلی
+    // (children) — با این تفاوت که نام ساب‌ایجنت pill اولِ هدر است. هر اجرای
+    // موازی کارت مستقل خودش را نگه می‌دارد.
     if (isSubagentCard(activity)) {
       flush();
       wrapTrace();
       flushEdits();
       nodes.push(
-        <ExploreCard
-          key={`exp-${seg.index}`}
-          activity={activity}
-          messageId={message.id}
-          index={seg.index}
-        />,
+        <div key={`exp-${seg.index}`} className="tool-trace">
+          <ToolGroupView
+            subagent={activity}
+            activities={(activity.children ?? []).map((child, ci) => ({
+              activity: child,
+              index: ci,
+            }))}
+          />
+        </div>,
       );
       return;
     }
@@ -1003,18 +1005,22 @@ export const ChatMessageView = memo(
             />
           ) : (
             message.streaming &&
-            (message.thinkingActive ? (
-              <ThinkingIndicator startedAt={message.thinkingStartedAt} />
-            ) : (
+            // ONE indicator instance for every phase, so the timer never resets:
+            // it always counts from the turn's workingStartedAt. The label is the
+            // live status when there is one (LSP / tool status) and "Working"
+            // otherwise; while the model reasons, an animated icon in front of the
+            // label replaces the old "Thinking" pill and its own stopwatch.
+            (
               <ThinkingIndicator
-                label={(() => {
-                  const lsp = lspStatusLabel(message.lspStatus);
-                  if (lsp) return lsp;
-                  return message.statusText ? `Working · ${message.statusText}` : "Working";
-                })()}
+                thinking={!!message.thinkingActive}
+                label={
+                  lspStatusLabel(message.lspStatus) ||
+                  message.statusText ||
+                  "Working"
+                }
                 startedAt={message.workingStartedAt}
               />
-            ))
+            )
           )}
           {/* Turn duration + send clock are ONE unit that parks exactly where
               the Working pill sat (measured: pill `left: 18` in RTL). They used

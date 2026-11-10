@@ -392,7 +392,9 @@
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 8px 3px;
+  /* Symmetric vertical padding: an off-center inset made the + icon and the
+     placeholder read a couple of px ABOVE the card's visual center. */
+  padding: 2px 8px;
 }
 
 .composer-input-row.compact .composer-bottom-row {
@@ -425,11 +427,13 @@
 
 .composer-input-row.compact .composer-input-stack .composer-input {
   min-height: 28px;
-  padding: 4px 8px;
+  /* 1px optical nudge down: font metrics make the single line read a touch
+     above the card's center even in a symmetric box. */
+  padding: 5px 8px 3px;
 }
 
 .composer-input-row.compact .composer-input-stack .composer-backdrop {
-  padding: 4px 8px;
+  padding: 5px 8px 3px;
 }
 
 /* Keep every icon vertically centered: drop the 2px lift used in the
@@ -457,7 +461,8 @@
   min-height: 0;
   max-height: none;
   box-sizing: border-box;
-  padding: 4px 8px;
+  /* Mirrors the compact textarea's padding (incl. its 1px optical nudge). */
+  padding: 5px 8px 3px;
   font-size: var(--chat-font-size);
   font-family: var(--font-sans);
   line-height: 1.4;
@@ -660,13 +665,17 @@
   box-sizing: border-box;
 }
 
-/* Composer footer: sits BELOW the composer card — mode, thinking, model cluster */
+/* Composer footer: sits BELOW the composer card. Three zones on ONE line —
+   mode + thinking at the LEFT edge, model picker + context ring exactly in
+   the MIDDLE, live voice + dictate mic at the RIGHT edge. The 1fr/auto/1fr
+   grid keeps the center pair truly centered no matter how wide the side
+   zones are, and the footer itself never exceeds the input card's width
+   (15-turn-tools caps it at 680px, same as .composer-inner). */
 .composer-footer {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  max-width: 760px;
+  max-width: 680px;
   margin: 0 auto;
   padding: 6px 8px 0;
   font-size: 11px;
@@ -675,21 +684,26 @@
   opacity: 1;
 }
 
-.composer-disclaimer {
-  flex: 1 1 auto;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  padding: 0 4px;
-}
-
+.composer-footer-left,
+.composer-footer-center,
 .composer-footer-right {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  flex: 0 0 auto;
+  min-width: 0;
   font-family: var(--font-mono);
+}
+
+.composer-footer-left {
+  justify-self: start;
+}
+
+.composer-footer-center {
+  justify-self: center;
+}
+
+.composer-footer-right {
+  justify-self: end;
 }
 
 .composer-mode {
@@ -750,6 +764,71 @@
 }
 .composer-footer .live-chev-btn {
   height: 24px;
+}
+
+/* Dictate mic in the footer-right zone (next to the live voice button): same
+   borderless ghost treatment as the live button — no ring, background or
+   shadow at rest. While recording/transcribing it shows NO animation (the
+   input row already animates) — the static icon just takes the accent color.
+   A live session owning the mic dims and locks the button instead of hiding
+   it; the same applies to the live button while a dictate records. */
+.composer-footer .icon-btn.mic-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 26px;
+  height: 26px;
+  background: transparent;
+  background-color: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  color: var(--text);
+}
+/* Absolutely centered on purpose: no padding/flex quirk can nudge the glyph
+   off the circular hover background. */
+.composer-footer .icon-btn.mic-btn svg {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  translate: -50% -50%;
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+.composer-footer .icon-btn.mic-btn:hover:not(:disabled),
+.composer-footer .icon-btn.mic-btn:active:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  color: var(--text);
+}
+.composer-footer .icon-btn.mic-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+}
+.composer-footer .icon-btn.mic-btn .wave {
+  display: none;
+}
+.composer-footer .icon-btn.mic-btn.recording,
+.composer-footer .icon-btn.mic-btn.transcribing {
+  background: transparent;
+  box-shadow: none;
+  color: var(--accent);
+  animation: none;
+}
+.composer-footer .icon-btn.mic-btn.recording svg,
+.composer-footer .icon-btn.mic-btn.transcribing svg {
+  animation: none;
+}
+.composer-footer .icon-btn.mic-btn:disabled,
+.composer-footer .icon-btn.live-btn:disabled,
+.composer-footer .live-chev-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+  background: transparent;
+  color: var(--text-dim);
+  box-shadow: none;
 }
 /* The chevron keeps the ghost treatment too: its base .live-chev-btn:hover
    paints a grey block, which reads as a chip inside the flat footer row. */
@@ -1206,12 +1285,12 @@
   left: 50%;
   --mode-x: -50%;
   transform: translateX(var(--mode-x));
-  min-width: 300px;
+  min-width: 190px;
   max-height: 320px;
   overflow-y: auto;
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   border: none;
-  border-radius: 18px;
+  border-radius: 16px;
   box-shadow:
     var(--shadow-pop),
     inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
@@ -1219,7 +1298,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 6px;
+  padding: 5px;
   backdrop-filter: blur(28px) saturate(1.3);
   transform-origin: bottom center;
   animation: mode-menu-in 0.15s ease-out;
@@ -1248,14 +1327,14 @@
 
 .mode-menu-item {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
-  padding: 9px 10px;
+  padding: 7px 10px;
   text-align: left;
   color: var(--text);
   background: transparent;
   border: 0;
-  border-radius: 12px;
+  border-radius: 10px;
   cursor: pointer;
   transition:
     background 0.12s,

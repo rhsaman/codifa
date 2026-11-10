@@ -24,6 +24,11 @@ pub struct AgentRequest {
     pub root: String,
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Upper-level persona a workspace runs in: `chat` (general-purpose agent)
+    /// or `code` (software-engineering agent). Absent from an older client, and
+    /// an unknown value, both mean `chat` — the general-purpose default.
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
     #[serde(default)]
     pub prompt: String,
     #[serde(default)]
@@ -96,6 +101,14 @@ pub struct AgentRequest {
     /// never bound, so the agent cannot touch the desktop at all.
     #[serde(default)]
     pub allow_computer: bool,
+    /// Per-chat desktop grant — the "Always in this chat" answer on a desktop
+    /// card, kept on the chat by the renderer and re-sent every turn. The
+    /// renderer also ORs this into `allow_computer` so the tool binds; THIS
+    /// field is what skips the per-task popup gate for the rest of the
+    /// conversation. The composer switch alone never sets it, so a switch
+    /// turned on in Settings still asks per task as before.
+    #[serde(default)]
+    pub allow_computer_chat: bool,
     /// True when the turn asks to create or edit a PLUGIN (`/plugin create` /
     /// `/plugin update`). The authoring actions of the `plugin` tool are bound
     /// only then, so an ordinary turn cannot silently rewrite the user's
@@ -123,6 +136,20 @@ pub struct AgentRequest {
     /// up; the flag above opens the whole space.
     #[serde(default)]
     pub allow_outside_folders: Vec<String>,
+    /// Per-chat blanket grant for the model's own `confirm_action` /
+    /// `request_permission` asks: once the user clicked "Always in this chat"
+    /// on such a card, later asks in the SAME conversation are approved
+    /// without a popup. The renderer keeps the grant on the chat and re-sends
+    /// it every turn; scheduled runs never send it, so a headless turn still
+    /// auto-denies through the `headless` check that runs FIRST.
+    #[serde(default)]
+    pub allow_confirm_chat: bool,
+    /// SSH destinations granted "Always in this chat". The `run_terminal` gate
+    /// skips them alongside the turn-local answers and the persisted
+    /// `trusted-hosts.json` hosts — this grant lives on the chat, not on disk,
+    /// so a fresh chat asks again.
+    #[serde(default)]
+    pub allow_ssh_hosts: Vec<String>,
     /// Web-search engines from Settings → Plugins, verbatim and in priority
     /// order: `order` 0 is the primary and higher orders are fallbacks tried in
     /// turn, so the user's list order IS the fallback chain.
@@ -246,6 +273,13 @@ pub struct AgentRequest {
 
 pub(super) fn default_mode() -> String {
     "build".to_string()
+}
+
+/// Default for `run_mode`: the general-purpose persona, so a request that never
+/// mentions it (the scheduler, a sub-agent, an older UI build) is not silently
+/// forced into the engineering persona.
+pub(super) fn default_run_mode() -> String {
+    "chat".to_string()
 }
 
 /// Default for `webSearchAutoFetch` (Settings → Web Providers) when the field
@@ -520,6 +554,25 @@ pub(super) fn retain_subagent_tools(schemas: &mut Vec<Value>, declared: &[String
             kept.push(schema);
         }
     }
+    // `batch` is the ROUND COMPOSER, not a capability: it runs nothing on its
+    // own and every op it carries is re-checked against the turn's caps gate, so
+    // keeping it cannot widen a child's reach by one tool. Dropping it did real
+    // damage: a declared profile ("Read, Grep, Bash") silently lost the only
+    // way to issue those three in ONE round, so the child spent three rounds on
+    // work the main agent does in one — and the batching levers, reading the
+    // real binding, then had nothing to offer it.
+    if !kept
+        .iter()
+        .any(|s| s["function"]["name"].as_str() == Some("batch"))
+    {
+        if let Some(schema) = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("batch"))
+            .cloned()
+        {
+            kept.push(schema);
+        }
+    }
     *schemas = kept;
     true
 }
@@ -619,6 +672,7 @@ impl AgentRequest {
             api_keys: self.api_keys.clone(),
             root: self.root.clone(),
             mode: self.mode.clone(),
+            run_mode: self.run_mode.clone(),
             prompt: self.prompt.clone(),
             // Never inherited — see the doc comment above.
             history: Vec::new(),
@@ -645,6 +699,15 @@ impl AgentRequest {
             // a sub-agent the turn delegates to searches the same disk.
             allow_outside: self.allow_outside,
             allow_outside_folders: self.allow_outside_folders.clone(),
+            // "Always in this chat" grants: the desktop grant rides along like
+            // `allow_computer` above (the child already skips the popup by
+            // MODE, this keeps the snapshot faithful); the model-confirmation
+            // grant stays parent-only (a child cannot call `confirm_action`),
+            // and no SSH host grant is inherited — a child never reaches the
+            // SSH gate.
+            allow_computer_chat: self.allow_computer_chat,
+            allow_confirm_chat: false,
+            allow_ssh_hosts: Vec::new(),
             search_plugins: self.search_plugins.clone(),
             // Media slots ride along: an explore that generates a preview image
             // uses the same configured provider the parent would have.

@@ -60,10 +60,11 @@ import {
   applyToolEvent,
   applyToolOutputEvent,
   diffStatsFromUnified,
-  editTargetOf,
+  editTargetsOf,
   makeToolActivity,
   resolveStuckActivities,
   resolveToolResult,
+  upsertCallFileDiff,
 } from "../lib/toolActivity";
 import {
   bumpToolRunning,
@@ -78,6 +79,7 @@ import { normalizeUsageModel } from "../lib/usage";
 import { otherSlotLevel, otherSlotModel, toolFallbackEntries } from "../lib/toolSlots";
 import { stripLeadingModeTag } from "../lib/modeTag";
 import type { ChatEditTarget } from "../types";
+import { normalizeRunMode } from "../types";
 import {
   contextPercent,
   computeContextUsed,
@@ -166,7 +168,7 @@ import {
 } from "../lib/thinking-options";
 import { isWireHistoryMessage, projectHistoryMessage } from "../lib/historyPayload";
 import { applyHistoryLimit } from "../lib/historyWindow";
-import { allModes, getMode } from "../lib/modes";
+import { allModes, getMode, readModePrompt } from "../lib/modes";
 import {
   extractMentionSkills,
   ensureSkillsList,
@@ -184,7 +186,7 @@ import {
   type PluginCommand,
 } from "../lib/skills";
 import { resolvePluginTurn } from "../lib/pluginBundle";
-import { detectDir, prepareContent } from "../lib/bidi";
+import { RTL_CHAR_RE, detectDir, prepareContent } from "../lib/bidi";
 import {
   registerChatSend,
   sendPendingSteerNext,
@@ -192,6 +194,7 @@ import {
   uid2,
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
+import { useDragReorder } from "../lib/useDragReorder";
 import { combineQuoteAndInput, formatChatQuote, isQuotableSelection } from "../lib/chatQuote";
 import {
   compactInputWidth,
@@ -220,13 +223,14 @@ import {
   formatShortcut,
   navChord,
 } from "../lib/shortcuts";
-import { shouldHandleForChat } from "../lib/chatWindowMeta";
+import { shouldHandleForChat, workspaceKeyFor } from "../lib/chatWindowMeta";
 import type {
   AgentMode,
   ChatMessage,
   McpServerConfig,
   MessageSegment,
   PastedText,
+  QueuedMessage,
   SidecarEvent,
   ThinkingLevel,
   ToolActivity,
@@ -234,13 +238,10 @@ import type {
 } from "../types";
 import {
   ChatMessageView,
-  QueuedCollapsibleText,
-  editQueuedText,
   isCollapsibleText,
 } from "./ChatMessage";
 import type { ChatCompactProgress } from "../types";
-import { MessageImages } from "./MessageImages";
-import { FileIcon, openWorkspaceFile } from "./FileIcon";
+import { FileIcon } from "./FileIcon";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -257,7 +258,7 @@ import { useViewerTabs } from "../lib/viewerTabs";
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
 import { LocalLiveSession, isHallucinatedTranscript, liveEditDelta, releaseWarmLiveMic, sanitizeLocalTranscript } from "../lib/localLive";
-import { analyzeClip16k, normalizeTranscript, resolveSttLanguage } from "../lib/stt";
+import { analyzeClip16k, normalizeTranscript, resolveSttLanguage, sttChainError } from "../lib/stt";
 import { isHtmlTranscriptJunk, LiveVoiceSession, sanitizeTranscriptText } from "../lib/realtimeLive";
 import { buildRealtimeTarget, finalizeLiveTranscript, mergeLiveTranscript, resolveLiveMode } from "../lib/liveSession";
 import { buildLiveSpeakSuffix } from "../lib/livePrompt";
@@ -624,6 +625,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const chatReconnecting =
     chat?.messages.some((m) => m.retry?.reconnecting === true) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
+  // Drag-to-reorder for the queue cards above the composer — the same shared
+  // HTML5 hook the Settings lists use (grip starts the drag, captured slot
+  // geometry keeps the slide preview stable, `moveAt` lands the commit).
+  const queueDrag = useDragReorder(
+    "chat-queue",
+    queuedMsgs.length,
+    (from, insertAt) => {
+      useStore.getState().moveQueuedMessage(chatIdRef.current, from, insertAt);
+    },
+    // No text/plain payload: the chat-window split panes read ANY text/plain
+    // drag as "a chat dragged in from outside" and light up their drop zones —
+    // the queue drag must stay a pure queue reorder.
+    { plainText: false },
+  );
   const busy = busyLocal || chatHasStreaming || chatReconnecting;
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   // Separate git-action states so commit/undo/push spinners never lock the
@@ -1291,13 +1306,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   }, []);
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   // Second mount point on the app bar's right end — the balance chip portals
-  // there so the wallet sits next to the workspace menu, not mid-bar.
+  // into the SLOT that App.tsx reserves just before the settings gear. Targeting
+  // the whole `#titlebar-right` would append after the gear (a portal appends to
+  // its container), which put the wallet to the RIGHT of settings.
   const [titlebarRightEl, setTitlebarRightEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     // The titlebar mounts in the same commit as this panel, so resolve the
     // portal target only after the DOM is actually committed.
     setTitlebarEl(document.getElementById("titlebar-toolbar"));
-    setTitlebarRightEl(document.getElementById("titlebar-right"));
+    setTitlebarRightEl(
+      document.getElementById("titlebar-balance-slot") ??
+        document.getElementById("titlebar-right"),
+    );
   }, []);
   const [recording, setRecording] = useState(false);
   // Live voice state lives in the app store, not here: one microphone is shared
@@ -1379,24 +1399,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const hasComposerText = hasText || hasAttachment;
   const showLiveActive = liveHere;
   const showStopOnly = !liveHere && isStreamingActive;
-  // Dictate mic stays visible during streaming (hidden only when live is active)
-  // so the user can dictate the next prompt while the agent works.
-  const showDictateDuringStreaming = !liveHere && isStreamingActive;
   // Send appears as soon as the composer carries something sendable: typed
   // text, a collapsed paste card, or an attached image. Attaching a screenshot
   // and pressing Send (without typing anything) must work; the old text-only
   // gate forced the user to invent a caption.
   const showSendOnly = !liveHere && !isStreamingActive && hasComposerText && !recording;
-  // Attachments alone must not hide the mics: user may attach a file/photo
-  // and then dictate the prompt. Typed text hides them too — EXCEPT while
-  // recording: streaming dictation writes its partials INTO the input as they
-  // are recognized, and the mic button is showing Stop. Swapping it for Send
-  // mid-dictation removed the only way to stop ("the button never turns off").
-  const showVoiceButtons = !liveHere && !liveOwnedByOtherChat && !isStreamingActive && (!hasText || recording);
-  // Live voice button shows whenever the composer is idle (empty input,
-  // not streaming, live not active) so it comes back after Stop. It stays
-  // hidden mid-stream and while typing, unless live is the active session.
-  const showLiveIdle = !liveHere && !liveOwnedByOtherChat && !isStreamingActive && !hasText;
+  // Footer voice cluster (below the composer, right side): live and dictate
+  // sit NEXT TO EACH OTHER and are ALWAYS visible (even while typing) — the
+  // one that does NOT own the microphone right now dims and locks instead of
+  // disappearing: live active here → the dictate mic dims; recording a
+  // dictate → the live button dims. Another chat owning live hides both here.
+  const footerVoiceVisible = !liveOwnedByOtherChat;
   const sttProviderId = useStore((s) => s.sttProviderId);
   const sttModel = useStore((s) => s.sttModel);
   const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
@@ -5160,23 +5173,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const current = findMsg()?.toolActivity ?? [];
         // Match a diff event to its tool card: when two edit_file/write_file
         // calls run concurrently, matching on tool name alone attaches the
-        // diff to both cards. The backend sends path, so match on path first
-        // and fall back to the legacy tool+running match when no card matches
-        // (e.g. mid-turn reconnected stream).
-        const pathOf = (a: ToolActivity) => editTargetOf(a.args);
-        const hasPath = typeof event.path === "string" && event.path !== "";
+        // diff to both cards. The backend sends path, so match the event
+        // against the card's FULL target list — a batch call names a different
+        // file per entry and the backend emits ONE diff event PER FILE, so one
+        // call legitimately arrives as several events — and fall back to the
+        // legacy tool+running match when no card matches (e.g. mid-turn
+        // reconnected stream).
+        const targetsOf = (a: ToolActivity) => editTargetsOf(a.args);
+        // Snapshot the path once: `hasPath` alone doesn't narrow `event.path`
+        // (aliased narrowing needs a const binding), and both uses below need
+        // a plain string.
+        const path = event.path;
+        const hasPath = typeof path === "string" && path !== "";
         const isTarget = (a: ToolActivity) =>
           a.tool === event.tool &&
           a.status === "running" &&
-          (!hasPath || pathOf(a) === event.path);
+          (!hasPath || targetsOf(a).includes(path));
         const anyPathMatch = current.some(isTarget);
         const next = current.map((a) => {
           if (isTarget(a) || (hasPath && !anyPathMatch && a.tool === event.tool && a.status === "running")) {
-            const diff = event.diff ?? "";
+            // Fold per file, keyed by path: the aggregate diff/diffStats are
+            // recomputed so a second file's event EXTENDS the card's change
+            // instead of overwriting the first file's.
+            const folded = upsertCallFileDiff(a, hasPath ? path : "", event.diff ?? "");
             return {
-              ...a,
-              diff,
-              diffStats: diffStatsFromUnified(diff),
+              ...folded,
               summary: event.summary,
               checkpoint: event.checkpoint,
             };
@@ -5195,15 +5216,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "turn_diff") {
         // Net change of a file since the turn's FIRST edit of it. The backend
         // sends it right before the per-call `diff`, while the edit card is still
-        // running; it rides on the same card (matched by path) so the Review
+        // running; it rides on the same card (matched against the card's FULL
+        // target list, same reason as `diff` above) so the Review
         // panel's "Last Turn" view can show what `git diff` would, not the sum of
         // every intermediate edit.
         const current = findMsg()?.toolActivity ?? [];
         const turnPath = typeof event.path === "string" ? event.path : "";
         const turnTool = (a: ToolActivity) => a.tool === "edit_file" || a.tool === "write_file";
         const next = current.map((a) =>
-          turnTool(a) && a.status === "running" && editTargetOf(a.args) === turnPath
-            ? { ...a, turnDiff: event.diff ?? "" }
+          turnTool(a) &&
+          a.status === "running" &&
+          (!turnPath || editTargetsOf(a.args).includes(turnPath))
+            ? upsertCallFileDiff(a, turnPath, "", event.diff ?? "")
             : a,
         );
         store.updateMessage(assistantMsg.id, { toolActivity: next });
@@ -5479,6 +5503,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           sections: sections.length > 0 ? sections : undefined,
           selected: [],
           secSelected: sections.length > 0 ? sections.map(() => []) : undefined,
+          secOwn: sections.length > 0 ? sections.map(() => false) : undefined,
+          secFreeText: sections.length > 0 ? sections.map(() => "") : undefined,
           freeText: "",
         });
         // Silent in live voice: the answer is spoken and the mic is open.
@@ -5648,19 +5674,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             steerPending: true,
             steerInterleaved: false,
           });
-        }
-      } else if (event.kind === "steer_interrupt") {
-        // The backend DROPPED the in-flight model reply to take this steer right
-        // away instead of letting the answer finish first — that wait was the
-        // "steer behaves like a queued message" report. Nothing needs to be
-        // re-sent from here: the steer is still in the backend's inbox and the
-        // re-issued step picks it up, then confirms with `steer_applied`. Keep
-        // the bubble pending meanwhile so it never looks lost, and do not touch
-        // `steerInterleaved` — an earlier tool result may already own a segment
-        // for this id.
-        const ids = Array.isArray(event.ids) ? event.ids : [];
-        for (const id of ids) {
-          useStore.getState().updateMessage(id, { steerPending: true });
         }
       } else if (event.kind === "status") {
         // Staged progress before first token (preparing context, contacting
@@ -5893,6 +5906,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           ?.thinkingLevel ?? thinkingLevel) as typeof thinkingLevel;
       const isForeground =
         useStore.getState().activeChatId === chat.id;
+      // The workspace's persona, read fresh for the same reason: a background
+      // drain belongs to another workspace, whose switch may differ. Keyed off
+      // THIS chat's own root (`rootDir`), not the global one — the same value
+      // the request is rooted at, so persona and workspace can never disagree.
+      const chatRunMode = normalizeRunMode(
+        useStore.getState().workspaceRunModes[workspaceKeyFor(rootDir)],
+      );
       await streamChat(
         {
           provider: activeProvider,
@@ -5901,6 +5921,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // chat's mode — an update session edits. The chat's own mode is
           // untouched, so closing the badge restores it verbatim.
           mode: chat.editTarget ? "build" : chat.mode,
+          // The persona of the WORKSPACE this chat belongs to — a workspace
+          // setting, so every chat in the project switches together.
+          runMode: chatRunMode,
           chatId: chat.id,
           prompt: activeGoalForSend ? `[Active goal: ${activeGoalForSend.condition}] ${promptWithResume}` : promptWithResume,
           history,
@@ -5914,7 +5937,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           images: sendImgs.map((i) =>
             i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
           ),
-          systemPrompt: s.settings.systemPrompts?.[chat.editTarget ? "build" : chat.mode] ?? "",
+          systemPrompt: readModePrompt(
+            s.settings.systemPrompts,
+            chatRunMode,
+            chat.editTarget ? "build" : chat.mode,
+          ),
           // Live voice only: shape the answer for the ear (one language, plain
           // prose, numbers as words). APPENDED by the backend, so the chat's
           // own custom prompt is untouched and typed turns send nothing at all
@@ -5968,9 +5995,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           plugins: effectivePlugins,
           allowCreate,
           cap: getMode(s.settings, chat.editTarget ? "build" : chat.mode).capabilities,
-          allowOutside: s.outsideAllowed,
-          allowOutsideFolders: s.outsideFolders,
-          allowComputer: s.computerUse,
+          // Grants live on TWO levels: the session/composer state (outside
+          // switch, folders, the Computer Use switch) AND this chat's
+          // "Always in this chat" grants (chatGrants) — merged here so a grant
+          // the user gave on a permission card rides EVERY turn of this chat,
+          // while a fresh chat starts clean.
+          allowOutside: s.outsideAllowed || !!chat.chatGrants?.outsideAll,
+          allowOutsideFolders: [
+            ...(s.outsideFolders ?? []),
+            ...(chat.chatGrants?.folders ?? []),
+          ],
+          allowComputer: s.computerUse || !!chat.chatGrants?.desktop,
+          allowComputerChat: !!chat.chatGrants?.desktop,
+          allowConfirmChat: !!chat.chatGrants?.confirm,
+          allowSshHosts: chat.chatGrants?.hosts ?? [],
           allowBrowser: s.browserUse,
           subagentModels: s.subagentModels,
           customSubagents: s.customSubagents ?? [],
@@ -7844,33 +7882,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     [],
   );
 
-  // Queue edit (not yet sent): update the queued text in place — no
-  // truncate/resend. Order-preserving: queueMessage appends, so a plain
-  // remove + add would move the edited item to the end; instead remove all
-  // unsent items and re-queue them in the same order with the edited text
-  // swapped in (editQueuedText is the pure, unit-tested swap).
-  const handleEditQueued = useCallback((id: string, newText: string) => {
-    const originId = chatIdRef.current;
-    const s = useStore.getState();
-    const ch = s.chats.find((c) => c.id === originId);
-    if (!ch) return;
-    const items = (ch.queued ?? []).filter((q) => !q.sent);
-    const next = editQueuedText(items, id, newText);
-    if (!next) return;
-    for (const q of items) s.removeQueuedMessage(originId, q.id);
-    for (const q of next) s.queueMessage(originId, { ...q });
-  }, []);
-
-  // Stable identity for memoized children, same pattern as onEdit above.
-  const handleEditQueuedRef = useRef(handleEditQueued);
-  handleEditQueuedRef.current = handleEditQueued;
-
-  const onEditQueued = useMemo(
-    () => (id: string, newText: string) => handleEditQueuedRef.current(id, newText),
-    [],
-  );
-
-  const submit = async (overrideText?: string) => {
+  const submit = async (overrideText?: string, steerNow = false) => {
     // An image still being normalized/read is PART of the message being sent:
     // pressing Enter during that async round-trip used to send the turn
     // without the picture (which then appeared in the composer of an
@@ -7939,8 +7951,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
       setSkillUsage(usage);
     }
-    // اگر کامپکت در جریان است پیام باید صف شود نه steer مستقیم
-    if (chatObj.compacting) {
+    // Read streaming state fresh from the store (not the render closure) so
+    // the decide-queue-or-steer below never acts on a stale closure (e.g.
+    // recording started before the turn began).
+    const freshChatForSteer = ss.chats.find((c) => c.id === chatObj.id);
+    const freshStreaming = freshChatForSteer?.messages.some((m) => m.streaming) ?? chatHasStreaming;
+    // QUEUE when compacting (steer can't be delivered mid-compact) — and,
+    // swapped per user ask: plain ENTER during a live stream QUEUES the
+    // message for after the turn; only Ctrl/Cmd+Enter (steerNow) steers
+    // mid-run.
+    if (chatObj.compacting || (freshStreaming && !steerNow)) {
       ss.queueMessage(chatObj.id, {
         id: uid2(),
         text: v,
@@ -7958,17 +7978,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       forceScrollToBottom();
       return;
     }
-    // While THIS chat's agent is working, Enter delivers a non-interrupting
-    // steer: the message becomes a REAL user message (visible immediately) and
-    // is POSTed to /chat/steer (injected at the next tool call). If the turn
-    // ends without the backend injecting it, the drain re-sends it as the next
-    // turn REUSING this same message. The input is NOT consumed by the stream —
-    // no abort.
-    // NOTE: read streaming state fresh from the store (not the render closure)
-    // so dictate auto-send during streaming still steers even when the closure
-    // is stale (e.g. recording started before the turn began).
-    const freshChatForSteer = ss.chats.find((c) => c.id === chatObj.id);
-    const freshStreaming = freshChatForSteer?.messages.some((m) => m.streaming) ?? chatHasStreaming;
+    // Ctrl/Cmd+Enter during a live stream delivers a non-interrupting STEER:
+    // the message becomes a REAL user message (visible immediately) and is
+    // POSTed to /chat/steer (injected at the next tool call). If the turn
+    // ends without the backend injecting it, the drain re-sends it as the
+    // next turn REUSING this same message (send clears steerPending, no
+    // duplicate bubble). The input is NOT consumed by the stream — no abort.
     if (freshStreaming) {
       const userMsg = ss.addMessage(chatObj.id, {
         role: "user",
@@ -8019,57 +8034,93 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     void send(v, atts, imgs, false, undefined, undefined, true);
   };
 
-  const queueForLater = () => {
-    const typed = input.trim();
-    const queuedImgs = imagesRef.current;
-    if (!typed && pastedBlocks.length === 0 && queuedImgs.length === 0 && !activeQuote) return;
-    // Slash commands run immediately and never enter the chat transcript as
-    // raw "/..." text, even when queued via the queue button.
-    if (typed.startsWith("/")) {
-      setInput("");
-      setCmdOpen(null);
-      setHistoryOpen(false);
-      void handleCommand(typed);
-      return;
-    }
-    const v = composePrompt(typed).trim();
+  /** Steer a queued message into the agent NOW (the ↵ button on the queue
+   *  card). While this chat's agent is running this mirrors submit()'s steer
+   *  path (a real user bubble with steerPending + POST /chat/steer, falling
+   *  back to a next-turn send on failure); when idle the item is simply sent
+   *  as a normal turn. The queue card only holds unsent items, so either way
+   *  the item leaves the queue first — the post-turn auto-drain must not
+   *  re-pick it while the steer POST is in flight. */
+  const steerQueuedNow = (q: QueuedMessage) => {
     const ss = useStore.getState();
     const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
     if (!chatObj) return;
-    const atts = attachments;
-    const imgs = queuedImgs;
-    const all = ss.settings.mcpServers ?? {};
-    const enabled = ss.settings.mcpEnabled ?? [];
-    const sel: Record<string, McpServerConfig> = {};
-    for (const n of enabled) if (all[n]) sel[n] = all[n];
-    const queuedSkills: string[] = Array.from(
-      extractMentionSkills(v, mentionCatalog()).skills,
-    );
-    if (queuedSkills.length > 0) {
-      const list = mentionCatalog();
-      let usage = loadSkillUsage();
-      for (const nm of queuedSkills) {
-        const hit = list.find((s) => s.name === nm);
-        usage = recordSkillUsage(hit ? hit.slug || hit.name : nm, usage);
-      }
-      setSkillUsage(usage);
+    const text = q.text?.trim();
+    if (!text) return;
+    const atts = q.attachments ?? [];
+    const imgs = q.images ?? [];
+    ss.removeQueuedMessage(chatObj.id, q.id);
+    const freshStreaming = chatObj.messages.some((m) => m.streaming);
+    if (!freshStreaming || chatObj.compacting) {
+      // Agent idle (or compacting — steer cannot be delivered mid-compact):
+      // deliver immediately as a normal turn, carrying the item's own
+      // mcp/skills/plugins the same way sendQueuedNext does.
+      void send(text, atts, imgs, false, undefined, undefined, true, {
+        mcpServers: q.mcpServers,
+        skills: q.skills,
+        plugins: q.plugins,
+      });
+      return;
     }
-    ss.queueMessage(chatObj.id, {
-      id: uid2(),
-      text: v,
+    const userMsg = ss.addMessage(chatObj.id, {
+      role: "user",
+      content: text,
       attachments: atts,
       images: imgs,
-      mcpServers: sel,
-      skills: queuedSkills,
+      mcpServers: q.mcpServers,
+      skills: q.skills,
       plugins: chatObj.pluginSession ? [chatObj.pluginSession.slug] : undefined,
-      kind: "queue",
+      steerPending: true,
     });
     forceScrollToBottom();
-    setInput("");
-    setPastedBlocks([]);
-    setActiveQuote(null);
-    setAttachments([]);
-    updateImages(() => []);
+    // Same active-goal prefix as submit()'s steer path: a mid-run steer must
+    // carry the active goal so the agent keeps working toward it.
+    const steerPrompt =
+      chatObj.goal?.active && !chatObj.goal.paused && !text.startsWith("/goal")
+        ? `[Active goal: ${chatObj.goal.condition}] ${text}`
+        : text;
+    // The steer endpoint has no workspace context, so workspace-relative
+    // attachment paths must be made absolute here (as submit() does).
+    const rootDir = chatObj.root || ss.root;
+    const steerAtts = atts.map((a) =>
+      !rootDir || /^(\/|[a-zA-Z]:[\\/])/.test(a)
+        ? a
+        : `${rootDir}/${a.replace(/^\/+/, "")}`,
+    );
+    void steerChat(chatObj.id, userMsg.id, steerPrompt, steerAtts, cleanImagesForSend(imgs), {
+      mcpServers: q.mcpServers,
+      skills: q.skills,
+    }).then((ok) => {
+      if (ok) return;
+      // The turn ended between the click and the POST (or the backend is not
+      // reachable): deliver as the NEXT turn, reusing this same user message
+      // (send clears steerPending, no duplicate bubble).
+      void send(text, atts, imgs, false, userMsg.id, undefined, true, undefined, chatObj.id);
+    });
+  };
+
+  /** Edit a queued message in the COMPOSER (the ✏ on the queue card): the
+   *  item is pulled out of the queue and its text/attachments/images are
+   *  restored into the input, where the user can rework it. Sending again
+   *  steers or re-queues depending on the agent state, like a fresh message. */
+  const editQueuedInComposer = (q: QueuedMessage) => {
+    const ss = useStore.getState();
+    const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
+    if (!chatObj) return;
+    ss.removeQueuedMessage(chatObj.id, q.id);
+    setInput(q.text ?? "");
+    setAttachments(q.attachments ?? []);
+    updateImages(() =>
+      (q.images ?? []).map((im) => ({
+        path: im.path,
+        name: im.name,
+        dataUrl: im.dataUrl,
+        // addImage stores the pre-normalization path here; queued images may
+        // or may not carry it depending on when they were queued.
+        origPath: (im as { origPath?: string }).origPath ?? im.path,
+      })),
+    );
+    requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
   const addImage = async (p: string, name: string) => {
@@ -8485,6 +8536,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       let running = 0;
       let settled = false;
       let lastError: unknown = null;
+      // Per-rung failures, keyed by chain position: the whole chain failing
+      // reports EVERY rung's own error (sttChainError), not just the last one,
+      // so "the fallback did nothing" is distinguishable from "both failed".
+      const rungErrors = new Map<number, unknown>();
       let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
       const settle = () => {
         settled = true;
@@ -8492,6 +8547,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       };
       const launch = (): boolean => {
         if (settled || next >= chains.length) return false;
+        const rungIndex = next;
         const opts = chains[next++];
         running++;
         if (hedgeTimer !== undefined) clearTimeout(hedgeTimer);
@@ -8507,6 +8563,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           },
           (e) => {
             lastError = e;
+            rungErrors.set(rungIndex, e);
             running--;
             if (settled) return;
             // `running === 0` alone is not "nothing in flight": a hedge timer
@@ -8516,7 +8573,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             const started = launch();
             if (!started && running === 0 && hedgeTimer === undefined) {
               settle();
-              reject(lastError ?? new Error('Transcription failed'));
+              reject(sttChainError(chains, rungErrors, lastError) ?? new Error('Transcription failed'));
             }
           },
         );
@@ -8808,7 +8865,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // Try each STT target in order; first success wins.
           let text = "";
           let lastError: unknown = null;
-          for (const opts of chains) {
+          const rungErrors = new Map<number, unknown>();
+          for (const [rungIndex, opts] of chains.entries()) {
             try {
               text = await transcribeAudio(
                 audio,
@@ -8819,10 +8877,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               lastError = null;
               break;
             } catch (e) {
+              rungErrors.set(rungIndex, e);
               lastError = e;
             }
           }
-          if (lastError) throw lastError;
+          if (lastError) throw sttChainError(chains, rungErrors, lastError);
           // Drop any echo of the prompt we sent: a provider that continues the
           // prompt would otherwise auto-send our own glossary back as a turn.
           const finalText = normalizeTranscript((text ?? "").trim());
@@ -10581,7 +10640,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      if (busy || compacting) queueForLater();
+      // Swapped per user ask: Ctrl/Cmd+Enter is the MID-RUN STEER now —
+      // streaming → steer (submit's steerNow path), compacting → queue
+      // (submit handles it), idle → a plain send.
+      void submit(undefined, true);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
@@ -10708,7 +10770,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const toolbar = null;
 
   // The wallet chip lives on the app bar's right end (see #titlebar-right in
-  // App.tsx), right of the static model-usage chip, not mid-bar.
+  // App.tsx), right of the static model-usage chip, not mid-bar. It is mounted
+  // for OpenRouter ONLY: credits are an OpenRouter endpoint, so any other
+  // provider used to leave a bare, permanently-empty wallet glyph in the bar.
   const balanceChip = (
     <BalanceChip
       providerName={
@@ -10745,7 +10809,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       onDrop={onPanelDrop}
     >
       {titlebarEl && toolbar ? (isFocused ? createPortal(toolbar, titlebarEl) : toolbar) : toolbar}
-      {titlebarRightEl && isFocused && createPortal(balanceChip, titlebarRightEl)}
+      {titlebarRightEl &&
+        isFocused &&
+        provider?.kind === "openrouter" &&
+        createPortal(balanceChip, titlebarRightEl)}
       {chat?.goal?.active && (() => {
         // Goal strip pinned above the transcript so the active goal stays
         // visible while scrolling. Quiet icon buttons; Pause/Clear also abort
@@ -11114,109 +11181,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               </>
             );
           })()}
-          {queuedMsgs.length > 0 && (
-            <div className="queued-bubbles">
-              {queuedMsgs.map((q) => (
-                <div
-                  className={`queued-bubble${q.kind === "steer" ? " steer" : ""}`}
-                  key={q.id}
-                  dir={detectDir(q.text)}
-                  title={
-                    q.kind === "steer"
-                      ? "Sent to the running agent — will be addressed now or as the next turn"
-                      : "Queued — auto-sends after the current turn"
-                  }
-                >
-                  <div className="queued-bubble-head">
-                    <span className="queued-bubble-icon">
-                      {q.kind === "steer" ? (
-                        <svg
-                          width="12"
-                          height="12"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2.2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <path d="M9 14L4 9l5-5" />
-                          <path d="M4 9h10a5 5 0 015 5v6" />
-                        </svg>
-                      ) : (
-                        <svg
-                          width="12"
-                          height="12"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2.2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <circle cx="12" cy="12" r="9" />
-                          <path d="M12 7v5l3 3" />
-                        </svg>
-                      )}
-                    </span>
-                    <span className="queued-bubble-label">
-                      {q.kind === "steer"
-                        ? "Steering the running agent…"
-                        : "Queued — auto-sends after the current turn"}
-                    </span>
-                    <span className="queued-bubble-pulse" />
-                    <button
-                      className="chip-x queued-bubble-x"
-                      onClick={() =>
-                        useStore.getState().removeQueuedMessage(chat.id, q.id)
-                      }
-                      title="Remove from queue"
-                    >
-                      ×
-                    </button>
-                  </div>
-                  <QueuedCollapsibleText id={q.id} text={q.text} onEdit={onEditQueued} />
-                  {q.attachments && q.attachments.length > 0 && (
-                    <div className="msg-attachments" dir="ltr">
-                      {q.attachments.map((a) => (
-                        <span
-                          className="attachment-chip attachment-chip-open"
-                          key={a}
-                          role="button"
-                          tabIndex={0}
-                          title={`${a} — open in the side panel`}
-                          // pointerdown, not click: focusing this chat window re-renders
-                          // the list and replaces the node before `click` fires (see FileChip).
-                          onPointerDown={() => openWorkspaceFile(a)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              openWorkspaceFile(a);
-                            }
-                          }}
-                        >
-                          <FileIcon path={a} size={20} />
-                          {a}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  {q.images && q.images.length > 0 && (
-                    <MessageImages images={q.images} />
-                  )}
-                  {q.skills && q.skills.length > 0 && (
-                    <div className="msg-attachments" dir="ltr">
-                      {(q.skills ?? []).map((sk) => (
-                        <span className="attachment-chip" key={`skill-${sk}`}>
-                          @{sk}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
           {/* Every notice (errors, compaction progress, skill/undo acks, TTS
               and live errors) now lives in the MESSAGE FOOTER via the single
               retry/status slot — there are no banners above the composer. */}
@@ -11228,10 +11192,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             like the inline ask card. */}
         {permissionReq &&
           (() => {
-            const fa = detectDir(permissionReq.action) === "rtl";
+            // The card's language follows the USER'S OWN chat language, not the
+            // model's action text: the model writes English actions ("Control
+            // the desktop") even in a Persian chat, so detectDir on it showed
+            // English buttons to a Persian-speaking user. Any Persian/Arabic
+            // character in ANY of this chat's user messages means RTL labels,
+            // with the action text as the fallback for an empty chat.
+            const fa =
+              (chat?.messages ?? []).some(
+                (m) => m.role === "user" && RTL_CHAR_RE.test(m.content),
+              ) || detectDir(permissionReq.action) === "rtl";
             const isConfirm = permissionReq.scope === "confirm";
             const isComputer = permissionReq.scope === "computer";
             const isSsh = permissionReq.scope === "ssh";
+            // The model's own `request_permission` ask used to fall through to
+            // the outside-workspace title AND its "Always allow" branch opened
+            // the whole outside space — it is its own kind of card.
+            const isPermAsk = permissionReq.scope === "permission";
             const title = isConfirm
               ? fa
                 ? "تأیید عملیات"
@@ -11244,9 +11221,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   ? fa
                     ? "اتصال به سرور (SSH)"
                     : "SSH server connection"
-                  : fa
-                    ? "دسترسی بیرون از ورکاسپیس"
-                    : "Outside workspace access";
+                  : isPermAsk
+                    ? fa
+                      ? "درخواست اجازه"
+                      : "Permission request"
+                    : fa
+                      ? "دسترسی بیرون از ورکاسپیس"
+                      : "Outside workspace access";
             const note = isConfirm
               ? fa
                 ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
@@ -11259,9 +11240,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   ? fa
                     ? "این به عامل اجازه می‌دهد با SSH به این سرور متصل شود و آنجا دستور اجرا کند. تا زمانی که اجازه ندهید هیچ دستوری روی سرور اجرا نمی‌شود."
                     : "This lets the agent open an SSH connection to this server and run commands there. Nothing runs on the server until you allow it."
-                  : fa
-                    ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
-                    : "This lets the agent work outside your current workspace.";
+                  : isPermAsk
+                    ? fa
+                      ? "عامل برای ادامهٔ این کار از شما اجازه می‌خواهد."
+                      : "The agent asks for your permission before doing this."
+                    : fa
+                      ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
+                      : "This lets the agent work outside your current workspace.";
             const folderNote =
               !isConfirm && !isComputer && permissionReq.folder && !isSsh
                 ? fa
@@ -11348,11 +11333,92 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         : "Deny + instruction"
                       : denyLabel}
                   </button>
-                  {isConfirm ? (
+                  {/* EVERY card offers the same pair: a one-shot allow, and an
+                      "Always in THIS chat" grant stored on the chat (it dies
+                      with the chat — a fresh chat asks again). Which grant the
+                      always-button registers follows the card's scope. */}
+                  <button
+                    type="button"
+                    className="btn perm-allow"
+                    onClick={() => {
+                      void answerPermission(
+                        permissionReq.id,
+                        true,
+                        chatIdRef.current,
+                      );
+                    }}
+                  >
+                    {fa ? "اجازه یکبار" : "Allow once"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn perm-allow-always"
+                    onClick={() => {
+                      // Per-chat grant — merged into chatGrants and re-sent
+                      // with every turn of THIS conversation. ssh carries its
+                      // destination (`user@host`) in `folder`.
+                      if (isSsh) {
+                        useStore.getState().setChatGrant(chatIdRef.current, {
+                          hosts: [permissionReq.folder || permissionReq.path || ""],
+                        });
+                      } else if (isComputer) {
+                        useStore.getState().setChatGrant(chatIdRef.current, {
+                          desktop: true,
+                        });
+                      } else if (isConfirm || isPermAsk) {
+                        useStore.getState().setChatGrant(chatIdRef.current, {
+                          confirm: true,
+                        });
+                      } else if (permissionReq.folder) {
+                        useStore.getState().setChatGrant(chatIdRef.current, {
+                          folders: [permissionReq.folder],
+                        });
+                      } else {
+                        useStore.getState().setChatGrant(chatIdRef.current, {
+                          outsideAll: true,
+                        });
+                      }
+                      void answerPermission(
+                        permissionReq.id,
+                        true,
+                        chatIdRef.current,
+                      );
+                    }}
+                  >
+                    {fa ? "همیشه در این چت" : "Always in this chat"}
+                  </button>
+                  {(isSsh ||
+                    (!isConfirm && !isComputer && !isPermAsk && permissionReq.scope === "outside")) && (
+                    // The OLD "Always allow": a GLOBAL grant (trusted-hosts.json
+                    // / trusted-folders.json / the session outside flag) kept
+                    // for the two scopes that always had it. A model confirm
+                    // card never shows this — its "always" is the chat grant
+                    // above, which used to misfire here as
+                    // setOutsideAllowed(true) on every scope="permission" card.
                     <button
                       type="button"
-                      className="btn perm-allow"
+                      className="btn perm-allow-always"
                       onClick={() => {
+                        if (isSsh) {
+                          // Per-host grant: the destination (`user@host`)
+                          // lands in trusted-hosts.json and never prompts
+                          // again — the host string must NOT go through the
+                          // folder trust (it would fail canonicalization).
+                          void trustSshHost(
+                            permissionReq.folder || permissionReq.path || "",
+                          );
+                        } else if (permissionReq.folder) {
+                          // Per-folder grant: only the requested folder's
+                          // subtree stays approved — NOT the whole
+                          // outside-workspace space. Persisted so the grant
+                          // survives relaunches.
+                          useStore
+                            .getState()
+                            .addOutsideFolder(permissionReq.folder);
+                          void trustOutsideFolder(permissionReq.folder);
+                        } else {
+                          useStore.getState().setOutsideAllowed(true);
+                        }
                         void answerPermission(
                           permissionReq.id,
                           true,
@@ -11360,83 +11426,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         );
                       }}
                     >
-                      {fa ? "تأیید" : "Confirm"}
+                      {fa ? "همیشه همه‌جا" : "Always everywhere"}
                     </button>
-                  ) : isComputer ? (
-                    // Desktop control has NO persistent grant: the composer
-                    // switch is the standing willingness, and this answer
-                    // covers the task in front of the user. A second button
-                    // that claimed "always" would be lying.
-                    <button
-                      type="button"
-                      className="btn perm-allow"
-                      onClick={() => {
-                        void answerPermission(
-                          permissionReq.id,
-                          true,
-                          chatIdRef.current,
-                        );
-                      }}
-                    >
-                      {fa ? "اجازه برای این کار" : "Allow this task"}
-                    </button>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        className="btn perm-allow"
-                        onClick={() => {
-                          void answerPermission(
-                            permissionReq.id,
-                            true,
-                            chatIdRef.current,
-                          );
-                        }}
-                      >
-                        {fa ? "اجازه موقت" : "Allow once"}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn perm-allow-always"
-                        onClick={() => {
-                          // scope-aware: "Always allow" persists the grant matching
-                          // the dialog's scope — ssh vs outside-workspace. A
-                          // computer card has no "always": desktop approval is
-                          // per task.
-                          if (permissionReq.scope === "ssh") {
-                            // Per-host grant: the destination (`user@host`)
-                            // lands in trusted-hosts.json and never prompts
-                            // again — NOT the whole outside space, and the
-                            // host string must NOT go through the folder
-                            // trust (it would fail canonicalization).
-                            void trustSshHost(
-                              permissionReq.folder || permissionReq.path || "",
-                            );
-                          } else if (permissionReq.folder) {
-                            // Per-folder grant: only the requested folder's
-                            // subtree stays approved — NOT the whole
-                            // outside-workspace space. The folder is
-                            // backend-normalized (nearest existing parent).
-                            // Persisted too: the in-memory list dies with the
-                            // session, and an "always" grant that asks again
-                            // after every relaunch is not "always".
-                            useStore
-                              .getState()
-                              .addOutsideFolder(permissionReq.folder);
-                            void trustOutsideFolder(permissionReq.folder);
-                          } else {
-                            useStore.getState().setOutsideAllowed(true);
-                          }
-                          void answerPermission(
-                            permissionReq.id,
-                            true,
-                            chatIdRef.current,
-                          );
-                        }}
-                      >
-                        {fa ? "همیشه اجازه بده" : "Always allow"}
-                      </button>
-                    </>
                   )}
                 </div>
               </div>
@@ -11642,6 +11633,187 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               </div>
             );
           })()}
+        {/* Queued messages as compact cards above the composer (Claude-app
+            style): one row per unsent item — "N message(s) queued" + a
+            single-line preview — with steer-now (↵), edit (✏) and remove (✕)
+            actions. ✏ pulls the item back INTO the composer input (removing
+            it from the queue); ↵ steers it into the running agent (or sends
+            it when idle). Replaces the old transcript bubbles for queues. */}
+        {queuedMsgs.length > 0 && (
+          <div className="queue-cards" dir="ltr">
+            {queuedMsgs.map((q, qi) => {
+              // Files/images sit on the side OPPOSITE the text: the preview
+              // hugs its natural direction edge (dir-aware), so an RTL message
+              // gets the chips on the LEFT (before the text) and an LTR one
+              // gets them on the RIGHT (after the text, before the actions).
+              const isRtl = detectDir(q.text) === "rtl";
+              const chips = (
+                <>
+                  {(q.images ?? []).some(
+                    (im) => !!im.dataUrl && !im.dataUrl.includes("\u2026"),
+                  ) && (
+                    <span className="queue-thumbs">
+                      {(q.images ?? []).slice(0, 3).map((im) =>
+                        im.dataUrl && !im.dataUrl.includes("\u2026") ? (
+                          <img
+                            key={im.path}
+                            className="queue-thumb"
+                            src={im.dataUrl}
+                            alt={im.name}
+                            title={im.name}
+                          />
+                        ) : null,
+                      )}
+                      {(q.images?.length ?? 0) > 3 && (
+                        <span className="queue-chip-more">
+                          +{(q.images ?? []).length - 3}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                  {(q.attachments?.length ?? 0) > 0 && (
+                    <span className="queue-chips">
+                      {(q.attachments ?? []).slice(0, 2).map((a) => (
+                        <span className="queue-chip" key={a} title={a}>
+                          <FileIcon path={a} size={13} />
+                          <span className="queue-chip-name">
+                            {a.split("/").pop() || a}
+                          </span>
+                        </span>
+                      ))}
+                      {(q.attachments?.length ?? 0) > 2 && (
+                        <span className="queue-chip-more">
+                          +{(q.attachments ?? []).length - 2}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                  {(q.skills?.length ?? 0) > 0 && (
+                    <span className="queue-chips">
+                      {(q.skills ?? []).slice(0, 2).map((sk) => (
+                        <span className="queue-chip" key={`skill-${sk}`} title={`@${sk}`}>
+                          @{sk}
+                        </span>
+                      ))}
+                      {(q.skills?.length ?? 0) > 2 && (
+                        <span className="queue-chip-more">
+                          +{(q.skills ?? []).length - 2}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </>
+              );
+              return (
+              <div
+                className={`queue-card${queueDrag.dragIndex === qi ? " drag-lift" : ""}`}
+                key={q.id}
+                data-drag-row
+                style={queueDrag.shiftStyle(qi)}
+                {...queueDrag.rowProps(qi)}
+              >
+                <div className="queue-row">
+                  <span className="queue-grip" {...queueDrag.handleProps(qi)} title="Drag to reorder">
+                    <svg viewBox="0 0 10 16" fill="currentColor" aria-hidden="true">
+                      <circle cx="3" cy="3" r="1.4" />
+                      <circle cx="7" cy="3" r="1.4" />
+                      <circle cx="3" cy="8" r="1.4" />
+                      <circle cx="7" cy="8" r="1.4" />
+                      <circle cx="3" cy="13" r="1.4" />
+                      <circle cx="7" cy="13" r="1.4" />
+                    </svg>
+                  </span>
+                  {isRtl ? chips : null}
+                  {/* Everything user-queued shares ONE line: the text preview
+                      on its natural side, the files/images on the opposite
+                      side. The row never grows with content — extra items
+                      collapse into a "+N" chip and long names ellipsize. */}
+                  <span className="queue-row-mid">
+                    <span
+                      className="queue-row-preview"
+                      dir={detectDir(q.text)}
+                      title={q.text}
+                    >
+                      {prepareContent(q.text) || "(empty)"}
+                    </span>
+                  </span>
+                  {isRtl ? null : chips}
+                  <span className="queue-row-actions">
+                        <button
+                          type="button"
+                          className="queue-act"
+                          disabled={compacting}
+                          onClick={() => steerQueuedNow(q)}
+                          title={
+                            compacting
+                              ? "Available after compaction finishes"
+                              : isStreamingActive
+                                ? "Steer into the running agent now"
+                                : "Send now"
+                          }
+                          aria-label={isStreamingActive ? "Steer now" : "Send now"}
+                        >
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M9 14L4 9l5-5" />
+                            <path d="M4 9h10a5 5 0 015 5v6" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="queue-act"
+                          onClick={() => editQueuedInComposer(q)}
+                          title="Edit in the composer"
+                          aria-label="Edit queued message in the composer"
+                        >
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="queue-act"
+                          onClick={() =>
+                            useStore.getState().removeQueuedMessage(chat.id, q.id)
+                          }
+                          title="Remove from queue"
+                          aria-label="Remove from queue"
+                        >
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M18 6L6 18" />
+                            <path d="M6 6l12 12" />
+                          </svg>
+                        </button>
+                      </span>
+                </div>
+              </div>
+              );
+            })}
+          </div>
+        )}
         <div className="composer-inner">
           <div className="composer-input-wrap">
             {historyOpen && (
@@ -12151,8 +12323,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       strokeLinejoin="round"
                       aria-hidden="true"
                     >
-                      <circle cx="12" cy="12" r="10" />
-                      <path d="M12 8v8M8 12h8" />
+                      <path d="M12 5v14" />
+                      <path d="M5 12h14" />
                     </svg>
                   </button>
                   {plusMenuOpen && (
@@ -12277,64 +12449,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       </svg>
                     </button>
                   )}
-                  {(showVoiceButtons || showLiveActive) && (
-                  <>
-                  {showVoiceButtons && (
-                  dictateConfirming ? dictateConfirmPair : (
-                  <button
-                    className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
-                    onPointerDown={warmMic}
-                    onClick={toggleRecording}
-                    title={
-                      transcribing
-                        ? "Transcribing voice…"
-                        : recording
-                          ? "Stop recording (Ctrl+X Space)"
-                          : "Record voice input (Ctrl+X then Space)"
-                    }
-                  >
-                    {recording ? (
-                      <span className="wave animate" aria-hidden="true">
-                        <span className="wave-bar" />
-                        <span className="wave-bar" />
-                        <span className="wave-bar" />
-                        <span className="wave-bar" />
-                      </span>
-                    ) : transcribing ? (
-                      <span className="wave transcribing" aria-hidden="true">
-                        <svg
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <circle cx="12" cy="12" r="10" />
-                          <path d="M8 9l0 6" />
-                          <path d="M12 7l0 10" />
-                          <path d="M16 9l0 6" />
-                        </svg>
-                      </span>
-                    ) : (
-                      <svg
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                        <line x1="12" y1="19" x2="12" y2="22" />
-                      </svg>
-                    )}
-                  </button>
-                  )
-                  )}
-                  </>
-                  )}
+                  {/* The dictate mic itself moved to the composer footer (right
+                      zone, next to the live voice button), but the streamed-
+                      dictation CONFIRM pair stays here in the input row — it
+                      acts on the text sitting in the input. */}
+                  {dictateConfirming && dictateConfirmPair}
                   {ctxPopoverOpen &&
                     ctxBreakdown &&
                     ctxPopoverPos &&
@@ -12478,57 +12597,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           <rect x="6" y="6" width="12" height="12" rx="2" />
                         </svg>
                       </button>
-                      {showDictateDuringStreaming && (dictateConfirming ? dictateConfirmPair : (
-                        <button
-                          className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
-                          onClick={toggleRecording}
-                          title={
-                            transcribing
-                              ? "Transcribing voice…"
-                              : recording
-                                ? "Stop recording (Ctrl+X Space)"
-                                : "Record voice input (Ctrl+X then Space)"
-                          }
-                        >
-                          {recording ? (
-                            <span className="wave animate" aria-hidden="true">
-                              <span className="wave-bar" />
-                              <span className="wave-bar" />
-                              <span className="wave-bar" />
-                              <span className="wave-bar" />
-                            </span>
-                          ) : transcribing ? (
-                            <span className="wave transcribing" aria-hidden="true">
-                              <svg
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              >
-                                <circle cx="12" cy="12" r="10" />
-                                <path d="M8 9l0 6" />
-                                <path d="M12 7l0 10" />
-                                <path d="M16 9l0 6" />
-                              </svg>
-                            </span>
-                          ) : (
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-                              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                              <line x1="12" y1="19" x2="12" y2="22" />
-                            </svg>
-                          )}
-                        </button>
-                      ))}
                     </>
                   ) : showSendOnly ? (
                     <button
@@ -12550,7 +12618,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         </div>
 
         <div className="composer-footer">
-          <span className="composer-footer-right">
+          {/* Three zones: mode + thinking LEFT, model picker + context ring
+              CENTER, live voice + dictate mic RIGHT — so every status control
+              keeps a fixed home and the center pair stays visually centered. */}
+          <span className="composer-footer-left">
             <span className="composer-mode">
               <ModeSelect
                 modes={modes}
@@ -12607,6 +12678,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </span>
                 )}
             </span>
+          </span>
+          <span className="composer-footer-center">
             <ProviderModelSelect chatId={chat?.id ?? activeChatId} compact />
             {/* Context meter: sits in the footer cluster next to the mode pill,
                 the thinking level and the model picker instead of inside the
@@ -12638,18 +12711,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <ContextRing pct={ctxPct} />
               </button>
             </div>
-            {/* Live voice lives in the footer next to the context meter: it is a
-                session-level control (mic + conversation), not a per-message
-                send action, and the input row is the tightest space in the
-                composer. The mic picker still anchors to .live-btn-wrap, so its
-                popover opens upward from the footer unchanged. */}
-            {(showLiveIdle || showLiveActive) && (
+          </span>
+          <span className="composer-footer-right">
+            {/* Live voice + dictate mic, RIGHT side, side by side — both stay
+                visible while typing (the send button in the card no longer
+                replaces them). The mic only steps aside while a live session
+                owns the audio. The mic picker still anchors to .live-btn-wrap,
+                so its popover opens upward from the footer unchanged. */}
+            {footerVoiceVisible && (
               <div className="live-btn-wrap" ref={micMenuRef}>
                 <button
                   type="button"
                   className={`icon-btn attach-btn live-btn${showLiveActive ? " live-active" : ""}`}
+                  disabled={recording}
                   onClick={toggleLive}
-                  title={showLiveActive ? "Stop live voice" : "Live voice conversation (Ctrl+X then L)"}
+                  title={
+                    recording
+                      ? "Dictation is using the microphone"
+                      : showLiveActive
+                        ? "Stop live voice"
+                        : "Live voice conversation (Ctrl+X then L)"
+                  }
                 >
                   {showLiveActive ? (
                     <span className="wave animate" aria-hidden="true">
@@ -12676,28 +12758,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       </svg>
                     </span>
                   )}
-                </button>
-                <button
-                  type="button"
-                  className="live-chev-btn"
-                  aria-label="Choose microphone"
-                  aria-expanded={micMenuOpen}
-                  onClick={() => {
-                    if (!micMenuOpen) void refreshMicDevices();
-                    setMicMenuOpen((v) => !v);
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M6 9l6 6 6-6" />
-                  </svg>
                 </button>
                 {micMenuOpen && (
                   <div className="mic-menu" role="menu" aria-label="Microphone" dir="ltr">
@@ -12787,6 +12847,71 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </div>
                 )}
               </div>
+            )}
+            {/* Dictate mic right after the live voice button (Ctrl+X then
+                Space): shows the recording wave / the transcribing pulse.
+                While a live session runs it STAYS visible but dims and locks
+                — the live conversation owns the microphone. The mic-picker
+                chevron follows on its right; its menu still anchors to
+                .live-btn-wrap above. */}
+            {footerVoiceVisible && (
+              <button
+                className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
+                disabled={liveHere}
+                onPointerDown={warmMic}
+                onClick={toggleRecording}
+                title={
+                  liveHere
+                    ? "Live voice is using the microphone"
+                    : transcribing
+                      ? "Transcribing voice…"
+                      : recording
+                        ? "Stop recording (Ctrl+X Space)"
+                        : "Record voice input (Ctrl+X then Space)"
+                }
+              >
+                {/* Static icon on purpose: the ANIMATION lives in the input
+                    row (the dictation dots / confirm pair) — the footer mic
+                    just takes the active color via .recording/.transcribing. */}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <path d="M12 19v3" />
+                </svg>
+              </button>
+            )}
+            {/* Mic-picker chevron sits to the RIGHT of the dictate mic and
+                opens the same microphone menu (anchored to .live-btn-wrap). */}
+            {footerVoiceVisible && (
+              <button
+                type="button"
+                className="live-chev-btn"
+                aria-label="Choose microphone"
+                aria-expanded={micMenuOpen}
+                onClick={() => {
+                  if (!micMenuOpen) void refreshMicDevices();
+                  setMicMenuOpen((v) => !v);
+                }}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M6 9l6 6 6-6" />
+                </svg>
+              </button>
             )}
           </span>
         </div>

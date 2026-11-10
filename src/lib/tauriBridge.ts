@@ -256,12 +256,15 @@ function removeDragGhost(): void {
 
 function makeDragGhost(source: HTMLElement, e: MouseEvent): void {
   removeDragGhost()
-  const rect = source.getBoundingClientRect()
+  // Grip-started lists mark their rows with [data-drag-row] (the same lookup
+  // the native setDragImage uses) — ghost the WHOLE row, not the tiny grip.
+  const ghostEl = source.closest<HTMLElement>('[data-drag-row]') ?? source
+  const rect = ghostEl.getBoundingClientRect()
   if (rect.width <= 0 || rect.height <= 0) return
-  const clone = source.cloneNode(true) as HTMLElement
+  const clone = ghostEl.cloneNode(true) as HTMLElement
   // The source carries the drag-state classes (muted hole); the ghost must
-  // read as the tab itself, floating.
-  clone.classList.remove("dragging", "drop-preview", "drop-before", "drop-after")
+  // read as the row itself, floating.
+  clone.classList.remove("dragging", "drop-preview", "drop-before", "drop-after", "drag-lift")
   clone.classList.add("dnd-ghost")
   clone.style.width = `${Math.round(rect.width)}px`
   clone.style.height = `${Math.round(rect.height)}px`

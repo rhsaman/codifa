@@ -2,7 +2,7 @@ import { fixZwsp, prepareContent } from '../../lib/bidi'
 import { parseDownloadProgress } from '../../lib/downloadProgress'
 import { fileBasename } from '../../lib/fileTypes'
 import { reviewPathOf } from '../../lib/reviewTurn'
-import { diffStatsFromUnified, editTargetOf, isSkillTool } from '../../lib/toolActivity'
+import { diffStatsFromUnified, editTargetOf, isSkillTool, latestNarrationLine } from '../../lib/toolActivity'
 import { useViewerTabs } from '../../lib/viewerTabs'
 import { useStore } from '../../lib/store'
 import type { ToolActivity } from '../../types'
@@ -11,7 +11,7 @@ import { Fragment, KeyboardEvent, memo, useEffect, useLayoutEffect, useRef, useS
 import { createPortal } from 'react-dom'
 import { ToolArgs, argsTextFor, fmtArgValue, rowDetail } from './args'
 import { DiffPreview, useDiffPreview } from './diff'
-import { IconSparkle, fmtTime } from './editGroup'
+import { IconSparkle, fmtTime, groupSpanMs } from './editGroup'
 import { IconChevron, StatusIcon, TerminalRowIcon } from './icons'
 import { activityLabel, batchOpTools, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel, useRunningClock } from './naming'
 import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
@@ -19,6 +19,7 @@ import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, Termi
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
   captions,
+  subagent,
 }: {
   activities: { activity: ToolActivity; index: number }[];
   /** Per-call narration lines: captions[i] is the model's narration that
@@ -27,19 +28,39 @@ export const ToolGroupView = memo(function ToolGroupView({
    *  summary title (Claude.ai keeps the latest caption as the collapsed
    *  summary). */
   captions?: (string | null)[];
+  /** A dedicated sub-agent run: its delegation call (`explore` / `agent__…`).
+   *  The agent's own name leads the header as a `trace-pill-sub` pill, its
+   *  state owns the group clock, and its narration (or task description)
+   *  becomes the head caption. The activities passed alongside are the run's
+   *  INNER tool calls (the delegation card's children), rendered as normal
+   *  trace rows — a sub-agent card is just a tool group with a name. */
+  subagent?: ToolActivity;
 }) {
   // Every run starts collapsed — including runs with web calls, whose hits are
   // one click away inside the expanded rows.
   const [open, setOpen] = useState(false);
   const subagentRows = useStore((s) => s.customSubagents);
-  const running = activities.some((a) => a.activity.status === "running");
+  // The delegation call's state owns the group clock: a sub-agent run is
+  // "running" even between its own tool calls, so the pill keeps its accent
+  // and the total keeps ticking while it works.
+  const subagentRunning = subagent?.status === "running";
+  const running =
+    activities.some((a) => a.activity.status === "running") || subagentRunning;
   // Live clock so the group total ticks while any call is still running.
   const now = useRunningClock(running);
-  const totalMs = activities.reduce((sum, a) => {
-    const act = a.activity;
-    if (act.status === "running" && act.startedAt) return sum + Math.max(0, now - act.startedAt);
-    return sum + (act.elapsedMs || 0);
-  }, 0);
+  // Start → end of the WHOLE group (see groupSpanMs), not the sum of the calls'
+  // own durations: parallel calls would count twice, the gaps between calls
+  // would vanish, and a sub-agent's delegation card (which already spans all of
+  // its inner calls) used to be added on top of them.
+  const totalMs = groupSpanMs(
+    [...(subagent ? [subagent] : []), ...activities.map((a) => a.activity)],
+    now,
+  );
+  // Dedicated sub-agent run: the agent's own name leads the header (user
+  // request) — the inner tool tallies follow as the regular label pills.
+  const subagentName = subagent
+    ? subagentDisplayName(subagent.tool, subagentRows)
+    : null;
   // Always show tool names + counts as the main status text. The narration
   // line (if any) rides along as the caption — always in the head, plus the
   // first row of the expanded panel (see renderSegments in ChatMessage.tsx).
@@ -77,13 +98,23 @@ export const ToolGroupView = memo(function ToolGroupView({
         .map(({ activity }) => activity.engine as string),
     ),
   ];
+  // Task description of a dedicated sub-agent run (what the old dedicated
+  // explore card showed as its title): rides as the name pill's tooltip, and
+  // becomes the head caption when the run has no narration of its own.
+  const subagentDesc = subagent
+    ? shortArg(String(subagent.args?.description ?? ""), 70)
+    : "";
+  // Caption for a dedicated sub-agent run: the run's own latest narration
+  // line, else the task description.
+  const subagentCaption = subagent
+    ? latestNarrationLine(subagent) || subagentDesc
+    : undefined;
   // The head shows the LAST narration (Claude.ai's collapsed summary title).
   const headCaption = (() => {
-    if (!captions) return undefined;
-    for (let i = captions.length - 1; i >= 0; i--) {
-      if (captions[i]) return captions[i] as string;
+    for (let i = (captions?.length ?? 0) - 1; i >= 0; i--) {
+      if (captions?.[i]) return captions[i] as string;
     }
-    return undefined;
+    return subagentCaption;
   })();
 
   return (
@@ -96,6 +127,14 @@ export const ToolGroupView = memo(function ToolGroupView({
       >
         <IconSparkle className="trace-sparkle" />
         <span className="trace-head-pills">
+          {subagentName && subagent && (
+            <span
+              className={`trace-pill trace-pill-sub${subagentRunning ? " running" : ""}`}
+              title={subagentDesc || subagentName || undefined}
+            >
+              {subagentName}
+            </span>
+          )}
           {Object.entries(toolCounts).map(([label, n]) => (
             <span key={label} className="trace-pill">
               {label}

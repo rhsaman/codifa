@@ -460,6 +460,7 @@ fn bench_codifa(task: &Task, model: &str) -> Result<RunMetrics, String> {
         api_keys: vec![],
         root: root.to_string_lossy().to_string(),
         mode: "build".to_string(),
+        run_mode: "code".to_string(),
         prompt: task.prompt.to_string(),
         // The bench IS a headless caller (no SSE client) — same shape as the
         // scheduler's requests.

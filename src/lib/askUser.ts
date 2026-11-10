@@ -87,40 +87,72 @@ export interface AskSectionLike {
   options: string[];
 }
 
-/** Combine every section's selection into the ONE sendable answer: one line
- *  per section, `Title: label` (labels joined with ", " when several were
- *  picked). Sections with no valid selection are skipped — canSubmitSections
- *  gates them before submit, this stays forgiving for partial state. */
+/** The labels picked inside one section, trimmed and blank-free. */
+function sectionLabels(sec: AskSectionLike, selected: number[]): string[] {
+  return selected
+    .map((idx) => sec.options[idx])
+    .filter((l: unknown): l is string => typeof l === "string" && l.trim().length > 0)
+    .map((l) => l.trim());
+}
+
+/** The user's own answer for one section — only counted while its "write my
+ *  own answer" box is ticked, mirroring the visibility of the text field. */
+function sectionOwnAnswer(
+  index: number,
+  secOwn: boolean[] | undefined,
+  secFreeText: string[] | undefined,
+): string {
+  if (!secOwn?.[index]) return "";
+  return (secFreeText?.[index] ?? "").trim();
+}
+
+/** Combine every section's answer into the ONE sendable answer: one line per
+ *  section, `Title: label` (labels joined with ", "). A section whose own
+ *  answer box is ticked contributes its typed text too, so a section can be
+ *  answered by picking options, by writing, or by both. Sections with nothing
+ *  to say are skipped — canSubmitSections gates them before submit, this stays
+ *  forgiving for partial state. */
 export function joinSectionAnswer(
   sections: AskSectionLike[],
   secSelected: number[][],
+  secOwn?: boolean[],
+  secFreeText?: string[],
 ): string {
   const lines: string[] = [];
   sections.forEach((sec, i) => {
-    const labels = (secSelected[i] ?? [])
-      .map((idx) => sec.options[idx])
-      .filter((l: unknown): l is string => typeof l === "string" && l.trim().length > 0)
-      .map((l) => l.trim());
-    if (labels.length === 0) return;
+    const parts = sectionLabels(sec, secSelected[i] ?? []);
+    const own = sectionOwnAnswer(i, secOwn, secFreeText);
+    if (own.length > 0) parts.push(own);
+    if (parts.length === 0) return;
     const title = sec.title.trim();
-    lines.push(title.length > 0 ? `${title}: ${labels.join(", ")}` : labels.join(", "));
+    lines.push(title.length > 0 ? `${title}: ${parts.join(", ")}` : parts.join(", "));
   });
   return lines.join("\n");
 }
 
-/** A multi-part card can submit only when EVERY section has at least one
- *  selected option with a non-empty label ("answer all, send together"). */
+/** A multi-part card can submit only when EVERY section has an answer of its
+ *  own — at least one picked option, or a non-empty typed answer ("answer all,
+ *  send together"). */
 export function canSubmitSections(
   sections: AskSectionLike[],
   secSelected: number[][],
+  secOwn?: boolean[],
+  secFreeText?: string[],
 ): boolean {
   if (sections.length === 0) return false;
-  return sections.every((sec, i) =>
-    (secSelected[i] ?? []).some((idx) => {
-      const label = sec.options[idx];
-      return typeof label === "string" && label.trim().length > 0;
-    }),
-  );
+  return sections.every((sec, i) => {
+    if (sectionOwnAnswer(i, secOwn, secFreeText).length > 0) return true;
+    return sectionLabels(sec, secSelected[i] ?? []).length > 0;
+  });
+}
+
+/** Write `value` at `section` of a parallel per-section array, padding gaps
+ *  with `pad` so a partially initialized request still toggles safely. */
+export function setSectionAt<T>(prev: T[], section: number, value: T, pad: T): T[] {
+  const next = [...prev];
+  while (next.length <= section) next.push(pad);
+  next[section] = value;
+  return next;
 }
 
 /** Toggle one option inside one section's selection, returning the new

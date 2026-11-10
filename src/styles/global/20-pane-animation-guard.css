@@ -1,0 +1,17 @@
+/* Pane open/close animation guard (lib/paneAnimation.ts).
+
+   During a sidebar/pane slide the guard freezes the horizontal size of the
+   chat scrollers, the sidebar body and the pane body, so the width animation
+   cannot re-wrap their text every frame. A frozen body can then be WIDER than
+   its shrinking container mid-slide, and without a clip it would paint over
+   the neighbouring area — clip the containers for the animation only (the
+   closed states already carry their own permanent overflow rules, and
+   .viewer-group never opens without overflow: hidden). `clip` is used over
+   `hidden` so no scroll container is created for the animation's duration. */
+body.pane-animating .chat-panel {
+  overflow-x: clip;
+}
+
+body.pane-animating .sidebar {
+  overflow: hidden;
+}

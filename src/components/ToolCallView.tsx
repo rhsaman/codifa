@@ -15,6 +15,7 @@ import { useStore } from "../lib/store";
 import {
   diffStatsFromUnified,
   editTargetOf,
+  editTargetsOf,
   isSkillTool,
   MEMORY_TOOLS,
   terminalOutputText,
@@ -183,6 +184,12 @@ export const ToolCallView = memo(function ToolCallView({
     activity.tool === "write_file" || activity.tool === "edit_file";
   /** مسیر فایلِ کارت نوشتن (path یا filePath) — برای هدر و پنل Review. */
   const writePath = reviewPathOf(activity);
+  // A batch write names a DIFFERENT file per entry; the head only shows the
+  // first (the Review panel's per-file rows carry the rest), so a bare first
+  // name would read as the WHOLE change. An honest "+N more" chip admits the
+  // call touched more files than it names.
+  const writeTargets = isWrite ? editTargetsOf(activity.args) : [];
+  const writeMore = writeTargets.length > 1 ? writeTargets.length - 1 : 0;
   // `read` names each file INSIDE `ranges` (one entry per file and window), so
   // the chip row follows ranges first; the bare `paths` list remains only as a
   // fallback for transcripts written before the schema dropped it.
@@ -241,8 +248,12 @@ export const ToolCallView = memo(function ToolCallView({
       }
       if (!activity.diff) return;
     const path = String(activity.args?.filePath ?? editTargetOf(activity.args) ?? "");
+      // The transcript may trim the aggregate `diff`; the per-file entry for
+      // THIS path stays complete, so prefer it for the reverse diff.
+      const revertDiff =
+        activity.diffs?.find((e) => e.path === path)?.diff ?? activity.diff;
       const { content: current } = (await api.fsRead(root, path)) ?? {};
-      const oldContent = applyReverseDiff(activity.diff, current ?? "");
+      const oldContent = applyReverseDiff(revertDiff, current ?? "");
       const ok = await api.fsWrite(root, path, oldContent);
       if (ok) onReverted?.();
     } finally {
@@ -297,11 +308,19 @@ export const ToolCallView = memo(function ToolCallView({
               <span className="tool-verb">
                 {activity.tool === "write_file" ? "Wrote" : "Edited"}
               </span>
-              <span className="tool-file" title={writePath}>
+              <span
+                className="tool-file"
+                title={writeMore ? writeTargets.join("\n") : writePath}
+              >
                 <span className="tool-file-name" dir="ltr">
                   {writePath.split("/").pop() ?? writePath}
                 </span>
               </span>
+              {writeMore > 0 && (
+                <span className="tool-path tool-more" dir="ltr">
+                  +{writeMore} more
+                </span>
+              )}
             </>
           ) : isSubagentCard(activity) ? (
             subagentDisplayName(activity.tool, subagentRows)
@@ -425,12 +444,19 @@ export const ToolCallView = memo(function ToolCallView({
           {isWrite &&
             activity.diff &&
             (() => {
-              const adds = (activity.diff.match(/^\+[^+]/gm) || []).length;
-              const dels = (activity.diff.match(/^-[^-]/gm) || []).length;
-              return adds + dels > 0 ? (
+              // The saved transcript trims `diff` to MAX_TOOL_TEXT; the
+              // ingest-recomputed `diffStats` came from the FULL diff, so it
+              // stays exact after reload while a regex recount would not.
+              const s =
+                activity.diffStats ??
+                {
+                  adds: (activity.diff.match(/^\+[^+]/gm) || []).length,
+                  dels: (activity.diff.match(/^-[^-]/gm) || []).length,
+                };
+              return s.adds + s.dels > 0 ? (
                 <span className="tool-diff-stats">
-                  <span className="review-count-add">+{adds}</span>{" "}
-                  <span className="review-count-del">-{dels}</span>
+                  <span className="review-count-add">+{s.adds}</span>{" "}
+                  <span className="review-count-del">-{s.dels}</span>
                 </span>
               ) : null;
             })()}

@@ -1,0 +1,258 @@
+/* Chat / Code persona switch — a two-state segmented control.
+
+   Four constraints drive every number here:
+
+   1. ALIGNMENT. It sits between plain 30x30 titlebar icon buttons, so its glyphs
+      share that box's optical centre. Its outer box is 28px tall — the tallest
+      an ALWAYS-PAINTED titlebar control may be on mac: the strip centers the row
+      at 19px and raises it 5px to the traffic lights' 14px centerline, so
+      anything taller pokes past the window's top edge and clips (the same lesson
+      `.mac .titlebar .ws-menu-wrap` in 01 already paid for). The pill is
+      positioned from the TOP (not floated by padding) so a step down cannot
+      drift it off the shared baseline.
+   2. LEGIBILITY. A 22px chip with no border, on a track only slightly darker
+      than the bar, was invisible — you could not tell which side was live. The
+      selected side is a LIGHT PILL with a near-black glyph; the unselected side
+      a dim outline glyph. The contrast between the two states IS the signal.
+   3. NO ACCENT RING. The accent is the app's hover/pressed language, so a
+      coloured cue here reads as "focused", not "selected". The only outline
+      left is `:focus-visible`, a keyboard affordance that is never traded away.
+   4. BOTH GLYPHS PRESENT. It never drops an icon to save width — a toggle
+      missing a side stops reading as a toggle — so it shrinks in ordered steps
+      below. Both sides stay tappable at every size. */
+.run-mode-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  /* 2 x 26px halves + 2 x 2px padding = 56x28 — same height as the raised row's
+     safe band, so the track stays fully inside the window on mac while the
+     glyphs keep the traffic lights' centerline. */
+  width: 56px;
+  height: 28px;
+  padding: 2px;
+  border-radius: 10px;
+  /* RECESSED, not tinted: mixed from black so it sits BELOW the surrounding
+     surface. Mixing from `--text` (the obvious choice) LIGHTENS the track on a
+     dark theme, and then the pill no longer reads as raised. */
+  background: color-mix(in srgb, #000 46%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, #000 40%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* THE PILL: one element, slid — not two backgrounds that swap. It rides BEHIND
+   both buttons (z-index), so the glyphs never have to move or fade. */
+.run-mode-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 26px;
+  height: 24px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 92%, transparent);
+  box-shadow: 0 1px 3px color-mix(in srgb, #000 55%, transparent),
+    0 0 0 0.5px color-mix(in srgb, #000 25%, transparent);
+  transition: transform 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+  pointer-events: none;
+}
+
+.run-mode-switch[data-mode="code"]::after {
+  /* The two halves sit FLUSH (no inter-half gap), so one 26px half is the whole
+     travel: the pill lands exactly on the second button and keeps the track's
+     2px inset on the right, mirroring the chat half's inset on the left. */
+  transform: translateX(26px);
+}
+
+.run-mode-switch .run-mode-btn {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 24px;
+  border-radius: 8px;
+  /* Transparent, not `none`: a transparent background still paints the button's
+     own rounded box, so hover tints stay inside the radius. */
+  background: transparent;
+  border: 0;
+  padding: 0;
+  /* Unselected: unmistakably retired next to the lit half. Selection is read
+     from brightness, so the gap has to be wide, not a nudge. */
+  color: color-mix(in srgb, var(--text-dim) 62%, transparent);
+  cursor: pointer;
+  transition: color 0.14s;
+}
+
+.run-mode-switch .run-mode-btn svg {
+  /* `display: block` kills the inline-baseline descender space an inline SVG
+     carries: with it, the glyph sits ~1px HIGH inside its grid cell and the
+     icon reads as mis-centred in the pill even though the box is centred. */
+  display: block;
+  /* A SQUARE box: the grid centres it, and both glyphs are drawn to a
+     near-square ink box inside the 24-unit viewBox, so the optical margins come
+     out equal on all four sides. 16px is the largest that still leaves a clear
+     margin inside a 26px half. */
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+/* THE SELECTED HALF: near-black glyph on the light pill. Three signals stack —
+   inverted glyph, full-brightness state, and the sliding pill underneath. */
+.run-mode-switch .run-mode-btn[aria-checked="true"] {
+  color: color-mix(in srgb, #000 84%, var(--bg));
+}
+
+/* Hover belongs to the half that is NOT chosen — a live side must not look like
+   it is still waiting for a click. */
+.run-mode-switch .run-mode-btn[aria-checked="false"]:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.run-mode-switch .run-mode-btn:active {
+  transform: scale(0.92);
+}
+
+/* The pill must not lag behind a click: same duration as `:active`. */
+.run-mode-switch:has(.run-mode-btn:active)::after {
+  transition-duration: 0.09s;
+}
+
+/* Keyboard focus must be VISIBLE. A cleared outline with nothing put back left
+   a keyboard user unable to tell which side they were on. Ringed on the BUTTON,
+   not the track, so it marks the side that would receive the action. */
+.run-mode-switch .run-mode-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 7px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-mode-switch::after,
+  .run-mode-switch .run-mode-btn {
+    transition: none;
+  }
+
+  .run-mode-switch .run-mode-btn:active {
+    transform: none;
+  }
+}
+
+/* REAL overflow, measured against the HOST's own width (`WindowStripCluster`
+   sets data-compact by measuring, not by asking the viewport): the sidebar is
+   drag-resizable and 88px of it is the traffic lights' gutter, so the strip can
+   be left with barely 120px — a case no media query can see, and the strip
+   clips (`overflow: hidden`). Each step therefore shrinks the controls
+   THEMSELVES: every button here has a fixed width, so tightening padding alone
+   moves nothing and the trailing icon gets cut. No step ever hides an icon — a
+   toggle missing a side stops reading as a toggle, and a hidden control is a
+   function the user cannot reach. The sidebar's minimum width is set to where
+   the xs step still fits (see SIDEBAR_MIN_WIDTH in src/lib/sidebarLayout.ts,
+   asserted by tests/sidebarClusterFit.test.ts). */
+.window-strip-cluster[data-compact] {
+  gap: 0;
+  padding-right: 0;
+}
+
+.window-strip-cluster[data-compact] .titlebar-icon-btn {
+  width: 26px;
+  height: 26px;
+}
+
+.window-strip-cluster[data-compact] .titlebar-icon-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.window-strip-cluster[data-compact] .update-btn {
+  width: 26px;
+}
+
+.window-strip-cluster[data-compact] .update-btn .update-icon,
+.window-strip-cluster[data-compact] .update-btn .update-ring {
+  width: 15px;
+  height: 15px;
+}
+
+/* Step 1: 22px halves inside a 48x28 track (2px padding + 2x22 + 2px padding).
+   The pill and its slide distance are restated — an offset left at the default
+   size overshoots and clips. */
+.window-strip-cluster[data-compact] .run-mode-switch {
+  width: 48px;
+  height: 28px;
+  padding: 2px;
+  border-radius: 8px;
+}
+
+.window-strip-cluster[data-compact] .run-mode-switch::after {
+  width: 22px;
+  height: 24px;
+  border-radius: 6px;
+}
+
+.window-strip-cluster[data-compact] .run-mode-switch[data-mode="code"]::after {
+  transform: translateX(22px);
+}
+
+.window-strip-cluster[data-compact] .run-mode-switch .run-mode-btn {
+  width: 22px;
+  height: 24px;
+  border-radius: 6px;
+}
+
+.window-strip-cluster[data-compact] .run-mode-switch .run-mode-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Step 2 — the floor: 19px halves inside a 42x26 track. Both persona icons, the
+   sidebar toggle and update still fit the narrowest legal sidebar, and every
+   one of them stays clickable. */
+.window-strip-cluster[data-compact="xs"] .run-mode-switch {
+  width: 42px;
+  height: 26px;
+  border-radius: 7px;
+}
+
+.window-strip-cluster[data-compact="xs"] .run-mode-switch::after {
+  width: 19px;
+  height: 22px;
+  border-radius: 5px;
+}
+
+.window-strip-cluster[data-compact="xs"] .run-mode-switch[data-mode="code"]::after {
+  transform: translateX(19px);
+}
+
+.window-strip-cluster[data-compact="xs"] .run-mode-switch .run-mode-btn {
+  width: 19px;
+  height: 22px;
+  border-radius: 5px;
+}
+
+.window-strip-cluster[data-compact="xs"] .run-mode-switch .run-mode-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.window-strip-cluster[data-compact="xs"] .titlebar-icon-btn {
+  width: 20px;
+  height: 20px;
+}
+
+.window-strip-cluster[data-compact="xs"] .titlebar-icon-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.window-strip-cluster[data-compact="xs"] .update-btn {
+  width: 20px;
+}
+
+.window-strip-cluster[data-compact="xs"] .update-btn .update-icon,
+.window-strip-cluster[data-compact="xs"] .update-btn .update-ring {
+  width: 13px;
+  height: 13px;
+}

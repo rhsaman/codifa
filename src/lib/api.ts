@@ -1,4 +1,4 @@
-import type { AgentMode, CustomSubagent, McpServerConfig, ModeCapabilities, ProviderConfig, ProviderHeader, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
+import type { AgentMode, CustomSubagent, McpServerConfig, ModeCapabilities, ProviderConfig, ProviderHeader, RealtimeSessionRequest, RealtimeSessionResponse, RunMode, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 import { retryBackoffMs } from './retry'
@@ -824,6 +824,9 @@ export interface StreamParams {
   provider: ProviderConfig
   root: string
   mode: AgentMode
+  /** Upper-level persona: `chat` (general-purpose agent) or `code` (engineering
+   *  agent). The backend picks the system-prompt tail from it; absent = `chat`. */
+  runMode?: RunMode
   prompt: string
   /** Renderer-side chat id — the backend stores plans per chat under
    *  <data>/plan/<workspace>/<chat-id>/plan.md. */
@@ -902,6 +905,16 @@ export interface StreamParams {
   /** User pre-approved desktop-app control (the `computer` tool's mutating
    *  actions) for this session/workspace — set by "Always allow". */
   allowComputer?: boolean
+  /** "Always in this chat" desktop grant: skips the per-task desktop popup for
+   *  the rest of THIS conversation. Kept on the chat (chatGrants), so a fresh
+   *  chat asks again; the composer switch alone never sets it. */
+  allowComputerChat?: boolean
+  /** "Always in this chat" grant for the model's own confirm_action /
+   *  request_permission asks: later asks in THIS conversation auto-approve. */
+  allowConfirmChat?: boolean
+  /** SSH destinations ("user@host") granted "Always in this chat" — the
+   *  run_terminal gate skips them, alongside turn answers and trusted hosts. */
+  allowSshHosts?: string[]
   /** The composer's Browser switch: when off the agent's `browser_*` tools are
    *  not bound and no browser is launched. The Browser panel is unaffected. */
   allowBrowser?: boolean
@@ -1100,6 +1113,7 @@ export async function streamChat(
           model: params.provider.model,
           root: params.root,
           mode: params.mode,
+          run_mode: params.runMode ?? 'chat',
           prompt: params.prompt,
           chat_id: params.chatId ?? '',
           history: params.history,
@@ -1127,6 +1141,9 @@ export async function streamChat(
           allow_outside: params.allowOutside ?? false,
           allow_outside_folders: params.allowOutsideFolders ?? [],
           allow_computer: params.allowComputer ?? false,
+          allow_computer_chat: params.allowComputerChat ?? false,
+          allow_confirm_chat: params.allowConfirmChat ?? false,
+          allow_ssh_hosts: params.allowSshHosts ?? [],
           allow_browser: params.allowBrowser ?? false,
           subagent_models: params.subagentModels ?? {},
           custom_subagents: params.customSubagents ?? [],
@@ -1899,6 +1916,8 @@ const LEGACY_PROMPT_KEYS: Record<string, string> = {
 export function normalizeSystemPromptKeys(
   prompts: Record<string, string>,
 ): Record<string, string> {
+  // Composite `runMode:mode` keys from a newer backend are left untouched: the
+  // loop below only rewrites the legacy LITERAL ids, never a prefixed key.
   const out: Record<string, string> = { ...prompts }
   for (const [legacy, canonical] of Object.entries(LEGACY_PROMPT_KEYS)) {
     const value = out[legacy]

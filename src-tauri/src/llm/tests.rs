@@ -45,7 +45,6 @@
                 None,
                 &mut sink,
                 None,
-                None,
             )
             .await
             .expect_err("header timeout must produce an error")
@@ -66,78 +65,6 @@
         assert!(
             err.1.contains("no response headers"),
             "unexpected error: {err:?}"
-        );
-    }
-
-    /// A steer typed while a provider is parked BEFORE its response headers
-    /// must drop the request at once, exactly like one typed mid-stream.
-    ///
-    /// The header wait used to race only Stop and the 60s deadline, so a steer
-    /// during a black-holed request sat on "Steering the running agent…" until
-    /// the whole budget expired. The stream must return an INTERRUPTED
-    /// accumulator (not an Err), because the turn re-issues the step with the
-    /// steer appended rather than reporting a provider failure.
-    #[test]
-    fn a_steer_landing_while_waiting_for_headers_drops_the_request() {
-        let _env = header_wait_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // A server that accepts the connection and then sends NOTHING.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (_s, _keep) = listener.accept().expect("accept");
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        });
-        let c = cfg("custom", &format!("http://127.0.0.1:{port}"), &["k"]);
-        let msgs = vec![json!({"role": "user", "content": "hi"})];
-        // Long enough that ONLY the steer can end the wait quickly.
-        let prev = std::env::var("CODIFA_HEADER_WAIT_SECS").ok();
-        std::env::set_var("CODIFA_HEADER_WAIT_SECS", "30");
-        // Build the runtime BEFORE starting the raiser: the thread is only a
-        // clock, and the generation stamp must be captured before it fires.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let sig = std::sync::Arc::new(InterruptSignal::new());
-        let raiser = {
-            let sig = sig.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                sig.raise();
-            })
-        };
-        let mut silent = |_sig: StreamSignal<'_>| {};
-        let mut sink: SignalSink<'_> = &mut silent;
-        let started = std::time::Instant::now();
-        let acc = rt
-            .block_on(async {
-                stream_chat(
-                    &http_client(),
-                    &c,
-                    &msgs,
-                    None,
-                    &mut sink,
-                    None,
-                    Some(sig.as_ref()),
-                )
-                .await
-            })
-            .expect("a steer is not a provider failure");
-        rt.shutdown_timeout(std::time::Duration::from_millis(200));
-        raiser.join().unwrap();
-        match prev {
-            Some(v) => std::env::set_var("CODIFA_HEADER_WAIT_SECS", v),
-            None => std::env::remove_var("CODIFA_HEADER_WAIT_SECS"),
-        }
-        assert!(acc.interrupted, "the steer must mark the stream interrupted");
-        assert_eq!(
-            acc.interrupt_base, 0,
-            "the pre-header generation must be stamped so the re-issued step ignores this raise"
-        );
-        // The steer, not the 30s budget, released us.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "the steer must end the header wait immediately"
         );
     }
 
@@ -516,7 +443,7 @@
             .build()
             .unwrap()
             .block_on(async {
-                stream_chat(&http_client(), &c, &msgs, None, &mut sink, None, None).await
+                stream_chat(&http_client(), &c, &msgs, None, &mut sink, None).await
             })
             .expect("a keyless local stream must run");
         assert_eq!(acc.text, "hi");
@@ -574,7 +501,6 @@
                     &msgs,
                     Some(&tools),
                     &mut sink,
-                    None,
                     None,
                 )
                 .await
@@ -1091,12 +1017,6 @@
         acc.tool_calls
             .push(json!({"function": {"name": "read", "arguments": "{}"}}));
         assert!(finish_stream("nvidia", acc).is_ok());
-
-        // A mid-turn steer ended the request on purpose: the agent re-issues the
-        // step, so an empty accumulator is the expected outcome.
-        let mut acc = StreamAcc::default();
-        acc.interrupted = true;
-        assert!(finish_stream("nvidia", acc).is_ok());
     }
 
     #[test]
@@ -1155,61 +1075,6 @@
         acc.usage = Some(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
         let err = finish_stream("custom", acc).unwrap_err().1;
         assert!(err.contains("refused the request"), "{err}");
-    }
-
-    #[test]
-    fn interrupt_signal_wakes_a_parked_waiter_and_stamps_generations() {
-        // Mid-turn steer: the stream read loop selects on this signal, so a raise
-        // must wake a waiter that is ALREADY parked (a lost wakeup would put the
-        // steer back to "waits for the whole model reply" — the reported bug).
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let sig = InterruptSignal::new();
-            let base = sig.generation();
-            assert!(!sig.interrupted_since(base));
-            let waiter = async {
-                sig.wait_for(base).await;
-                true
-            };
-            let raiser = async {
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                sig.raise();
-            };
-            let (woke, _) = tokio::join!(waiter, raiser);
-            assert!(woke, "a parked waiter must be woken by raise()");
-            assert!(sig.interrupted_since(base));
-        });
-    }
-
-    #[test]
-    fn a_raise_from_an_earlier_window_never_cancels_a_new_request() {
-        // The bug behind "sometimes the steer works, sometimes it waits": a raise
-        // that landed while NO stream was parked used to leak into the next
-        // request (or be wiped by reset()). The generation stamp makes each
-        // stream see only raises that happened AFTER it started.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let sig = InterruptSignal::new();
-            // A steer lands while the agent is between model calls.
-            sig.raise();
-            // The NEXT request starts: it stamps the current generation, so that
-            // older raise is NOT its own — it must not be interrupted.
-            let base = sig.generation();
-            assert!(!sig.interrupted_since(base));
-            // A second steer lands while this request is live: that one IS its
-            // own and must fire immediately.
-            sig.raise();
-            assert!(sig.interrupted_since(base));
-            // wait_for resolves without parking (counter already ahead).
-            let gen = sig.wait_for(base).await;
-            assert_eq!(gen, base + 1);
-        });
     }
 
     fn tokio_test_block(client: &Client, c: &LlmConfig) -> String {

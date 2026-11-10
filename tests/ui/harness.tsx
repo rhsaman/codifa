@@ -507,6 +507,50 @@ function initialState(scenario: string | null) {
         chats: [chat({ messages })],
       };
     }
+    case "ask":
+      // Flat ask_user card inside a transcript message, with the LIVE request
+      // still pending on the chat (that pair is what ChatMessage renders).
+      // Drives the own-answer tick that reveals the answer field.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "user",
+                content: "اسکرین‌شات رو ببین",
+                createdAt: now,
+              },
+              {
+                id: "m2",
+                role: "assistant",
+                mode: "build",
+                createdAt: now,
+                content: "",
+                toolActivity: [
+                  {
+                    tool: "ask_user",
+                    status: "running",
+                    args: { question: "دقیقاً کدومش خرابه؟ (اسکرین‌شات چند تا مشکل داره)" },
+                  },
+                ],
+                segments: [{ kind: "tool", index: 0 }],
+              },
+            ],
+            pendingAsk: {
+              id: "a-ask",
+              question: "دقیقاً کدومش خرابه؟ (اسکرین‌شات چند تا مشکل داره)",
+              options: [
+                "ردیف خالی توی کارت «files edited» که اسم فایل نداره",
+                "پنل راست (PROMPT) ARGS که JSON خام و \\n ها رو خالی می‌ریزه",
+                "ردیف Write توی چت که اسم فایل رو نمی‌نویسه",
+              ],
+            },
+          }),
+        ],
+      };
     case "composer":
     default:
       return {

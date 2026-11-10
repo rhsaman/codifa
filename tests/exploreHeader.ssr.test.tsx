@@ -1,9 +1,10 @@
 // SSR test for the tool-group header with PARALLEL explore runs.
 //
-// The main agent fires several explores in one step; the header must show one
-// pill PER explore carrying its short description (so the user can tell what
-// each one is looking for) instead of collapsing them into a single
-// "Explore ×2" count. Non-sub-agent tools keep the counted-pill behaviour.
+// Each sub-agent run renders as its own ToolGroupView card (exactly like a
+// regular tool group) with the agent's NAME as the first header pill; the
+// run's task description rides as the pill's tooltip, and the head caption is
+// the run's own latest narration line (else the description). Non-sub-agent
+// tools keep the counted-pill behaviour.
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -41,7 +42,7 @@ function makeMessage(toolActivity: Array<unknown>) {
   }
 }
 
-console.log('1) دو explore موازی → دو کارت مستقل، هر کدام با هدر «Explore · توضیح»:')
+console.log('1) دو explore موازی → دو کارت مستقل مثل tool group، هر کدام با pill نام خودش:')
 {
   const msg = makeMessage([
     {
@@ -64,28 +65,35 @@ console.log('1) دو explore موازی → دو کارت مستقل، هر کد
   const text = plain.replace(/<[^>]*>/g, '')
   check('پیل ساب‌ایجنت رندر شد', html.includes('trace-pill-sub'))
   check(
-    'هر explore کارت مستقل خودش را دارد',
-    (html.match(/tool-card explore/g) || []).length === 2,
-    (html.match(/tool-card explore/g) || []).length,
+    'هر explore کارت مستقل خودش را دارد (یک گروه در یک قاب tool-trace)',
+    (html.match(/tool-group/g) || []).length === 2 &&
+      (html.match(/tool-trace/g) || []).length === 2,
+    [html.match(/tool-group/g)?.length, html.match(/tool-trace/g)?.length],
   )
   check(
-    'هر کارت به openExplore وصل است (دکمهٔ بومی)',
-    (html.match(/explore-card-open/g) || []).length === 2,
-    (html.match(/explore-card-open/g) || []).length,
+    'کارت explore قدیمی (tool-card explore) رندر نشد',
+    !html.includes('tool-card explore') && !html.includes('explore-card-open'),
+  )
+  // کارت اول narration دارد → caption هدر آخرین جملهٔ خود ساب‌ایجنت است و
+  // توضیح وظیفه فقط tooltip پیل نام می‌ماند.
+  check(
+    'توضیح کارت اول tooltip پیل نام است',
+    html.includes('Find the auth flow'),
+    html.slice(0, 300),
   )
   check(
-    'هدر کارت اول توضیح خودش را دارد',
-    text.includes('Find the auth flow'),
-    text.slice(0, 300),
-  )
-  check(
-    'هدر کارت دوم توضیح خودش را دارد',
+    'هدر کارت دوم توضیح خودش را دارد (caption وقتی narration نیست)',
     text.includes('Map the settings store'),
     text.slice(0, 300),
   )
   check(
-    'آخرین جملهٔ ساب‌ایجنت در کارت دیده می‌شود',
+    'آخرین جملهٔ ساب‌ایجنت caption هدر است',
     text.includes('Now tracing the login handler'),
+    text.slice(0, 400),
+  )
+  check(
+    'جملهٔ اول narration در هدر نیست (فقط آخرین کپشن)',
+    !text.includes('Reading src/auth.ts'),
     text.slice(0, 400),
   )
   check(

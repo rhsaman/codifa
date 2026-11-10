@@ -3,6 +3,21 @@ export type ProviderKind = 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvid
 
 export type AgentMode = string
 
+/** The upper-level persona a workspace runs in. `chat` is the general-purpose
+ *  agent — answers, text, research, files, shell, and code as one job among many
+ *  — and it is the DEFAULT. `code` is the software-engineering agent: the same
+ *  tools, but a persona aimed at reading, planning and writing the user's
+ *  codebase. The two differ in the system prompt, not in what they may touch. */
+export type RunMode = 'chat' | 'code'
+
+export const RUN_MODES: RunMode[] = ['chat', 'code']
+
+/** Anything a stored payload may hold (an old file, a hand-edited value) falls
+ *  back to the general-purpose default instead of an undefined persona. */
+export function normalizeRunMode(value: unknown): RunMode {
+  return value === 'code' ? 'code' : 'chat'
+}
+
 /** A recently used model, tied to the provider it was used on so it can be
  *  re-selected unambiguously (models are shown as provider/model). */
 export interface RecentModel {

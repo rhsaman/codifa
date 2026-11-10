@@ -152,9 +152,19 @@ pub struct GitAutoCommitBody {
 
 /// How many times the WHOLE commit-message model list is walked top to bottom.
 /// After the last fallback fails the walk starts over from the first model (a
-/// provider that was down a minute ago is often back). A list of one model is
-/// not rotated. Mirrors `COMPACT_MAX_CYCLES` in compact.rs.
+/// provider that was down a minute ago is often back). A one-model list is
+/// rotated too — a transient failure must not leave the Commit button broken
+/// until the user clicks it again. Mirrors `COMPACT_MAX_CYCLES` in compact.rs.
 pub(super) const COMMIT_MAX_CYCLES: usize = 3;
+
+/// One commit-message call may not hold the button forever: this is a side
+/// call, not the chat turn. It used `NO_TIMEOUT_SECS` (24h), so a provider
+/// that accepted the request and stalled never failed and the fallback list
+/// was never reached.
+pub(super) const COMMIT_CALL_TIMEOUT_SECS: u64 = 90;
+
+/// The whole walk (every pass, every rung) shares this wall-clock budget.
+pub(super) const COMMIT_TOTAL_BUDGET_SECS: u64 = 180;
 
 /// Pause between two passes over the list, so dead rungs are not hammered.
 /// The ONLY pause in the walk — a failing rung hands the call to the next
@@ -224,9 +234,10 @@ pub(super) async fn git_autocommit(Json(body): Json<GitAutoCommitBody>) -> Respo
         api_keys: keys,
         temperature: None,
         max_tokens: None,
-        // Inert today (llm.rs applies no request timeout on purpose); kept so
-        // the struct stays fully populated.
-        timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+        // A commit message is a SIDE call: bound it so a stalled provider
+        // fails and the walk moves to the next rung instead of blocking the
+        // Commit button on a 24h deadline.
+        timeout_secs: COMMIT_CALL_TIMEOUT_SECS,
         reasoning_level: r_level,
         model_reasoning: r_model,
         auto_think: r_auto,
@@ -304,34 +315,50 @@ No code fences, no quotes, no preamble, no trailing explanation.";
             api_keys: k,
             temperature: None,
             max_tokens: None,
-            timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+            timeout_secs: COMMIT_CALL_TIMEOUT_SECS,
             reasoning_level: lvl,
             model_reasoning: mr,
             auto_think: auto,
         });
     }
     // Walk the list top to bottom; after the last rung fails, start over from the
-    // first (see COMMIT_MAX_CYCLES). No wall-clock cap: a model that is thinking
-    // must never be cut off, so only a real failure moves the walk on.
-    let cycles = if chain.len() > 1 { COMMIT_MAX_CYCLES } else { 1 };
+    // first (see COMMIT_MAX_CYCLES). The whole walk shares a wall-clock budget:
+    // a model that stalls would otherwise never fail, so the fallback list was
+    // unreachable — every rung used to run on NO_TIMEOUT_SECS. A per-call
+    // timeout still leaves a thinking model plenty of room to finish.
+    let cycles = COMMIT_MAX_CYCLES;
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(COMMIT_TOTAL_BUDGET_SECS);
     let mut first_error = String::new();
     let mut tried: Vec<String> = Vec::new();
     let mut done = None;
     'walk: for cycle in 0..cycles {
         if cycle > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(COMMIT_CYCLE_PAUSE_SECS)).await;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let pause = std::time::Duration::from_secs(COMMIT_CYCLE_PAUSE_SECS);
+            if remaining <= pause {
+                break 'walk;
+            }
+            tokio::time::sleep(pause).await;
         }
         for c in &chain {
-            let why = match llm::complete(&client, c, SYSTEM, &user).await {
-                Ok(r) if !r.text.trim().is_empty() => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break 'walk;
+            }
+            let why = match tokio::time::timeout(remaining, llm::complete(&client, c, SYSTEM, &user))
+                .await
+            {
+                Ok(Ok(r)) if !r.text.trim().is_empty() => {
                     done = Some((r, c));
                     break 'walk;
                 }
                 // Reasoning models can burn the whole budget on the thinking
                 // block and return empty content; log it so rust.log shows the
                 // cause.
-                Ok(_) => "the model returned an empty commit message".to_string(),
-                Err(e) => e,
+                Ok(Ok(_)) => "the model returned an empty commit message".to_string(),
+                Ok(Err(e)) => e,
+                Err(_) => format!("gave no answer within {COMMIT_TOTAL_BUDGET_SECS}s"),
             };
             let label = if c.provider_id.is_empty() {
                 c.model.clone()

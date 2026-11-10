@@ -1,7 +1,7 @@
 import type { Chat } from './chat.ts'
 import type { MarketplaceSource } from './market.ts'
 import type { McpServerConfig, SearchConsoleConfig, SearchPluginConfig } from './mcp.ts'
-import type { AgentModeDef, CustomSubagent, MediaFallback, ProviderConfig, RecentModel, SttFallback, ThinkingLevel, ToolFallback, TtsFallback } from './providers.ts'
+import type { AgentModeDef, CustomSubagent, MediaFallback, ProviderConfig, RecentModel, RunMode, SttFallback, ThinkingLevel, ToolFallback, TtsFallback } from './providers.ts'
 
 
 export interface Settings {
@@ -100,6 +100,10 @@ export interface Settings {
   searchConsole?: SearchConsoleConfig
   /** Per-workspace accent color, keyed by workspace key (root path, "" for no project). */
   workspaceColors?: Record<string, string>
+  /** Upper-level persona per workspace key (`chat` = general-purpose agent,
+   *  `code` = engineering agent). A workspace setting, so switching a project
+   *  switches every chat in it. Missing key = the general-purpose default. */
+  workspaceRunModes?: Record<string, RunMode>
   /** Workspace keys pinned to the top of the sidebar, most-recently-pinned first. */
   pinnedWorkspaces?: string[]
   /** Chat ids pinned to the top of their workspace group, most-recently-pinned first. */

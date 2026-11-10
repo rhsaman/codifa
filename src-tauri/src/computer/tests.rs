@@ -138,3 +138,26 @@
         assert_eq!(got.width(), MAX_IMAGE_EDGE);
         assert_eq!(got.height(), MAX_IMAGE_EDGE / 2);
     }
+
+    /// A window capture is already downscaled to POINTS, so its mapping must use
+    /// the window's own width — not the display's. Deriving it from the display
+    /// made a 1280-point window on a 2560-point Retina screen map at 2.0 points
+    /// per pixel; every `click` built from that image landed at twice the
+    /// intended coordinate (traced: a blind click at 1700,60 for a window that
+    /// only spans 1280 points).
+    #[test]
+    fn shot_mapping_uses_the_capture_box_not_the_display() {
+        let img = image::DynamicImage::from(image::RgbaImage::new(1280, 800));
+        let shot = save_shot(&img, "window".into(), 1280.0, 30.0, 1280.0).unwrap();
+        assert!((shot.points_per_pixel - 1.0).abs() < 1e-9, "{}", shot.points_per_pixel);
+        assert_eq!((shot.origin_x, shot.origin_y), (1280.0, 30.0));
+
+        // A downscaled capture (2560 points shown in 1280 pixels) maps 2 points
+        // per pixel, so the model's coordinates are still in screen points.
+        let shot = save_shot(&img, "display".into(), 0.0, 0.0, 2560.0).unwrap();
+        assert!((shot.points_per_pixel - 2.0).abs() < 1e-9, "{}", shot.points_per_pixel);
+
+        // A missing span can never produce a zero/NaN multiplier.
+        let shot = save_shot(&img, "unknown".into(), 0.0, 0.0, 0.0).unwrap();
+        assert!((shot.points_per_pixel - 1.0).abs() < 1e-9);
+    }

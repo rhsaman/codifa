@@ -927,6 +927,13 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
             .and_then(Value::as_str)
             .unwrap_or("build")
             .to_string(),
+        // A scheduled task runs headless with nobody to clarify the intent, so
+        // it keeps the general-purpose default unless the task names a persona.
+        run_mode: task
+            .get("run_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("chat")
+            .to_string(),
         prompt,
         history: vec![],
         system_prompt: String::new(),
@@ -956,6 +963,12 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         data_root: data_root.to_string_lossy().to_string(),
         // Headless scheduled runs never touch the desktop.
         allow_computer: false,
+        // "Always in this chat" grants are renderer state keyed by the live
+        // chat — a headless run has neither, so every gate here stays at its
+        // deny-first default.
+        allow_computer_chat: false,
+        allow_confirm_chat: false,
+        allow_ssh_hosts: Vec::new(),
         // The browser is OPT-IN per task (`allow_browser` in the schedule JSON,
         // the editor's checkbox): a scheduled turn drives the SAME shared
         // Chromium and profile the interactive panel uses, so an imported or
@@ -1088,7 +1101,12 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         "[schedule] run {run_id} for '{sid}' starting: {chain_rungs} rung(s), first '{}'",
         chain.first().map(|(_, m, ..)| m.as_str()).unwrap_or("-")
     );
-    let cycles = if chain.len() > 1 { SCHEDULE_MAX_CYCLES } else { 1 };
+    // Every list is rotated, a one-model list included: after its only rung
+    // fails the walk starts it again (a transient 429/5xx must not leave the
+    // scheduled run dead until the next cron tick). The attempt count, not a
+    // clock, is what bounds the walk — a full agent turn may legitimately run
+    // for minutes.
+    let cycles = if chain.is_empty() { 1 } else { SCHEDULE_MAX_CYCLES };
     'cycles: for cycle in 0..cycles {
         if cycle > 0 {
             // The pause BETWEEN passes is the only wait in the walk. It must

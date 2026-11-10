@@ -1,20 +1,52 @@
+import { useEffect, useRef } from "react";
 import { useStore } from "../lib/store";
+import { isPaneAnimating, onPaneAnimationEnd } from "../lib/paneAnimation";
 import { UpdateButton } from "./UpdateButton";
+import { RunModeSwitch } from "./RunModeSwitch";
 
-/** Window-level controls: sidebar toggle, settings, and — when a newer
- *  version exists — the update pill, right beside the settings gear (the ONE
- *  place updates happen from; hidden entirely otherwise). Text direction is
- *  decided automatically per message (detectDir) — the old RTL/LTR toggle
- *  pill was removed. The workspace pill (folder + project name) does NOT live
- *  here — it renders in the chat titlebar (WorkspaceMenuButton), whose free
- *  width keeps the name fully visible; this cluster's home inside the sidebar
- *  strip is too narrow for it. Rendered at the window's top-left in BOTH
- *  sidebar states — inside the sidebar's drag strip when the sidebar is open,
- *  inline at the app bar's solo corner when it is closed — so opening the
- *  sidebar never pushes them to the right. CSS decides which instance is
- *  visible (.mac + .solo rules); the same JSX renders in both hosts. */
+/** Window-level controls that ride the sidebar's drag strip beside the traffic
+ *  lights. Left to right: the update pill (only when a newer version exists),
+ *  the sidebar toggle, then the Chat/Code persona switch.
+ *
+ *  Settings does NOT live here — it sits on the app bar's right end, directly
+ *  right of the wallet chip (see `#titlebar-right` in App.tsx).
+ *
+ *  The strip sets `data-compact` by MEASURING its host, because the sidebar is
+ *  drag-resizable and a viewport media query cannot see that. No step ever hides
+ *  a control: a toggle missing a side stops reading as a toggle. */
 export function WindowStripCluster() {
   const sidebarOpen = useStore((s) => s.sidebarOpen);
+  const clusterRef = useRef<HTMLSpanElement | null>(null);
+  useEffect(() => {
+    const el = clusterRef.current;
+    const host = el?.parentElement;
+    if (!el || !host) return;
+    const fit = () => {
+      // Mid-slide the host's width is frozen (lib/paneAnimation.ts), so this
+      // measurement would be stale anyway; the end hook below re-runs it.
+      if (isPaneAnimating()) return;
+      delete el.dataset.compact;
+      if (host.scrollWidth <= host.clientWidth + 1) return;
+      el.dataset.compact = "sm";
+      if (host.scrollWidth <= host.clientWidth + 1) return;
+      el.dataset.compact = "xs";
+    };
+    fit();
+    // Older WebViews and the test harness may not expose ResizeObserver; the
+    // synchronous fit above still covers mount, and the sidebar toggle re-runs
+    // this effect.
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(fit);
+    ro.observe(host);
+    // While the sidebar slides, its frozen inner keeps the host at a constant
+    // width — ResizeObserver is silent exactly while the fit goes stale, so
+    // re-fit when the freeze lifts.
+    const offAnimationEnd = onPaneAnimationEnd(fit);
+    return () => {
+      ro.disconnect();
+      offAnimationEnd();
+    };
+  }, [sidebarOpen]);
   const iconProps = {
     width: 17,
     height: 17,
@@ -27,31 +59,28 @@ export function WindowStripCluster() {
     "aria-hidden": true,
   };
   return (
-    <span className="window-strip-cluster">
+    <span className="window-strip-cluster" ref={clusterRef}>
+      {/* Appears only when a newer version exists — nothing renders otherwise. */}
+      <UpdateButton />
       <button
         className="icon-btn titlebar-icon-btn"
-        aria-label={sidebarOpen ? "Hide sidebar (⌘B)" : "Show sidebar (⌘B)"}
-        title={sidebarOpen ? "Hide sidebar (⌘B)" : "Show sidebar (⌘B)"}
+        aria-label={sidebarOpen ? "Hide sidebar (\u2318B)" : "Show sidebar (\u2318B)"}
+        title={sidebarOpen ? "Hide sidebar (\u2318B)" : "Show sidebar (\u2318B)"}
         aria-pressed={sidebarOpen}
         onClick={() => useStore.getState().toggleSidebar()}
       >
+        {/* A framed panel with its sidebar column marked: the icon states what
+            the button toggles, where the old hamburger only stated "some menu".
+            The outer box is the app bar pane-toggle's EXACT geometry (rect 3,4
+            18x16 r2.5) so the two panel icons read as one size across the
+            titlebar — the sidebar rect used to sit a full unit lower and
+            shorter (4.5/18x15), and the pair read as mismatched. */}
         <svg {...iconProps}>
-          <path d="M3 6h18M3 12h18M3 18h12" />
+          <rect x="3" y="4" width="18" height="16" rx="2.5" />
+          <path d="M8 9.5v5" />
         </svg>
       </button>
-      <button
-        className="titlebar-icon-btn"
-        aria-label="Open settings (⌘,)"
-        title="Settings (⌘,)"
-        onClick={() => useStore.getState().setSettingsOpen(true)}
-      >
-        <svg {...iconProps}>
-          <circle cx="12" cy="12" r="3" />
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-        </svg>
-      </button>
-      {/* Appears only when a newer version exists — nothing renders otherwise. */}
-      <UpdateButton />
+      <RunModeSwitch />
     </span>
   );
 }

@@ -3,7 +3,7 @@ import { toWorkspacePath } from '../../lib/fileTree'
 import { api } from '../../lib/fs'
 import { reviewPathOf } from '../../lib/reviewTurn'
 import { useStore } from '../../lib/store'
-import { diffStatsFromUnified } from '../../lib/toolActivity'
+import { diffStatsFromUnified, editTargetsOf } from '../../lib/toolActivity'
 import { useViewerTabs } from '../../lib/viewerTabs'
 import type { ToolActivity } from '../../types'
 import { KeyboardEvent, memo, useState } from 'react'
@@ -38,11 +38,11 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
   const { adds, dels } = editGroupStats(activities);
   // Live clock so the group total ticks while any file edit is still running.
   const now = useRunningClock(running);
-  const totalMs = activities.reduce((sum, a) => {
-    const act = a.activity;
-    if (act.status === "running" && act.startedAt) return sum + Math.max(0, now - act.startedAt);
-    return sum + (act.elapsedMs || 0);
-  }, 0);
+  // Start → end of the whole group, not the sum of each edit's own duration.
+  const totalMs = groupSpanMs(
+    activities.map((a) => a.activity),
+    now,
+  );
 
   const revertOne = async (entry: { activity: ToolActivity; index: number }) => {
     if (!root) return;
@@ -59,8 +59,12 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
       if (!entry.activity.diff) return;
       const path = reviewPathOf(entry.activity);
       if (!path) return;
+      // The transcript may trim the aggregate `diff`; the per-file entry for
+      // THIS path stays complete, so prefer it for the reverse diff.
+      const revertDiff =
+        entry.activity.diffs?.find((e) => e.path === path)?.diff ?? entry.activity.diff;
       const { content: current } = (await api.fsRead(root, path)) ?? {};
-      const oldContent = applyReverseDiff(entry.activity.diff, current ?? "");
+      const oldContent = applyReverseDiff(revertDiff, current ?? "");
       const ok = await api.fsWrite(root, path, oldContent);
       if (ok) onReverted?.(entry.index);
     } finally {
@@ -93,6 +97,10 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
           {activities.map((entry) => {
             const path = reviewPathOf(entry.activity);
             const base = path.split("/").pop() || path;
+            // A batch call names a different file per entry; the row shows the
+            // first (the Review panel lists every file), so admit the rest.
+            const targets = editTargetsOf(entry.activity.args);
+            const more = targets.length > 1 ? targets.length - 1 : 0;
             const st = entry.activity.diff
               ? (entry.activity.diffStats ?? diffStatsFromUnified(entry.activity.diff))
               : null;
@@ -109,7 +117,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                   className="edit-group-row-main"
                   role="button"
                   tabIndex={0}
-                  title={path ? toWorkspacePath(root, path) : undefined}
+                  title={path ? (more ? targets.join("\n") : toWorkspacePath(root, path)) : undefined}
                   onClick={() => messageId && openReview(messageId, path)}
                   onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
                     if (e.key === "Enter" || e.key === " ") {
@@ -120,6 +128,9 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                 >
                   <StatusIcon status={entry.activity.status} />
                   <span className="edit-group-file" dir="auto">{base}</span>
+                  {more > 0 && (
+                    <span className="tool-path tool-more" dir="ltr">+{more} more</span>
+                  )}
                   <span className="edit-group-row-end">
                     {stats && (
                       <span className="trace-row-diff-stats" dir="ltr">{stats}</span>
@@ -174,6 +185,28 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
     </div>
   );
 });
+
+/** Wall-clock span of a tool group: the first call's start → the last call's
+ *  end (a call still running ends "now"). It is NOT the sum of the calls' own
+ *  durations: parallel calls would be counted twice, and the gaps between calls
+ *  (the model reasoning, narration) would be dropped. A call without a start
+ *  stamp (older transcripts) falls back to summing the durations. */
+export function groupSpanMs(acts: ToolActivity[], now: number): number {
+  let start = Infinity;
+  let end = -Infinity;
+  let summed = 0;
+  for (const a of acts) {
+    const own =
+      a.status === "running" && a.startedAt
+        ? Math.max(0, now - a.startedAt)
+        : a.elapsedMs || 0;
+    summed += own;
+    if (!a.startedAt) continue;
+    start = Math.min(start, a.startedAt);
+    end = Math.max(end, a.startedAt + own);
+  }
+  return start === Infinity ? summed : Math.max(0, end - start);
+}
 
 export function fmtTime(ms?: number): string {
   if (!ms) return "";

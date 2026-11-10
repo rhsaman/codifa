@@ -123,6 +123,35 @@
         assert!(flat.is_err());
     }
 
+    /// A 200 whose image payload decodes to NOTHING must be a rung FAILURE:
+    /// gateways answer OK with an empty body when their own upstream died, and
+    /// counting it as success would save a 0-byte file and never walk the
+    /// fallback ladder (the same rule the TTS chain already enforces).
+    #[test]
+    fn empty_image_payloads_are_rung_failures() {
+        let empty_b64 = base64::engine::general_purpose::STANDARD.encode(b"");
+        let err = openai_images_parse(&json!({ "data": [{ "b64_json": empty_b64 }] }))
+            .unwrap_err();
+        assert!(err.contains("zero bytes"), "{err}");
+
+        let empty_inline = base64::engine::general_purpose::STANDARD.encode(b"");
+        let err = gemini_image_parse(&json!({ "candidates": [{ "content": { "parts": [
+            { "inlineData": { "mimeType": "image/png", "data": empty_inline } }
+        ] } }] }))
+        .unwrap_err();
+        assert!(err.contains("zero bytes"), "{err}");
+
+        // An EMPTY data URL is skipped inside the chat-completions parse: it
+        // must not decode into Bytes(vec![]) (a saved empty file) — with no
+        // other image in the list the rung fails like any other dead answer.
+        let blank = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(b""));
+        let err = openrouter_image_parse(&json!({ "choices": [{ "message": {
+            "images": [{ "image_url": { "url": blank } }]
+        } }] }))
+        .unwrap_err();
+        assert!(err.contains("no image"), "{err}");
+    }
+
     #[test]
     fn gemini_body_and_parse() {
         let body = gemini_image_body("a cat", Some((&b"IMG"[..], "image/png")));

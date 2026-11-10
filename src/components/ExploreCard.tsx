@@ -1,8 +1,5 @@
 import type { ToolActivity } from "../types";
-import { useStore } from "../lib/store";
-import { latestNarrationLine } from "../lib/toolActivity";
-import { useViewerTabs } from "../lib/viewerTabs";
-import { StatusIcon, subagentDisplayName, toolLabel, useRunningClock } from "./ToolCallView";
+import { toolLabel } from "./ToolCallView";
 import { batchOpTools } from "./toolcall/naming";
 
 /** Short label of a sub-agent run: the model's own description when it supplied
@@ -23,8 +20,13 @@ export interface ExploreToolCount {
 }
 
 /** Tool tally of one run (children, nested ones included): which tools the
- *  sub-agent called and how many times. Drives both the chips on the chat card
- *  and the side panel's header summary, so the two views never disagree. */
+ *  sub-agent called and how many times. Drives the side panel's header
+ *  summary and the thinking strip's "N searches, M reads" line, so the two
+ *  views never disagree.
+ *
+ *  (The chat card itself no longer uses these tallies: it renders as a
+ *  ToolGroupView with the agent's name in the header — see renderSegments in
+ *  ChatMessage.tsx.) */
 export function exploreToolCounts(activity: ToolActivity): ExploreToolCount[] {
   // Keyed by LABEL, not raw tool name: `grep` and `glob` both render as
   // "Search Files", so keying on the name produced two chips with an identical
@@ -69,119 +71,4 @@ export function exploreToolCounts(activity: ToolActivity): ExploreToolCount[] {
 /** Total number of tool calls a run made (nested calls included). */
 export function exploreCallTotal(activity: ToolActivity): number {
   return exploreToolCounts(activity).reduce((n, c) => n + c.count, 0);
-}
-
-function fmtMs(ms?: number): string {
-  if (!ms) return "";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const totalSec = ms / 1000;
-  // An explore run can take many minutes (it runs up to a dozen steps), so a
-  // raw second count reads as noise — "5400.0s" instead of "90m". Same
-  // minute+second shape the tool cards use.
-  if (totalSec >= 60) {
-    const m = Math.floor(totalSec / 60);
-    const s = Math.round(totalSec % 60);
-    return s > 0 ? `${m}m ${s}s` : `${m}m`;
-  }
-  return `${totalSec.toFixed(1)}s`;
-}
-
-/** One-line state word for the status badge's title/aria-label. */
-function statusLabel(status: ToolActivity["status"]): string {
-  if (status === "running") return "Working…";
-  if (status === "error") return "Failed";
-  if (status === "denied") return "Blocked";
-  return "Done";
-}
-
-/** Chat-side card for ONE explore (sub-agent) run.
- *
- *  The card stays a compact summary inside the chat: a live status badge
- *  (spinner while the run works, a check once it lands), the run title, and
- *  one chip per tool with its call count — so the user sees WHAT ran and HOW
- *  MANY times without reading a wall of output. The calls themselves live in
- *  the side panel: clicking the card opens (or retargets) that run's tool
- *  group there via `openExplore` (user request). */
-export function ExploreCard({
-  activity,
-  messageId,
-  index,
-}: {
-  activity: ToolActivity;
-  /** id پیام مالک این اجرا — برای باز کردن اجرا در پنل راست. */
-  messageId: string;
-  index: number;
-}) {
-  const running = activity.status === "running";
-  const now = useRunningClock(running);
-  const ms =
-    running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs;
-  const subagentRows = useStore((s) => s.customSubagents);
-  const agentName = subagentDisplayName(activity.tool, subagentRows);
-  const title = exploreTitle(activity, agentName);
-  const counts = exploreToolCounts(activity);
-  const total = exploreCallTotal(activity);
-  const state = statusLabel(activity.status);
-  const narration = latestNarrationLine(activity);
-
-  return (
-    <div className={`tool-card explore ${activity.status}${running ? " running" : ""}`}>
-      <div className="tool-group explore">
-        <button
-          type="button"
-          className="trace-head explore-card-open"
-          title="Open this run's tool calls in the side panel"
-          aria-label={`Open ${title} in the side panel`}
-          onClick={() =>
-            useViewerTabs.getState().openExplore(messageId, index, title)
-          }
-        >
-          <span
-            className={`explore-card-status ${activity.status}`}
-            role="img"
-            title={state}
-            aria-label={state}
-          >
-            <StatusIcon status={activity.status} />
-          </span>
-          <span className="trace-pill trace-pill-sub">{agentName}</span>
-          <span className="trace-head-desc" dir="auto" title={title}>
-            {title}
-          </span>
-          <span className="trace-head-right">
-            {total > 0 && (
-              <span className="explore-card-count">{`${total} calls`}</span>
-            )}
-            {ms ? <span className="trace-time">{fmtMs(ms)}</span> : null}
-            <span className="explore-card-arrow" aria-hidden="true">
-              ↗
-            </span>
-          </span>
-        </button>
-        {running && <div className="explore-card-progress" aria-hidden="true" />}
-        {counts.length > 0 && (
-          <div className="explore-tool-chips">
-            {counts.map((c) => (
-              <span key={c.label} className="explore-tool-chip" title={c.label}>
-                <span className="explore-tool-name">{c.label}</span>
-                <span className="explore-tool-n">{`×${c.count}`}</span>
-              </span>
-            ))}
-          </div>
-        )}
-        {narration && (
-          <div
-            className="explore-narration"
-            dir="auto"
-            title={narration.length > 300 ? `${narration.slice(0, 300)}…` : narration}
-          >
-            <span className="explore-narration-mark" aria-hidden="true">
-              “
-            </span>
-            <span className="explore-narration-line">{narration}</span>
-          </div>
-        )}
-      </div>
-    </div>
-  );
 }

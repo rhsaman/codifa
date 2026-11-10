@@ -392,6 +392,183 @@
   max-width: 100%;
 }
 
+/* ── Queued-message cards above the composer (Claude-app style) ──────────
+   One compact row per unsent queue item: "N message(s) queued" + a
+   single-line preview, with steer-now (↵), edit (✏) and remove (✕) ghost
+   icons on the trailing edge. Sits in the .composer overlay directly above
+   .composer-inner, so it matches the input card's width and centering.
+   (The old .queued-bubble styles above stay for the steer-pending bubbles
+   rendered inside the transcript by ChatMessage.) */
+.queue-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto 8px;
+  pointer-events: auto;
+}
+
+.queue-card {
+  min-width: 0;
+  border-radius: 16px;
+  padding: 7px 8px 7px 14px;
+  background: color-mix(in srgb, var(--text) 7%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+}
+
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Drag-to-reorder grip (starts the shared useDragReorder drag). */
+.queue-grip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  cursor: grab;
+  color: var(--text-dim);
+  opacity: 0.55;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+
+.queue-grip:hover {
+  opacity: 1;
+  color: var(--text);
+}
+
+.queue-grip:active {
+  cursor: grabbing;
+}
+
+.queue-grip svg {
+  width: 10px;
+  height: 16px;
+}
+
+/* Card being dragged fades; the others slide via shiftStyle transforms. */
+.queue-card.drag-lift {
+  opacity: 0.45;
+}
+
+/* The middle column holds everything user-queued on ONE line: the text
+   preview first (it shrinks/ellipsizes), then the compact indicators. */
+.queue-row-mid {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+/* The preview GROWS to fill the row so the text's own direction puts it on
+   its natural side: dir=rtl Persian hugs the RIGHT edge (start = right) and
+   ellipsizes leftward; LTR English starts at the left edge. */
+.queue-row-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--chat-font-size);
+  line-height: 1.4;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.queue-thumbs,
+.queue-chips {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 20px inline thumbnail — the queued image never renders at full size in the
+   card (the card's height must not grow with its content). */
+.queue-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  object-fit: cover;
+  display: block;
+}
+
+.queue-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 150px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.queue-chip-name {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.queue-chip-more {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.queue-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.queue-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.queue-act svg {
+  width: 15px;
+  height: 15px;
+}
+
+.queue-act:hover {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  color: var(--text);
+}
+
+.queue-act:disabled {
+  opacity: 0.4;
+  cursor: default;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.queue-act:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
 .chat-messages {
   min-width: 0;
   overflow-x: clip;
@@ -545,6 +722,15 @@
 
 .msg-thinking-dots .dot:nth-child(3) {
   animation-delay: 0.4s;
+}
+
+/* انیمیشن فقط وقتی اجرا می‌شود که مدل واقعاً فکر می‌کند (`busy` از
+   ThinkingIndicator)؛ در فاز Working نقطه‌ها به‌صورت یک «…» ثابت می‌مانند —
+   حرکت یعنی «فکر کردن». بعد از قواعد nth-child می‌آید تا animation: none
+   بر delay آن‌ها غلبه کند. */
+.msg-thinking-dots:not(.busy) .dot {
+  animation: none;
+  opacity: 0.45;
 }
 
 @keyframes msg-thinking-dot {

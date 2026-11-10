@@ -45,21 +45,28 @@ export function buildReviewTurn(
   >();
   const walk = (list: ToolActivity[]) => {
     for (const a of list) {
-      if (
-        (a.tool === "edit_file" || a.tool === "write_file") &&
-        a.diff
-      ) {
-        const path = reviewPathOf(a);
-        if (path && inReview(path)) {
-          const s = a.diffStats ?? diffStatsFromUnified(a.diff);
+      if (a.tool === "edit_file" || a.tool === "write_file") {
+        // Per-file entries when the backend sent them (a batch call names a
+        // different file per entry): each file is attributed ITS OWN stats and
+        // net diff. Without them, the card's aggregate `diff` would be booked
+        // entirely under the first file's path. The fallback keeps older
+        // transcripts (single aggregate diff, one target) working as before.
+        const perFile: { path: string; diff: string; turnDiff?: string }[] = a.diffs
+          ? a.diffs.map((e) => ({ path: e.path, diff: e.diff, turnDiff: e.turnDiff }))
+          : a.diff
+            ? [{ path: reviewPathOf(a), diff: a.diff, turnDiff: a.turnDiff }]
+            : [];
+        for (const { path, diff, turnDiff } of perFile) {
+          if (!path || !diff || !inReview(path)) continue;
+          const s = diffStatsFromUnified(diff);
           const cur = byPath.get(path);
           if (cur) {
             cur.adds += s.adds;
             cur.dels += s.dels;
-            cur.diffs.push(a.diff);
-            cur.net = a.turnDiff;
+            cur.diffs.push(diff);
+            cur.net = turnDiff;
           } else {
-            byPath.set(path, { adds: s.adds, dels: s.dels, diffs: [a.diff], net: a.turnDiff });
+            byPath.set(path, { adds: s.adds, dels: s.dels, diffs: [diff], net: turnDiff });
           }
         }
       }

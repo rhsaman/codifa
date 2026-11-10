@@ -201,6 +201,9 @@ console.log("۷-ه) تب browser چت‌محور است و تب git ورک‌ا�
   // The hand-made chat ids have no store rows, so both resolve to the same
   // fallback workspace — exactly the case the split is about.
   const WS = workspaceKey("")
+  // گیت فقط در حالت کد باز می‌شود (gate در openGitDiff)؛ این بخش مکانیک
+  // ورک‌اسپیس‌محورِ تب git را تست می‌کند، پس پرسونا را کد می‌کنیم.
+  useStore.setState((s) => ({ workspaceRunModes: { ...s.workspaceRunModes, [WS]: "code" } }))
   useViewerTabs.getState().openBrowser("chat-a")
   useViewerTabs.getState().openGitDiff("chat-a")
   useViewerTabs.getState().openBrowser("chat-b")

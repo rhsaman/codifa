@@ -209,6 +209,14 @@ console.log('9) a batch edit names its file per entry (no top-level path):')
   check('no path at all is empty, never a crash', editTargetOf({}) === '' && editTargetOf(undefined) === '')
   // A per-entry path with no file in it must not become a review row for a dir.
   check('editTargetOf skips a blank entry path', editTargetOf({ edits: [{ path: '  ' }, { path: 'ok.ts' }] }) === 'ok.ts')
+  // `write_file`'s batch shape names its file inside `files[]`; without this the
+  // Write card and its "N files edited" row rendered with no filename at all.
+  const writeBatch = { files: [{ path: '/tmp/a.tsx', content: 'x' }] }
+  check('editTargetOf reads a write_file files[] path', editTargetOf(writeBatch) === '/tmp/a.tsx')
+  check(
+    'editTargetOf prefers edits[] over files[]',
+    editTargetOf({ edits: [{ path: 'e.ts' }], files: [{ path: 'f.ts' }] }) === 'e.ts',
+  )
 
   // The same resolution backs the review panel and the card row.
   const act = { tool: 'edit_file', status: 'done', args: batch } as any

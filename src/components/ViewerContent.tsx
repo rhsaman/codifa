@@ -66,7 +66,15 @@ function ViewerContentInner() {
   // in the store — that helper is the shared spelling of this rule behind the
   // rail icons' pressed state, so keep the two in step.
   const scope = useViewerScope();
-  const visible = visibleTabs(tabs, scope);
+  // Git is a CODE-mode surface (the persona switch hides the dock's Git icon
+  // for the chat persona): the body mirrors that filter exactly, so an
+  // already-open Git tab falls back to the Panel page instead of staying
+  // painted behind a dock button that no longer exists. The tab itself stays
+  // in state and reappears when the workspace switches back to Code.
+  const runMode = useStore((s) => s.workspaceRunModes[s.activeWorkspaceKey]);
+  const visible = visibleTabs(tabs, scope).filter(
+    (t) => runMode === "code" || t.kind !== "review",
+  );
   // Same rule as `shownViewerTabId`: the chat's own tab beats a shared page tab
   // (schedule/inbox/…), so an open file never loses the pane to Schedule — and
   // only strip surfaces may win a fallback, so a dock page (git/todos/…) that

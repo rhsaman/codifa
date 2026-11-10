@@ -2418,17 +2418,18 @@ body.coder-resizing .terminal-panel {
 /* macOS frameless window strip cluster: the cluster rides the sidebar's
    TRAILING corner. The traffic lights are OS-pinned and do not move — the
    strip keeps its 88px left gutter for them — while the buttons stack
-   leading→trailing as: update · settings · hamburger. */
+   leading→trailing as: update · sidebar · persona switch. Settings is NOT here:
+   it lives on the app bar's right end, right of the wallet chip. */
 .window-strip-cluster {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   min-width: 0;
   margin-left: auto;
-  /* Pinned to the sidebar's trailing edge, hugging the hamburger into the
-     corner. row-reverse turns the DOM order (update, settings, toggle) into
-     the visual order update · settings · hamburger. */
-  flex-direction: row-reverse;
+  /* Pinned to the sidebar's trailing edge and hugging the corner with the
+     trailing icon. The JSX already carries the visual order, so no
+     `row-reverse` — a reversed DOM order would put the tab sequence out of
+     step with what the user sees. */
   padding-right: 4px;
 }
 

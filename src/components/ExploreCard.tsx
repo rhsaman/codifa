@@ -3,6 +3,7 @@ import { useStore } from "../lib/store";
 import { latestNarrationLine } from "../lib/toolActivity";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { StatusIcon, subagentDisplayName, toolLabel, useRunningClock } from "./ToolCallView";
+import { batchOpTools } from "./toolcall/naming";
 
 /** Short label of a sub-agent run: the model's own description when it supplied
  *  one, else the run summary, else the sub-agent's own name. */
@@ -32,21 +33,20 @@ export function exploreToolCounts(activity: ToolActivity): ExploreToolCount[] {
   const walk = (list?: ToolActivity[]) => {
     for (const a of list ?? []) {
       // A `batch` call IS its inner ops on the UI: a bare "Batch ×3" chip says
-      // nothing about what ran (user request). The ops ride the call's args —
-      // tally each op's tool as its own chip; when the args are missing
-      // (older transcripts), the plain Batch chip stays.
+      // nothing about what ran (user request). Tally each op's tool as its own
+      // chip. `batchOpTools` reads the call's args and, for a transcript whose
+      // args were lost, the op labels the executor echoes in the result — so an
+      // older run never falls back to a plain "batch" chip.
       if (a.tool === "batch") {
-        const ops = Array.isArray(a.args?.ops)
-          ? (a.args!.ops as Array<{ tool?: string }>)
-          : [];
+        const ops = batchOpTools(a);
         if (ops.length > 0) {
-          for (const op of ops) {
-            const label = toolLabel(String(op.tool ?? ""));
+          for (const tool of ops) {
+            const label = toolLabel(tool);
             const cur = counts.get(label);
             if (cur) {
               cur.count += 1;
             } else {
-              counts.set(label, { tool: String(op.tool ?? ""), label, count: 1 });
+              counts.set(label, { tool, label, count: 1 });
             }
           }
           continue;

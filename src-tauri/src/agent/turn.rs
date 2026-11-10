@@ -182,6 +182,37 @@ pub(super) fn run_stop_hooks(
     }
 }
 
+/// What the "Working" pill names while a tool runs. A `batch` is only a
+/// wrapper, so the pill lists the tools it carries ("read ×2, grep") instead
+/// of the word "batch"; every other tool keeps its own name.
+pub(super) fn tool_status_label(name: &str, args: &Value) -> String {
+    if name != "batch" {
+        return name.to_string();
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    if let Some(ops) = args["ops"].as_array() {
+        for op in ops {
+            let tool = op["tool"].as_str().unwrap_or_default().trim().to_string();
+            if tool.is_empty() {
+                continue;
+            }
+            if let Some(i) = counts.iter().position(|(t, _)| *t == tool) {
+                counts[i].1 += 1;
+            } else {
+                counts.push((tool, 1));
+            }
+        }
+    }
+    if counts.is_empty() {
+        return name.to_string();
+    }
+    counts
+        .into_iter()
+        .map(|(t, n)| if n > 1 { format!("{} ×{}", t, n) } else { t })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Cap the UI echo, record the trace row, emit the Tool event and push the
 /// tool message — shared by the parallel (read-only batch) and sequential
 /// tool paths so both produce identical cards/traces/model messages.
@@ -2728,7 +2759,7 @@ the Vision model's description instead.\n"
             if is_readonly(name) || (shell_read && !background_call) {
                 emit(&AgentEvent::Status {
                     stage: "tool".into(),
-                    content: name.clone(),
+                    content: tool_status_label(name, &args),
                 });
                 emit(&AgentEvent::ToolStart {
                     id: id.clone(),
@@ -3221,7 +3252,7 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             }
             emit(&AgentEvent::Status {
                 stage: "tool".into(),
-                content: name.clone(),
+                content: tool_status_label(name, &args),
             });
             // Two-phase protocol (like the Python sidecar): the start event
             // mints a running card immediately, so long tools (explore) are

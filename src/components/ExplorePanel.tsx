@@ -5,6 +5,7 @@ import { toolCallBody } from "../lib/toolActivity";
 import { exploreTitle, exploreToolCounts } from "./ExploreCard";
 import { subagentDisplayName } from "./ToolCallView";
 import { StatusIcon } from "./ToolCallView";
+import { activityLabel, batchOpTools } from "./toolcall/naming";
 import { useVimScroll } from "../lib/useVimScroll";
 
 /** One argument line ("path: src/a.ts") for a call row's body. */
@@ -28,6 +29,20 @@ function callDetail(activity: ToolActivity): string {
     pick("description") ||
     ""
   ).split("\n")[0];
+}
+
+/** The name a call row shows. A `batch` is only a wrapper, so its row is named
+ *  after the tools it ran ("read ×2, grep"), never the word "batch". */
+function callTool(activity: ToolActivity): string {
+  if (activity.tool !== "batch") return activity.tool;
+  const counts = new Map<string, number>();
+  for (const tool of batchOpTools(activity)) {
+    counts.set(tool, (counts.get(tool) ?? 0) + 1);
+  }
+  if (counts.size === 0) return activityLabel(activity);
+  return [...counts]
+    .map(([tool, n]) => (n > 1 ? `${tool} ×${n}` : tool))
+    .join(", ");
 }
 
 /** Everything a call produced: search/terminal output, diff, or result text. */
@@ -56,7 +71,7 @@ function ExploreCallRow({ activity }: { activity: ToolActivity }) {
         onClick={() => setOpen((o) => !o)}
       >
         <span className={`explore-call-dot ${activity.status}`} aria-hidden="true" />
-        <span className="explore-call-tool">{activity.tool}</span>
+        <span className="explore-call-tool">{callTool(activity)}</span>
         {detail && (
           <span className="explore-call-detail" dir="auto" title={detail}>
             {detail}

@@ -1,0 +1,70 @@
+/* ── Chat polish: user message, tool trace, composer ─────────────────────────
+   Loaded LAST on purpose: every rule below only overrides a value set earlier,
+   so deleting this file (and its @import in ../global.css) restores the
+   previous look exactly. Colors come from theme variables only, so every
+   built-in theme (dark and light) follows. */
+
+/* 1) User message — a plain rounded card like the Claude app: no speech-bubble
+   tail, no outline. The fill is the theme's own text color mixed 6% into --bg,
+   so it is always one quiet step off the page (a theme whose --bg-panel equals
+   --bg, like Dracula, used to lose the card without its border).
+   The inline edit box keeps its own look: it is excluded below. */
+.msg.user .msg-bubble:not(.editing):not(:has(.msg-edit-wrap)),
+.chat-messages[data-dir="rtl"] .msg.user .msg-bubble:not(.editing):not(:has(.msg-edit-wrap)) {
+  background: color-mix(in srgb, var(--text) 6%, var(--bg));
+  border-color: transparent;
+  border-radius: 18px;
+  padding: 10px 16px;
+}
+
+.msg.user .msg-bubble:not(.editing):not(:has(.msg-edit-wrap))::after,
+.chat-messages[data-dir="rtl"] .msg.user .msg-bubble:not(.editing):not(:has(.msg-edit-wrap))::after {
+  display: none;
+}
+
+/* 2) Tool trace — a bit more air around the card, neutral hover (the old accent
+   tint read orange on the neutral themes), a visible keyboard focus ring, and
+   neutral count pills in the collapsed group header. */
+.msg-bubble.segmented > .tool-trace {
+  margin: 8px 4px;
+}
+
+.trace-head:hover,
+.trace-row-head:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.trace-row.expanded {
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  border-top-color: var(--hairline, rgba(255, 255, 255, 0.06));
+}
+
+.trace-head:focus-visible,
+.trace-row-head:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: -2px;
+  border-radius: 6px;
+}
+
+.trace-head-pills .trace-pill:not(.trace-pill-sub) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* 3) Composer — the card is one step lighter than the page (as in the Claude
+   app), slightly rounder, and its border brightens while the input has focus. */
+.composer-inner {
+  background: color-mix(in srgb, var(--text) 8%, var(--bg));
+  border-radius: 18px;
+}
+
+.composer-inner:focus-within {
+  border-color: color-mix(in srgb, var(--text) 30%, var(--border));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trace-head,
+  .trace-row-head,
+  .composer-inner {
+    transition: none;
+  }
+}

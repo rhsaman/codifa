@@ -2,24 +2,27 @@ import { fixZwsp, prepareContent } from '../../lib/bidi'
 import { parseDownloadProgress } from '../../lib/downloadProgress'
 import { fileBasename } from '../../lib/fileTypes'
 import { reviewPathOf } from '../../lib/reviewTurn'
-import { diffStatsFromUnified, editTargetOf, isSkillTool, latestNarrationLine } from '../../lib/toolActivity'
+import { diffStatsFromUnified, editTargetOf, isSkillTool } from '../../lib/toolActivity'
 import { useViewerTabs } from '../../lib/viewerTabs'
 import { useStore } from '../../lib/store'
 import type { ToolActivity } from '../../types'
 import { openWorkspaceFile } from '../FileIcon'
+import { MarkdownProse } from '../message/markdown'
 import { Fragment, KeyboardEvent, memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { ToolArgs, argsTextFor, fmtArgValue, rowDetail } from './args'
+import { fmtArgValue, rowDetail } from './args'
 import { DiffPreview, useDiffPreview } from './diff'
-import { fmtTime } from './editGroup'
+import { fmtTime, groupSpanMs } from './editGroup'
 import { IconChevron, StatusIcon, TerminalRowIcon } from './icons'
-import { activityLabel, batchOpTools, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel } from './naming'
-import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
+import { TraceRequestBlock, TraceResponseBlock, TraceTextBlock } from './ioBlocks'
+import { activityLabel, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, useRunningClock } from './naming'
+import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
 
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
   captions,
   subagent,
+  live,
 }: {
   activities: { activity: ToolActivity; index: number }[];
   /** Per-call narration lines: captions[i] is the model's narration that
@@ -29,12 +32,16 @@ export const ToolGroupView = memo(function ToolGroupView({
    *  summary). */
   captions?: (string | null)[];
   /** A dedicated sub-agent run: its delegation call (`explore` / `agent__…`).
-   *  The agent's own name leads the header as a `trace-pill-sub` pill, its
-   *  state owns the group clock, and its narration (or task description)
-   *  becomes the head caption. The activities passed alongside are the run's
-   *  INNER tool calls (the delegation card's children), rendered as normal
-   *  trace rows — a sub-agent card is just a tool group with a name. */
+   *  The agent's own name leads the header, its state owns the group clock, and
+   *  its narration (or task description) becomes the head caption. The
+   *  activities passed alongside are the run's INNER tool calls (the delegation
+   *  card's children), rendered as normal trace rows — a sub-agent card is just
+   *  a tool group with a name. */
   subagent?: ToolActivity;
+  /** The turn is still streaming. Keeps the header clock ticking across the
+   *  gap between two calls (the model thinking), instead of freezing on every
+   *  tool-call boundary; a finished turn stops the clock. */
+  live?: boolean;
 }) {
   // Every run starts collapsed — including runs with web calls, whose hits are
   // one click away inside the expanded rows.
@@ -50,41 +57,35 @@ export const ToolGroupView = memo(function ToolGroupView({
   const subagentName = subagent
     ? subagentDisplayName(subagent.tool, subagentRows)
     : null;
-  // Tool names + counts: only the header's FALLBACK text now (see headText) —
-  // the header itself shows the agent's latest words, never the tool list.
-  // Counted per LABEL (not per tool): grep and glob share the label
-  // "Search Files", so counting by raw tool name would list it twice.
-  // Sub-agent cards (explore) are not counted into the labels: each one is
-  // listed on its own with the short description of what it looks for.
-  const subagentPills = activities
-    .filter(({ activity }) => isSubagentCard(activity))
-    .map(({ activity, index }) => ({
-      key: index,
-      label: subagentDisplayName(activity.tool, subagentRows),
-      desc: shortArg(String(activity.args?.description ?? ""), 70),
-      running: activity.status === "running",
-    }));
-  const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
-    if (isSubagentCard(a.activity)) return acc;
-    // A batch is only a wrapper: its pills are the tools it ran, merged with the
-    // same-label pills of ordinary calls — "batch" is never a pill.
-    const names = a.activity.tool === "batch" ? batchOpTools(a.activity) : [];
-    for (const tool of names.length > 0 ? names : [a.activity.tool]) {
-      const label = toolLabel(tool);
-      acc[label] = (acc[label] || 0) + 1;
-    }
-    return acc;
-  }, {});
+  // The header is ONE line of the agent's own words (see headText) — never the
+  // tool names or their counts (user request). Sub-agent runs fall back to
+  // their own name, so a run that has not spoken yet is still identifiable.
   // Task description of a dedicated sub-agent run (what the old dedicated
   // explore card showed as its title): rides as the name pill's tooltip, and
   // becomes the head caption when the run has no narration of its own.
   const subagentDesc = subagent
     ? shortArg(String(subagent.args?.description ?? ""), 70)
     : "";
-  // Caption for a dedicated sub-agent run: the run's own latest narration
-  // line, else the task description.
+  // A sub-agent's narration, split by the call it preceded — the same shape as
+  // the main agent's per-call captions, so both cards read identically.
+  // Its FINAL REPORT is not narration: it is the result handed back to the MAIN
+  // agent, who answers the user. The report is, by construction, the text said
+  // AFTER the run's last tool call (`after >= calls`) — so once the run has
+  // finished, that trailing text stays out of the chat (user request); only the
+  // working lines it said between calls remain. Position, not a text match with
+  // `resultText`: the returned result is wrapped/reformatted and never compared
+  // equal to what streamed.
+  const subagentParts = (subagent?.narrationParts ?? []).filter(
+    (p) => !(subagent?.status === "done" && p.after >= activities.length),
+  );
+  // Caption for a dedicated sub-agent run: the latest line it said (report
+  // excluded), else the task description.
   const subagentCaption = subagent
-    ? latestNarrationLine(subagent) || subagentDesc
+    ? (subagentParts
+        .flatMap((p) => p.text.split("\n"))
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .pop() ?? "") || subagentDesc
     : undefined;
   // The head shows the LAST narration (Claude.ai's collapsed summary title).
   const headCaption = (() => {
@@ -93,14 +94,21 @@ export const ToolGroupView = memo(function ToolGroupView({
     }
     return subagentCaption;
   })();
-  // The header is ONE line of the agent's own words (Claude style): its latest
-  // narration. Only a run that has said nothing yet falls back to what it is
-  // doing — the tool tally, else the sub-agent's name.
-  const tally = [
-    ...Object.entries(toolCounts).map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)),
-    ...subagentPills.map((p) => (p.desc ? `${p.label}: ${p.desc}` : p.label)),
-  ].join(" · ");
-  const headText = prepareContent(headCaption || tally || subagentName || "");
+  // The head states the run's elapsed time on the right (like the collapsed
+  // and opened states of the reference UI), so the body never repeats it. The
+  // clock keeps ticking while the turn is live, not only while a call runs.
+  const now = useRunningClock(running || !!live);
+  const ms = groupSpanMs(
+    [...(subagent ? [subagent] : []), ...activities.map((a) => a.activity)],
+    now,
+    !!live,
+  );
+  // One line, in order of specificity: the agent's latest words → what the
+  // first call is doing. A sub-agent card renders its NAME in its own span
+  // (see the head below), so it is not repeated as fallback text here.
+  const headText = prepareContent(
+    (headCaption ?? "") || (subagent ? "" : activityLabel(activities[0].activity) || ""),
+  );
 
   return (
     <div
@@ -114,26 +122,53 @@ export const ToolGroupView = memo(function ToolGroupView({
         {/* The button lays out LTR (text left-aligned like the rest of the
             transcript); the text inside picks its own direction, so a Persian
             line reads RTL with the chevron right after it. */}
+        {running && (
+          <span className="trace-head-dots" aria-hidden="true">
+            <i />
+            <i />
+            <i />
+          </span>
+        )}
+        {/* A sub-agent run leads with its OWN name, then the latest words it
+            said — the tool names/counts were removed from the header entirely
+            (user request): the opened body is where the calls live. */}
+        {subagent && (
+          <span className="trace-head-name" title={subagentName ?? undefined}>
+            {subagentName}
+          </span>
+        )}
         <span className="trace-head-text" dir="auto" title={headText}>
           {headText}
         </span>
+        {ms ? <span className="trace-head-ms">{fmtTime(ms)}</span> : null}
         <IconChevron open={open} className="trace-chev" />
       </button>
-      {/* The hits of a search belong to the individual `web_search` row: they
-          are rendered INSIDE that row while it is expanded, so a collapsed
-          group head stays a single compact line. */}
+      {/* Opened: one rounded card whose rows are the calls, with the agent's own
+          prose sitting BETWEEN them exactly where it was said — the main agent
+          (per-call `captions`) and a sub-agent (its `narrationParts`) share this
+          one shape, so both cards read identically. Dividers come from CSS (a
+          hairline above every row but the first): a line of prose and a tool
+          call are equal steps of the same run. */}
       {open && (
-        <div className="trace-list">
+        <div className="trace-body">
           {activities.map(({ activity, index }, i) => (
             <Fragment key={index}>
+              {subagentParts
+                .filter((p) => p.after === i)
+                .map((p, pi) => (
+                  <TraceNarration key={`sn-${i}-${pi}`} text={p.text} />
+                ))}
               {captions?.[i] && (
-                <div className="trace-narration" dir="auto">
-                  {prepareContent(captions[i] as string)}
-                </div>
+                <TraceNarration text={captions[i] as string} />
               )}
               <TraceRow activity={activity} />
             </Fragment>
           ))}
+          {subagentParts
+            .filter((p) => p.after >= activities.length)
+            .map((p, pi) => (
+              <TraceNarration key={`se-${pi}`} text={p.text} />
+            ))}
         </div>
       )}
     </div>
@@ -162,7 +197,7 @@ export function subArgSummary(activity: ToolActivity): string {
   // said nothing about what ran (user request). The row label already names the
   // tools it ran (`activityLabel`), so the detail stays empty rather than
   // repeating them; the per-op detail lives in the expanded body.
-  if (activity.tool === "batch") return "";
+  if (activity.tool === "batch" || activity.tool === "batch_search") return "";
 
   // load_plugin/load_skill: the plugin or skill's own name is the whole story —
   // printing `slug:x` as a `key:value` arg (the generic fallback below) reads
@@ -409,8 +444,6 @@ export const TraceRow = memo(function TraceRow({
     : activityLabel(activity);
   const detail = rowDetail(activity);
 
-  const argsText = argsTextFor(activity);
-
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
   // Every row expands IN PLACE: args / result / results stay inside the row
@@ -446,84 +479,41 @@ export const TraceRow = memo(function TraceRow({
         <span className="trace-row-end">
           {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
           <StatusIcon status={activity.status} />
-          <IconChevron open={expanded} className="trace-row-chev" />
+          <IconChevron caret open={expanded} className="trace-row-chev" />
         </span>
       </button>
       {expanded && (
         <div className="trace-row-expand">
-          {ms ? (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Duration</span>
-              <span className="trace-expand-val">{fmtTime(ms)}</span>
-            </div>
-          ) : null}
+          <TraceRequestBlock activity={activity} />
           {/* The backend stamps the tool NAME as the summary; for a skill load
               that only repeats the head label — the skill name is the real
               detail. */}
-          {activity.summary &&
-            !isSkillTool(activity.tool) && (
-              <div className="trace-expand-section">
-                <span className="trace-expand-key">Summary</span>
-                <span className="trace-expand-val" dir="auto">
-                  {fixZwsp(activity.summary)}
-                </span>
-              </div>
-            )}
-          {argsText && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Args</span>
-              <pre className="trace-expand-val trace-expand-pre" dir="auto">
-                {argsText}
-              </pre>
-            </div>
+          {activity.summary && !isSkillTool(activity.tool) && (
+            <TraceTextBlock
+              title="Summary"
+              text={activity.summary}
+              pre={false}
+            />
           )}
-          {activity.diff && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Diff</span>
-              <pre
-                className="trace-expand-val trace-expand-pre trace-expand-diff"
-                dir="auto"
-              >
-                {activity.diff}
-              </pre>
-            </div>
-          )}
-          {activity.resultText && activity.tool !== "run_terminal" && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Result</span>
-              <pre className="trace-expand-val trace-expand-pre" dir="auto">
-                {activity.resultText}
-              </pre>
-            </div>
-          )}
+          {/* A writer call that carried several files (`edits:[…]` /
+              `files:[…]`) keeps one diff per file — render them separately so
+              each change is readable on its own, like a group of edits. */}
+          {activity.diffs && activity.diffs.length > 1
+            ? activity.diffs.map((f) => (
+                <TraceTextBlock
+                  key={f.path}
+                  title={`Diff · ${f.path}`}
+                  text={f.diff}
+                />
+              ))
+            : activity.diff && <TraceTextBlock title="Diff" text={activity.diff} />}
+          <TraceResponseBlock activity={activity} />
           {/* The hits of a `web_search` / `fetch_url` row belong to THIS row:
               they render at the bottom of its own expanded body — never as a
               sibling block hanging outside the tool call — and the row starts
               expanded so the payload shows without a second click. Folding the
               row tucks them back inside the collapsed call. */}
           {isWebRow(activity) && <InlineWebResults activity={activity} />}
-          {/* The `Results` section below is the FILE-path list (read / grep /
-              terminal); web rows already rendered their links above. */}
-          {!isWebRow(activity) &&
-            (resultRows(activity).length > 0 ||
-              (activity.tool === "run_terminal" &&
-                Boolean(activity.resultText))) && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Results</span>
-              {activity.tool === "run_terminal" ? (
-                <TerminalResultText
-                  items={activity.items ?? activity.results}
-                  fallbackText={activity.resultText}
-                />
-              ) : MEDIA_TOOLS.has(activity.tool) ? (
-                // Generated media renders as REAL thumbnails/playables here —
-                // FileResultLinks' icon+name rows hid the picture entirely.
-                <MediaResultLinks items={resultRows(activity)} />
-              ) : (
-                <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
-              )}
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -663,8 +653,10 @@ export const TraceNarration = memo(function TraceNarration({
   text: string;
 }) {
   return (
+    // Rendered as Markdown: a sub-agent's report arrives with headings, bullets
+    // and bold, which printed as raw `##` / `**` / `-` in a plain text div.
     <div className="trace-narration" dir="auto">
-      {prepareContent(text)}
+      <MarkdownProse text={prepareContent(text)} />
     </div>
   );
 });
@@ -708,8 +700,6 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     ? subagentDisplayName(activity.tool, subagentRows)
     : activityLabel(activity);
   const detail = rowDetail(activity);
-
-  const argsText = argsTextFor(activity);
 
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
@@ -800,84 +790,41 @@ export const ToolSingleRow = memo(function ToolSingleRow({
             </button>
           )}
           {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
-          <IconChevron open={expanded} className="trace-row-chev" />
+          <IconChevron caret open={expanded} className="trace-row-chev" />
         </span>
       </div>
       {expanded ? (
         <div className="trace-row-expand">
-          {ms ? (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Duration</span>
-              <span className="trace-expand-val">{fmtTime(ms)}</span>
-            </div>
-          ) : null}
+          <TraceRequestBlock activity={activity} />
           {/* The backend stamps the tool NAME as the summary; for a skill load
               that only repeats the head label — the skill name is the real
               detail. */}
-          {activity.summary &&
-            !isSkillTool(activity.tool) && (
-              <div className="trace-expand-section">
-                <span className="trace-expand-key">Summary</span>
-                <span className="trace-expand-val" dir="auto">
-                  {fixZwsp(activity.summary)}
-                </span>
-              </div>
-            )}
-          {argsText && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Args</span>
-              <pre className="trace-expand-val trace-expand-pre" dir="auto">
-                {argsText}
-              </pre>
-            </div>
+          {activity.summary && !isSkillTool(activity.tool) && (
+            <TraceTextBlock
+              title="Summary"
+              text={activity.summary}
+              pre={false}
+            />
           )}
-          {activity.diff && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Diff</span>
-              <pre
-                className="trace-expand-val trace-expand-pre trace-expand-diff"
-                dir="auto"
-              >
-                {activity.diff}
-              </pre>
-            </div>
-          )}
-          {activity.resultText && activity.tool !== "run_terminal" && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Result</span>
-              <pre className="trace-expand-val trace-expand-pre" dir="auto">
-                {activity.resultText}
-              </pre>
-            </div>
-          )}
+          {/* A writer call that carried several files (`edits:[…]` /
+              `files:[…]`) keeps one diff per file — render them separately so
+              each change is readable on its own, like a group of edits. */}
+          {activity.diffs && activity.diffs.length > 1
+            ? activity.diffs.map((f) => (
+                <TraceTextBlock
+                  key={f.path}
+                  title={`Diff · ${f.path}`}
+                  text={f.diff}
+                />
+              ))
+            : activity.diff && <TraceTextBlock title="Diff" text={activity.diff} />}
+          <TraceResponseBlock activity={activity} />
           {/* The hits of a `web_search` / `fetch_url` row belong to THIS row:
               they render at the bottom of its own expanded body — never as a
               sibling block hanging outside the tool call — and the row starts
               expanded so the payload shows without a second click. Folding the
               row tucks them back inside the collapsed call. */}
           {isWebRow(activity) && <InlineWebResults activity={activity} />}
-          {/* The `Results` section below is the FILE-path list (read / grep /
-              terminal); web rows already rendered their links above. */}
-          {!isWebRow(activity) &&
-            (resultRows(activity).length > 0 ||
-              (activity.tool === "run_terminal" &&
-                Boolean(activity.resultText))) && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Results</span>
-              {activity.tool === "run_terminal" ? (
-                <TerminalResultText
-                  items={activity.items ?? activity.results}
-                  fallbackText={activity.resultText}
-                />
-              ) : MEDIA_TOOLS.has(activity.tool) ? (
-                // Generated media renders as REAL thumbnails/playables here —
-                // FileResultLinks' icon+name rows hid the picture entirely.
-                <MediaResultLinks items={resultRows(activity)} />
-              ) : (
-                <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
-              )}
-            </div>
-          )}
         </div>
       ) : null}
       {preview.snap &&

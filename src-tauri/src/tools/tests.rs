@@ -69,10 +69,11 @@
 
 
     #[test]
-    fn batch_runs_every_op_in_order_with_full_results() {
-        // The round-elimination executor: a whole step (read + grep + write +
-        // terminal) in ONE dispatch, each sub-result the FULL output of the
-        // same tool, labeled per op, run in order.
+    fn batch_runs_every_lookup_op_in_order_with_full_results() {
+        // The round-elimination executor: a whole SEARCH phase (read + grep +
+        // terminal) in ONE dispatch, each sub-result the FULL output of the same
+        // tool, labeled per op, run in order. A WRITE is not a batch op — see
+        // `a_writer_is_refused_inside_a_batch_and_names_its_own_call_shape`.
         let root = std::env::temp_dir().join(format!("codifa-batch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -80,25 +81,87 @@
         let base = root.to_str().unwrap();
         let out = dispatch_with_data_root(
             base,
-            "batch",
+            "batch_search",
             &json!({"ops": [
                 {"tool": "read", "args": {"filePath": "a.txt"}},
                 {"tool": "grep", "args": {"pattern": "todo", "path": ".", "include": "*.txt"}},
-                {"tool": "write_file", "args": {"path": "new.txt", "content": "written by batch"}},
                 {"tool": "run_terminal", "args": {"command": "echo batch-terminal-ok"}},
             ]}),
             None,
             Some(base),
         )
         .unwrap();
-        assert!(out.contains("[1/4] read"), "{out}");
-        assert!(out.contains("[2/4] grep"), "{out}");
-        assert!(out.contains("[3/4] write_file"), "{out}");
-        assert!(out.contains("[4/4] run_terminal"), "{out}");
+        assert!(out.contains("[1/3] read"), "{out}");
+        assert!(out.contains("[2/3] grep"), "{out}");
+        assert!(out.contains("[3/3] run_terminal"), "{out}");
         assert!(out.contains("hello todo list"), "read sub-result carries the file: {out}");
         assert!(out.contains("batch-terminal-ok"), "terminal sub-result ran: {out}");
-        // The write HAPPENED (in-order execution the later ops could see).
-        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "written by batch");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_writer_is_refused_inside_a_batch_and_names_its_own_call_shape() {
+        // A writer nested in `batch_search` would land with NO pre-edit snapshot,
+        // NO out-of-workspace permit and NO diff, because the agent loop only
+        // prepares a write when the call's OWN name is a writer. Traced: models
+        // read the old tool name as "do the whole step here" and put their
+        // writers inside it. The refusal must name the per-family shape so the
+        // next round is the fix, not another probe.
+        let root = std::env::temp_dir().join(format!("codifa-batch-writer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.to_str().unwrap();
+        let out = dispatch_with_data_root(
+            base,
+            "batch_search",
+            &json!({"ops": [
+                {"tool": "read", "args": {"filePath": "missing.txt"}},
+                {"tool": "write_file", "args": {"path": "nope.txt", "content": "x"}},
+                {"tool": "edit_file", "args": {"path": "nope.txt", "edits": []}},
+            ]}),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        // The LOOKUP still ran, so the batch itself is not burned.
+        assert!(out.contains("[1/3] read"), "{out}");
+        // Both writers refused, and the message teaches the real shape.
+        assert!(out.contains("[2/3] write_file → REFUSED"), "{out}");
+        assert!(out.contains("[3/3] edit_file → REFUSED"), "{out}");
+        assert!(out.contains("files:[{path, content}]"), "{out}");
+        assert!(out.contains("edits:[{path, old_string, new_string, replace_all}]"), "{out}");
+        // Nothing was written.
+        assert!(!root.join("nope.txt").exists(), "a nested writer must not land");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_pre_rename_batch_name_still_executes() {
+        // The tool is now `batch_search`, but a transcript recorded before the
+        // rename says `batch`. It must still EXECUTE (not "unknown tool") and a
+        // nested `batch` op must still be refused as a nested batch, or replaying
+        // any older chat would burn its rounds on a name that no longer resolves.
+        let root = std::env::temp_dir().join(format!("codifa-batch-old-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "old name still works").unwrap();
+        let base = root.to_str().unwrap();
+        assert!(crate::tools::is_batch_tool("batch") && crate::tools::is_batch_tool("batch_search"));
+        assert!(!crate::tools::is_batch_tool("read"));
+        let out = dispatch_with_data_root(
+            base,
+            "batch",
+            &json!({"ops": [
+                {"tool": "read", "args": {"filePath": "a.txt"}},
+                {"tool": "batch", "args": {"ops": []}},
+            ]}),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        assert!(out.contains("[1/2] read"), "the old name must still run: {out}");
+        assert!(out.contains("old name still works"), "{out}");
+        assert!(out.contains("nested batch_search is not allowed"), "{out}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -119,7 +182,7 @@
                 {"tool": "shell", "args": {"command": "echo second-alias"}}
             ]
         });
-        let out = dispatch_bounded(base, "batch", &args, None, None).unwrap();
+        let out = dispatch_bounded(base, "batch_search", &args, None, None).unwrap();
         assert!(!out.contains("is not a batch tool"), "both names must resolve: {out}");
         assert!(out.contains("hello-alias"), "the resolved command really ran: {out}");
         assert!(out.contains("second-alias"), "and so did the second one: {out}");
@@ -143,7 +206,7 @@
             {"tool": "read", "args": {"filePath": "missing-string-ops.txt"}}
         ])
         .to_string();
-        let out = dispatch_bounded(base, "batch", &json!({"ops": inner}), None, None).unwrap();
+        let out = dispatch_bounded(base, "batch_search", &json!({"ops": inner}), None, None).unwrap();
         assert!(!out.contains("ops must be"), "the string form is parsed, not refused: {out}");
         assert!(out.contains("from-string-ops"), "the op really ran: {out}");
         assert!(out.contains("[1/2]") && out.contains("[2/2]"), "both ops kept: {out}");
@@ -184,10 +247,10 @@
         // A failing op comes back as an inline ERROR; the rest still run.
         let out = dispatch_with_data_root(
             base,
-            "batch",
+            "batch_search",
             &json!({"ops": [
                 {"tool": "read", "args": {"filePath": "missing.txt"}},
-                {"tool": "batch", "args": {"ops": []}},
+                {"tool": "batch_search", "args": {"ops": []}},
                 {"tool": "teleport", "args": {}},
             ]}),
             None,
@@ -195,13 +258,13 @@
         )
         .unwrap();
         assert!(out.contains("ERROR:"), "the failed read is inline: {out}");
-        assert!(out.contains("nested batch is not allowed"), "{out}");
+        assert!(out.contains("nested batch_search is not allowed"), "{out}");
         assert!(out.contains("is not a batch tool"), "{out}");        // Over the op cap: a plain error naming the cap.
         let mut ops = Vec::new();
         for _ in 0..11 {
             ops.push(json!({"tool": "current_time", "args": {}}));
         }
-        let err = dispatch_with_data_root(base, "batch", &json!({"ops": ops}), None, Some(base))
+        let err = dispatch_with_data_root(base, "batch_search", &json!({"ops": ops}), None, Some(base))
             .unwrap_err();
         assert!(err.contains("exceed the 10 cap"), "{err}");
         let _ = fs::remove_dir_all(&root);

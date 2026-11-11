@@ -75,6 +75,11 @@ export interface ToolActivity {
    *  history, and the chat card shows the latest line while the side panel
    *  keeps the full log. */
   narration?: string
+  /** The same narration split by WHERE it arrived, so the opened card can show
+   *  each line between the tool calls it preceded — exactly like the main
+   *  agent's per-call captions. `after` is the card's child count when the
+   *  chunk arrived: `0` = before the first call, `n` = right after the n-th. */
+  narrationParts?: { after: number, text: string }[]
   /** Nested sub-agent tool calls when this is an explore card. */
   children?: ToolActivity[]
   /** Which model executed this specific tool call. Empty/absent = the main

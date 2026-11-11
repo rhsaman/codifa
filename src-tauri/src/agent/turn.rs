@@ -182,11 +182,11 @@ pub(super) fn run_stop_hooks(
     }
 }
 
-/// What the "Working" pill names while a tool runs. A `batch` is only a
+/// What the "Working" pill names while a tool runs. `batch_search` is only a
 /// wrapper, so the pill lists the tools it carries ("read ×2, grep") instead
-/// of the word "batch"; every other tool keeps its own name.
+/// of the tool's own name; every other tool keeps its own name.
 pub(super) fn tool_status_label(name: &str, args: &Value) -> String {
-    if name != "batch" {
+    if !crate::tools::is_batch_tool(name) {
         return name.to_string();
     }
     let mut counts: Vec<(String, usize)> = Vec::new();
@@ -314,8 +314,8 @@ pub(super) fn finish_tool(
             // For a `batch` call: how many ops it carried (from the ARGS, not
             // the echo — a long batch result is echo-truncated and its labels
             // disappear, which under-counted the round-elimination metric).
-            "batch_ops": if name == "batch" {
-                args["ops"].as_array().map(|a| a.len()).unwrap_or(0)
+            "batch_ops": if crate::tools::is_batch_tool(name) {
+                crate::tools::batch_ops(&args).map(|a| a.len()).unwrap_or(0)
             } else {
                 0
             },
@@ -2385,11 +2385,14 @@ the Vision model's description instead.\n"
             .collect();
 
         // Discovery streak: a round is "discovery" when EVERY call in it only
-        // locates or reads (see `is_discovery_tool`). A round that edits, writes
-        // or runs a command resets the streak — the agent has moved on to doing
-        // the work, which is what the streak nudge wants it to reach.
+        // locates or reads. The test looks THROUGH a `batch_search` wrapper
+        // (`round_is_discovery`): judged by its raw name the wrapper matched no
+        // lookup, so every batched search round RESET the streak and the
+        // `explore` nudge never fired — traced, 21 real search rounds in a row
+        // were counted as 1. A round that edits, writes or runs a command still
+        // resets it: the agent has moved on to doing the work.
         if !tool_calls.is_empty() {
-            if tool_calls.iter().all(|(_, n, _)| is_discovery_tool(n)) {
+            if round_is_discovery(&tool_calls) {
                 discovery_streak += 1;
             } else {
                 discovery_streak = 0;
@@ -3441,7 +3444,7 @@ user to ask for it. Available this turn: `list` and `run`."
                         }
                     }
                 }
-            } else if name == "batch" {
+            } else if crate::tools::is_batch_tool(&name) {
                 // Per-op caps gating happens HERE — the only place the turn's
                 // caps live: an op the turn may not run is pre-marked
                 // `refused` and comes back as an inline refusal while the rest
@@ -3457,6 +3460,12 @@ user to ask for it. Available this turn: `list` and `run`."
                 // malformed JSON. One parser, one verdict. An unusable shape is
                 // left untouched for the executor to reject with its message.
                 if let Ok(normalized) = tools::batch_ops(&batch_args) {
+                    // The tools this turn really advertises. A delegation gate
+                    // only redirects to `grep`/`read` when they are bound.
+                    let bound: std::collections::HashSet<&str> = schemas
+                        .iter()
+                        .filter_map(|s| s["function"]["name"].as_str())
+                        .collect();
                     let mut ops = normalized;
                     for op in ops.iter_mut() {
                         // Resolve the alias FIRST: the executor runs `run_command`
@@ -3466,26 +3475,17 @@ user to ask for it. Available this turn: `list` and `run`."
                         let raw =
                             op["tool"].as_str().unwrap_or_default().trim().to_ascii_lowercase();
                         let tool = tools::batch_tool_name(&raw).unwrap_or(raw);
-                        let reason = match tool.as_str() {
-                            "write_file" | "edit_file" if !caps.write_files => Some(
-                                "this turn is read-only — writing or editing files needs Build mode"
-                                    .to_string(),
-                            ),
-                            "run_terminal" if !caps.run_terminal => Some(
-                                "this turn cannot run commands — running them needs a mode with terminal access"
-                                    .to_string(),
-                            ),
-                            "run_terminal" if !caps.write_files && is_mutating_command(
-                                op["args"]["command"].as_str().unwrap_or_default(),
-                            ) =>
-                            {
-                                Some(
-                                    "this turn is read-only — a command that would change the workspace needs Build mode"
-                                        .to_string(),
-                                )
-                            }
-                            _ => None,
-                        };
+                        let reason = batch_op_refusal(
+                            &caps,
+                            &tool,
+                            &op["args"],
+                            &req.mode,
+                            &root,
+                            // The child's REAL tool list, not a guess: a profile
+                            // narrowed to `read` has no `grep` to switch to.
+                            bound.contains("grep"),
+                            bound.contains("read"),
+                        );
                         if let Some(reason) = reason {
                             op["refused"] = json!(reason);
                         }

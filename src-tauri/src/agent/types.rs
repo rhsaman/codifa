@@ -348,6 +348,63 @@ pub fn caps_for_mode(mode: &str) -> ToolCaps {
     }
 }
 
+/// The refusal text when this turn's capabilities forbid ONE op inside a
+/// `batch`, else `None`.
+///
+/// A batch is not a privileged context: every verdict the TOP-LEVEL call
+/// boundary makes must hold for an op too, or the batch becomes a shelter the
+/// model learns to hide in. Traced (`mwbmxr0r`): 285 terminal ops inside
+/// batches, 224 of them really RAN, against 143 native read/grep/glob/lsp ops —
+/// the terminal outran the very tools it was supposed to delegate to, because
+/// `ls`/`grep -rn`/`sed -n` were refused one level up and ran one level down.
+///
+/// `mode`/`can_search`/`can_read` describe the caller: a `subagent` child
+/// narrowed to `read` has no `grep` to switch to, so a delegation gate stands
+/// down for it exactly like it does at the top level. A child that DOES
+/// advertise the native alternative has no excuse, so the gate bites there too.
+pub(super) fn batch_op_refusal(
+    caps: &ToolCaps,
+    name: &str,
+    args: &Value,
+    mode: &str,
+    root: &str,
+    can_search: bool,
+    can_read: bool,
+) -> Option<String> {
+    match name {
+        "write_file" | "edit_file" if !caps.write_files => Some(
+            "this turn is read-only — writing or editing files needs Build mode".to_string(),
+        ),
+        "run_terminal" if !caps.run_terminal => Some(
+            "this turn cannot run commands — running them needs a mode with terminal access"
+                .to_string(),
+        ),
+        "run_terminal" => {
+            let cmd = args["command"].as_str().unwrap_or_default();
+            if !caps.write_files && is_mutating_command(cmd) {
+                return Some(
+                    "this turn is read-only — a command that would change the workspace needs Build mode"
+                        .to_string(),
+                );
+            }
+            if (mode != "subagent" || can_search) && is_file_search_command(cmd, root) {
+                return Some(
+                    "the terminal does not locate files. Use `grep` (one token, with path= and include=), `glob` (file names), or `find_symbol` (a symbol's definition AND every usage in ONE call) as another op of this batch."
+                        .to_string(),
+                );
+            }
+            if (mode != "subagent" || can_read) && workspace_file_read(cmd, root) {
+                return Some(
+                    "the terminal does not read workspace files. Use `read` with ranges=[{path,offset,limit}] as another op of this batch — it takes SEVERAL files and windows in ONE call."
+                        .to_string(),
+                );
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// The refusal text when this turn's capabilities forbid `name`, else `None`.
 /// Phrased like the other in-loop refusals: one plain sentence the model can act
 /// on, no "Error:" prefix (the card already renders failure from `ok`).
@@ -382,7 +439,7 @@ pub(super) fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
         // write/terminal ops are gated per-op in the loop, the only place the
         // caps are known): a turn that cannot read the workspace cannot batch
         // its lookups either.
-        "batch" => (caps.read_files, "read or search the workspace"),
+        "batch_search" => (caps.read_files, "read or search the workspace"),
         "web_search" | "fetch_url" => (caps.web, "search or fetch the web"),
         _ => return None,
     };
@@ -563,11 +620,11 @@ pub(super) fn retain_subagent_tools(schemas: &mut Vec<Value>, declared: &[String
     // real binding, then had nothing to offer it.
     if !kept
         .iter()
-        .any(|s| s["function"]["name"].as_str() == Some("batch"))
+        .any(|s| s["function"]["name"].as_str() == Some(crate::tools::BATCH_TOOL))
     {
         if let Some(schema) = schemas
             .iter()
-            .find(|s| s["function"]["name"].as_str() == Some("batch"))
+            .find(|s| s["function"]["name"].as_str() == Some(crate::tools::BATCH_TOOL))
             .cloned()
         {
             kept.push(schema);

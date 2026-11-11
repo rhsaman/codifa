@@ -248,6 +248,7 @@ function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivi
     branch: incoming.branch ?? existing.branch,
     // Narration is appended by its own helper; a re-emit must never wipe it.
     narration: incoming.narration ?? existing.narration,
+    narrationParts: incoming.narrationParts ?? existing.narrationParts,
   };
 }
 
@@ -255,6 +256,11 @@ function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivi
  *  a multi-minute browser run can stream a lot of prose; keeping only the tail
  *  bounds memory without losing the latest context. */
 export const NARRATION_MAX_CHARS = 24_000;
+
+/** Cap the number of split narration lines kept on one card: a long browser run
+ *  narrates before every step, and an unbounded list would grow the persisted
+ *  message. The side panel still holds the full log. */
+export const NARRATION_PARTS_MAX = 200;
 
 /**
  * Append a sub-agent's branch-tagged narration to ITS delegation card.
@@ -291,8 +297,22 @@ export function appendBranchNarration(
   if (narration.length > NARRATION_MAX_CHARS) {
     narration = `…${narration.slice(narration.length - NARRATION_MAX_CHARS)}`;
   }
+  // Same text, split by position: the opened card shows each line BETWEEN the
+  // tool calls it preceded (the main agent's captions behave the same way).
+  const after = card.children?.length ?? 0;
+  const parts = (card.narrationParts ?? []).slice();
+  const tail = parts[parts.length - 1];
+  // Models stream tokens, so consecutive chunks at the same position are ONE
+  // line — a newline per chunk would print a word per row.
+  if (tail && tail.after === after) {
+    parts[parts.length - 1] = { after, text: tail.text + text };
+  } else {
+    parts.push({ after, text });
+  }
+  let dropped = parts.length - NARRATION_PARTS_MAX;
+  if (dropped > 0) parts.splice(0, dropped);
   const next = activities.slice();
-  next[idx] = { ...card, narration };
+  next[idx] = { ...card, narration, narrationParts: parts };
   return next;
 }
 
@@ -562,6 +582,11 @@ export const TEXT_RESULT_TOOLS = new Set([
   "delete_memory",
   "explore",
   "read",
+  // A batch answers with one `=== [i/n] tool ===` section per op (the read
+  // windows, grep hits…). Without this the whole body was dropped and the
+  // Response panel showed only a filename scan of it.
+  "batch",
+  "batch_search",
   // Terminal output arrives as a plain string in `event.result` — without
   // this the Run-a-command card shows Duration/Args but never its output.
   "run_terminal",

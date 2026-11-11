@@ -34,8 +34,17 @@
   background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
+/* An opened call takes NO fill of its own (user request): the opened header must
+   look exactly like the collapsed one, so the ONLY coloured surface in a tool
+   card stays the Request / Response payload panel inside it. Two base rules
+   painted it (`--accent` 4% in 06-, `--text` 3% here) — both are cancelled for
+   the chat trace below. */
+.tool-trace .trace-row.expanded,
+.tool-trace .trace-row.expanded > .trace-row-head {
+  background: none;
+}
+
 .trace-row.expanded {
-  background: color-mix(in srgb, var(--text) 3%, transparent);
   border-top-color: var(--hairline, rgba(255, 255, 255, 0.06));
 }
 
@@ -169,6 +178,22 @@
   font-size: 13px;
 }
 
+/* The sub-agent's own name leads its header; the latest words it said follow
+   as the regular dim caption. No tool names or counts live here (user
+   request) — those are the opened body's rows. */
+.tool-trace .trace-head-name {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.tool-trace .trace-head-name + .trace-head-text::before {
+  content: "·";
+  margin-right: 6px;
+  opacity: 0.45;
+}
+
 .tool-trace .trace-head:hover,
 .tool-trace .trace-row-head:hover {
   background: none;
@@ -213,39 +238,234 @@
   color: var(--text);
 }
 
-/* Opened: the rows hang off a thin left guide instead of sitting in a card. */
-.tool-group.open {
-  gap: 2px;
+/* Opened: NO card of its own — same flat surface as the header (user request).
+   The steps are separated only by hairlines; all the colour lives in the
+   inner Request / Response panels (light inside, dark outside). */
+.tool-group.open > .trace-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  overflow: visible;
 }
 
-.tool-group.open > .trace-list {
-  gap: 0;
-  margin-left: 6px;
-  padding-left: 10px;
-  border-left: 1px solid var(--hairline, rgba(255, 255, 255, 0.08));
+/* A hairline above every step but the first: prose and calls read as one
+   sequence, not as a stack of separate bubbles. */
+.tool-group.open > .trace-body > * {
+  border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.1));
 }
 
-.tool-trace .trace-list > .trace-row,
-.tool-trace .trace-list > .trace-narration {
+.tool-group.open > .trace-body > *:first-child {
   border-top: 0;
 }
 
-.tool-trace .trace-narration {
-  padding: 4px 8px;
+.tool-trace .trace-body > .trace-row {
+  padding: 0;
 }
 
+.tool-trace .trace-body .trace-row-head {
+  padding: 8px 12px;
+}
+
+.tool-trace .trace-body .trace-narration {
+  padding: 8px 12px;
+  color: var(--text-dim);
+}
+
+.tool-trace .trace-body .trace-row-expand {
+  padding: 0 12px 10px;
+  border-top: 0;
+  background: none;
+}
+
+/* A standalone single call (not inside a group) opens exactly like a row of an
+   opened group: bare header, no fill, and the only coloured surface is the
+   Request / Response panel under it (user request). */
+.tool-trace > .trace-row.single {
+  padding: 0;
+  background: none;
+}
+
+.tool-trace > .trace-row.single > .trace-row-head {
+  padding: 6px 2px;
+  background: none;
+}
+
+.tool-trace > .trace-row.single > .trace-row-expand {
+  padding: 0 2px 10px;
+  border-top: 0;
+  background: none;
+}
+
+/* The expanded body of EVERY call is bare too. The old base rule painted it
+   with the inset well (--bg-inset), which gave the open card a fill of its own
+   and made the layout look inverted: a big coloured block outside, the payload
+   panels inside it. Now the only coloured surface in a call is the
+   Request / Response panel (user request: no fill outside, light inside). */
+.trace-row-expand,
+.trace-row.single > .trace-row-expand,
+.trace-row.edit-file > .trace-row-expand {
+  border-top: 0;
+  background: none;
+}
+
+/* ——— Request / Response blocks of an opened call ———
+   Two labelled panels that are the ONLY raised surface in a tool card: the
+   card itself is bare, so these read instantly as "the payload" (user
+   request: light inside, dark outside). The fill is derived from the theme's
+   own text tone instead of `--bg-panel`: that token sits only one step off the
+   chat background, so the panels were indistinguishable from the card. */
+.trace-io {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  margin: 8px 0 2px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 86%, var(--text) 14%);
+  overflow: hidden;
+}
+
+.trace-io-head {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.trace-io-body {
+  min-width: 0;
+  padding: 8px 0;
+  max-height: 340px;
+  overflow: auto;
+}
+
+/* A call's row reads like the group header: label, then the time and the
+   chevron right AFTER the text on the same line — not pinned to the far
+   right edge (user request). */
 .tool-trace .trace-row-head {
-  padding: 4px 8px;
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  align-self: flex-start;
+  margin-right: auto;
+  text-align: left;
 }
 
-.tool-trace .trace-row.expanded {
-  background: none;
+.tool-trace .trace-row-head > .trace-row-detail {
+  flex: 0 1 auto;
 }
 
-.tool-trace .trace-row-expand {
-  padding: 4px 8px 6px;
-  border-top: 0;
-  background: none;
+.tool-trace .trace-row-end {
+  margin-left: 0;
+}
+
+/* File list inside a Response panel: type icon + name, one file per line,
+   with air before the text output that follows it. */
+.trace-io-files {
+  padding: 0 12px;
+}
+
+.trace-io-files + .trace-io-pre,
+.trace-io-files + .trace-io-op {
+  margin-top: 10px;
+}
+
+.trace-io-files .file-results {
+  margin: 0;
+  padding: 0;
+  max-height: none;
+}
+
+.trace-io-files .file-result {
+  display: flex;
+  align-items: center;
+  padding: 2px 0;
+}
+
+.file-results .file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-results .file-icon-svg {
+  flex: 0 0 auto;
+}
+
+/* One step of a batch (Request: its args, Response: its output): a small
+   numbered label, a hairline between steps, the rows indented under it. */
+.trace-io-op + .trace-io-op {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.trace-io-op-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.trace-io-op-n {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.trace-io-row {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 0 12px 3px;
+}
+
+.trace-io-key {
+  flex: 0 0 auto;
+  min-width: 64px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.trace-io-val {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.trace-io-pre {
+  margin: 0;
+  padding: 0 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 @media (prefers-reduced-motion: reduce) {

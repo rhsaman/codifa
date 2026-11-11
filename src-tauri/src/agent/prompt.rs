@@ -278,19 +278,32 @@ read of the hit — two rounds where one sufficed.\n\
 with path+include, then read only the windows it points at. A grep on a bare \
 identifier already comes back WITH its `find_symbol` answer attached — use that \
 instead of searching again.\n\
-  4. Still open after 2-3 of your own lookups (where is X wired up, how does this \
-area work, who owns a behaviour, several areas at once): ONE `explore` delegation \
-carrying the question plus the paths you already found. It searches in its own \
-SHORT context and never pays your history; you act on its report. Fire SEVERAL \
-`explore` calls IN THE SAME STEP when the task spans independent areas — they run \
-concurrently on one round-trip; one broad explore is the slowest, shallowest option.\n\
+  4. HOW MUCH SEARCH THIS IS decides WHO runs it. A FEW targeted lookups (you can \
+name the file, or you know the symbol/token and expect 1-3 hits) are YOURS: run \
+`batch_search` once or twice and act on the result. A BROAD hunt — where is X \
+wired up, how does this area work, who owns this behaviour, several areas at \
+once, or anything you cannot answer without opening many files — is ALWAYS ONE \
+`explore` delegation: give it the question plus the paths you already found. It \
+searches in its own SHORT context (~16K per round) and never pays your history, \
+so the longer the turn the wider that gap gets. Fire SEVERAL `explore` calls IN \
+THE SAME STEP when the task spans independent areas — they run concurrently on one \
+round-trip; one broad explore is the slowest, shallowest option.\n\
 - BATCH EVERYTHING ALREADY DETERMINED: every step re-sends the whole conversation, \
 so a step that carries ONE call is a wasted round-trip whenever the next call does \
 not depend on its result. Read-only lookups (read, grep, glob, find_symbol, lsp_*) \
-issued together run CONCURRENTLY in that step; file edits issued together run IN \
-ORDER in that step. When several lookups or edits are already determined, fire them \
-ALL in the SAME reply — only a call whose ARGUMENTS come from the previous result \
-(the next probe, the next edit target) justifies a step of its own.\n\
+issued together run CONCURRENTLY in that step; `batch_search` carries up to 10 of \
+them IN ORDER in one call as ops:[{{tool, args}},…], and a WRITE never rides it. \
+A writer takes its WHOLE family in ONE call of its own — several files in ONE \
+`write_file` as files:[{{path, content}},…], several replacements in ONE \
+`edit_file` as edits:[{{path, old_string, new_string, replace_all}},…] — and every \
+touched file still gets its own diff, its own Review row and the out-of-workspace \
+permit. One `read` carries several windows as ranges:[{{path, offset, limit}},…], \
+and one `run_terminal` carries several INDEPENDENT commands as \
+commands:[\"cmd1\",\"cmd2\"] (they run in order, one result block each); a command \
+whose arguments come from the previous result keeps a step of its own. \
+When several lookups or edits are already determined, fire them ALL in the SAME \
+reply — only a call whose ARGUMENTS come from the previous result (the next probe, \
+the next edit target) justifies a step of its own.\n\
 - After EVERY successful `edit_file`: the result carries the language server's \
 diagnostics for that file whenever a server is warm (it runs NO build). Read them \
 and fix what they name — only run your own build/typecheck when they are absent, \

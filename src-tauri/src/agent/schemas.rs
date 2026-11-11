@@ -187,8 +187,8 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
             }),
         ),
         (
-            "batch",
-            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}, {\"tool\": \"edit_file\", ...}, {\"tool\": \"run_terminal\", ...}]. Batchable: read, grep, glob, find_symbol, the lsp_* lookups, run_terminal, edit_file, write_file, update_plan, current_time, system_stats (max 10). Every result comes back COMPLETE, labeled per op, run in order — a later op sees an earlier edit's effects. Plan the WHOLE step here: all the lookups you expect to need, the edits, and the verification command together. A wave that needs a result you do not have yet waits for your next round.",
+            "batch_search",
+            "SEARCH composer — run SEVERAL read-only lookups IN ORDER in this ONE call, a whole search phase in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}, {\"tool\": \"find_symbol\", ...}, {\"tool\": \"run_terminal\", ...}]. Batchable: read, grep, glob, find_symbol, the lsp_* lookups, run_terminal (read-only commands), update_plan, current_time, system_stats (max 10). WRITES ARE NOT BATCH OPS: `edit_file` and `write_file` are refused here — they carry their whole family in ONE call of their own (files:[{path, content}], edits:[{path, old_string, new_string, replace_all}]) so the snapshot, the diff and the out-of-workspace permit still happen. Plan the WHOLE search phase here; a wave that needs a result you do not have yet waits for your next round.",
             json!({
                 "ops": {
                     "type": "array",
@@ -196,7 +196,7 @@ pub(super) fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value
                     "items": {
                         "type": "object",
                         "properties": {
-                            "tool": {"type": "string", "description": "One of the batchable tools"},
+                            "tool": {"type": "string", "description": "One of the batchable lookup tools"},
                             "args": {"type": "object", "description": "That tool's normal arguments"}
                         },
                         "required": ["tool"]
@@ -1139,8 +1139,8 @@ pub(super) fn research_schemas() -> Vec<Value> {
             json!({"filePath": {"type": "string"}}),
         ),
         (
-            "batch",
-            "Run SEVERAL tool calls IN ORDER in this ONE call — a whole research step in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}] (max 10). Batchable: read, grep, glob, find_symbol, the lsp_* lookups, current_time, system_stats — plus run_terminal and the file writers WHEN they are in your tool list. Every result comes back COMPLETE, labeled per op. Plan the WHOLE search phase here — every lookup you expect to need in one round; a wave that needs a result you do not have yet waits for your next round.",
+            "batch_search",
+            "SEARCH composer — run SEVERAL read-only lookups IN ORDER in this ONE call, a whole search phase in one round-trip: ops=[{\"tool\": \"grep\", \"args\": {...}}, {\"tool\": \"read\", ...}] (max 10). Batchable: read, grep, glob, find_symbol, the lsp_* lookups, current_time, system_stats, run_terminal (read-only commands). WRITES ARE NOT BATCH OPS — `edit_file`/`write_file` are refused here; they take their whole family in ONE call of their own. Plan the WHOLE search phase here; a wave that needs a result you do not have yet waits for your next round.",
             json!({
                 "ops": {
                     "type": "array",

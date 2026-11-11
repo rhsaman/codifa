@@ -954,7 +954,7 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
         // for the model's next round. Ops the TURN may not run are pre-marked
         // `refused` by the loop's caps gate (the only place caps live) and come
         // back as inline refusals without executing.
-        "batch" => {
+        name if is_batch_tool(name) => {
             // Tolerant parse (see `batch_ops`): the array, a stringified array,
             // or an `{ops:[…]}` wrapper all mean the same step. The error keeps
             // its copy-pasteable example because the failing model retries
@@ -977,15 +977,17 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
                     out.push_str(&format!("\n=== {label} → REFUSED ===\n{reason}\n"));
                     continue;
                 }
-                if tool == "batch" {
+                if is_batch_tool(&tool) {
                     out.push_str(&format!(
-                        "\n=== {label} → REFUSED ===\nnested batch is not allowed — one level only\n"
+                        "\n=== {label} → REFUSED ===\nnested {BATCH_TOOL} is not allowed — one level only\n"
                     ));
                     continue;
                 }
                 if !BATCH_TOOLS.contains(&tool.as_str()) {
                     let reason = if tool == "load_plugin" {
                         "`load_plugin` changes the tool set for the next round, so it cannot run inside a batch — call it directly in your next reply.".to_string()
+                    } else if matches!(tool.as_str(), "write_file" | "edit_file") {
+                        "a writer cannot run inside a batch: the agent loop only snapshots the file, asks for an out-of-workspace permit and reports a diff when the call's own name is a writer, so a nested one lands with no diff and no Review row. Put the WHOLE family in ONE call of its own instead — several files fit ONE write_file as files:[{path, content}], several independent replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}]. Keep the lookups in this batch.".to_string()
                     } else if crate::browser_driver::handles(&tool) {
                         "browser tools drive one shared page in order and their next call depends on the previous result — call it directly in your next reply.".to_string()
                     } else if tool.starts_with(crate::mcp::TOOL_PREFIX) {
@@ -1042,6 +1044,19 @@ pub(super) fn plugin_detached_path_warning(store: &Path, view: &Value) -> String
 /// same reason (one shared page / a wire round-trip per call). The DELEGATION
 /// tools stay out: their results are turn-shaping decisions the model should
 /// make on its own round.
+///
+/// The WRITERS (`edit_file`, `write_file`) stay out too, and for a stronger
+/// reason than ordering: the agent loop only prepares a write when the call's
+/// OWN name is a writer. `pre_edit` is computed under
+/// `name == "edit_file" || name == "write_file"` and `outside_target` only
+/// extends its target list for those same two names — so an op nested inside
+/// `batch` arrives with NO pre-edit snapshot and NO out-of-workspace permit
+/// check. The write lands, but it produces no diff, no Review row, no
+/// `applied change` for the model, and it can reach a folder the user never
+/// approved. Both writers already take a whole family in ONE call
+/// (`files:[{path, content}]`, `edits:[{path, old_string, new_string,
+/// replace_all}]`), which keeps the round count identical while keeping the
+/// snapshot, the diff and the permit.
 pub(crate) const BATCH_TOOLS: &[&str] = &[
     "read",
     "grep",
@@ -1054,11 +1069,24 @@ pub(crate) const BATCH_TOOLS: &[&str] = &[
     "lsp_hover",
     "lsp_diagnostics",
     "run_terminal",
-    "edit_file",
-    "write_file",
     "current_time",
     "system_stats",
 ];
+
+/// The ONE batch tool's advertised name.
+///
+/// It is a SEARCH composer, not a write composer: only lookups ride it. The
+/// name says so, because `batch` read as "do the whole step here" and models
+/// put their writers inside it — where the loop cannot snapshot the file, ask
+/// for an out-of-workspace permit or emit a diff.
+pub(crate) const BATCH_TOOL: &str = "batch_search";
+
+/// True for the batch tool under its CURRENT name or the pre-rename one, so a
+/// transcript recorded before the rename still executes instead of failing as
+/// an unknown tool.
+pub(crate) fn is_batch_tool(name: &str) -> bool {
+    name == BATCH_TOOL || name == "batch"
+}
 
 /// How many tool calls ONE batch may carry. 10-call steps fit; the cap keeps
 /// a single result from growing unbounded (each sub-result keeps its own

@@ -368,6 +368,7 @@ export const FileResultLinks = memo(function FileResultLinks({  tool,
         return (
           <li key={i} className="file-result">
             <FileChip
+              icon
               path={file}
               line={line ? Number(line) : undefined}
               // Basename only in the UI — the full path stays in the tooltip.

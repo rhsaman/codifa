@@ -3,10 +3,36 @@ import type { ToolActivity } from '../../types'
 export function IconChevron({
   open,
   className,
+  caret,
 }: {
   open?: boolean;
   className?: string;
+  /** A call row's own mark: the same right→down turn as the group header
+   *  (closed points right, open points down), but smaller and thinner. */
+  caret?: boolean;
 }) {
+  if (caret) {
+    return (
+      <svg
+        className={`${className ?? ""} ${open ? "open" : ""}`}
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+        style={{
+          transition: "transform 0.18s ease",
+          transform: open ? "rotate(90deg)" : "rotate(0deg)",
+        }}
+      >
+        <path d="M9 18l6-6-6-6" />
+      </svg>
+    );
+  }
   return (
     <svg
       className={`${className ?? ""} ${open ? "open" : ""}`}

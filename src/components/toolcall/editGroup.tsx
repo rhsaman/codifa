@@ -3,14 +3,13 @@ import { toWorkspacePath } from '../../lib/fileTree'
 import { api } from '../../lib/fs'
 import { reviewPathOf } from '../../lib/reviewTurn'
 import { useStore } from '../../lib/store'
-import { diffStatsFromUnified, editTargetsOf } from '../../lib/toolActivity'
 import { useViewerTabs } from '../../lib/viewerTabs'
 import type { ToolActivity } from '../../types'
-import { KeyboardEvent, memo, useState } from 'react'
+import { KeyboardEvent, Fragment, memo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { DiffPreview, applyReverseDiff, useDiffPreview } from './diff'
 import { IconChevron, StatusIcon } from './icons'
-import { editGroupStats, useRunningClock } from './naming'
+import { editGroupStats, editFileRows, useRunningClock } from './naming'
 
 export const ToolEditGroupView = memo(function ToolEditGroupView({
   activities,
@@ -95,19 +94,26 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
       {open && (
         <div className="edit-group-list">
           {activities.map((entry) => {
-            const path = reviewPathOf(entry.activity);
-            const base = path.split("/").pop() || path;
-            // A batch call names a different file per entry; the row shows the
-            // first (the Review panel lists every file), so admit the rest.
-            const targets = editTargetsOf(entry.activity.args);
-            const more = targets.length > 1 ? targets.length - 1 : 0;
-            const st = entry.activity.diff
-              ? (entry.activity.diffStats ?? diffStatsFromUnified(entry.activity.diff))
-              : null;
-            const stats = st && (st.adds || st.dels) ? `+${st.adds} -${st.dels}` : null;
+            // ONE writer call may carry a WHOLE FAMILY (`edits:[{path,…}]` /
+            // `files:[{path, content}]`). The backend emits one diff event per
+            // touched file and `toolActivity` keeps them in `diffs`, but the
+            // card rendered the call as a SINGLE row naming the first file and
+            // hiding the rest behind a "+N more" pill — so a grouped edit read
+            // like a one-file edit and the other files' diffs were unreachable
+            // from the card. `editFileRows` gives every touched file its own row
+            // (name, +N -M, Review pill), exactly like a run of separate edits.
+            const files = editFileRows(entry.activity);
             return (
+              <Fragment key={entry.index}>
+                {files.map((file) => {
+                  const path = file.path;
+                  const base = path.split("/").pop() || path;
+                  const diff = file.diff;
+                  const stats =
+                    file.adds || file.dels ? `+${file.adds} -${file.dels}` : null;
+                  return (
               <div
-                key={entry.index}
+                key={`${entry.index}:${path}`}
                 className={`edit-group-row ${entry.activity.status}${entry.activity.reverted ? " reverted" : ""}`}
               >
                 {/* A div with button semantics, not a real <button>: the
@@ -117,7 +123,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                   className="edit-group-row-main"
                   role="button"
                   tabIndex={0}
-                  title={path ? (more ? targets.join("\n") : toWorkspacePath(root, path)) : undefined}
+                  title={path ? toWorkspacePath(root, path) : undefined}
                   onClick={() => messageId && openReview(messageId, path)}
                   onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
                     if (e.key === "Enter" || e.key === " ") {
@@ -128,9 +134,6 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                 >
                   <StatusIcon status={entry.activity.status} />
                   <span className="edit-group-file" dir="auto">{base}</span>
-                  {more > 0 && (
-                    <span className="tool-path tool-more" dir="ltr">+{more} more</span>
-                  )}
                   <span className="edit-group-row-end">
                     {stats && (
                       <span className="trace-row-diff-stats" dir="ltr">{stats}</span>
@@ -143,7 +146,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                       const ms = act.status === "running" && act.startedAt ? Math.max(0, now - act.startedAt) : act.elapsedMs;
                       return ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null;
                     })()}
-                    {entry.activity.diff && (
+                    {diff && (
                       <button
                         type="button"
                         className="trace-row-review"
@@ -155,8 +158,8 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                           e.stopPropagation();
                           preview.open(
                             e.currentTarget.closest(".edit-group-row"),
-                            entry.activity.diff,
-                            reviewPathOf(entry.activity),
+                            diff,
+                            path,
                           );
                         }}
                       >
@@ -166,6 +169,9 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                   </span>
                 </div>
               </div>
+                  );
+                })}
+              </Fragment>
             );
           })}
         </div>
@@ -190,8 +196,17 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
  *  end (a call still running ends "now"). It is NOT the sum of the calls' own
  *  durations: parallel calls would be counted twice, and the gaps between calls
  *  (the model reasoning, narration) would be dropped. A call without a start
- *  stamp (older transcripts) falls back to summing the durations. */
-export function groupSpanMs(acts: ToolActivity[], now: number): number {
+ *  stamp (older transcripts) falls back to summing the durations.
+ *
+ *  `live` keeps the clock running while the turn is still streaming but NO call
+ *  is executing (the model is thinking between two calls): the reference UI's
+ *  header timer counts wall-clock time, so it must never freeze on a tool-call
+ *  boundary. The span still freezes once the turn ends. */
+export function groupSpanMs(
+  acts: ToolActivity[],
+  now: number,
+  live = false,
+): number {
   let start = Infinity;
   let end = -Infinity;
   let summed = 0;
@@ -205,7 +220,9 @@ export function groupSpanMs(acts: ToolActivity[], now: number): number {
     start = Math.min(start, a.startedAt);
     end = Math.max(end, a.startedAt + own);
   }
-  return start === Infinity ? summed : Math.max(0, end - start);
+  if (start === Infinity) return summed;
+  if (live) end = Math.max(end, now);
+  return Math.max(0, end - start);
 }
 
 export function fmtTime(ms?: number): string {

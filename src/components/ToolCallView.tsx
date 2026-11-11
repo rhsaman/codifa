@@ -500,6 +500,7 @@ export const ToolCallView = memo(function ToolCallView({
           {activity.summary &&
             !isWrite &&
             activity.tool !== "batch" &&
+            activity.tool !== "batch_search" &&
             !isSkillTool(activity.tool) && (
               <div className="tool-summary">{fixZwsp(activity.summary)}</div>
             )}

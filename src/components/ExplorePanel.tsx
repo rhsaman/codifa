@@ -5,7 +5,7 @@ import { toolCallBody } from "../lib/toolActivity";
 import { exploreTitle, exploreToolCounts } from "./ExploreCard";
 import { subagentDisplayName } from "./ToolCallView";
 import { StatusIcon } from "./ToolCallView";
-import { activityLabel, batchOpTools } from "./toolcall/naming";
+import { activityLabel, batchOpTools, isBatchTool } from "./toolcall/naming";
 import { useVimScroll } from "../lib/useVimScroll";
 
 /** One argument line ("path: src/a.ts") for a call row's body. */
@@ -34,7 +34,7 @@ function callDetail(activity: ToolActivity): string {
 /** The name a call row shows. A `batch` is only a wrapper, so its row is named
  *  after the tools it ran ("read ×2, grep"), never the word "batch". */
 function callTool(activity: ToolActivity): string {
-  if (activity.tool !== "batch") return activity.tool;
+  if (!isBatchTool(activity.tool)) return activity.tool;
   const counts = new Map<string, number>();
   for (const tool of batchOpTools(activity)) {
     counts.set(tool, (counts.get(tool) ?? 0) + 1);

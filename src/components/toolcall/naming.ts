@@ -1,4 +1,5 @@
 import { bareToolName, mcpServerOf } from '../../lib/mcpTools'
+import { reviewPathOf } from '../../lib/reviewTurn'
 import { diffStatsFromUnified } from '../../lib/toolActivity'
 import type { CustomSubagent, ToolActivity } from '../../types'
 import { DELEGATION_PREFIX, isDelegationTool, subagentIdOf } from '../../lib/subagents'
@@ -74,10 +75,22 @@ export const TOOL_LABEL: Record<string, string> = {
   system_stats: "System Stats",
   computer: "Computer",
   search_console: "Search Console",
-  // Safety net only: a batch card is labelled with the tools it ran
+  // Safety net only: a batch_search card is labelled with the tools it ran
   // (`activityLabel`), so this shows just when no op is known yet.
+  batch_search: "Tools",
+  // The pre-rename spelling, kept so stored history still labels correctly.
   batch: "Tools",
 };
+
+/** True for the batch composer under its CURRENT name or the pre-rename one.
+ *
+ *  The tool was renamed to `batch_search` to say what it is — a SEARCH composer
+ *  that only carries lookups; writes never ride it. A transcript recorded before
+ *  the rename still says `batch`, so both spellings must label and group
+ *  identically. The backend resolves the same pair (`tools::is_batch_tool`). */
+export function isBatchTool(name: string): boolean {
+  return name === "batch_search" || name === "batch";
+}
 
 /** Foreign names for a tool we DO have, mapped to the canonical name.
  *
@@ -121,6 +134,12 @@ export const TOOL_ALIAS: Record<string, string> = {
   ask_question: "ask_user",
   permission: "confirm_action",
   request_permission: "confirm_action",
+  // The batch composer was renamed to `batch_search` to say what it is (a SEARCH
+  // composer — writes never ride it). Stored history still says `batch`, so both
+  // spellings collapse onto the current name and render one chip.
+  batch: "batch_search",
+  batch_tools: "batch_search",
+  batch_calls: "batch_search",
 };
 
 /** Canonical tool name for a raw one (case / dash / underscore-insensitive). */
@@ -190,7 +209,19 @@ export function toolLabel(tool: string): string {
  *  RESULT (`=== [1/2] read ===`), so the names are recoverable from there. */
 export function batchOpTools(activity: ToolActivity): string[] {
   const out: string[] = [];
-  const ops = activity.args?.ops;
+  // `ops` normally arrives as an array, but several providers double-encode
+  // nested JSON: the model means an array and the wire carries a stringified
+  // one. The backend decodes that shape (`tools::batch_ops`), so the card must
+  // read it the same way — otherwise a batch that really ran three tools is
+  // labelled "Tools" and the user cannot see what happened.
+  let ops = activity.args?.ops;
+  if (typeof ops === "string") {
+    try {
+      ops = JSON.parse(ops);
+    } catch {
+      ops = undefined;
+    }
+  }
   if (Array.isArray(ops)) {
     for (const op of ops as Array<{ tool?: unknown } | null>) {
       const name = typeof op?.tool === "string" ? op.tool.trim() : "";
@@ -198,8 +229,13 @@ export function batchOpTools(activity: ToolActivity): string[] {
     }
   }
   if (out.length === 0) {
+    // The executor labels every op in its RESULT. An op the turn refused keeps
+    // an arrow: `=== [1/2] read → REFUSED ===`. The old `(\S+) ===` pattern
+    // required the name to sit immediately before ` ===`, so every refused op
+    // was dropped — a batch whose ops were all refused fell back to the
+    // "Tools" label. Match the name right after the bracket instead.
     for (const m of (activity.resultText ?? "").matchAll(
-      /=== \[\d+\/\d+\] (\S+) ===/g,
+      /=== \[\d+\/\d+\] ([A-Za-z0-9_]+)/g,
     )) {
       out.push(canonicalTool(m[1]));
     }
@@ -210,7 +246,10 @@ export function batchOpTools(activity: ToolActivity): string[] {
 /** The label a card/row shows for one activity. Same as `toolLabel`, except a
  *  `batch` is named after the tools it ran, tallied: "Search Files, Read File ×2". */
 export function activityLabel(activity: ToolActivity): string {
-  if (activity.tool === "batch") {
+  // Both spellings: the current `batch_search` AND the pre-rename `batch`.
+  // Matching only `batch` left every new call labelled with the bare fallback
+  // "Tools" instead of the tools it ran.
+  if (isBatchTool(activity.tool)) {
     const counts = new Map<string, number>();
     for (const tool of batchOpTools(activity)) {
       const label = toolLabel(tool);
@@ -247,7 +286,10 @@ export function subagentDisplayName(
   if (tool === "explore") return "Explore";
   const id = subagentIdOf(tool);
   if (!id) return toolLabel(tool);
-  const row = rows.find((r) => r.id === id);
+  // The tool name carries the SLUG of the row id (the backend slugs it when
+  // advertising `agent__<slug>`), so match on the slug too.
+  const slug = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const row = rows.find((r) => r.id === id || slug(r.id) === id);
   const name = row?.name?.trim();
   if (name) return name;
   const pretty = id
@@ -291,8 +333,8 @@ export const TOOL_NOUN: Record<string, [string, string]> = {
 export function groupSummary(activities: ToolActivity[]): string {
   const counts: Record<string, number> = {};
   for (const a of activities) {
-    // A batch is only a wrapper: count the tools it ran, never "batch" itself.
-    const names = a.tool === "batch" ? batchOpTools(a) : [];
+    // A batch is only a wrapper: count the tools it ran, never the wrapper itself.
+    const names = isBatchTool(a.tool) ? batchOpTools(a) : [];
     for (const tool of names.length > 0 ? names : [a.tool]) {
       counts[tool] = (counts[tool] || 0) + 1;
     }
@@ -322,6 +364,45 @@ export const isExploreCard = isSubagentCard;
 export const EDIT_TOOLS = new Set(["edit_file", "write_file"]);
 
 export const isEditActivity = (a: ToolActivity) => EDIT_TOOLS.has(a.tool);
+
+/** The per-file rows ONE writer activity renders in the edit group.
+ *
+ *  A writer call may carry a WHOLE FAMILY — `edit_file` as
+ *  `edits:[{path, old_string, new_string}]`, `write_file` as
+ *  `files:[{path, content}]`. The backend emits one `diff` event per touched
+ *  file and `toolActivity` keeps them in `diffs`, but the card used to render
+ *  the call as a SINGLE row naming the first file and hiding the rest behind a
+ *  "+N more" pill — so a grouped edit read like a one-file edit and the other
+ *  files' diffs were unreachable from the card. One row per touched file, each
+ *  with its own diff and its own +N -M. */
+export interface EditFileRow {
+  path: string;
+  diff: string;
+  adds: number;
+  dels: number;
+}
+
+export function editFileRows(activity: ToolActivity): EditFileRow[] {
+  const perFile =
+    activity.diffs && activity.diffs.length > 1 ? activity.diffs : null;
+  const files = perFile ?? [
+    { path: reviewPathOf(activity), diff: activity.diff ?? "" },
+  ];
+  return files.map((file) => {
+    const diff = file.diff ?? "";
+    // Per file when the call carried several (each has its own diff), the
+    // call's aggregate otherwise.
+    const st = perFile
+      ? diffStatsFromUnified(diff)
+      : (activity.diffStats ?? (diff ? diffStatsFromUnified(diff) : null));
+    return {
+      path: file.path,
+      diff,
+      adds: st?.adds ?? 0,
+      dels: st?.dels ?? 0,
+    };
+  });
+}
 
 /** جمع +N -M چند فعالیت ویرایش (ترجیحاً diffStats ذخیره‌شده، وگرنه محاسبه
  *  از روی متن دیف) — برای هدر گروه ویرایش. */

@@ -312,6 +312,7 @@ export function renderSegments(
           key={key}
           activities={pending}
           captions={captions.slice()}
+          live={message.streaming}
         />,
       );
     }
@@ -437,6 +438,7 @@ export function renderSegments(
         <div key={`exp-${seg.index}`} className="tool-trace">
           <ToolGroupView
             subagent={activity}
+            live={message.streaming}
             activities={(activity.children ?? []).map((child, ci) => ({
               activity: child,
               index: ci,

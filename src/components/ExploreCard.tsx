@@ -1,6 +1,6 @@
 import type { ToolActivity } from "../types";
 import { toolLabel } from "./ToolCallView";
-import { batchOpTools } from "./toolcall/naming";
+import { batchOpTools, isBatchTool } from "./toolcall/naming";
 
 /** Short label of a sub-agent run: the model's own description when it supplied
  *  one, else the run summary, else the sub-agent's own name. */
@@ -39,7 +39,7 @@ export function exploreToolCounts(activity: ToolActivity): ExploreToolCount[] {
       // chip. `batchOpTools` reads the call's args and, for a transcript whose
       // args were lost, the op labels the executor echoes in the result — so an
       // older run never falls back to a plain "batch" chip.
-      if (a.tool === "batch") {
+      if (isBatchTool(a.tool)) {
         const ops = batchOpTools(a);
         if (ops.length > 0) {
           for (const tool of ops) {

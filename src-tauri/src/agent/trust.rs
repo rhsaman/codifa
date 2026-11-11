@@ -603,6 +603,11 @@ pub(crate) fn canonical_tool_name(name: &str, advertised: &[String]) -> Option<S
         "create_file" | "writefile" => "write_file",
         "str_replace" | "replace_in_file" | "editfile" => "edit_file",
         "plan" | "todos" | "todo_write" | "write_todos" | "update_todos" => "update_plan",
+        // The batch tool was renamed to `batch_search` to say what it is (a
+        // SEARCH composer, never a write one). The old spelling stays an alias
+        // so a model that learned the previous name — or a replayed transcript —
+        // still lands on the real tool instead of "unknown tool".
+        "batch" | "batch_search" | "batch_tools" | "batch_calls" => "batch_search",
         "ask" | "question" | "ask_question" => "ask_user",
         "permission" | "request_permission" => "confirm_action",
         _ => return None,

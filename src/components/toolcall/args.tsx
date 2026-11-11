@@ -2,7 +2,7 @@ import { fixZwsp } from '../../lib/bidi'
 import type { ToolActivity } from '../../types'
 import { DiffView } from './diff'
 import { shortArg, subArgSummary } from './groups'
-import { canonicalTool } from './naming'
+import { canonicalTool, isBatchTool } from './naming'
 
 export const HEADER_SHOWN_KEYS = new Set([
   "command",
@@ -57,7 +57,7 @@ export function ToolArgs({
   // about what ran (user request), and the card label already names the tools
   // it ran (`activityLabel`) — so no chips here; the per-op detail lives in the
   // expanded body.
-  if (tool === "batch") return null;
+  if (tool === "batch" || tool === "batch_search") return null;
   const entries = Object.entries(args).filter(
     ([k]) =>
       !HEADER_SHOWN_KEYS.has(k) && !HIDDEN_KEYS.has(k) && !skip?.has(k),
@@ -94,7 +94,7 @@ export function rowDetail(activity: ToolActivity): string {
   const tool = canonicalTool(activity.tool);
   // The row's label already names the tools a batch ran; repeating them (or
   // the wrapper's own name) in the detail would only add noise.
-  if (tool === "batch") return "";
+  if (isBatchTool(tool)) return "";
   if (tool === "load_plugin") {
     const what = [activity.args?.slug, activity.args?.skill]
       .filter((v): v is string => typeof v === "string" && v.trim().length > 0)

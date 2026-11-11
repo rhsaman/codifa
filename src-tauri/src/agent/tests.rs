@@ -685,7 +685,7 @@
             .collect();
         assert_eq!(
             names,
-            vec!["read", "load_plugin", "batch"],
+            vec!["read", "load_plugin", "batch_search"],
             "only the declared, existing work tool survives — plus the always-on plugin loader and the round composer"
         );
 
@@ -724,14 +724,14 @@
         // Case-only differences already worked and must keep working.
         assert_eq!(
             names(&["Read", "Grep", "Glob"]),
-            vec!["read", "grep", "glob", "load_plugin", "batch"]
+            vec!["read", "grep", "glob", "load_plugin", "batch_search"]
         );
         // These differ by SPELLING; before the alias table they vanished.
         assert_eq!(
             names(&["WebSearch", "WebFetch"]),
-            vec!["web_search", "fetch_url", "load_plugin", "batch"]
+            vec!["web_search", "fetch_url", "load_plugin", "batch_search"]
         );
-        assert_eq!(names(&["LS"]), vec!["glob", "load_plugin", "batch"]);
+        assert_eq!(names(&["LS"]), vec!["glob", "load_plugin", "batch_search"]);
         // `Bash` canonicalizes to `run_terminal`, which the research table does
         // not hold: nothing matches, so the function reports the miss and the
         // caller keeps the table rather than leaving the agent tool-less. (A
@@ -764,12 +764,12 @@
         // The real bundle shape found on this machine.
         assert_eq!(
             names(&["Read", "Grep", "Glob", "Bash"]),
-            vec!["batch", "glob", "grep", "load_plugin", "read", "run_terminal"]
+            vec!["batch_search", "glob", "grep", "load_plugin", "read", "run_terminal"]
         );
         // A write-capable pack keeps its writing tools too.
         assert_eq!(
             names(&["Read", "Bash", "Edit", "Write"]),
-            vec!["batch", "edit_file", "load_plugin", "read", "run_terminal", "write_file"]
+            vec!["batch_search", "edit_file", "load_plugin", "read", "run_terminal", "write_file"]
         );
     }
 
@@ -798,7 +798,7 @@
                 .filter_map(|s| s["function"]["name"].as_str())
                 .collect();
             assert!(
-                names.contains(&"batch"),
+                names.contains(&"batch_search"),
                 "{declared:?} lost the round composer: {names:?}"
             );
             // It must still not invent a work tool the pack never declared.
@@ -829,7 +829,7 @@
             "edit_file",
             "web_search",
             "fetch_url",
-            "batch",
+            "batch_search",
             "load_plugin",
         ] {
             assert!(names.contains(&wanted), "{wanted} must be available");
@@ -1905,6 +1905,108 @@
 
 
     #[test]
+    fn a_batch_is_not_a_shelter_for_the_terminal_gates() {
+        // THE traced defect (`mwbmxr0r`, `mwbn4lhu`): the top-level boundary
+        // refused `ls`/`grep -rn`/`sed -n` with "the terminal does not locate
+        // files", so the model learned to put the SAME command inside `batch`,
+        // where no per-op gate ran. 285 terminal ops inside batches, 224 of
+        // them really RAN, against 143 native read/grep/glob/lsp ops. One level
+        // must make no difference: the same two verdicts apply to an op.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let build = caps_for_mode("build");
+        let term = |cmd: &str| json!({ "tool": "run_terminal", "args": { "command": cmd } });
+        let judge = |op: &Value| {
+            batch_op_refusal(
+                &build,
+                op["tool"].as_str().unwrap_or_default(),
+                &op["args"],
+                "agent",
+                root,
+                true,
+                true,
+            )
+        };
+        // File discovery and workspace dumps are refused INSIDE a batch too.
+        for cmd in [
+            "grep -rn foo src",
+            "rg TODO",
+            "find . -name '*.ts'",
+            "cat src/main.rs",
+            "sed -n '1,20p' src/main.rs",
+        ] {
+            let reason = judge(&term(cmd)).unwrap_or_else(|| {
+                panic!("{cmd:?} is refused at the top level, so it must be refused in a batch")
+            });
+            assert!(
+                reason.contains("grep") || reason.contains("read"),
+                "the refusal must point at the native tool that answers in the SAME batch: {reason}"
+            );
+        }
+        // The work only the terminal can do stays allowed — batching it is the
+        // whole point of the executor.
+        for cmd in [
+            "ls -la",
+            "du -sh *",
+            "cargo test 2>&1 | tail -5",
+            "git status --short",
+            "npm run build",
+            "cat /tmp/probe.log",
+        ] {
+            assert!(
+                judge(&term(cmd)).is_none(),
+                "{cmd:?} is a real terminal job and must stay allowed in a batch"
+            );
+        }
+        // A narrowed CHILD may own no `grep`/`read` at all, so the two
+        // delegation gates stand down for it exactly like they do one level up.
+        assert!(batch_op_refusal(
+            &build,
+            "run_terminal",
+            &json!({ "command": "grep -rn foo src" }),
+            "subagent",
+            root,
+            false,
+            false,
+        )
+        .is_none());
+        // But a child that DOES bind `grep` has the same alternative the main
+        // agent has, so the gate bites there too — the exemption is about the
+        // tool being absent, not about the caller being a child.
+        assert!(batch_op_refusal(
+            &build,
+            "run_terminal",
+            &json!({ "command": "grep -rn foo src" }),
+            "subagent",
+            root,
+            true,
+            false,
+        )
+        .is_some());
+        // The read-only caps still bite inside a batch.
+        let ask = caps_for_mode("ask");
+        assert!(batch_op_refusal(
+            &ask,
+            "write_file",
+            &json!({ "path": "a.ts", "content": "x" }),
+            "agent",
+            root,
+            true,
+            true,
+        )
+        .is_some());
+        assert!(batch_op_refusal(
+            &ask,
+            "run_terminal",
+            &json!({ "command": "echo x > src/app.ts" }),
+            "agent",
+            root,
+            true,
+            true,
+        )
+        .is_some());
+    }
+
+    #[test]
     fn traced_gates_still_catch_the_real_thing() {
         let root = env!("CARGO_MANIFEST_DIR");
         // The refusals that were CORRECT must stay refusals — the native tool
@@ -2887,8 +2989,8 @@
             // `unzip … | sed …` or `pdftotext` in the shell (+~45 chars). The
             // measured tree was already 41 chars over the old ceiling from the
             // `update_plan` multi-step prose, so this step absorbs both.
-            ("main", tool_schemas(false, false), 24_750usize),
-            ("main+browser", tool_schemas(false, true), 31_400),
+            ("main", tool_schemas(false, false), 25_100usize),
+            ("main+browser", tool_schemas(false, true), 31_600),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -3460,9 +3562,14 @@
             assert!(hint.contains("commands:"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
-        // A SHELL round is a chain only when its command MUTATES, so a bare
-        // `run_terminal` with no command carries nothing to batch and stays silent.
-        assert!(single_call_hint("agent", &one("run_terminal"), 1, root).is_none());
+        // A SHELL round is now told about `commands:[…]` whatever it does: two
+        // inspections that do not need each other's output are mergeable, and
+        // only the MODEL knows which those are. The hint names the boundary
+        // ("only a command whose arguments come from the previous result keeps a
+        // step of its own") instead of guessing it from the command text.
+        let shell = single_call_hint("agent", &one("run_terminal"), 1, root)
+            .expect("a lone shell round must be named");
+        assert!(shell.contains("commands:["), "{shell}");
         for name in ["browser_evaluate", "browser_navigate"] {
             assert!(
                 single_call_hint("agent", &one(name), 1, root).is_none(),
@@ -3476,10 +3583,16 @@
                 json!({"command": cmd}).to_string(),
             )]
         };
+        // A mutating command keeps its own step ONLY when its arguments come
+        // from the previous result; otherwise a build/test round is as mergeable
+        // as a read. It is told, and it never claims concurrency it does not have.
         for cmd in ["rm -rf /tmp/x", "mv a b", "touch new.rs", "echo hi > f.txt"] {
+            let told = single_call_hint("agent", &mutating(cmd), 1, root)
+                .expect("a lone shell round must be named");
+            assert!(told.contains("INDEPENDENT"), "{cmd}: {told}");
             assert!(
-                single_call_hint("agent", &mutating(cmd), 1, root).is_none(),
-                "{cmd} mutates and must stay silent"
+                !told.to_lowercase().contains("concurrent"),
+                "{cmd} mutates, so it must not promise concurrency: {told}"
             );
         }
         // A READ-ONLY command is the one shell shape that IS a missed batch: the
@@ -3598,29 +3711,44 @@
         assert!(!first.contains("rounds in a row"), "{first}");
         let fifth = single_call_hint("agent", &one, 5, root).unwrap();
         assert!(fifth.contains("5 rounds in a row"), "{fifth}");
-        assert!(fifth.contains("Batch NOW"), "{fifth}");
+        // A WRITE is answered with the per-family wording, never with the batch
+        // instruction: the executor refuses a nested writer (no snapshot, no
+        // permit, no diff), so telling the model to batch it is an instruction
+        // it cannot obey. The escalation still shows the accumulated price.
+        assert!(!fifth.contains("batch_search"), "a write must not be told to batch: {fifth}");
+        assert!(fifth.contains("write_file") && fifth.contains("edit_file"), "{fifth}");
         assert_ne!(first, fifth, "the text must change as the streak grows");
     }
 
     #[test]
-    fn a_lone_shell_probe_is_never_told_to_batch() {
-        // Traced: 59 consecutive rounds of one chat were all lone `run_terminal`,
-        // each command a probe whose arguments came from the previous result, and
-        // the hint fired on 50 of them — an instruction the model could not obey,
-        // left in the re-sent history (~350 chars on every later round) while it
-        // batched on 2 rounds out of 59. A shell round must therefore stay silent
-        // and must not grow the streak either, or the counter would report waste
-        // that was never addressable.
+    fn a_lone_shell_round_is_told_to_merge_independent_commands() {
+        // Traced (`mvxsy14e`): 30 of 131 rounds were ONE `run_terminal` — a build,
+        // a test run, a `grep` over a log — each independent of the next, each
+        // paying a full re-send of the conversation. The lever used to skip every
+        // shell round on the "probe chain" argument, so none of them was ever
+        // named. The chain rule only holds when a command's ARGUMENTS come from
+        // the previous result (build → test → probe over its output), and the
+        // model is the only one who knows that — so the lever speaks and states
+        // the boundary itself.
         let root = env!("CARGO_MANIFEST_DIR");
-        // A genuinely MUTATING command is a probe chain and stays silent.
         let mutating = vec![(
             "c1".to_string(),
             "run_terminal".to_string(),
             json!({"command": "rm -rf /tmp/codifa-nope"}).to_string(),
         )];
-        assert!(single_call_hint("agent", &mutating, 3, root).is_none());
-        assert!(!single_call_is_serial("agent", &mutating, root));
-        // The act-then-observe browser tools are the same chain and stay silent.
+        let told = single_call_hint("agent", &mutating, 3, root).expect("must speak");
+        assert!(told.contains("commands=["), "{told}");
+        assert!(told.contains("INDEPENDENT"), "{told}");
+        assert!(
+            told.contains("previous result"),
+            "the chain boundary must be stated, not guessed: {told}"
+        );
+        assert!(
+            single_call_is_serial("agent", &mutating, root),
+            "a lone shell round is a round that could have carried the next one"
+        );
+        // The act-then-observe browser tools ARE a chain (observe → act on what
+        // was observed) and stay silent.
         let browser = vec![("c1".to_string(), "browser_evaluate".to_string(), "{}".to_string())];
         assert!(single_call_hint("agent", &browser, 1, root).is_none());
         assert!(!single_call_is_serial("agent", &browser, root));
@@ -3683,22 +3811,27 @@
         };
 
         // The main agent / an explore child: both levers are available.
-        let full = caps(&["batch", "read", "grep", "run_terminal"]);
+        let full = caps(&["batch_search", "read", "grep", "run_terminal"]);
         assert!(full.has_batch && full.has_lookup, "{full:?}");
         assert!(super::batch_protocol_message(&full).is_some());
         let hint = super::single_call_hint_with(&full, "subagent", &one("grep"), 1, root)
             .expect("a lookup child with `batch` must be told to batch");
         assert!(hint.contains("grep"), "{hint}");
 
-        // A child that carries `batch` but NO file lookup: the wrapper wording
-        // stands on its own, and the lookup names must not appear. (A `browser_*`
-        // call is answered by the serial driver branch BEFORE this one — that is
-        // the correct shape for it, so the family is probed through a write.)
-        let no_lookup = caps(&["batch", "edit_file", "run_terminal"]);
+        // A child that carries `batch_search` but NO file lookup: the per-family
+        // wording stands on its own, and the lookup names must not appear. (A
+        // `browser_*` call is answered by the serial driver branch BEFORE this
+        // one — that is the correct shape for it, so the family is probed through
+        // a write.) A write NEVER rides the batch, so this text must not name it.
+        let no_lookup = caps(&["batch_search", "edit_file", "run_terminal"]);
         assert!(no_lookup.has_batch && !no_lookup.has_lookup, "{no_lookup:?}");
         let hint = super::single_call_hint_with(&no_lookup, "subagent", &one("edit_file"), 1, root)
-            .expect("a batchable child still gets the wrapper wording");
-        assert!(hint.contains("batch"), "{hint}");
+            .expect("a write-capable child still gets the per-family wording");
+        assert!(
+            !hint.contains("batch_search"),
+            "a write must never be told to ride the batch: {hint}"
+        );
+        assert!(hint.contains("write_file") && hint.contains("edit_file"), "{hint}");
         assert!(!hint.contains("grep"), "a lookup-less child has no grep: {hint}");
         assert!(!hint.contains("find_symbol"), "{hint}");
 
@@ -3749,7 +3882,7 @@
         let batch_of = |ops: Value| {
             vec![(
                 "c1".to_string(),
-                "batch".to_string(),
+                "batch_search".to_string(),
                 json!({ "ops": ops }).to_string(),
             )]
         };
@@ -3805,15 +3938,24 @@
         // Escalates off the streak instead of repeating itself.
         let later = single_call_hint("agent", &read, 4, root).expect("must speak");
         assert!(later.contains("4 rounds in a row"), "{later}");
-        // The wording must never promise ordering for a read, and never promise
-        // concurrency for a MUTATING command — that one stays silent.
+        // The wording must never promise ordering for a read. A MUTATING command
+        // is a build/test round: it still grows the streak and still gets told
+        // about `commands:[…]`, because whether two commands need each other's
+        // output is something only the MODEL knows — the hint names the
+        // boundary instead of guessing it from the command text.
         let mutating = vec![(
             "c1".to_string(),
             "run_terminal".to_string(),
             json!({"command": "mv a.rs b.rs"}).to_string(),
         )];
-        assert!(single_call_hint("agent", &mutating, 3, root).is_none());
-        assert!(!single_call_is_serial("agent", &mutating, root));
+        let told = single_call_hint("agent", &mutating, 3, root).expect("must speak");
+        assert!(!told.contains("CONCURRENT"), "never concurrency for a mutator: {told}");
+        assert!(told.contains("INDEPENDENT"), "{told}");
+        assert!(told.contains("commands=["), "{told}");
+        assert!(
+            single_call_is_serial("agent", &mutating, root),
+            "a build/test round is independent of the next inspection, so it grows the streak"
+        );
     }
 
     /// The hint and the step runner must classify a shell round the SAME way.
@@ -3850,15 +3992,19 @@
                 is_shell_read_only(cmd, root),
                 "the helper must not invent its own rule for {cmd:?}"
             );
-            let told = single_call_hint("agent", &call, 1, root).is_some();
+            // The READ flag now decides only the WORDING (a read rides the
+            // concurrent lookup phase). Whether the lever fires is independent of
+            // it: a build/test round is as mergeable as a read, so every lone
+            // shell round is told about `commands:[…]`.
+            let told = single_call_hint("agent", &call, 1, root).expect("must speak");
             assert_eq!(
-                told, executor_batches,
-                "{cmd:?}: hint says batchable={told} but the runner says {executor_batches}"
-            );
-            assert_eq!(
-                single_call_is_serial("agent", &call, root),
+                told.to_lowercase().contains("concurrent"),
                 executor_batches,
-                "{cmd:?}: a batchable round must grow the streak, a chain must not"
+                "{cmd:?}: concurrency wording must follow the runner's read verdict"
+            );
+            assert!(
+                single_call_is_serial("agent", &call, root),
+                "{cmd:?}: every lone shell round grows the streak"
             );
         }
     }
@@ -3913,6 +4059,60 @@
         // budget, so it must never receive the delegation nudge.
         assert!(discovery_streak_hint("subagent", STREAK_NUDGE_AT).is_none());
         assert!(discovery_streak_hint("subagent", STREAK_NUDGE_LATE).is_none());
+    }
+
+    #[test]
+    fn a_batched_search_round_keeps_the_discovery_streak_alive() {
+        // THE traced defect (`mwbn4lhu`, 60 rounds): the streak was counted off
+        // the RAW call name, and a search round is one `batch_search` wrapper —
+        // a name that is not itself a lookup. So every batched round RESET the
+        // counter: it reported a longest streak of 1 while the run held 21
+        // consecutive search rounds, and the `explore` nudge fired ZERO times
+        // (39 rounds sat at streak >= 3, 27 at >= 7).
+        let ops = |list: &[(&str, &str)]| {
+            let json = serde_json::json!({
+                "ops": list
+                    .iter()
+                    .map(|(t, _)| serde_json::json!({"tool": t, "args": {}}))
+                    .collect::<Vec<_>>()
+            });
+            vec![(
+                "c1".to_string(),
+                crate::tools::BATCH_TOOL.to_string(),
+                json.to_string(),
+            )]
+        };
+        // A batch of lookups is a discovery round.
+        assert!(round_is_discovery(&ops(&[("read", ""), ("grep", "")])));
+        assert!(round_is_discovery(&ops(&[("lsp_symbols", "")])));
+        // A batch carrying the terminal is work, not research: the streak must
+        // still break, exactly like a lone `run_terminal` round does.
+        assert!(!round_is_discovery(&ops(&[("read", ""), ("run_terminal", "")])));
+        // A lone lookup and a lone explore both count (unchanged behaviour).
+        let one = |n: &str| vec![("c1".to_string(), n.to_string(), "{}".to_string())];
+        assert!(round_is_discovery(&one("read")));
+        assert!(round_is_discovery(&one("explore")));
+        assert!(!round_is_discovery(&one("edit_file")));
+        assert!(!round_is_discovery(&[]));
+        // Malformed `ops`: still a SEARCH round, because the composer refuses
+        // writers. Treating it as work would let bad JSON hide a long streak.
+        let broken = vec![(
+            "c1".to_string(),
+            crate::tools::BATCH_TOOL.to_string(),
+            "{not json".to_string(),
+        )];
+        assert!(round_is_discovery(&broken));
+        // The decisive shape: a full streak of batched search rounds must reach
+        // the nudge boundary instead of collapsing to 1 every round.
+        let mut streak = 0;
+        for _ in 0..STREAK_NUDGE_AT {
+            assert!(round_is_discovery(&ops(&[("read", ""), ("grep", "")])));
+            streak += 1;
+        }
+        assert!(
+            discovery_streak_hint("agent", streak).is_some(),
+            "a batched search streak must reach the explore nudge at {STREAK_NUDGE_AT}"
+        );
     }
 
     #[test]
@@ -7140,9 +7340,11 @@ done
     #[tokio::test]
     async fn a_batch_round_carries_a_whole_step_in_one_llm_call() {
         // THE round-elimination scenario: the model plans a whole step —
-        // lookups + a write + the verify command — as ONE `batch` call. Four
-        // tool calls, ONE llm round; the answer round makes two. Nothing is
-        // skipped: every sub-result is the full output of its tool.
+        // lookups + the verify command — as ONE `batch_search` call, then the
+        // WRITE in its own call (a writer never rides the batch: it needs the
+        // snapshot, the permit and the diff). Three lookups, ONE llm round; the
+        // write round and the answer round follow. Nothing is skipped: every
+        // sub-result is the full output of its tool.
         let dir = std::env::temp_dir().join(format!("codifa-scen-batch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -7151,13 +7353,17 @@ done
             "ops": [
                 {"tool": "read", "args": {"filePath": "a.txt"}},
                 {"tool": "grep", "args": {"pattern": "batch", "path": ".", "include": "*.txt"}},
-                {"tool": "write_file", "args": {"path": "out.txt", "content": "step output"}},
                 {"tool": "run_terminal", "args": {"command": "echo verify-ok"}},
             ]
         });
+        let write_args = json!({"path": "out.txt", "content": "step output"});
         let (base, _rx) = spawn_scripted_mock_upstream(vec![
             vec![
-                tool_call_frame("c1", "batch", &batch_args.to_string()),
+                tool_call_frame("c1", "batch_search", &batch_args.to_string()),
+                finish_frame("tool_calls", 150, 10),
+            ],
+            vec![
+                tool_call_frame("c2", "write_file", &write_args.to_string()),
                 finish_frame("tool_calls", 150, 10),
             ],
             vec![text_frame("step complete"), finish_frame("stop", 200, 8)],
@@ -7167,23 +7373,26 @@ done
         let res = scenario_turn(&base, "scen-batch", dir.to_str().unwrap(), events.clone()).await;
         assert!(res.is_ok(), "{res:?}");
         let ev = events.lock().unwrap();
-        // ONE tool round + ONE answer round = TWO llm calls for FOUR tool calls.
-        assert_eq!(count_kind(&ev, "usage"), 2, "4 tool calls must cost 1 tool round");
         let result = ev
             .iter()
-            .find(|e| e["kind"] == "tool_result" && e["name"] == "batch")
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "batch_search")
             .and_then(|e| e["result"].as_str())
             .unwrap_or_default()
             .to_string();
-        for label in ["[1/4] read", "[2/4] grep", "[3/4] write_file", "[4/4] run_terminal"] {
+        for label in ["[1/3] read", "[2/3] grep", "[3/3] run_terminal"] {
             assert!(result.contains(label), "missing {label}: {result}");
         }
         assert!(result.contains("hello batch") && result.contains("verify-ok"), "{result}");
-        // The write inside the batch really landed on disk.
+        // The write, in its OWN call, really landed on disk — and the round it
+        // took is the price of the snapshot, the permit and the diff that a
+        // nested writer could not produce.
         assert_eq!(
             std::fs::read_to_string(dir.join("out.txt")).unwrap(),
             "step output"
         );
+        // batch round + write round + answer round = THREE llm calls. The
+        // lookups still cost ONE, which is the saving that matters.
+        assert_eq!(count_kind(&ev, "usage"), 3, "lookups must still cost one round");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7205,7 +7414,7 @@ done
         });
         let (base, _rx) = spawn_scripted_mock_upstream(vec![
             vec![
-                tool_call_frame("c1", "batch", &batch_args.to_string()),
+                tool_call_frame("c1", "batch_search", &batch_args.to_string()),
                 finish_frame("tool_calls", 120, 6),
             ],
             vec![text_frame("answered around it"), finish_frame("stop", 140, 8)],
@@ -7236,7 +7445,7 @@ done
         let ev = events.lock().unwrap();
         let result = ev
             .iter()
-            .find(|e| e["kind"] == "tool_result" && e["name"] == "batch")
+            .find(|e| e["kind"] == "tool_result" && e["name"] == "batch_search")
             .and_then(|e| e["result"].as_str())
             .unwrap_or_default()
             .to_string();
@@ -7268,7 +7477,7 @@ done
         ]});
         let (base, mut rx) = spawn_scripted_mock_upstream(vec![
             vec![
-                tool_call_frame("c1", "batch", &batch_args.to_string()),
+                tool_call_frame("c1", "batch_search", &batch_args.to_string()),
                 finish_frame("tool_calls", 150, 10),
             ],
             vec![text_frame("step done"), finish_frame("stop", 200, 8)],

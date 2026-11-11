@@ -306,7 +306,14 @@ pub(super) fn resolve_delegation_profile(parent: &AgentRequest, tool: &str) -> O
     parent
         .custom_subagents
         .iter()
-        .find(|row| row["id"].as_str().map(str::trim) == Some(key))
+        // The tool name carries the SLUG of the row id (`delegation_tool_name`),
+        // so a row whose stored id is not already slug-safe (hand-edited
+        // settings, an import) must still be found by its slug — an exact-id
+        // match alone silently ran such an agent as the builtin `explore`.
+        .find(|row| {
+            let id = row["id"].as_str().map(str::trim).unwrap_or_default();
+            id == key || (!id.is_empty() && crate::subagents::agent_slug(id) == key)
+        })
         .cloned()
         .or_else(|| {
             crate::plugins::find_plugin_agent(std::path::Path::new(&parent.data_root), key)
@@ -424,7 +431,7 @@ pub(super) fn mutates_workspace(name: &str, _args: &Value) -> bool {
         // reader did not recognise (a stringified ops array) counted as ZERO
         // writers, i.e. a stale body could outlive a batch that rewrote it.
         // Unparseable is treated as a WRITER — the safe direction.
-        "batch" => crate::tools::batch_ops(_args)
+        name if crate::tools::is_batch_tool(name) => crate::tools::batch_ops(_args)
             .map(|ops| ops.iter().any(batch_writes))
             .unwrap_or(true),
         // A terminal command runs arbitrary `sh -c`: the workspace-file guard
@@ -682,7 +689,7 @@ pub(super) fn lookup_key(name: &str, args: &Value) -> Option<String> {
         // carried it. "As it is right now" is only true while nothing has
         // changed the file: `run_terminal` can, which is why every mutating call
         // clears the guard (see READONLY_NATIVE_TOOLS).
-        "batch" => {
+        name if crate::tools::is_batch_tool(name) => {
             // The whole batch is its identity: an identical re-batch is
             // answered with a pointer (its results are already in context,
             // and re-running the same edits would fail their old_strings
@@ -831,6 +838,37 @@ pub(super) fn is_discovery_tool(name: &str) -> bool {
     )
 }
 
+/// Whether a WHOLE round only locates or reads — the unit the discovery streak
+/// counts.
+///
+/// A round whose single call is `batch_search` must be judged by the OPS it
+/// carries, never by the wrapper: `batch_search` is not a lookup name itself, so
+/// the raw-name test failed it and RESET the streak on every batched round.
+///
+/// Traced (`mwbn4lhu`, 60 rounds): the counter reported a longest streak of 1
+/// while the real run held 21 consecutive search rounds — 39 rounds sat at
+/// streak >= 3 and 27 at >= 7, exactly the waste the `explore` nudge exists to
+/// stop, and it fired ZERO times. `expand_batch` is the same look-through the two
+/// batching levers already do, so all three levers now measure one thing.
+pub(super) fn round_is_discovery(calls: &[(String, String, String)]) -> bool {
+    if calls.is_empty() {
+        return false;
+    }
+    match expand_batch(calls) {
+        Some(ops) => ops.iter().all(|(_, n, _)| is_discovery_tool(n)),
+        None => {
+            // A lone `batch_search` whose ops cannot be read is still a SEARCH
+            // round — the composer never writes (writers are refused inside it).
+            // Counting it as work would let malformed JSON hide a long streak,
+            // which is the same blind spot this function was written to close.
+            if calls.len() == 1 && crate::tools::is_batch_tool(&calls[0].1) {
+                return true;
+            }
+            calls.iter().all(|(_, n, _)| is_discovery_tool(n))
+        }
+    }
+}
+
 /// Nudge to hand a LONG research streak to `explore`, delivered ONCE per streak.
 ///
 /// Measured on the live corpus: the main agent ran 91 discovery streaks, 31 of
@@ -941,7 +979,7 @@ pub(super) fn shell_read_is_batchable(raw_args: &str, root: &str) -> bool {
 /// Op names are resolved through the same alias table the executor uses, so a
 /// `run_command` op is judged as `run_terminal` (see `canonical_tool_name`).
 fn expand_batch(calls: &[(String, String, String)]) -> Option<Vec<(String, String, String)>> {
-    if calls.len() != 1 || calls[0].1 != "batch" {
+    if calls.len() != 1 || !crate::tools::is_batch_tool(&calls[0].1) {
         return None;
     }
     let args: Value = serde_json::from_str(&calls[0].2).ok()?;
@@ -977,10 +1015,15 @@ fn expand_batch(calls: &[(String, String, String)]) -> Option<Vec<(String, Strin
 /// answers by calling the missing name and loses the round to the refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BatchCapability {
-    /// `batch` is advertised this turn.
+    /// The batch composer is advertised this turn.
     pub has_batch: bool,
     /// At least one read/search lookup is advertised this turn.
     pub has_lookup: bool,
+    /// At least one of `write_file`/`edit_file` is advertised this turn. A child
+    /// with no writer must never be handed the per-family WRITE wording: it would
+    /// name a tool the child cannot call, and the traced model answers by calling
+    /// the missing name and losing the round to the refusal.
+    pub has_writer: bool,
 }
 
 impl BatchCapability {
@@ -988,6 +1031,7 @@ impl BatchCapability {
     pub(super) const FULL: Self = Self {
         has_batch: true,
         has_lookup: true,
+        has_writer: true,
     };
 
     /// Derive the capability from the exact tool names this run advertised — the
@@ -1015,8 +1059,13 @@ impl BatchCapability {
             )
         });
         Self {
-            has_batch: advertised.iter().any(|a| a == "batch"),
+            has_batch: advertised
+                .iter()
+                .any(|a| crate::tools::is_batch_tool(a)),
             has_lookup,
+            has_writer: advertised
+                .iter()
+                .any(|a| matches!(a.as_str(), "write_file" | "edit_file")),
         }
     }
 }
@@ -1082,9 +1131,21 @@ pub(super) fn single_call_hint_with(
                 "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
             ));
         }
+        if matches!(name, "edit_file" | "write_file" | "artifact") {
+            // A WRITE is never a batch op, so it must be answered BEFORE the
+            // generic `has_batch` wording below — otherwise a child that owns
+            // `batch_search` is told to put its writer inside it, which is
+            // exactly what the executor refuses (no snapshot, no permit, no
+            // diff). The per-family shape is the fix and costs the same round.
+            // A child with NO writer at all gets no wording naming one.
+            if !caps.has_writer {
+                return None;
+            }
+            return Some(Cow::Owned(single_call_hint_text(lone_rounds, false)));
+        }
         if caps.has_batch {
             return Some(Cow::Borrowed(
-                "[hint] That step had ONE call. Every step costs a model round trip, so put the whole step in ONE `batch` call as ops:[{tool, args},…] — every call you can already foresee, in order — and keep the report for the step after.",
+                "[hint] That step had ONE call. Every step costs a model round trip, so put the whole SEARCH phase in ONE `batch_search` call as ops:[{tool, args},…] — every lookup you can already foresee, in order — and keep the report for the step after. Writes never ride it.",
             ));
         }
         if caps.has_lookup {
@@ -1158,21 +1219,41 @@ pub(super) fn single_call_hint_with(
     // missed: it runs in the same concurrent batch as the lookups, yet the
     // "probe chain" rule silenced the hint for every `run_terminal` round. The
     // wording must therefore promise CONCURRENCY here, never ordering.
-    if name == "run_terminal" && shell_read_is_batchable(&calls[0].2, root) {
+    // `run_terminal` is back in the lever, worded for INDEPENDENT commands.
+    // It used to be gated on a read-only command, which excluded the largest
+    // traced group: a lone `cargo test`/build round is independent of the `git
+    // status` that follows it, yet neither is a pure read, so the hint stayed
+    // silent on 30 of 131 rounds in trace `mvxsy14e`. The exclusion argument
+    // ("every shell round is a probe chain") only holds when a command's
+    // ARGUMENTS come from the previous result — build → test — and the model is
+    // the only one who knows that. So the lever speaks on every lone shell round
+    // and names the boundary itself, instead of guessing it from the command.
+    if name == "run_terminal" {
+        if shell_read_is_batchable(&calls[0].2, root) {
+            if lone_rounds <= 1 {
+                return Some(Cow::Borrowed(
+                    "[hint] That step had ONE call. This command only READS, so it runs in the SAME concurrent batch as other lookups — and every step re-sends the whole conversation. Put the remaining commands you already know you need into ONE run_terminal call via commands=[\"cmd1\",\"cmd2\",…] (they run in order, one result block each), next to the reads and greps of the same step.",
+                ));
+            }
+            return Some(Cow::Owned(format!(
+                "[hint] {lone_rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation. Batch NOW: one run_terminal call with commands=[…] runs every inspection IN ORDER in this one call (one result block each); reads and greps ride the SAME step."
+            )));
+        }
         if lone_rounds <= 1 {
             return Some(Cow::Borrowed(
-                "[hint] That step had ONE call. This command only READS, so it runs in the SAME concurrent batch as other lookups — and every step re-sends the whole conversation. Put the remaining commands you already know you need into ONE run_terminal call via commands=[\"cmd1\",\"cmd2\",…] (they run in order, one result block each), next to the reads and greps of the same step.",
+                "[hint] That step had ONE call, and every step re-sends the whole conversation. A command that does NOT need the previous result belongs in the SAME call as the others: one run_terminal takes several INDEPENDENT commands as commands:[\"cmd1\",\"cmd2\"] (in order, one result block each). Keep a command on its own only when its arguments come from the last result — build → test, then a probe over what it printed.",
             ));
         }
         return Some(Cow::Owned(format!(
-            "[hint] {lone_rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation. Batch NOW: one run_terminal call with commands=[…] runs every inspection IN ORDER in this one call (one result block each); reads and greps ride the SAME step."
+            "[hint] {lone_rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation. Batch NOW: one run_terminal call with commands=[…] runs every INDEPENDENT command IN ORDER in this one call (one result block each). Only a command whose arguments come from the previous result — build → test, then a probe over its output — keeps a step of its own."
         )));
     }
     if matches!(name, "edit_file" | "write_file" | "artifact") {
-        // The teaching text names `batch`, so it is only honest when this turn
-        // carries it; a narrowed profile without `batch` keeps its files in ONE
-        // write_file / edit_file instead (the per-family shape still works).
-        return Some(Cow::Owned(single_call_hint_text(lone_rounds, caps.has_batch)));
+        // A WRITE is never a batch op, so this branch must never send it into
+        // `batch_search`: the loop only snapshots the file, asks for an
+        // out-of-workspace permit and emits a diff when the call's OWN name is a
+        // writer. The per-family shape is the fix, and it costs the same round.
+        return Some(Cow::Owned(single_call_hint_text(lone_rounds, false)));
     }
     None
 }
@@ -1180,10 +1261,10 @@ pub(super) fn single_call_hint_with(
 /// True when this round spent its whole round-trip on ONE call whose siblings
 /// were already knowable. Main agent only: the sub-agent has its own wording.
 ///
-/// Two families count, because BOTH run in one batch and both are rounds the
-/// model could have merged:
-///   - a file write (`edit_file` / `write_file` / `artifact`) — independent
-///     siblings run IN ORDER in one step;
+/// Two families count, because BOTH are rounds the model could have merged:
+///   - a file write (`edit_file` / `write_file` / `artifact`) — a whole family
+///     fits ONE call as `files:[…]` / `edits:[…]`, so a lone one is a wasted
+///     round even though the write itself never rides `batch`;
 ///   - a read-only native lookup (`read`, `grep`, `glob`, `find_symbol`, the five
 ///     `lsp_*` lookups, `fetch_url`) — these run CONCURRENTLY, so a
 ///     lone one is the most common wasted round (measured: 54 of 65 rounds in
@@ -1221,11 +1302,14 @@ pub(super) fn single_call_is_serial_with(
     if calls.len() != 1 {
         return false;
     }
-    // A shell round is a CHAIN only when it MUTATES. A read-only command shares
-    // the concurrent lookup batch, so a lone one is as batchable as a lone
-    // `grep` and must grow the streak (see `shell_read_is_batchable`).
+    // A lone shell round grows the streak whatever it does: the hint now asks
+    // only for commands that do not need each other's output, so it can speak on
+    // a build/test round too. Whether the command is a pure READ still decides
+    // the WORDING (a read rides the concurrent lookup phase), never whether the
+    // lever fires.
     if calls[0].1 == "run_terminal" {
-        return shell_read_is_batchable(&calls[0].2, root);
+        let _ = root;
+        return true;
     }
     // The whole read-only family, because that is the set that really runs as one
     // concurrent batch (`READONLY_NATIVE_TOOLS`). The four LSP lookups were
@@ -1314,8 +1398,12 @@ pub(super) const LONE_CALL_HINT_MAX_PER_TURN: usize = 3;
 /// `cargo run --example` then `python3` over what it printed). Nothing in that
 /// run was batchable, so the hint was an instruction the model could not obey,
 /// and it stayed in the re-sent history. The hint speaks only where batching is
-/// actually possible — file edits and the read-only lookups — and leaves the
-/// shell loop alone.
+/// actually possible — the read-only lookups — and leaves the shell loop alone.
+///
+/// A WRITE is never sent into `batch`: the loop only snapshots the file, asks
+/// for an out-of-workspace permit and emits a diff when the call's OWN name is a
+/// writer, so a nested one would land silently. The per-family shape carries a
+/// whole family in one call instead, which costs the same round.
 pub(super) fn single_call_hint_text(rounds: usize, has_batch: bool) -> String {
     if rounds <= 1 {
         return if has_batch {
@@ -1330,16 +1418,16 @@ pub(super) fn single_call_hint_text(rounds: usize, has_batch: bool) -> String {
         );
     }
     format!(
-        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch NOW: the `batch` tool runs your whole step (lookups + edits + the verify command) IN ORDER in ONE call as ops:[{{tool, args}},…] — or per-family: files:[{{path, content}}] on write_file, edits:[…] on edit_file, commands:[\"…\"] on run_terminal."
+        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch NOW: `batch_search` runs every LOOKUP of your step (reads, greps, finds, lsp, read-only shell commands) IN ORDER in ONE call as ops:[{{tool, args}},…]. Writes stay OUT of it — they take their whole family in ONE call of their own: files:[{{path, content}}] on write_file, edits:[…] on edit_file — so the diff, the Review row and the out-of-workspace permit still happen."
     )
 }
 
 /// The teaching form, delivered once at the start of a streak.
-pub(super) const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so a whole step belongs in ONE call: the `batch` tool runs up to 10 tool calls (lookups, edits, the verify command) IN ORDER in one round-trip as ops:[{tool, args},…]; several files also fit ONE write_file as files:[{path, content}]; several replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}]; several shell commands ONE run_terminal as commands:[\"…\"].";
+pub(super) const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so a whole SEARCH phase belongs in ONE call: `batch_search` runs up to 10 lookups (reads, greps, finds, lsp, read-only shell commands) IN ORDER in one round-trip as ops:[{tool, args},…]. Writes are NOT batch ops — they take their whole family in one call of their own: several files ONE write_file as files:[{path, content}], several replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}], several shell commands ONE run_terminal as commands:[\"…\"].";
 
 /// The same teaching for a turn that has NO `batch` bound: only the per-family
 /// shapes remain, because naming a wrapper the model cannot call costs a round.
-pub(super) const SINGLE_CALL_HINT_ONLY_FAMILIES: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so merge what you can into ONE call: several files fit ONE write_file as files:[{path, content}], and several independent replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}].";
+pub(super) const SINGLE_CALL_HINT_ONLY_FAMILIES: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so merge what you can into ONE call: several files fit ONE write_file as files:[{path, content}], several independent replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}], and several shell commands ONE run_terminal as commands:[\"…\"].";
 
 /// Cap on the saved-plan body injected into the system prompt. A plan is
 /// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
@@ -1391,7 +1479,7 @@ pub(super) const ACTIVE_PLUGIN_CONTEXT_HEAD: &str =
 /// step. This is the model-INDEPENDENT round-trip lever — the reply SHAPE is
 /// dictated by the loop, not requested from the model.
 pub(super) const BATCH_PROTOCOL_HEAD: &str =
-    "=== PROTOCOL: your first tool reply is ONE batch with the whole step (NOT a new request) ===";
+    "=== PROTOCOL: your first tool reply is ONE batch_search with the whole search phase (NOT a new request) ===";
 
 /// True for a message that exists ONLY on the wire (the renderer never stores
 /// it): the trailing plan/checklist context, the skills reminder, the plugin
@@ -1507,22 +1595,26 @@ pub(super) fn batch_protocol_message(caps: &BatchCapability) -> Option<Value> {
     let content = if caps.has_lookup {
         format!(
             "{BATCH_PROTOCOL_HEAD}\n\
-             For this task, your FIRST reply that makes tool calls must be ONE `batch` \
-             call carrying EVERY call you expect to need — the lookups (grep/glob/read/\
-             find_symbol/lsp_*), the files to open, the commands to check — as \
+             For this task, your FIRST reply that makes tool calls must be ONE `batch_search` \
+             call carrying EVERY lookup you expect to need — grep/glob/read/\
+             find_symbol/lsp_*, the files to open, the read-only commands to check — as \
              ops:[{{\"tool\":\"grep\",\"args\":{{...}}}},…] (max 10). Every result comes back \
              together in one round-trip; a dependent second wave (calls that needed a \
              result you just got) goes in your NEXT reply. A reply with a single \
              independent tool call wastes a whole round-trip — never send one. \
-             `load_plugin`, the `browser_*` tools and MCP connector tools are NOT \
-             batchable: they change the tool set or act on one shared page in order, so \
-             call them directly in your next reply."
+             `edit_file` and `write_file` are NOT batch ops: they carry their whole \
+             family in ONE call of their own (files:[{{path, content}}], \
+             edits:[{{path, old_string, new_string, replace_all}}]) so the diff, the \
+             Review row and the out-of-workspace permit still happen. `load_plugin`, the \
+             `browser_*` tools and MCP connector tools are NOT batchable either: they \
+             change the tool set or act on one shared page in order, so call them \
+             directly in your next reply."
         )
     } else {
         format!(
             "{BATCH_PROTOCOL_HEAD}\n\
-             For this task, your FIRST reply that makes tool calls must be ONE `batch` \
-             call carrying EVERY call you expect to need, as ops:[{{\"tool\":\"run_terminal\",\"args\":{{...}}}},…] \
+             For this task, your FIRST reply that makes tool calls must be ONE `batch_search` \
+             call carrying EVERY lookup you expect to need, as ops:[{{\"tool\":\"run_terminal\",\"args\":{{...}}}},…] \
              (max 10). Every result comes back together in one round-trip; a dependent \
              second wave goes in your NEXT reply. A reply with a single independent tool \
              call wastes a whole round-trip — never send one."

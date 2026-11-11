@@ -588,8 +588,11 @@ export function FileChip({
   display,
   className,
   onClick,
+  icon,
 }: {
   path: string;
+  /** Show the file-type icon before the name (result lists only). */
+  icon?: boolean;
   line?: number;
   /** Label to show (defaults to the path as written). */
   display?: string;
@@ -623,8 +626,9 @@ export function FileChip({
       // the same path is idempotent (an in-place refresh).
       onClick={handle}
     >
-      {/* No file-type icon: in flowing prose a colored badge before every
-          path chip is noise (user request) — the pill + name is enough. */}
+      {/* No file-type icon in flowing prose (a colored badge before every
+          path chip is noise, user request) — only result lists opt in. */}
+      {icon && <FileIcon path={path} size={16} />}
       <span className="file-chip-name" dir="ltr">
         {label}
       </span>

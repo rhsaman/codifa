@@ -75,9 +75,19 @@ try {
 } catch (e) {
   check('ردیف trace رندر شد', false, e)
 }
-check('هدر گروه کلاس badge پروایدر دارد', groupedHtml.includes('trace-row-engine'))
-check('هدر گروه provider تِیولی را نشان می‌دهد', groupedHtml.includes('Tavily'))
-check('هدر گروه provider داک‌داک‌گو را هم نشان می‌دهد', groupedHtml.includes('DuckDuckGo'))
+// هدر دیگر نام/شمارش ابزارها را نشان نمی‌دهد (درخواست کاربر): badge پروایدر و
+// نام ابزارها فقط داخل بدنهٔ بازشده، روی ردیف همان فراخوانی، می‌آیند.
+check(
+  'هدر گروه badge پروایدر ندارد',
+  !groupedHtml.slice(0, groupedHtml.indexOf('trace-body')).includes('DuckDuckGo'),
+)
+const opened = renderToString(
+  <ToolSingleRow
+    activity={{ tool: 'web_search', engine: 'duckduckgo', status: 'done' } as never}
+  />,
+)
+check('ردیف تکی badge پروایدر دارد', opened.includes('trace-row-engine'))
+check('ردیف تکی نام پروایدر را نشان می‌دهد', opened.includes('DuckDuckGo'))
 
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)

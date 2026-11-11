@@ -1898,8 +1898,11 @@
   position: relative;
   overflow: visible;
   border-radius: 6px;
-  background: #1e1f24;
-  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  /* A measuring tool, not a DevTools easter egg: theme surfaces + text-derived
+     marks, so the scale stays legible on light palettes too (the old rule
+     hard-coded Chrome's #1e1f24/#fff and went invisible on Solarized Light). */
+  background: var(--bg-panel);
+  border: 1px solid var(--hairline, rgba(127, 127, 127, 0.25));
   cursor: ew-resize;
   outline: none;
 }
@@ -1915,8 +1918,12 @@
   padding: 0 28px;
   border-radius: 0;
   border: none;
-  background-color: #202124;
-  background-image: repeating-linear-gradient(to right, rgba(255, 255, 255, 0.12) 0 1px, transparent 1px 20px);
+  background-color: var(--bg-panel);
+  background-image: repeating-linear-gradient(
+    to right,
+    color-mix(in srgb, var(--text) 16%, transparent) 0 1px,
+    transparent 1px 20px
+  );
   background-size: 100% 5px;
   background-repeat: no-repeat;
   background-position: bottom;
@@ -1963,11 +1970,11 @@
   bottom: 3px;
   width: 1px;
   transform: translateX(-50%);
-  background: rgba(255, 255, 255, 0.4);
+  background: color-mix(in srgb, var(--text) 45%, transparent);
 }
 
 .browser-ruler-tick:hover::after {
-  background: #fff;
+  background: var(--text);
 }
 
 .browser-ruler-tick-label {
@@ -1977,7 +1984,7 @@
   transform: translateX(-50%);
   font-size: 9px;
   line-height: 1;
-  color: rgba(255, 255, 255, 0.65);
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   pointer-events: none;
@@ -1989,9 +1996,12 @@
   bottom: 0;
   width: 9px;
   transform: translateX(-50%);
-  background: rgba(255, 255, 255, 0.14);
-  border-left: 1px solid #fff;
-  border-right: 1px solid #fff;
+  /* The pinned width is a SELECTION, so it reads in the accent — the same
+     language as every other chosen state in the app (was hard-coded white,
+     which vanished on light palettes). */
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
   border-radius: 1px;
   cursor: ew-resize;
 }
@@ -2005,13 +2015,13 @@
   transform: translateX(-50%);
   padding: 2px 8px;
   border-radius: 4px;
-  background: #3c4043;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  color: #e8eaed;
+  background: var(--bg-panel);
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  color: var(--text);
   font-size: 11px;
   white-space: nowrap;
   pointer-events: none;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 8px color-mix(in srgb, #000 35%, transparent);
   z-index: 5;
 }
 

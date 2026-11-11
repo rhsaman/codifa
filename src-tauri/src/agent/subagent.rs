@@ -850,12 +850,14 @@ pub(super) fn is_discovery_tool(name: &str) -> bool {
 /// streak >= 3 and 27 at >= 7, exactly the waste the `explore` nudge exists to
 /// stop, and it fired ZERO times. `expand_batch` is the same look-through the two
 /// batching levers already do, so all three levers now measure one thing.
-pub(super) fn round_is_discovery(calls: &[(String, String, String)]) -> bool {
+pub(super) fn round_is_discovery(calls: &[(String, String, String)], root: &str) -> bool {
     if calls.is_empty() {
         return false;
     }
     match expand_batch(calls) {
-        Some(ops) => ops.iter().all(|(_, n, _)| is_discovery_tool(n)),
+        Some(ops) => ops
+            .iter()
+            .all(|(_, n, a)| op_is_discovery(n, a, root)),
         None => {
             // A lone `batch_search` whose ops cannot be read is still a SEARCH
             // round — the composer never writes (writers are refused inside it).
@@ -864,9 +866,44 @@ pub(super) fn round_is_discovery(calls: &[(String, String, String)]) -> bool {
             if calls.len() == 1 && crate::tools::is_batch_tool(&calls[0].1) {
                 return true;
             }
-            calls.iter().all(|(_, n, _)| is_discovery_tool(n))
+            calls
+                .iter()
+                .all(|(_, n, a)| op_is_discovery(n, a, root))
         }
     }
+}
+
+/// Whether ONE op of a round only locates or reads.
+///
+/// A read-only `run_terminal` is an INSPECTION and counts as research: it reads
+/// the environment exactly like a `grep` reads the tree, so it must not reset a
+/// streak that is still searching. Traced (`mwc2jvvj`, run 0): research arrived
+/// as batched shell ops and every one of them zeroed the counter, so 14 real
+/// research rounds were reported as 5 and the late `explore` nudge never fired.
+///
+/// A MUTATING command, a build/test run or a probe chain still resets the
+/// streak: those mean the agent has moved on to doing the work.
+fn op_is_discovery(name: &str, raw_args: &str, root: &str) -> bool {
+    if is_discovery_tool(name) {
+        return true;
+    }
+    if name != "run_terminal" {
+        return false;
+    }
+    let args: Value = serde_json::from_str(raw_args).unwrap_or(Value::Null);
+    // `commands:[…]` is the batched shell form; `command` is the single form.
+    // EVERY segment must be an inspection, so one build command inside the list
+    // keeps the whole round classified as work.
+    if let Some(list) = args["commands"].as_array() {
+        return !list.is_empty()
+            && list
+                .iter()
+                .filter_map(|c| c.as_str())
+                .all(|c| crate::agent::shell_safety::is_research_command(c, root));
+    }
+    args["command"]
+        .as_str()
+        .is_some_and(|c| crate::agent::shell_safety::is_research_command(c, root))
 }
 
 /// Nudge to hand a LONG research streak to `explore`, delivered ONCE per streak.
@@ -902,20 +939,37 @@ pub(super) const STREAK_NUDGE_AT: usize = 3;
 /// dozen tokens on a result already being sent.
 pub(super) const STREAK_NUDGE_LATE: usize = 7;
 
+/// How often the late nudge REPEATS once a streak has passed its boundary.
+///
+/// Traced (`mwbmxr0r`, run 2): 47 consecutive search rounds carried 2_801_092
+/// wire tokens, of which 2_510_450 (89%) sat at round 8 and beyond. The nudge
+/// existed at exactly streak 3 and 7, so after round 7 the chat ran 34 rounds
+/// in TOTAL silence — the counter had already proved the expensive shape and
+/// the lever had nothing left to say. A boundary that fires once cannot bound a
+/// streak that does not stop, so past the late boundary it repeats on a cadence.
+///
+/// Repeating is nearly free: `strip_stale_hints` elides every hint but the
+/// newest before each request, so a delivery costs the round it lands on and is
+/// never re-billed — measured against a ~79K-token wire prompt at that depth.
+pub(super) const STREAK_NUDGE_EVERY: usize = 3;
+
 pub(super) fn discovery_streak_hint(mode: &str, streak: usize) -> Option<&'static str> {
     // Sub-agents have no `explore` of their own and their budget is tiny.
     if mode == "subagent" {
         return None;
     }
-    match streak {
-        STREAK_NUDGE_AT => Some(
+    // The first boundary, then the late one, then a bounded cadence past it.
+    if streak == STREAK_NUDGE_AT {
+        return Some(
             "[hint] This step is the 3rd round of locating/reading in a row, and every round re-sends the whole conversation. A question this broad — where something is wired up, how an area works — is exactly what ONE `explore` answers in a single round-trip: give it the question (plus the file paths you already found) and work from its report. Only keep looking here when the very next call answers what you need.",
-        ),
-        STREAK_NUDGE_LATE => Some(
-            "[hint] This step is the 7th round of locating/reading in a row: the search has outgrown targeted checks and each further round re-sends the whole conversation for one lookup. Hand the question to ONE `explore` now (question + the paths already found) and keep this transcript for the work that follows. If the answer is already in hand, stop looking and act on it.",
-        ),
-        _ => None,
+        );
     }
+    if streak >= STREAK_NUDGE_LATE && (streak - STREAK_NUDGE_LATE) % STREAK_NUDGE_EVERY == 0 {
+        return Some(
+            "[hint] This step is the 7th round of locating/reading in a row: the search has outgrown targeted checks and each further round re-sends the whole conversation for one lookup. Hand the question to ONE `explore` now (question + the paths already found) and keep this transcript for the work that follows. If the answer is already in hand, stop looking and act on it.",
+        );
+    }
+    None
 }
 
 /// The ONE nudge a round may carry, or `None`.
@@ -1429,6 +1483,36 @@ pub(super) const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every 
 /// shapes remain, because naming a wrapper the model cannot call costs a round.
 pub(super) const SINGLE_CALL_HINT_ONLY_FAMILIES: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so merge what you can into ONE call: several files fit ONE write_file as files:[{path, content}], several independent replacements ONE edit_file as edits:[{path, old_string, new_string, replace_all}], and several shell commands ONE run_terminal as commands:[\"…\"].";
 
+/// Which lever owns a round's hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HintLever {
+    /// The discovery-streak nudge (`discovery_streak_hint`).
+    Streak,
+    /// The escalating lone-call batching lever.
+    LoneCall,
+    /// Anything else — a guard note, a retry nudge.
+    Other,
+}
+
+/// Classify a round's hint by the LEVER that produced it, never by its text.
+///
+/// The two levers share the phrase "rounds in a row", so the substring test
+/// this replaces (`h.contains("ONE call") || h.contains("rounds in a row")`)
+/// could not tell a streak delivery from a lone-call one. Every streak nudge
+/// therefore spent the lone-call budget, and once
+/// `MAX_LONE_CALL_HINTS_PER_TURN` was spent the gate dropped the streak nudge
+/// too — the lever that bounds an unbounded search was silenced by the budget
+/// of a different lever. Typed, the two budgets stay separate.
+pub(super) fn hint_lever(mode: &str, streak: usize, text: &str) -> HintLever {
+    if discovery_streak_hint(mode, streak).is_some() {
+        return HintLever::Streak;
+    }
+    if text.contains("ONE call") || text.contains("rounds in a row") {
+        return HintLever::LoneCall;
+    }
+    HintLever::Other
+}
+
 /// Cap on the saved-plan body injected into the system prompt. A plan is
 /// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
 /// cost; a long plan is cut in the middle (head + tail survive, so the goal and
@@ -1672,7 +1756,10 @@ pub(super) fn plan_section(data_root: &str, workspace: &str, chat_id: &str) -> S
                 );
             }
             out.push_str(&format!(
-                "\n\n=== SAVED PLAN (from disk — follow it, do NOT re-plan) ===\n{body}\n"
+                "\n\n=== SAVED PLAN (from disk — follow it, do NOT re-plan) ===\n{body}\n\
+                 This plan ALREADY located the files and lines (Plan mode researched it). Build \
+                 straight from it — do NOT re-run searches the plan already answers. Search only \
+                 for something the plan could not have known.\n"
             ));
         }
     }

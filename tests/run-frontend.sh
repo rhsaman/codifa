@@ -82,6 +82,7 @@ updater-core|tests/updater-core.test.ts|-
 retry|tests/retry.test.ts|-
 errorText|tests/errorText.test.ts|-
 retryRetired|tests/retryRetired.test.ts|-
+retryResumeClock|tests/retryResumeClock.test.ts|-
 retryStore|tests/retryStore.test.ts|--packages=external --external:electron
 retryStream|tests/retryStream.test.ts|--packages=external --external:electron
 contextWindow|tests/contextWindow.test.ts|--packages=external --external:electron
@@ -136,6 +137,7 @@ slash|tests/slash.test.ts|--packages=external --external:electron
 chatTree|tests/chatTree.test.ts|
 webkitDeadKey|tests/webkitDeadKey.test.ts|
 fileDrag|tests/fileDrag.test.ts|
+fileDragBridge|tests/fileDragBridge.test.ts|--packages=external --external:electron
 chatWindowMeta|tests/chatWindowMeta.test.ts|
 chatClose|tests/chatClose.test.ts|
 viewerTabs|tests/viewerTabs.test.ts|--packages=external --external:electron

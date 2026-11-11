@@ -253,7 +253,7 @@ export function renderSegments(
     traceAnchor = null;
   };
 
-  const flush = () => {
+  const flush = (runClosed = false) => {
     if (pending.length === 0) {
       // A held-back caption with no groupable call after it (e.g. the run
       // ended on a narration) renders as plain prose instead of vanishing.
@@ -280,8 +280,24 @@ export function renderSegments(
     // The first activity's index survives that reclassification: the group
     // keeps one identity across renders no matter which scan point ends up
     // triggering the flush.
+    // A narration held while streaming (the follow-up call has not arrived
+    // yet) rides the group as its LIVE caption: the head shows it the moment
+    // it streams, and when the call lands it becomes that call's per-call
+    // caption — same text, same group, no chat → header jump (user request).
+    const liveCaption = pendingCaption;
+    pendingCaption = null;
+    // The group clock runs while the run is OPEN, not while the whole turn
+    // streams: `live` here means "more calls may still join this run". A run
+    // closed by whatever follows it (real prose, an edit run, the turn ending)
+    // freezes its header time at the last call's end — mid-turn too (user
+    // request: the group time is start → end of THE GROUP, not of the turn).
+    const live = message.streaming && !runClosed;
     const key = `grp-${pending[0].index}`;
-    if (pending.length === 1 && !isSubagentCard(pending[0].activity)) {
+    if (
+      pending.length === 1 &&
+      !isSubagentCard(pending[0].activity) &&
+      !liveCaption
+    ) {
       // یک فراخوانی تکی: narration مدل — اگر بود — به‌صورت ردیف جدا بالای
       // همین ردیف رندر می‌شود (TraceNarration) — مثل Claude.ai که کپشنِ
       // کارِ تکی در کادر جدا بالای ردیف ابزار دیده می‌شود.
@@ -307,18 +323,21 @@ export function renderSegments(
       // renders it as a pill carrying the short description of what that
       // explore is looking for, which ToolSingleRow cannot show — so a single
       // explore is no longer an anonymous row.
+      // A lone FIRST call mid-stream with a live caption does too: the header
+      // is where the running narration lives; when the turn ends (live caption
+      // gone) a single call settles back to ToolSingleRow above.
       trace.push(
         <ToolGroupView
           key={key}
           activities={pending}
           captions={captions.slice()}
-          live={message.streaming}
+          live={live}
+          liveCaption={liveCaption}
         />,
       );
     }
     pending = [];
     captions.length = 0;
-    pendingCaption = null;
   };
 
   const renderProse = (key: string, text: string) => {
@@ -333,7 +352,7 @@ export function renderSegments(
   const segs = message.segments ?? [];
   segs.forEach((seg, i) => {
     if (seg.kind === "user") {
-      flush();
+      flush(true);
       wrapTrace();
       flushEdits();
       const steerMsg = useStore
@@ -352,7 +371,7 @@ export function renderSegments(
       // same treatment as an interleaved steer message above — the summary
       // message itself lives in the store (compactChat pushes it there too),
       // this segment just anchors where it renders.
-      flush();
+      flush(true);
       wrapTrace();
       flushEdits();
       const summaryMsg = useStore
@@ -367,7 +386,7 @@ export function renderSegments(
     if (seg.kind === "artifact") {
       // An artifact card sits where the agent built it, between the prose that
       // introduced it and whatever comes next — not appended at the end.
-      flush();
+      flush(true);
       wrapTrace();
       flushEdits();
       nodes.push(<ArtifactCard key={i} segment={seg} messageId={message.id} />);
@@ -397,7 +416,18 @@ export function renderSegments(
         !ALWAYS_VISIBLE_TOOLS.has(nextActivity.tool) &&
         !isSubagentCard(nextActivity);
 
-      if (nextIsGroupable && isCaptionCandidate(seg.text)) {
+      if (
+        isCaptionCandidate(seg.text) &&
+        (nextIsGroupable ||
+          // A short line still streaming AFTER the run's calls with no
+          // follow-up call yet: the model talking BETWEEN calls. Hold it as
+          // the group's LIVE caption so it updates the header in place,
+          // instead of rendering as chat prose that would jump into the
+          // header the moment the next call lands (user request). Text that
+          // outgrows caption shape and end-of-turn text fall through to the
+          // prose branch below — the final answer renders exactly as before.
+          (!next && pending.length > 0 && message.streaming))
+      ) {
         // A narration BEFORE a groupable tool: it belongs to the NEXT call.
         // Do NOT flush here — a narration BETWEEN two calls (caption, tool,
         // caption, tool) must attach to its own call while the run keeps
@@ -407,8 +437,10 @@ export function renderSegments(
         return;
       }
 
-      // Genuine prose — flush whatever tool run was accumulating.
-      flush();
+      // Genuine prose — flush whatever tool run was accumulating. The run is
+      // CLOSED from here on: its header clock freezes at the last call's end
+      // even though the turn keeps streaming (user request).
+      flush(true);
       wrapTrace();
       flushEdits();
       renderProse(String(i), seg.text);
@@ -421,7 +453,7 @@ export function renderSegments(
     // نمی‌شوند. تک‌ویرایش مثل قبل کارت تکی (ToolCallView) می‌ماند تا Undo و
     // Review تکی هر فایل حفظ شود؛ ۲+ ویرایش در یک ToolEditGroupView جمع می‌شوند.
     if (isEditActivity(activity) && !isSubagentCard(activity)) {
-      flush();
+      flush(true);
       wrapTrace();
       pendingEdit.push({ activity, index: seg.index });
       return;
@@ -431,7 +463,7 @@ export function renderSegments(
     // (children) — با این تفاوت که نام ساب‌ایجنت pill اولِ هدر است. هر اجرای
     // موازی کارت مستقل خودش را نگه می‌دارد.
     if (isSubagentCard(activity)) {
-      flush();
+      flush(true);
       wrapTrace();
       flushEdits();
       nodes.push(
@@ -449,7 +481,7 @@ export function renderSegments(
       return;
     }
     if (activity.tool === "ask_user") {
-      flush();
+      flush(true);
       wrapTrace();
       flushEdits();
       const ownerChat = useStore
@@ -469,7 +501,7 @@ export function renderSegments(
       return;
     }
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool)) {
-      flush();
+      flush(true);
       wrapTrace();
       flushEdits();
       nodes.push(

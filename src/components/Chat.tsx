@@ -9,6 +9,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { RangeSlider } from "./RangeSlider";
+import { SelectionToolbar, useFloatingSelection } from "./SelectionToolbar";
 import { APP_DIR, getActiveProvider, getChatProvider, ensureChatHydrated, ensureChatTail, loadEarlierChatMessages, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, trimChatBodyWindow, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { useVimScroll } from "../lib/useVimScroll";
@@ -16,7 +17,7 @@ import { shouldEnterInsert, shouldLeaveInsert } from "../lib/chatNormalMode";
 import { isPrefixArmed } from "../lib/prefixState";
 import { isEditableTarget, paneOwner } from "../lib/panePointer";
 import { physicalKey } from "../lib/shortcuts";
-import { AutoRetryScheduler, isDeterministicTurnError, isKeepTextRetry, planRetry, resetStreamForRetry, resolveRestartUser, retryBackoffMs, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
+import { AutoRetryScheduler, isDeterministicTurnError, isKeepTextRetry, planRetry, resetStreamForRetry, resolveRestartUser, resumeClockRestart, retryBackoffMs, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import { markModelTestFailed } from "../lib/useModelTests";
 import {
   isSlashCommand,
@@ -195,7 +196,13 @@ import {
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
 import { useDragReorder } from "../lib/useDragReorder";
-import { combineQuoteAndInput, formatChatQuote, isQuotableSelection } from "../lib/chatQuote";
+import {
+  combineQuoteAndInput,
+  formatChatQuote,
+  isQuotableSelection,
+  onReplyQuoteRequest,
+  quotePreviewText,
+} from "../lib/chatQuote";
 import {
   compactInputWidth,
   composerHeight,
@@ -1987,65 +1994,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     for (const k of Array.from(goalSendingRef.current)) if (!live.has(k)) goalSendingRef.current.delete(k);
   }, [chatIdKey]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // Reply-to-selection: floating reply button over selected transcript text.
-  // activeQuote is the pinned quote shown above the composer until sent.
-  const [quoteSel, setQuoteSel] = useState<{ text: string; x: number; y: number } | null>(null);
+  // Reply-to-selection: floating Reply/Read-aloud toolbar over selected
+  // transcript text. activeQuote is the pinned quote shown above the composer
+  // until sent; quoteTtsBusy keeps the toolbar mounted while the voice plays
+  // (useTtsPlayback stops on unmount — scroll must not kill playback).
   const [activeQuote, setActiveQuote] = useState<string | null>(null);
-  const quoteSelRef = useRef<{ text: string; x: number; y: number } | null>(null);
-  quoteSelRef.current = quoteSel;
-  const refreshQuoteSel = useCallback(() => {
+  const [quoteTtsBusy, setQuoteTtsBusy] = useState(false);
+  const quoteBar = useFloatingSelection((el) => {
     const rootEl = scrollRef.current;
-    const sel = typeof window !== "undefined" ? window.getSelection() : null;
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-      if (quoteSelRef.current) setQuoteSel(null);
-      return;
-    }
-    const text = sel.toString();
-    if (!isQuotableSelection(text)) {
-      if (quoteSelRef.current) setQuoteSel(null);
-      return;
-    }
-    const anchor = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode?.parentElement ?? null;
-    const focusEl = sel.focusNode instanceof Element ? sel.focusNode : sel.focusNode?.parentElement ?? null;
-    const inTranscript = (el: Element | null) => !!el && !!rootEl && rootEl.contains(el) && !composerRef.current?.contains(el);
-    if (!inTranscript(anchor) && !inTranscript(focusEl)) return;
-    try {
-      const rect = sel.getRangeAt(0).getBoundingClientRect();
-      if (!rect || (rect.width === 0 && rect.height === 0)) return;
-      const x = Math.min(Math.max(rect.left + rect.width / 2, 48), window.innerWidth - 48);
-      const y = Math.max(rect.top - 8, 8);
-      setQuoteSel({ text, x, y });
-    } catch {
-      // ignore invalid ranges
-    }
-  }, []);
-  useEffect(() => {
-    document.addEventListener("selectionchange", refreshQuoteSel);
-    const onScroll = () => {
-      if (quoteSelRef.current) setQuoteSel(null);
-    };
-    document.addEventListener("scroll", onScroll, true);
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && quoteSelRef.current) setQuoteSel(null);
-    };
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("selectionchange", refreshQuoteSel);
-      document.removeEventListener("scroll", onScroll, true);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [refreshQuoteSel]);
-  const applyQuoteSel = useCallback(() => {
-    const cur = quoteSelRef.current;
-    if (!cur) return;
-    const block = formatChatQuote(cur.text);
-    if (block) setActiveQuote(block);
-    try {
-      window.getSelection()?.removeAllRanges();
-    } catch {
-      // ignore
-    }
-    setQuoteSel(null);
+    return !!el && !!rootEl && rootEl.contains(el) && !composerRef.current?.contains(el);
+  });
+  const focusComposerEnd = useCallback(() => {
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
@@ -2053,6 +2012,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       el.selectionStart = el.selectionEnd = el.value.length;
     });
   }, []);
+  const handleSelectionReply = useCallback(
+    (text: string) => {
+      const block = formatChatQuote(text);
+      if (block) setActiveQuote(block);
+      quoteBar.clear();
+      focusComposerEnd();
+    },
+    [quoteBar, focusComposerEnd],
+  );
+  // Reply requests from the other surfaces (reading mode, schedule inbox and
+  // panel) pin their selection into THIS composer — the quote bridge lives in
+  // lib/chatQuote.ts.
+  useEffect(
+    () => onReplyQuoteRequest((block) => {
+      setActiveQuote(block);
+      focusComposerEnd();
+    }),
+    [focusComposerEnd],
+  );
   // Hidden mirror + row/action widths used to count visual lines at the
   // compact input width (layout-independent, so no compact/expanded flip
   // loop). The single-line mirror height is cached (font never changes).
@@ -4337,8 +4315,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // switching chats (unmount/remount) doesn't reset it to zero. Kept
           // from the original turn start on continuations so the finished
           // turn's persisted duration covers the whole turn, not just the
-          // resumed segment.
-          ...(existing.workingStartedAt
+          // resumed segment — the retry ladder's re-sends land here too, and
+          // the pill must span them (the close handler keeps the base alive
+          // exactly for this resume). Only a resume after a LONG idle (a
+          // manual Retry clicked much later) starts the clock over.
+          ...(existing.workingStartedAt != null &&
+            !resumeClockRestart(
+              existing.workingStartedAt,
+              existing.turnElapsedMs,
+              Date.now(),
+            )
             ? {}
             : { workingStartedAt: Date.now() }),
         });
@@ -6116,10 +6102,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const turnStart = curMsg?.workingStartedAt ?? curMsg?.thinkingStartedAt;
       const turnElapsedMs =
         turnStart != null ? Math.max(0, Date.now() - turnStart) : undefined;
+      // A close with a retry path armed (the auto ladder, a give-up awaiting
+      // the manual Retry, a watchdog/interrupted line) RESUMES THIS SAME
+      // bubble, so the clock base must survive it: the Working pill has to
+      // count the whole turn — failed attempts and backoff waits included —
+      // not restart from zero on every re-send. Without this, a build turn
+      // that hit two 60s provider drops showed "3m 1s" on the pill while the
+      // tool group clock had kept running for 24m. Only a clean end or a user
+      // Stop wipes the base, so the NEXT turn starts a fresh clock.
+      const resumeArmed = !!curMsg?.error || !!curMsg?.retry;
       useStore.getState().updateMessage(assistantMsg.id, {
         streaming: false,
         thinkingActive: false,
-        workingStartedAt: undefined,
+        ...(resumeArmed ? {} : { workingStartedAt: undefined }),
         ...(turnElapsedMs != null ? { turnElapsedMs } : {}),
         ...(keepRetry ? {} : { retry: null }),
       });
@@ -8218,17 +8213,40 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     dragDepth.current = 0;
     setDragOver(false);
     const dropped = Array.from(e.dataTransfer.files ?? []);
+    // WKWebView sometimes exposes OS drags ONLY as file URLs — and sometimes
+    // only a PARTIAL File list for a multi-selection. Parse the uri list for
+    // EVERY drop (not just when files is empty) so a mixed images+files drag
+    // attaches every item; the files pass below marks what it covered.
+    const uriPaths: string[] = [];
+    const raw =
+      e.dataTransfer.getData("text/uri-list") ||
+      e.dataTransfer.getData("public.file-url") ||
+      "";
+    for (const line of raw.split(/\r?\n/)) {
+      const url = line.trim();
+      if (!url.startsWith("file://")) continue;
+      let p = decodeURIComponent(url.replace(/^file:\/\/(?:localhost)?/, ""));
+      // Windows file:///C:/... yields "/C:/..." — strip the leading slash.
+      if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
+      uriPaths.push(p);
+    }
+    const uriNames = new Set(uriPaths.map((p) => p.split("/").pop() ?? p));
+    const attachedPaths = new Set<string>();
+    const attachedNames = new Set<string>();
     for (const f of dropped) {
       const p =
         window.coder.getPathForFile(f) || (f as File & { path?: string }).path;
       if (p) {
         addDroppedFile(p, f.name);
+        attachedPaths.add(p);
+        attachedNames.add(f.name);
         continue;
       }
-      // WKWebView gives no path for OS drags (Tauri native drag events are
-      // disabled so the HTML5 DnD handlers work). Images don't need a path —
-      // attach them by content as a data URL, like screenshots.
-      if (f.type.startsWith("image/")) {
+      // No path (WKWebView OS drag). Images don't need one — attach them by
+      // content as a data URL, like screenshots — but only when the uri pass
+      // below can't attach the same item by path (that copy is lighter than a
+      // base64 payload and imports into the workspace).
+      if (f.type.startsWith("image/") && !uriNames.has(f.name)) {
         const reader = new FileReader();
         reader.onload = () => {
           updateImages((imgs) =>
@@ -8243,22 +8261,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         reader.readAsDataURL(f);
       }
     }
-    // WKWebView sometimes exposes OS drags ONLY as file URLs (dataTransfer
-    // files is empty). Parse text/uri-list / public.file-url and attach by
-    // path so Finder drags still work.
-    if (dropped.length === 0) {
-      const raw =
-        e.dataTransfer.getData("text/uri-list") ||
-        e.dataTransfer.getData("public.file-url") ||
-        "";
-      for (const line of raw.split(/\r?\n/)) {
-        const url = line.trim();
-        if (!url.startsWith("file://")) continue;
-        let p = decodeURIComponent(url.replace(/^file:\/\/(?:localhost)?/, ""));
-        // Windows file:///C:/... yields "/C:/..." — strip the leading slash.
-        if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
-        addDroppedFile(p, p.split("/").pop() ?? p);
-      }
+    // Uri-pass leftovers: every dragged item the File list didn't already
+    // attach (partial WebKit File lists, files-only uri drags). Same-named
+    // entries were resolved per-occurrence by the bridge (see
+    // pathForDroppedFile), so the files pass marked each one attached.
+    for (const p of uriPaths) {
+      const name = p.split("/").pop() ?? p;
+      if (attachedPaths.has(p) || attachedNames.has(name)) continue;
+      attachedPaths.add(p);
+      attachedNames.add(name);
+      addDroppedFile(p, name);
     }
   };
 
@@ -12109,25 +12121,44 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 )}
               </div>
             )}
-            {activeQuote && (
-              <div className="paste-cards">
-                <div className="paste-card reply-card" dir="ltr">
-                  <button
-                    className="chip-x paste-card-x"
-                    onClick={() => setActiveQuote(null)}
-                    title="Remove reply quote"
-                  >
-                    ×
-                  </button>
-                  <div className="paste-card-preview">
-                    {activeQuote}
-                  </div>
-                  <div className="paste-card-foot">
-                    <span className="paste-card-badge">Replying to</span>
+            {activeQuote && (() => {
+              const replyPreview = quotePreviewText(activeQuote);
+              return (
+                <div className="composer-reply-wrap">
+                  {/* Compact reply bar (not a paste card): reply arrow +
+                      one-line quoted preview + ghost ×, sitting 6px inside
+                      the composer card. FIXED chrome geometry (icon left,
+                      × right in both directions, like .msg-actions); only
+                      the quote text follows its own language. */}
+                  <div className="composer-reply-bar" dir="ltr">
+                    <svg
+                      className="composer-reply-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M10 6 4 12l6 6" />
+                      <path d="M4 12h9a6 6 0 0 1 6 6v2" />
+                    </svg>
+                    <div className="composer-reply-text" dir={detectDir(replyPreview)}>
+                      “{replyPreview}”
+                    </div>
+                    <button
+                      className="composer-reply-x"
+                      onClick={() => setActiveQuote(null)}
+                      title="Remove reply quote"
+                      aria-label="Remove reply quote"
+                    >
+                      ×
+                    </button>
                   </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
             {pastedBlocks.length > 0 && (
               <div className="paste-cards">
                 {pastedBlocks.map((b) => {
@@ -12222,8 +12253,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <span className="edit-target-glyph" aria-hidden="true">
                   {chat.editTarget.target === "artifact" ? "◆" : "●"}
                 </span>
-                <span className="edit-target-name">
-                  {chat.editTarget.action} · {chat.editTarget.name}
+                <span className="edit-target-label">
+                  <span className="edit-target-action">{chat.editTarget.action}</span>
+                  <span className="edit-target-name">{chat.editTarget.name}</span>
                 </span>
                 <button
                   className="edit-target-x"
@@ -12243,7 +12275,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <span className="edit-target-glyph" aria-hidden="true">
                   ◈
                 </span>
-                <span className="edit-target-name">{chat.pluginSession.label}</span>
+                <span className="edit-target-label">
+                  <span className="edit-target-name">{chat.pluginSession.label}</span>
+                </span>
                 <button
                   className="edit-target-x"
                   onClick={() => useStore.getState().clearChatPluginSession(chat.id)}
@@ -12916,40 +12950,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           </span>
         </div>
       </div>
-      {quoteSel && (
-        <button
-          type="button"
-          className="chat-quote-reply"
-          title="Reply to selection"
-          aria-label="Reply to selected text"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={applyQuoteSel}
-          style={{
-            // Positioning only — the visuals (surface, accent border/text,
-            // radius) live in .chat-quote-reply so themes restyle the chip.
-            position: "fixed",
-            left: quoteSel.x,
-            top: quoteSel.y,
-            transform: "translate(-50%, -100%)",
-            zIndex: 60,
-          }}
-        >
-          <svg
-            width="13"
-            height="13"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M9 14L4 9l5-5" />
-            <path d="M4 9h10a5 5 0 015 5v6" />
-          </svg>
-          <span>Reply</span>
-        </button>
+      {(quoteBar.sel || (quoteTtsBusy && quoteBar.lastSel.current)) && (
+        <SelectionToolbar
+          sel={quoteBar.sel ?? quoteBar.lastSel.current}
+          onReply={handleSelectionReply}
+          onBusyChange={setQuoteTtsBusy}
+        />
       )}
       {dragOver && (
         <div className="chat-file-drop-overlay" aria-hidden="true">

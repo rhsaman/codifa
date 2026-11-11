@@ -10,6 +10,8 @@ import { isPrefixArmed } from "../lib/prefixState";
 import { isEditableTarget, markVimRegion, snapshotIntent } from "../lib/panePointer";
 import { focusChatInput } from "../lib/chatFocus";
 import { ChatBubble } from "./ChatBubble";
+import { SelectionToolbar, useFloatingSelection } from "./SelectionToolbar";
+import { requestReplyQuote } from "../lib/chatQuote";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
@@ -252,6 +254,18 @@ export function ScheduleInbox() {
 
   const inboxRef = useRef<HTMLDivElement>(null);
   const pageRef = useRef<HTMLDivElement>(null);
+
+  // Selection toolbar (Reply / Read aloud) over run outputs and task prompts.
+  // Reply pins the selection into the chat composer via the quote bridge.
+  const [selTtsBusy, setSelTtsBusy] = useState(false);
+  const selectionBar = useFloatingSelection((el) => {
+    const page = pageRef.current;
+    return !!el && !!page && page.contains(el);
+  });
+  const handleInboxReply = (text: string) => {
+    requestReplyQuote(text);
+    selectionBar.clear();
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -742,6 +756,13 @@ export function ScheduleInbox() {
             )
           )}
         </div>
+        {(selectionBar.sel || (selTtsBusy && selectionBar.lastSel.current)) && (
+          <SelectionToolbar
+            sel={selectionBar.sel ?? selectionBar.lastSel.current}
+            onReply={handleInboxReply}
+            onBusyChange={setSelTtsBusy}
+          />
+        )}
       </div>
     </div>
   );

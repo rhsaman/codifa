@@ -288,7 +288,7 @@ export function subagentDisplayName(
   if (!id) return toolLabel(tool);
   // The tool name carries the SLUG of the row id (the backend slugs it when
   // advertising `agent__<slug>`), so match on the slug too.
-  const slug = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const slug = (s: string) => s.trim().toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_-]/g, "");
   const row = rows.find((r) => r.id === id || slug(r.id) === id);
   const name = row?.name?.trim();
   if (name) return name;

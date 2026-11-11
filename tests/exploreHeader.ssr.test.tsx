@@ -1,10 +1,9 @@
 // SSR test for the tool-group header with PARALLEL explore runs.
 //
 // Each sub-agent run renders as its own ToolGroupView card (exactly like a
-// regular tool group) with the agent's NAME as the first header pill; the
-// run's task description rides as the pill's tooltip, and the head caption is
-// the run's own latest narration line (else the description). Non-sub-agent
-// tools keep the counted-pill behaviour.
+// regular tool group) with the agent's NAME leading the header; the head
+// caption is the run's own latest narration line (else the task description).
+// Narration arrives via `narrationParts` (the sub-agent event contract).
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -42,14 +41,17 @@ function makeMessage(toolActivity: Array<unknown>) {
   }
 }
 
-console.log('1) دو explore موازی → دو کارت مستقل مثل tool group، هر کدام با pill نام خودش:')
+console.log('1) دو explore موازی → دو کارت مستقل مثل tool group، هر کدام با نام خودش:')
 {
   const msg = makeMessage([
     {
       tool: 'explore',
       status: 'running',
       args: { description: 'Find the auth flow', prompt: 'where is login handled' },
-      narration: 'Reading src/auth.ts\nNow tracing the login handler',
+      narrationParts: [
+        { after: 0, text: 'Reading src/auth.ts' },
+        { after: 0, text: 'Now tracing the login handler' },
+      ],
     },
     {
       tool: 'explore',
@@ -63,7 +65,7 @@ console.log('1) دو explore موازی → دو کارت مستقل مثل tool
   // comments (and tags) before matching rendered header text.
   const plain = html.replace(/<!--.*?-->/g, '')
   const text = plain.replace(/<[^>]*>/g, '')
-  check('پیل ساب‌ایجنت رندر شد', html.includes('trace-pill-sub'))
+  check('نام ساب‌ایجنت در هدر رندر شد', html.includes('trace-head-name'))
   check(
     'هر explore کارت مستقل خودش را دارد (یک گروه در یک قاب tool-trace)',
     (html.match(/tool-group/g) || []).length === 2 &&
@@ -74,12 +76,12 @@ console.log('1) دو explore موازی → دو کارت مستقل مثل tool
     'کارت explore قدیمی (tool-card explore) رندر نشد',
     !html.includes('tool-card explore') && !html.includes('explore-card-open'),
   )
-  // کارت اول narration دارد → caption هدر آخرین جملهٔ خود ساب‌ایجنت است و
-  // توضیح وظیفه فقط tooltip پیل نام می‌ماند.
+  // کارت اول narration دارد → caption هدر جملهٔ خود ساب‌ایجنت است و توضیح
+  // وظیفه جایی رندر نمی‌شود.
   check(
-    'توضیح کارت اول tooltip پیل نام است',
-    html.includes('Find the auth flow'),
-    html.slice(0, 300),
+    'کارت اول narration دارد → توضیح وظیفه‌اش رندر نمی‌شود',
+    !text.includes('Find the auth flow'),
+    text.slice(0, 400),
   )
   check(
     'هدر کارت دوم توضیح خودش را دارد (caption وقتی narration نیست)',
@@ -97,14 +99,14 @@ console.log('1) دو explore موازی → دو کارت مستقل مثل tool
     text.slice(0, 400),
   )
   check(
-    'دو پیل جدا (نه یک ×2)',
-    (html.match(/trace-pill-sub/g) || []).length === 2,
-    (html.match(/trace-pill-sub/g) || []).length,
+    'دو نام جدا (هر کارت pill نام خودش)',
+    (html.match(/trace-head-name/g) || []).length === 2,
+    (html.match(/trace-head-name/g) || []).length,
   )
   check('شمارنده ×2 برای explore ساخته نشد', !html.includes('Explore ×2'))
 }
 
-console.log('2) ابزارهای معمولی همچنان شمارنده‌ای جمع می‌شوند:')
+console.log('2) ابزارهای معمولی: یک گروه، نام آخرین فراخوانی در هدر، بدون شمارنده:')
 {
   const msg = makeMessage([
     { tool: 'read', status: 'done', args: { filePath: 'a.ts' } },
@@ -112,16 +114,17 @@ console.log('2) ابزارهای معمولی همچنان شمارنده‌ای
     { tool: 'grep', status: 'done', args: { pattern: 'x' } },
   ])
   const html = renderToString(<ChatMessageView message={msg} />)
-  // React SSR splits `×{n}` into two text nodes with a `<!-- -->` separator,
-  // so strip comments before matching the badge content.
-  const plain = html.replace(/<!--.*?-->/g, '')
-  const badge = plain.match(/trace-pill-count[^>]*>([^<]*)</)
   check(
-    'شمارندهٔ تعداد برای ابزارهای معمولی رندر شد',
-    !!badge && badge[1].includes('2'),
-    badge?.[1],
+    'یک گروه واحد رندر شد',
+    (html.match(/tool-group/g) || []).length === 1,
+    html.match(/tool-group/g)?.length,
   )
-  check('پیل ساب‌ایجنت ساخته نشد', !html.includes('trace-pill-sub'))
+  check(
+    'نام آخرین فراخوانی (Search Files برای grep) در هدر است',
+    /trace-head-tool[^>]*>Search Files</.test(html),
+  )
+  check('badge شمارنده (trace-pill-count) رندر نشد', !html.includes('trace-pill-count'))
+  check('نام ساب‌ایجنت ساخته نشد', !html.includes('trace-head-name'))
 }
 
 console.log('3) برچسب ابزار MCP نام سرور و ابزار را نشان می‌دهد:')

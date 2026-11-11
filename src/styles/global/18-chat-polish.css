@@ -60,18 +60,18 @@
 }
 
 /* 3) Composer — the card shares the SIDEBAR's background (one surface family
-   across the app chrome) with a soft hairline and a fully rounded pill-like
-   radius, as in the reference; the shadow alone lifts it off the transcript. */
+   across the app chrome); the shadow alone lifts it off the transcript — no
+   outline (user ask: the hairline ring around the input read as a box).
+   Radius follows the target mock (12px) — the previous pill-like 28px read as
+   an oversized bubble. */
 .composer-inner {
   background: var(--bg-sidebar);
-  border-color: color-mix(in srgb, var(--text) 12%, transparent);
-  border-radius: 28px;
+  border-color: transparent;
+  border-radius: 12px;
   box-shadow: 0 2px 14px -6px rgba(0, 0, 0, 0.35);
 }
-
-.composer-inner:focus-within {
-  border-color: color-mix(in srgb, var(--text) 18%, transparent);
-}
+/* focus-within used to brighten the border; with the border gone it only
+   re-showed a ring on click, so it is gone with it. */
 .composer-input::placeholder {
   color: color-mix(in srgb, var(--text-dim) 75%, transparent);
 }
@@ -139,7 +139,10 @@
   background: color-mix(in srgb, var(--text) 7%, transparent);
   color: var(--text);
 }
-.composer-footer .mode-btn-label {
+/* Same specificity as the 15-…css segment rules so this (loading later)
+   actually wins: the mode label reads like the "Max" effort label next to
+   it instead of bold glowing caps. */
+.composer-footer .mode-select.icon-only .mode-btn-label {
   font-weight: 500;
   letter-spacing: 0;
   text-transform: none;
@@ -178,9 +181,10 @@
   font-size: 13px;
 }
 
-/* The sub-agent's own name leads its header; the latest words it said follow
-   as the regular dim caption. No tool names or counts live here (user
-   request) — those are the opened body's rows. */
+/* The sub-agent's own name leads its header; after it the run's LATEST call
+   is named, then the latest words the agent said as the dim caption
+   (name · tool · text — user request). The opened body's rows carry the
+   full per-call detail. */
 .tool-trace .trace-head-name {
   flex: 0 0 auto;
   font-weight: 600;
@@ -188,10 +192,35 @@
   white-space: nowrap;
 }
 
-.tool-trace .trace-head-name + .trace-head-text::before {
+/* The run's latest tool, named before the caption text ("Read File · text").
+   Dim like the caption — the name pill keeps the bold accent. */
+.tool-trace .trace-head-tool {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.tool-trace .trace-head-name + .trace-head-text::before,
+.tool-trace .trace-head-name + .trace-head-tool::before,
+.tool-trace .trace-head-tool + .trace-head-text::before {
   content: "·";
   margin-right: 6px;
   opacity: 0.45;
+}
+
+/* A finished sub-agent run wears a tick at the head of its line: the same glyph
+   as a completed tool row, but tinted like the caption text (NOT the semantic
+   green `.status-ok` sets) so it reads as "this run ended", not a success
+   badge. Hover follows the caption's own colour lift. */
+.tool-trace .trace-head-check {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--text-dim);
+  transition: color 0.15s ease;
+}
+
+.tool-group > .trace-head:hover .trace-head-check {
+  color: var(--text);
 }
 
 .tool-trace .trace-head:hover,
@@ -227,6 +256,14 @@
   50% {
     opacity: 1;
   }
+}
+
+/* Elapsed time at the head's right edge: one line, never squeezed — the
+   caption text (min-width: 0) absorbs the squeeze instead, so "4m 4s" never
+   stacks onto two lines (user request). */
+.tool-group > .trace-head .trace-head-ms {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .tool-group > .trace-head .trace-chev {

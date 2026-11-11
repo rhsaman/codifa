@@ -1099,11 +1099,33 @@ pub(crate) const BATCH_MAX_OPS: usize = 10;
 /// IMMEDIATELY: traced (`mwam7hcn`) 19 of 141 `batch` calls were unusable and
 /// each one burned a whole round (≈26K prompt tokens) on the retry. The bare
 /// "needs ops" wording gave the model nothing to correct, so it guessed again.
+/// Error for an `ops` STRING that is not valid JSON: names the serde error
+/// and the exact spot in the model's own text, so the fix is one escape — not
+/// a full-shape guess.
+fn malformed_ops_json(s: &str, e: &serde_json::Error) -> String {
+    let col = e.column().saturating_sub(1);
+    let window: String = s
+        .chars()
+        .skip(col.saturating_sub(40))
+        .take(80)
+        .collect();
+    format!(
+        "batch: the string in `ops` is not valid JSON ({e}) — near: …{window}… \
+Fix that exact spot and resend the same batch; otherwise {}",
+        batch_ops_error()
+    )
+}
+
 fn batch_ops_error() -> String {
     "batch: ops must be a NON-empty array of {tool, args} pairs, e.g. \
      {\"ops\":[{\"tool\":\"grep\",\"args\":{\"pattern\":\"todo\",\"path\":\".\"}},\
      {\"tool\":\"read\",\"args\":{\"filePath\":\"a.txt\"}}]}; tool one of: read, grep, glob, \
-     find_symbol, lsp_*, run_terminal, edit_file, write_file"
+     find_symbol, lsp_*, run_terminal"
+    // `edit_file`/`write_file` are deliberately NOT in this list: they were
+    // removed from `BATCH_TOOLS` because a write inside the composer skips the
+    // snapshot, the Review diff and the out-of-workspace permit. Advertising
+    // them here told the traced model to retry the shape it had just been
+    // refused, one round per retry.
         .into()
 }
 
@@ -1115,19 +1137,23 @@ fn batch_ops_error() -> String {
 /// while the ops inside were perfectly valid — each refusal cost a retry round.
 /// Markdown fences are tolerated too, since a model that thinks in prose often
 /// wraps its JSON in them.
-fn decode_ops_string(text: &str) -> Option<Vec<Value>> {
+fn decode_ops_string(text: &str) -> Result<Vec<Value>, String> {
     let mut body = text.trim();
     if let Some(rest) = body.strip_prefix("```") {
         // Drop the fence's language tag, then the closing fence.
         body = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
         body = body.trim_end_matches("```").trim();
     }
-    let parsed: Value = serde_json::from_str(body).ok()?;
-    match parsed {
-        Value::Array(ops) => Some(ops),
+    match serde_json::from_str::<Value>(body) {
+        Ok(Value::Array(ops)) => Ok(ops),
         // A string holding `{"ops":[…]}` — unwrap the wrapper, not the string.
-        Value::Object(mut o) => o.remove("ops")?.as_array().cloned(),
-        _ => None,
+        Ok(Value::Object(mut o)) => o
+            .remove("ops")
+            .and_then(|v| v.as_array().cloned())
+            .ok_or_else(batch_ops_error),
+        Ok(_) => Err(batch_ops_error()),
+        // Malformed: name THE spot (see `malformed_ops_json`).
+        Err(e) => Err(malformed_ops_json(body, &e)),
     }
 }
 
@@ -1142,7 +1168,7 @@ fn decode_ops_string(text: &str) -> Option<Vec<Value>> {
 pub(crate) fn batch_ops(args: &Value) -> Result<Vec<Value>, String> {
     let ops = match args.get("ops") {
         Some(Value::Array(a)) => a.clone(),
-        Some(Value::String(s)) => decode_ops_string(s).ok_or_else(batch_ops_error)?,
+        Some(Value::String(s)) => decode_ops_string(s)?,
         _ => return Err(batch_ops_error()),
     };
     // An op may be a stringified object for the same double-encoding reason.

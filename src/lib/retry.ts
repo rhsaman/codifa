@@ -210,6 +210,36 @@ export function isDeterministicTurnError(reason: string): boolean {
 }
 
 /**
+ * Idle gap past which resuming a failed turn starts its elapsed clock over.
+ *
+ * The auto-retry ladder's longest wait is 60s (RETRY_BACKOFF_MS cap), so every
+ * automatic re-send — and the watchdog's immediate resends — land well inside
+ * this window and keep the original clock base. A manual Retry clicked long
+ * after the failure is a new working session, not the same stretch of wall
+ * time, and counts from the resume instead.
+ */
+export const RESUME_CLOCK_GAP_MS = 5 * 60_000
+
+/**
+ * Whether resuming a closed bubble must RESTART the "Working" elapsed clock
+ * instead of keeping its original `workingStartedAt`.
+ *
+ * The clock base survives a retry-armed close (the pill must span the whole
+ * turn — failed attempts and backoff waits included — instead of resetting to
+ * zero on every re-send), so "when did this bubble go idle" is reconstructed
+ * as base + parked duration. A missing duration means the bubble never parked
+ * one (still streaming, or legacy state) and the base is always kept.
+ */
+export function resumeClockRestart(
+  workingStartedAt: number,
+  turnElapsedMs: number | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (turnElapsedMs == null) return false
+  return now - (workingStartedAt + turnElapsedMs) > RESUME_CLOCK_GAP_MS
+}
+
+/**
  * Epoch-guarded scheduler for automatic retries (watchdog stall resends,
  * banner resends, post-turn drains).
  *

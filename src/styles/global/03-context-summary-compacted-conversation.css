@@ -304,7 +304,7 @@
   flex-direction: column;
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: 12px;
   padding: 0;
   transition: border-color 0.18s ease;
 }
@@ -1144,27 +1144,13 @@
   color: var(--danger);
   border: none;
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--danger) 22%, transparent);
-  animation: stop-pulse 1.1s ease-in-out infinite;
 }
 
 .stop-btn:hover {
-  animation: none;
   background: var(--danger);
   color: #fff;
   box-shadow: 0 6px 18px color-mix(in srgb, var(--danger) 42%, transparent);
   transform: translateY(-1px);
-}
-
-@keyframes stop-pulse {
-
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 40%, transparent);
-  }
-
-  50% {
-    box-shadow: 0 0 0 6px transparent;
-  }
 }
 
 /* Queue button: shown next to Stop while a chat is working. Sends the typed
@@ -1285,20 +1271,20 @@
   left: 50%;
   --mode-x: -50%;
   transform: translateX(var(--mode-x));
-  min-width: 190px;
+  min-width: 170px;
   max-height: 320px;
   overflow-y: auto;
   background: color-mix(in srgb, var(--bg) 92%, transparent);
-  border: none;
-  border-radius: 16px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.08));
+  border-radius: 12px;
   box-shadow:
     var(--shadow-pop),
     inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
   z-index: 40;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 5px;
+  gap: 1px;
+  padding: 4px;
   backdrop-filter: blur(28px) saturate(1.3);
   transform-origin: bottom center;
   animation: mode-menu-in 0.15s ease-out;
@@ -1328,66 +1314,49 @@
 .mode-menu-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 7px 10px;
+  gap: 9px;
+  padding: 6px 9px;
   text-align: left;
   color: var(--text);
   background: transparent;
   border: 0;
-  border-radius: 10px;
+  border-radius: 8px;
   cursor: pointer;
-  transition:
-    background 0.12s,
-    box-shadow 0.12s;
+  transition: background 0.12s;
 }
 
 .mode-menu-item:hover {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
 }
 
 .mode-menu-item:active {
   transform: scale(0.96);
 }
 
+/* Selected row: one soft accent wash, the accent label does the rest — no
+   dot, no ring, no glow (the old row stacked three markers and read as a
+   clunky box). */
 .mode-menu-item.active {
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 16%, transparent),
-      color-mix(in srgb, var(--accent) 8%, transparent));
-  box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent),
-    0 1px 8px -3px color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
 }
 
-.mode-menu-item.active::before {
-  content: "";
-  align-self: center;
-  flex: 0 0 auto;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px 1px color-mix(in srgb, var(--accent) 60%, transparent);
+.mode-menu-item.active .mode-menu-label {
+  color: var(--accent);
 }
 
 .mode-menu-item .mode-select-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
   flex: 0 0 auto;
-  border-radius: 9px;
-  font-size: 14px;
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+  font-size: 15px;
+  color: var(--text-dim);
 }
 
 .mode-menu-item.active .mode-select-icon {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
-    0 0 10px -2px color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
 }
 
 .mode-menu-text {
@@ -1400,7 +1369,7 @@
 
 .mode-menu-label {
   font-size: 12.5px;
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .mode-menu-desc {

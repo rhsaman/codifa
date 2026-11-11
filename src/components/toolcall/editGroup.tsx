@@ -198,10 +198,11 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
  *  (the model reasoning, narration) would be dropped. A call without a start
  *  stamp (older transcripts) falls back to summing the durations.
  *
- *  `live` keeps the clock running while the turn is still streaming but NO call
- *  is executing (the model is thinking between two calls): the reference UI's
- *  header timer counts wall-clock time, so it must never freeze on a tool-call
- *  boundary. The span still freezes once the turn ends. */
+ *  `live` keeps the clock running while the RUN is still open but NO call is
+ *  executing (the model is thinking between two calls, narration streaming):
+ *  the header timer counts the group's wall-clock time, so it must not freeze
+ *  on a tool-call boundary. Once the run is closed (`live=false`) — even
+ *  mid-turn — the span freezes at the last call's end (user request). */
 export function groupSpanMs(
   acts: ToolActivity[],
   now: number,

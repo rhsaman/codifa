@@ -13,7 +13,7 @@ import { createPortal } from 'react-dom'
 import { fmtArgValue, rowDetail } from './args'
 import { DiffPreview, useDiffPreview } from './diff'
 import { fmtTime, groupSpanMs } from './editGroup'
-import { IconChevron, StatusIcon, TerminalRowIcon } from './icons'
+import { IconCheck, IconChevron, StatusIcon, TerminalRowIcon } from './icons'
 import { TraceRequestBlock, TraceResponseBlock, TraceTextBlock } from './ioBlocks'
 import { activityLabel, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, useRunningClock } from './naming'
 import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
@@ -21,6 +21,7 @@ import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, WebRe
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
   captions,
+  liveCaption,
   subagent,
   live,
 }: {
@@ -31,6 +32,13 @@ export const ToolGroupView = memo(function ToolGroupView({
    *  summary title (Claude.ai keeps the latest caption as the collapsed
    *  summary). */
   captions?: (string | null)[];
+  /** Narration streamed AFTER the run's last call but BEFORE the next one
+   *  arrived (main agent, mid-stream only): the newest words the agent said.
+   *  It leads the head text and trails the opened body; when its call lands
+   *  it becomes that call's per-call caption — same text, same group, so the
+   *  header updates in place instead of the line first showing in the chat
+   *  (user request). */
+  liveCaption?: string | null;
   /** A dedicated sub-agent run: its delegation call (`explore` / `agent__…`).
    *  The agent's own name leads the header, its state owns the group clock, and
    *  its narration (or task description) becomes the head caption. The
@@ -38,9 +46,12 @@ export const ToolGroupView = memo(function ToolGroupView({
    *  card's children), rendered as normal trace rows — a sub-agent card is just
    *  a tool group with a name. */
   subagent?: ToolActivity;
-  /** The turn is still streaming. Keeps the header clock ticking across the
-   *  gap between two calls (the model thinking), instead of freezing on every
-   *  tool-call boundary; a finished turn stops the clock. */
+  /** The run is still OPEN: the turn is streaming AND nothing has closed this
+   *  run yet (real prose, an edit run, the turn ending). Keeps the header clock
+   *  ticking across the gap between two calls (the model thinking, narration
+   *  streaming); once the run closes — even mid-turn — the clock freezes at
+   *  the last call's end (user request: the group time spans the GROUP,
+   *  start → end, not the whole turn). */
   live?: boolean;
 }) {
   // Every run starts collapsed — including runs with web calls, whose hits are
@@ -50,8 +61,12 @@ export const ToolGroupView = memo(function ToolGroupView({
   // The delegation call's state owns the group's running state: a sub-agent
   // run is "running" even between its own tool calls.
   const subagentRunning = subagent?.status === "running";
-  const running =
-    activities.some((a) => a.activity.status === "running") || subagentRunning;
+  // A dedicated sub-agent card is governed by the delegation call ALONE: a
+  // stale child left "running" in a finished run must not keep the card ticking
+  // or its clock counting (user request).
+  const running = subagent
+    ? subagentRunning
+    : activities.some((a) => a.activity.status === "running");
   // Dedicated sub-agent run: its own name is the header's last-resort text
   // (when the agent has said nothing yet and has no task description).
   const subagentName = subagent
@@ -94,21 +109,35 @@ export const ToolGroupView = memo(function ToolGroupView({
     }
     return subagentCaption;
   })();
+  // The run's LATEST call, named before the caption text — "Read File · now
+  // checking the auth flow" — and on a delegation card, between the agent's
+  // own name pill and the text (user request). A delegation call with no
+  // inner calls yet names no tool.
+  const lastLabel = activities.length
+    ? activityLabel(activities[activities.length - 1].activity)
+    : null;
   // The head states the run's elapsed time on the right (like the collapsed
   // and opened states of the reference UI), so the body never repeats it. The
   // clock keeps ticking while the turn is live, not only while a call runs.
-  const now = useRunningClock(running || !!live);
+  // EXCEPT for a dedicated sub-agent card: that card is about ONE run, so its
+  // clock stops the instant that run ends (user request) — `live` alone (the
+  // outer turn still streaming) kept it counting long after the agent was done.
+  const spanLive = subagent ? subagentRunning : !!live;
+  const now = useRunningClock(running || spanLive);
   const ms = groupSpanMs(
-    [...(subagent ? [subagent] : []), ...activities.map((a) => a.activity)],
+    subagent ? [subagent] : activities.map((a) => a.activity),
     now,
-    !!live,
+    spanLive,
   );
-  // One line, in order of specificity: the agent's latest words → what the
-  // first call is doing. A sub-agent card renders its NAME in its own span
-  // (see the head below), so it is not repeated as fallback text here.
-  const headText = prepareContent(
-    (headCaption ?? "") || (subagent ? "" : activityLabel(activities[0].activity) || ""),
-  );
+  // A finished sub-agent run swaps the running dots for a tick at the head of
+  // its line: the run's own completion mark (user request), so a done card is
+  // recognizable without opening it.
+  const subagentDone = subagent?.status === "done";
+  // One line: the agent's newest words. The live caption — streamed after the
+  // run's last call — outranks the per-call captions until its own call lands.
+  // The run's latest call is named in its own span before this text (see
+  // lastLabel), so no label fallback is needed here.
+  const headText = prepareContent(liveCaption || headCaption || "");
 
   return (
     <div
@@ -129,12 +158,19 @@ export const ToolGroupView = memo(function ToolGroupView({
             <i />
           </span>
         )}
+        {subagentDone && <IconCheck className="trace-head-check" />}
         {/* A sub-agent run leads with its OWN name, then the latest words it
-            said — the tool names/counts were removed from the header entirely
-            (user request): the opened body is where the calls live. */}
+            said — the opened body is where the calls live. */}
         {subagent && (
           <span className="trace-head-name" title={subagentName ?? undefined}>
             {subagentName}
+          </span>
+        )}
+        {/* The run's LATEST call, named BEFORE the caption text (user
+            request) — after the sub-agent's own name on a delegation card. */}
+        {lastLabel && (
+          <span className="trace-head-tool" title={lastLabel}>
+            {lastLabel}
           </span>
         )}
         <span className="trace-head-text" dir="auto" title={headText}>
@@ -169,6 +205,10 @@ export const ToolGroupView = memo(function ToolGroupView({
             .map((p, pi) => (
               <TraceNarration key={`se-${pi}`} text={p.text} />
             ))}
+          {/* The narration streaming for the NEXT call sits at the run's
+              tail: when that call lands it becomes the caption above the new
+              row — the same spot, so the expanded view never jumps. */}
+          {live && liveCaption && <TraceNarration text={liveCaption} />}
         </div>
       )}
     </div>

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ChatBubble } from './ChatBubble'
+import { SelectionToolbar, useFloatingSelection } from './SelectionToolbar'
 import type { ChatMessage } from '../types'
 import { splitSections } from '../lib/sections'
+import { requestReplyQuote } from '../lib/chatQuote'
 import { APP_DIR, useStore } from '../lib/store'
 import { detectDir } from '../lib/bidi'
 import { physicalKey } from '../lib/shortcuts'
@@ -93,6 +95,20 @@ export function ReadingMode({
     return () => window.removeEventListener('resize', onResize)
   }, [])
   const contentRef = useRef<HTMLDivElement>(null)
+
+  // Selection toolbar (Reply / Read aloud) over the section text. Reply pins
+  // the selection into the chat composer and closes the panel, so the quote
+  // is reachable; Read aloud uses the shared TTS stack.
+  const [selTtsBusy, setSelTtsBusy] = useState(false)
+  const selectionBar = useFloatingSelection((el) => {
+    const root = contentRef.current
+    return !!el && !!root && root.contains(el)
+  })
+  const handleReadingReply = (text: string) => {
+    requestReplyQuote(text)
+    selectionBar.clear()
+    onClose()
+  }
 
   // Esc closes the panel; ↑/↓ jump between sections.
   useEffect(() => {
@@ -290,6 +306,13 @@ export function ReadingMode({
             <kbd>Esc</kbd> close
           </span>
         </div>
+        {(selectionBar.sel || (selTtsBusy && selectionBar.lastSel.current)) && (
+          <SelectionToolbar
+            sel={selectionBar.sel ?? selectionBar.lastSel.current}
+            onReply={handleReadingReply}
+            onBusyChange={setSelTtsBusy}
+          />
+        )}
       </div>
     </div>
   )

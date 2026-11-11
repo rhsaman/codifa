@@ -86,9 +86,9 @@ const bridge: CoderApi = {
     }>('computer_permissions'),
   requestScreenRecording: () => invoke<boolean>('request_screen_recording'),
   // Tauri's drag-drop event carries absolute paths; the bridge records the
-  // latest dropped path per File name so getPathForFile stays sync (parity
-  // with Electron's webUtils.getPathForFile).
-  getPathForFile: (file: File) => droppedPaths.get(file.name) ?? '',
+  // latest dropped paths so getPathForFile stays sync (parity with Electron's
+  // webUtils.getPathForFile).
+  getPathForFile: (file: File) => pathForDroppedFile(file),
   storeGet: <T>(key: string) => invoke<T | null>('store_get', { key }),
   storeSet: (key, value) => invoke<boolean>('store_set', { key, value }),
   chatGet: <T>(id: string, opts?: { before?: number; limit?: number }) =>
@@ -170,12 +170,38 @@ const bridge: CoderApi = {
       .catch(() => false),
 }
 
-/** Latest absolute path seen per dropped file name (see getPathForFile). */
-const droppedPaths = new Map<string, string>()
+/** Absolute paths of the most recent OS drop, in Finder order (see
+ *  pathForDroppedFile). */
+let lastDropPaths: string[] = []
+/** Per-drop cursor for same-basename disambiguation (see pathForDroppedFile). */
+const dropNameCursor = new Map<string, number>()
 
-/** Record absolute paths from Tauri drag-drop events (called from main.tsx). */
+/** Record absolute paths from Tauri drag-drop events (called from main.tsx).
+ *  Each drop replaces the previous record AND resets the name cursor, so a
+ *  later drag of a same-named different file can never resolve to the old
+ *  drop's path. */
 export function recordDroppedPaths(files: { name: string; path: string }[]): void {
-  for (const { name, path } of files) droppedPaths.set(name, path)
+  lastDropPaths = files.map((f) => f.path)
+  dropNameCursor.clear()
+}
+
+/** Resolve a dropped File to its absolute path (sync — the native drop event
+ *  always lands before the DOM drop handler reads this). Multi-file drags
+ *  match by basename: a unique name resolves directly; same-named files in ONE
+ *  drop (index.html in two folders, or several report.pdf exports) hand out
+ *  occurrences in drop order — the DOM handler walks dataTransfer.files in the
+ *  same Finder order the native event recorded. Exported for the bridge unit
+ *  test (tests/fileDragBridge.test.ts) — installDragShim needs a DOM, so the
+ *  test cannot reach this through installTauriBridge/window.coder. */
+export function pathForDroppedFile(file: File): string {
+  const candidates = lastDropPaths.filter(
+    (p) => p.split('/').pop() === file.name,
+  )
+  if (candidates.length === 0) return ''
+  if (candidates.length === 1) return candidates[0]
+  const seen = dropNameCursor.get(file.name) ?? 0
+  dropNameCursor.set(file.name, seen + 1)
+  return candidates[Math.min(seen, candidates.length - 1)]
 }
 
 /** Install the Tauri-backed window.coder bridge (no-op in web mode). */

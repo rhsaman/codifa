@@ -2059,3 +2059,25 @@ token mid 3
         assert!(err.contains("test_stats.py"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+#[test]
+fn tmp_batch_ops_error_names_the_malformed_spot() {
+    // The traced payload (`mwbmxr0r`, 20:12): a string-encoded ops array that
+    // is 95% correct with ONE bad escape — the refusal must name the spot so
+    // the model fixes ONE character instead of guessing the whole shape.
+    let encoded = r#"[{"args": {"filePath": "a.rs"}, "tool": "read"}, {"args": {"pattern": "broken "sidebar-}, "tool": "grep"}]"#;
+    let args = json!({"ops": encoded});
+    let err = crate::tools::dispatch::batch_ops(&args).unwrap_err();
+    assert!(err.contains("not valid JSON"), "{err}");
+    assert!(err.contains("near:"), "{err}");
+    // The window shows the broken escape area.
+    assert!(err.contains("sidebar"), "{err}");
+    // A VALID string-encoded array still decodes (the happy path that the
+    // traced sessions rely on).
+    let ok = crate::tools::dispatch::batch_ops(&json!({
+        "ops": r#"[{"args": {"filePath": "a.rs"}, "tool": "read"}]"#
+    }))
+    .expect("valid string-encoded ops must decode");
+    assert_eq!(ok[0]["tool"], json!("read"));
+}
+

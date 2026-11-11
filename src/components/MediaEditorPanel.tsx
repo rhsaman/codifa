@@ -66,6 +66,50 @@ async function mediaEdit(
   return { files: data.files ?? [], message: data.message ?? "" };
 }
 
+/** An absolute filesystem path (POSIX or Windows) — NOT a virtual `media/…`
+ *  path. Those live outside the chat's media sandbox and may therefore miss
+ *  the sidecar's media route; they get the desktop-bridge data-URL fallback. */
+function isAbsFsPath(p: string): boolean {
+  return /^[/\\]/.test(p) || /^[a-zA-Z]:[/\\]/.test(p);
+}
+
+const FILE_ICON = (
+  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="3" y="3" width="18" height="18" rx="3" />
+    <circle cx="9" cy="9" r="1.6" />
+    <path d="M21 15.5 16 10.5 5.5 21" />
+  </svg>
+);
+const DOWNLOAD_ICON = (
+  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M12 3v12m0 0 4-4m-4 4-4-4" />
+    <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+  </svg>
+);
+const REFRESH_ICON = (
+  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M20 11a8 8 0 1 0-2.3 6.3" />
+    <path d="M20 4v7h-7" />
+  </svg>
+);
+const OPEN_ICON = (
+  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M14 4h6v6" />
+    <path d="M20 4 11 13" />
+    <path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5" />
+  </svg>
+);
+const ZOOM_IN_ICON = (
+  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+    <path d="M12 6v12M6 12h12" />
+  </svg>
+);
+const ZOOM_OUT_ICON = (
+  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+    <path d="M6 12h12" />
+  </svg>
+);
+
 export function MediaEditorPanel({
   filePath,
   fileRoot,
@@ -80,12 +124,61 @@ export function MediaEditorPanel({
   const cid = chatId ?? useStore((s) => s.activeChatId) ?? "";
   const isVideo = isMediaVideoPath(filePath);
   const base = peekSidecarUrl();
-  const src = useMemo(() => mediaFileUrl(filePath, base), [filePath, base]);
+  const cleanPath = filePath.trim();
 
+  // Primary source: the sidecar media route (original bytes, chat-scoped
+  // sandbox + workspace fallback). An ABSOLUTE path outside both sandboxes —
+  // a screenshot in /var/folders, a file the agent read from anywhere — 404s
+  // there, so on first failure the desktop bridge reads it as a data URL
+  // (images only; the same source FileViewerPanel uses).
+  const directUrl = useMemo(
+    () => (base ? mediaFileUrl(cleanPath, base, root) : null),
+    [cleanPath, base, root],
+  );
+  const [fallbackSrc, setFallbackSrc] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [meta, setMeta] = useState<{ w?: number; h?: number; seconds?: number }>({});
   const [reload, setReload] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const src = fallbackSrc ?? directUrl;
+
+  const handleLoadError = useCallback(() => {
+    if (fallbackSrc) {
+      setLoadError("The file could not be decoded.");
+      return;
+    }
+    if (!isAbsFsPath(cleanPath)) {
+      setLoadError("This media file is missing or unreadable.");
+      return;
+    }
+    api
+      .readImage(cleanPath)
+      .then((dataUrl) => {
+        if (dataUrl) setFallbackSrc(dataUrl);
+        else setLoadError("This file is missing, or too large to display.");
+      })
+      .catch(() => setLoadError("This file is missing, or too large to display."));
+  }, [cleanPath, fallbackSrc]);
+
+  const refresh = useCallback(() => {
+    setFallbackSrc(null);
+    setLoadError(null);
+    setMeta({});
+    setReload((n) => n + 1);
+  }, []);
+
+  const openExternally = useCallback(() => {
+    if (api.openFileExternal) {
+      void api
+        .openFileExternal(cleanPath, "default")
+        .then((r) => {
+          if (r && r.ok === false && r.error) setError(r.error);
+        })
+        .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    }
+  }, [cleanPath]);
 
   // The result of a crop/trim opens as a NEW media tab so the original stays.
   const openResult = useCallback(
@@ -116,41 +209,98 @@ export function MediaEditorPanel({
     [root, cid, openResult],
   );
 
+  const name = cleanPath.split(/[\\/]/).pop() || cleanPath;
+  const dirTail = cleanPath.slice(0, cleanPath.length - name.length).replace(/[\\/]$/, "");
+  const dims =
+    meta.w && meta.h
+      ? `${meta.w}×${meta.h}`
+      : meta.seconds
+        ? `${meta.seconds.toFixed(1)}s`
+        : null;
+
   return (
     <div className="media-editor" dir="auto">
       <div className="media-editor-head">
-        <span className="media-editor-path" dir="ltr" title={filePath}>
-          {filePath}
+        <span className="media-editor-fileicon" aria-hidden="true">
+          {FILE_ICON}
         </span>
-        <button
-          type="button"
-          className="btn tiny secondary"
-          onClick={() => {
-            setError(null);
-            void downloadMedia(src, filePath)
-              .then((outcome) => {
-                if (outcome === "saved") setNotice("Saved.");
-                else if (outcome === "downloaded") setNotice("Downloaded.");
-              })
-              .catch((e) =>
-                setError(e instanceof Error ? e.message : String(e)),
-              );
-          }}
-          title="Save a copy anywhere on disk"
-        >
-          Download
-        </button>
-        <button
-          type="button"
-          className="btn tiny secondary"
-          onClick={() => setReload((n) => n + 1)}
-          title="Re-read the file from disk (after a regeneration)"
-        >
-          Refresh
-        </button>
+        <span className="media-editor-title" dir="ltr">
+          <span className="media-editor-filename" title={cleanPath}>
+            {name}
+          </span>
+          {dirTail && (
+            <span className="media-editor-dir" dir="ltr" title={cleanPath}>
+              {dirTail}
+            </span>
+          )}
+        </span>
+        {dims && (
+          <span className="media-editor-badge" dir="ltr">
+            {dims}
+          </span>
+        )}
+        <span className="media-editor-badge media-editor-badge-kind" dir="ltr">
+          {isVideo ? "video" : "image"}
+        </span>
+        <span className="media-editor-actions">
+          <button
+            type="button"
+            className="media-editor-iconbtn"
+            onClick={() => {
+              setError(null);
+              void downloadMedia(src ?? cleanPath, cleanPath, fallbackSrc ?? undefined)
+                .then((outcome) => {
+                  if (outcome === "saved") setNotice("Saved.");
+                  else if (outcome === "downloaded") setNotice("Downloaded.");
+                })
+                .catch((e) =>
+                  setError(e instanceof Error ? e.message : String(e)),
+                );
+            }}
+            title="Save a copy anywhere on disk"
+            aria-label="Download"
+          >
+            {DOWNLOAD_ICON}
+          </button>
+          <button
+            type="button"
+            className="media-editor-iconbtn"
+            onClick={refresh}
+            title="Re-read the file from disk (after a regeneration)"
+            aria-label="Refresh"
+          >
+            {REFRESH_ICON}
+          </button>
+          <button
+            type="button"
+            className="media-editor-iconbtn"
+            onClick={openExternally}
+            title="Open with the default app"
+            aria-label="Open externally"
+          >
+            {OPEN_ICON}
+          </button>
+        </span>
       </div>
 
-      {isVideo ? (
+      {loadError ? (
+        <div className="media-editor-body">
+          <div className="media-editor-canvas media-editor-canvas-empty">
+            <div className="media-editor-missing">
+              <span className="media-editor-missing-glyph" aria-hidden="true">
+                {isVideo ? "🎬" : "🖼️"}
+              </span>
+              <span className="media-editor-missing-text">{loadError}</span>
+              <span className="media-editor-missing-path" dir="ltr">
+                {cleanPath}
+              </span>
+              <button type="button" className="btn tiny secondary" onClick={refresh}>
+                Retry
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : isVideo ? (
         <VideoEditor
           key={`${src}#${reload}`}
           src={src}
@@ -159,7 +309,8 @@ export function MediaEditorPanel({
           cid={cid}
           busy={busy}
           run={run}
-          onNotice={setNotice}
+          onError={handleLoadError}
+          onMeta={setMeta}
         />
       ) : (
         <ImageEditor
@@ -170,11 +321,12 @@ export function MediaEditorPanel({
           cid={cid}
           busy={busy}
           run={run}
-          onNotice={setNotice}
+          onError={handleLoadError}
+          onMeta={setMeta}
         />
       )}
 
-      {busy && <div className="media-editor-status">Working — {busy}…</div>}
+      {busy && <div className="media-editor-status is-busy">Working — {busy}…</div>}
       {notice && <div className="media-editor-status ok">{notice}</div>}
       {error && <div className="media-editor-status err">{error}</div>}
     </div>
@@ -211,9 +363,9 @@ function AskAgentBox({
     const outcome = sendOrQueue(cid, prompt, image);
     setStatus(
       outcome === "sent"
-        ? "Sent to the agent — the reply appears in the chat."
+        ? "Sent — the reply appears in the chat."
         : outcome === "queued"
-          ? "Queued — it will send when the current turn finishes."
+          ? "Queued — sends when the current turn finishes."
           : "Chat not available.",
     );
     if (outcome !== "unavailable") setTyped("");
@@ -226,7 +378,7 @@ function AskAgentBox({
         // own language (dir=auto): a Persian sentence still renders RTL.
         dir="auto"
         rows={2}
-        placeholder="What should I change? Type here, Enter to send"
+        placeholder="What should I change? Type here…"
         value={typed}
         disabled={disabled}
         onChange={(e) => setTyped(e.target.value)}
@@ -237,14 +389,19 @@ function AskAgentBox({
           }
         }}
       />
-      <button
-        type="button"
-        className="btn tiny primary"
-        disabled={disabled || !typed.trim() || !cid}
-        onClick={send}
-      >
-        Send to agent
-      </button>
+      <div className="media-editor-ask-foot">
+        <span className="media-editor-ask-hint">
+          <kbd>Enter ↵</kbd> send · <kbd>Shift+Enter</kbd> newline
+        </span>
+        <button
+          type="button"
+          className="btn tiny primary"
+          disabled={disabled || !typed.trim() || !cid}
+          onClick={send}
+        >
+          Send to agent
+        </button>
+      </div>
       {status && <span className="media-editor-hint" dir="ltr">{status}</span>}
     </div>
   );
@@ -261,22 +418,49 @@ function ImageEditor({
   cid,
   busy,
   run,
+  onError,
+  onMeta,
 }: {
-  src: string;
+  src: string | null;
   filePath: string;
   root: string;
   cid: string;
   busy: string | null;
   run: (label: string, body: Record<string, unknown>) => Promise<void>;
-  onNotice?: (msg: string | null) => void;
+  onError: () => void;
+  onMeta?: (m: { w?: number; h?: number }) => void;
 }) {
   const imgRef = useRef<HTMLImageElement>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [natural, setNatural] = useState({ w: 0, h: 0 });
   // Selection in NATURAL image pixels — what a mask/region needs.
   const [rect, setRect] = useState<Rect | null>(null);
   const drag = useRef<{ x: number; y: number; mode: "pan" | "select" } | null>(null);
+
+  const clampScale = (s: number) => Math.min(8, Math.max(0.2, s));
+
+  useEffect(() => {
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
+    setRect(null);
+  }, [src]);
+
+  // The header shows the real pixel size (and the crop rescale uses it).
+  useEffect(() => {
+    onMeta?.({ w: natural.w || undefined, h: natural.h || undefined });
+  }, [natural, onMeta]);
+
+  // Escape clears the selection without touching zoom/pan.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setRect(null);
+    };
+    const el = canvasRef.current;
+    el?.addEventListener("keydown", onKey);
+    return () => el?.removeEventListener("keydown", onKey);
+  }, []);
 
   const reset = () => {
     setScale(1);
@@ -295,16 +479,17 @@ function ImageEditor({
     };
   };
 
-  // The overlay rect is computed in DISPLAY coordinates so it tracks zoom/pan:
-  // kept in natural px, converted once per render via the img box ratio.
+  // The overlay rect is computed in CANVAS coordinates so it tracks zoom/pan:
+  // kept in natural px, mapped through the img box position every render.
   const displayRect = (() => {
+    const canvasBox = canvasRef.current?.getBoundingClientRect();
     const box = imgRef.current?.getBoundingClientRect();
-    if (!box || !rect || !natural.w || !natural.h) return null;
+    if (!canvasBox || !box || !rect || !natural.w || !natural.h) return null;
     const sx = box.width / natural.w;
     const sy = box.height / natural.h;
     return {
-      left: rect.x * sx,
-      top: rect.y * sy,
+      left: box.left - canvasBox.left + rect.x * sx,
+      top: box.top - canvasBox.top + rect.y * sy,
       width: rect.w * sx,
       height: rect.h * sy,
     };
@@ -341,7 +526,7 @@ function ImageEditor({
 
   const onWheel = (e: React.WheelEvent) => {
     e.preventDefault();
-    setScale((s) => Math.min(8, Math.max(0.2, s * (e.deltaY < 0 ? 1.15 : 1 / 1.15))));
+    setScale((s) => clampScale(s * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
   };
 
   /** Crop the selected region off-screen to a PNG data URL — the inline copy
@@ -374,16 +559,33 @@ function ImageEditor({
     }
   };
 
+  if (!src) {
+    // The sidecar origin is not known yet — nothing to fetch (the panel
+    // re-renders once peekSidecarUrl() resolves).
+    return (
+      <div className="media-editor-body">
+        <div className="media-editor-canvas media-editor-canvas-empty">
+          <div className="media-editor-missing">
+            <span className="media-editor-missing-glyph" aria-hidden="true">🖼️</span>
+            <span className="media-editor-missing-text">Waiting for the backend…</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="media-editor-body">
       <div
+        ref={canvasRef}
         className="media-editor-canvas"
+        tabIndex={-1}
         onWheel={onWheel}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
-        style={{ cursor: "crosshair", overflow: "hidden", position: "relative" }}
       >
+        {/* eslint-disable-next-line @next/next/no-img-element -- editor canvas */}
         <img
           ref={imgRef}
           className="media-editor-img"
@@ -396,31 +598,83 @@ function ImageEditor({
             const img = e.currentTarget;
             setNatural({ w: img.naturalWidth, h: img.naturalHeight });
           }}
+          onError={onError}
         />
         {displayRect && (
           <div
             className="media-editor-selection"
             style={{
-              position: "absolute",
               left: displayRect.left,
               top: displayRect.top,
               width: displayRect.width,
               height: displayRect.height,
             }}
-          />
+          >
+            <span className="media-editor-sel-size" dir="ltr">
+              {Math.round(rect!.w)} × {Math.round(rect!.h)}
+            </span>
+          </div>
         )}
       </div>
 
-      <div className="media-editor-tools">
+      <div className="media-editor-toolbar">
+        <span className="media-editor-toolgroup">
+          <button
+            type="button"
+            className="media-editor-toolbtn"
+            onClick={() => setScale((s) => clampScale(s / 1.25))}
+            title="Zoom out"
+            aria-label="Zoom out"
+          >
+            {ZOOM_OUT_ICON}
+          </button>
+          <button
+            type="button"
+            className="media-editor-zoompct"
+            onClick={() => setScale(1)}
+            title="Reset zoom to 100%"
+            dir="ltr"
+          >
+            {Math.round(scale * 100)}%
+          </button>
+          <button
+            type="button"
+            className="media-editor-toolbtn"
+            onClick={() => setScale((s) => clampScale(s * 1.25))}
+            title="Zoom in"
+            aria-label="Zoom in"
+          >
+            {ZOOM_IN_ICON}
+          </button>
+          <span className="media-editor-toolsep" />
+          <button type="button" className="media-editor-toolbtn wide" onClick={reset}>
+            Fit
+          </button>
+        </span>
+
+        <span className="media-editor-toolhint" dir="ltr">
+          drag to select · shift-drag to pan
+        </span>
+
+        <span className="media-editor-toolspring" />
+
         {rect && natural.w > 0 && (
           <span className="media-editor-hint" dir="ltr">
             {Math.round(rect.x)},{Math.round(rect.y)} · {Math.round(rect.w)}×{Math.round(rect.h)} px
           </span>
         )}
-        <button type="button" className="btn tiny secondary" onClick={reset}>Fit</button>
+        {rect && (
+          <button
+            type="button"
+            className="btn tiny secondary"
+            onClick={() => setRect(null)}
+          >
+            Clear
+          </button>
+        )}
         <button
           type="button"
-          className="btn tiny secondary"
+          className={`btn tiny ${rect ? "primary" : "secondary"}`}
           disabled={!rect || !!busy}
           onClick={() => void run("Cropping", {
             action: "crop",
@@ -429,6 +683,8 @@ function ImageEditor({
             y: Math.round(rect?.y ?? 0),
             w: Math.round(rect?.w ?? 0),
             h: Math.round(rect?.h ?? 0),
+            src_w: natural.w,
+            src_h: natural.h,
           })}
         >
           Crop selection
@@ -463,20 +719,27 @@ function VideoEditor({
   cid,
   busy,
   run,
+  onError,
+  onMeta,
 }: {
-  src: string;
+  src: string | null;
   filePath: string;
   root: string;
   cid: string;
   busy: string | null;
   run: (label: string, body: Record<string, unknown>) => Promise<void>;
-  onNotice?: (msg: string | null) => void;
+  onError: () => void;
+  onMeta?: (m: { seconds?: number }) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [range, setRange] = useState<{ start: number; end: number } | null>(null);
   const [queue, setQueue] = useState<string[]>(() => loadMergeQueue());
+
+  useEffect(() => {
+    onMeta?.({ seconds: duration > 0 ? duration : undefined });
+  }, [duration, onMeta]);
 
   const persistQueue = (next: string[]) => {
     setQueue(next);
@@ -487,12 +750,12 @@ function VideoEditor({
     const v = videoRef.current;
     if (!v) return;
     const onTime = () => setTime(v.currentTime);
-    const onMeta = () => setDuration(v.duration || 0);
+    const onMeta2 = () => setDuration(v.duration || 0);
     v.addEventListener("timeupdate", onTime);
-    v.addEventListener("loadedmetadata", onMeta);
+    v.addEventListener("loadedmetadata", onMeta2);
     return () => {
       v.removeEventListener("timeupdate", onTime);
-      v.removeEventListener("loadedmetadata", onMeta);
+      v.removeEventListener("loadedmetadata", onMeta2);
     };
   }, []);
 
@@ -512,14 +775,32 @@ function VideoEditor({
     v.addEventListener("timeupdate", stop);
   };
 
+  if (!src) {
+    return (
+      <div className="media-editor-body">
+        <div className="media-editor-canvas media-editor-canvas-empty">
+          <div className="media-editor-missing">
+            <span className="media-editor-missing-glyph">🎬</span>
+            <span>Waiting for the backend…</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="media-editor-body">
-      <video ref={videoRef} className="media-editor-video" src={src} controls preload="metadata" />
+      <div className="media-editor-canvas media-editor-canvas-video">
+        <video ref={videoRef} className="media-editor-video" src={src} controls preload="metadata" onError={onError} />
+      </div>
 
-      <div className="media-editor-tools">
-        <span className="media-editor-hint" dir="ltr">
-          {time.toFixed(2)}s / {duration.toFixed(2)}s
+      <div className="media-editor-toolbar">
+        <span className="media-editor-toolgroup">
+          <span className="media-editor-hint" dir="ltr">
+            {time.toFixed(2)}s / {duration.toFixed(2)}s
+          </span>
         </span>
+        <span className="media-editor-toolspring" />
         <button
           type="button"
           className="btn tiny secondary"
@@ -538,19 +819,17 @@ function VideoEditor({
         >
           Mark end
         </button>
-        {range && (
-          <span className="media-editor-hint" dir="ltr">
-            {range.start.toFixed(2)}s–{range.end.toFixed(2)}s
-          </span>
-        )}
         {range && range.end > range.start && (
           <>
+            <span className="media-editor-hint" dir="ltr">
+              {range.start.toFixed(2)}s–{range.end.toFixed(2)}s
+            </span>
             <button type="button" className="btn tiny secondary" onClick={playSelection}>
-              Preview range
+              Preview
             </button>
             <button
               type="button"
-              className="btn tiny secondary"
+              className="btn tiny primary"
               disabled={!!busy}
               onClick={() => void run("Trimming", {
                 action: "trim",
@@ -632,7 +911,7 @@ function VideoEditor({
               disabled={i === queue.length - 1}
               onClick={() => {
                 const next = [...queue];
-                [next[i + 1], next[i]] = [next[i], next[i + 1]];
+                [next[i + 1], next[i]] = [next[i], next[i - 1]];
                 persistQueue(next);
               }}
             >

@@ -7,6 +7,10 @@ import {
   formatChatQuote,
   insertQuoteIntoInput,
   isQuotableSelection,
+  onReplyQuoteRequest,
+  quotePreviewText,
+  requestReplyQuote,
+  splitQuoteFromContent,
 } from "../src/lib/chatQuote";
 
 export {};
@@ -74,6 +78,50 @@ console.log("3) combineQuoteAndInput — pinned reply plus typed question:");
     "empty quote returns input",
     combineQuoteAndInput("   ", "my question") === "my question",
   );
+}
+
+console.log("4) quotePreviewText — one-line preview for the composer reply bar:");
+{
+  check("single line strips the prefix", quotePreviewText("> hello") === "hello");
+  check(
+    "multiline joins into one line",
+    quotePreviewText("> a\n>\n> b") === "a b",
+    JSON.stringify(quotePreviewText("> a\n>\n> b")),
+  );
+  check("plain text passes through", quotePreviewText("no quote") === "no quote");
+  check("blank block is empty", quotePreviewText(">  \n>") === "");
+}
+
+console.log("5) splitQuoteFromContent — sent bubble recovers quote + body:");
+{
+  const noQuote = splitQuoteFromContent("just a question");
+  check("no quote -> null + verbatim body", noQuote.quote === null && noQuote.body === "just a question");
+  const sent = splitQuoteFromContent("> hello\n\nwhat is this?");
+  check("quote + body split", sent.quote === "hello" && sent.body === "what is this?");
+  const multi = splitQuoteFromContent("> a\n> b\n\nbody line");
+  check("multiline quote", multi.quote === "a\nb" && multi.body === "body line");
+  const quoteOnly = splitQuoteFromContent("> only the quote\n\n");
+  check("quote-only send has empty body", quoteOnly.quote === "only the quote" && quoteOnly.body === "");
+  const crlf = splitQuoteFromContent("> hi\r\n\r\nbody");
+  check("CRLF normalised", crlf.quote === "hi" && crlf.body === "body");
+  const deepBlock = splitQuoteFromContent("body first\n> not a quote");
+  check("quote after body is not split", deepBlock.quote === null && deepBlock.body === "body first\n> not a quote");
+  const missingSep = splitQuoteFromContent("> q\nbody");
+  check("missing blank separator still splits", missingSep.quote === "q" && missingSep.body === "body");
+}
+
+console.log("6) requestReplyQuote bridge — non-chat surfaces pin into the composer:");
+{
+  let received: string | null = null;
+  const off = onReplyQuoteRequest((b) => { received = b; });
+  requestReplyQuote("hello");
+  check("listener got the formatted block", received === "> hello");
+  received = null;
+  off();
+  requestReplyQuote("again");
+  check("unsubscribed listener stays silent", received === null);
+  requestReplyQuote("   ");
+  check("blank selection is a no-op", received === null);
 }
 
 if (failed > 0) {

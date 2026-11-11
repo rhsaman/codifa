@@ -56,7 +56,7 @@
     flex: 0 0 auto;
   }
 
-  .composer-inner > .attachment-chips {
+  .composer-input-wrap > .attachment-chips {
     flex-wrap: wrap;
   }
 }
@@ -316,28 +316,89 @@
   border-color: color-mix(in srgb, var(--accent) 60%, transparent);
 }
 
-.chat-quote-reply {
+/* Selection toolbar (Reply + Read aloud) floating above selected text in the
+   chat transcript, reading mode, schedule inbox and schedule panel. One dark
+   grouped pill: two adjacent buttons with a hairline divider, icons in the
+   theme accent, `pointer-events: auto` because the reading-mode overlay root
+   (z-120) disables pointer events on everything inside its portal. No outline
+   — the tinted ring boxed the two actions (user ask); the shadow separates. */
+.selection-toolbar {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 6px 12px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  background: color-mix(in srgb, var(--accent) 16%, var(--bg-panel));
-  color: var(--accent);
+  padding: 3px;
+  border-radius: 11px;
+  border: none;
+  background: color-mix(in srgb, var(--bg-elev) 92%, var(--text) 4%);
+  box-shadow: var(--shadow-pop);
+  user-select: none;
+  pointer-events: auto;
+}
+
+.selection-toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 6px;
+  padding: 5px 11px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
   font-family: var(--font-sans);
   font-size: 12.5px;
   font-weight: 600;
+  /* The fixed-position bar shrink-to-fits against the viewport edge near the
+     screen border; without nowrap the label wrapped into two lines. */
+  white-space: nowrap;
   cursor: pointer;
-  box-shadow: var(--shadow-pop);
   transition:
     background 0.14s ease,
-    border-color 0.14s ease;
+    color 0.14s ease;
 }
 
-.chat-quote-reply:hover {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 26%, var(--bg-panel));
+.selection-toolbar-btn + .selection-toolbar-btn {
+  /* Hairline divider between the two actions (Reply | Read aloud). */
+  border-inline-start: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.selection-toolbar-btn svg {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.selection-toolbar-btn:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+}
+
+.selection-toolbar .tts-spinner {
+  animation: spin 0.7s linear infinite;
+}
+
+/* Friendly TTS error (Persian, from useSpeakText) shown under the buttons. */
+.selection-toolbar-error {
+  position: absolute;
+  top: calc(100% + 6px);
+  inset-inline-start: 0;
+  max-width: 320px;
+  padding: 6px 10px;
+  border-radius: 9px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-elev) 94%, var(--text) 4%);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  box-shadow: var(--shadow-pop);
+}
+
+/* ── Themed text selection on the reading surfaces ────────────────────────
+   The accent mix replaces the OS-default blue highlight so a selection reads
+   with the active palette everywhere the selection toolbar can appear. */
+.chat-messages ::selection,
+.reading-mode ::selection,
+.schedule-inbox ::selection,
+.schedule-list ::selection {
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 /* ── 8. Git bar tooltips flip DOWN in the review header ──────────────────

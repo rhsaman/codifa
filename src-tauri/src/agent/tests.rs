@@ -4030,12 +4030,54 @@
     }
 
     #[test]
-    fn discovery_streak_nudge_fires_once_at_the_boundary() {
+    fn a_streak_nudge_is_never_charged_against_the_lone_call_budget() {
+        // THE traced defect (`mwbmxr0r`, run 2): the delivered text was sniffed
+        // with `contains("rounds in a row")`, a phrase BOTH levers use. So every
+        // streak delivery spent the lone-call budget, and once
+        // `MAX_LONE_CALL_HINTS_PER_TURN` (2) was gone the gate at the delivery
+        // site dropped the streak nudge as well: the lever that bounds an
+        // unbounded search was silenced by the budget of a different lever. The
+        // run then spent 34 rounds past its last hint.
+        //
+        // A streak delivery must NEVER classify as a lone call, at ANY streak
+        // length — including the new cadence points past the late boundary.
+        for streak in STREAK_NUDGE_AT..=40 {
+            let text = discovery_streak_hint("agent", streak);
+            let lever = hint_lever("agent", streak, text.unwrap_or(""));
+            assert_ne!(
+                lever,
+                HintLever::LoneCall,
+                "streak {streak} was charged to the lone-call budget: {text:?}"
+            );
+            if text.is_some() {
+                assert_eq!(lever, HintLever::Streak, "streak {streak}");
+            }
+        }
+        // The lone-call lever keeps its own classification — including the quiet
+        // fallback text, which carries the same shared phrasing.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
+        let lone = single_call_hint("agent", &one, 1, root).unwrap();
+        assert_eq!(hint_lever("agent", 1, &lone), HintLever::LoneCall);
+        // A guard note belongs to neither budget and is never capped.
+        assert_eq!(
+            hint_lever("agent", 1, "[hint] no hit anywhere in that scope"),
+            HintLever::Other
+        );
+    }
+
+    #[test]
+    fn discovery_streak_nudge_repeats_after_the_late_boundary() {
         // The per-round single-call hint was measured as wallpaper (423 of 863
         // rounds carried it, 315 single-call rounds followed it), so the streak
-        // nudge fires ONCE per streak — at the boundary, never before and never
-        // again inside the same streak. Firing earlier or repeatedly would put it
-        // back on the same footing as the hint it replaces.
+        // nudge stays quiet inside the early window and fires only at two shots.
+        //
+        // Traced (`mwbmxr0r`, run 2): the second shot was the LAST one. 47
+        // consecutive search rounds carried 2_801_092 wire tokens and 2_510_450
+        // of them (89%) sat at round 8+ — the 34 rounds past the late boundary
+        // ran in total silence because the lever had no case for them. The
+        // streak never stopped, so the reminder is now on a cadence instead of
+        // stopping at round 7.
         for streak in 1..STREAK_NUDGE_AT {
             assert!(
                 discovery_streak_hint("agent", streak).is_none(),
@@ -4044,21 +4086,43 @@
         }
         let hint = discovery_streak_hint("agent", STREAK_NUDGE_AT).unwrap();
         assert!(hint.contains("`explore`"), "{hint}");
-        // Past the boundary stays silent until the LATE boundary, where the
-        // measured waste says the streak is no longer a finishing move: 1_443_180
-        // of the 2_361_303 uncached tokens past the third round sat at round 7+.
+        // Between the two boundaries stays silent, exactly as before.
         for streak in (STREAK_NUDGE_AT + 1)..STREAK_NUDGE_LATE {
             assert!(discovery_streak_hint("agent", streak).is_none(), "streak {streak}");
         }
         let late = discovery_streak_hint("agent", STREAK_NUDGE_LATE).unwrap();
         assert!(late.contains("`explore`"), "{late}");
-        for streak in (STREAK_NUDGE_LATE + 1)..=25 {
-            assert!(discovery_streak_hint("agent", streak).is_none(), "streak {streak}");
+        // Past it the reminder repeats — never twice in a row, and never again
+        // silent for the rest of the streak.
+        let mut fired_since = 0;
+        let mut fired = 0;
+        for streak in (STREAK_NUDGE_LATE + 1)..=40 {
+            match discovery_streak_hint("agent", streak) {
+                Some(h) => {
+                    assert!(h.contains("`explore`"), "{h}");
+                    assert!(
+                        fired_since >= STREAK_NUDGE_EVERY - 1,
+                        "two nudges only {fired_since} round(s) apart at streak {streak}"
+                    );
+                    fired_since = 0;
+                    fired += 1;
+                }
+                None => fired_since += 1,
+            }
         }
+        assert!(fired > 0, "the streak passed round 7 for 33 more rounds in silence");
+        assert!(
+            fired_since <= STREAK_NUDGE_EVERY - 1,
+            "the streak ended with a silent tail of {fired_since} rounds"
+        );
         // The explore sub-agent has no `explore` of its own and a 3-round
-        // budget, so it must never receive the delegation nudge.
-        assert!(discovery_streak_hint("subagent", STREAK_NUDGE_AT).is_none());
-        assert!(discovery_streak_hint("subagent", STREAK_NUDGE_LATE).is_none());
+        // budget, so it must never receive the delegation nudge — at ANY streak.
+        for streak in STREAK_NUDGE_AT..=40 {
+            assert!(
+                discovery_streak_hint("subagent", streak).is_none(),
+                "subagent streak {streak}"
+            );
+        }
     }
 
     #[test]
@@ -4082,18 +4146,61 @@
                 json.to_string(),
             )]
         };
+        let root = env!("CARGO_MANIFEST_DIR");
         // A batch of lookups is a discovery round.
-        assert!(round_is_discovery(&ops(&[("read", ""), ("grep", "")])));
-        assert!(round_is_discovery(&ops(&[("lsp_symbols", "")])));
-        // A batch carrying the terminal is work, not research: the streak must
-        // still break, exactly like a lone `run_terminal` round does.
-        assert!(!round_is_discovery(&ops(&[("read", ""), ("run_terminal", "")])));
+        assert!(round_is_discovery(&ops(&[("read", ""), ("grep", "")]), root));
+        assert!(round_is_discovery(&ops(&[("lsp_symbols", "")]), root));
+        // A batch carrying a MUTATING terminal command is work, not research:
+        // the streak must still break, exactly like a lone `run_terminal` does.
+        let mutating = |list: &[(&str, serde_json::Value)]| {
+            let json = serde_json::json!({
+                "ops": list
+                    .iter()
+                    .map(|(t, a)| serde_json::json!({"tool": t, "args": a}))
+                    .collect::<Vec<_>>()
+            });
+            vec![(
+                "c1".to_string(),
+                crate::tools::BATCH_TOOL.to_string(),
+                json.to_string(),
+            )]
+        };
+        assert!(!round_is_discovery(
+            &mutating(&[
+                ("read", serde_json::json!({})),
+                ("run_terminal", serde_json::json!({"command": "rm -rf build"})),
+            ]),
+            root
+        ));
+        // THE traced defect (`mwc2jvvj`, run 0): research arrived as a READ-ONLY
+        // shell op inside the batch, and pressing it reset the counter — 14 real
+        // research rounds were reported as 5, so the late `explore` nudge never
+        // fired. An inspection is a lookup and must extend the streak.
+        assert!(round_is_discovery(
+            &mutating(&[
+                ("read", serde_json::json!({})),
+                (
+                    "run_terminal",
+                    serde_json::json!({"commands": ["ls -lt src", "git log --oneline -5"]}),
+                ),
+            ]),
+            root
+        ));
+        // A BUILD or TEST run is the agent doing the work, never research —
+        // counting it would nudge `explore` on the round that proved the fix.
+        assert!(!round_is_discovery(
+            &mutating(&[(
+                "run_terminal",
+                serde_json::json!({"command": "cargo test --lib 2>&1 | tail -5"}),
+            )]),
+            root
+        ));
         // A lone lookup and a lone explore both count (unchanged behaviour).
         let one = |n: &str| vec![("c1".to_string(), n.to_string(), "{}".to_string())];
-        assert!(round_is_discovery(&one("read")));
-        assert!(round_is_discovery(&one("explore")));
-        assert!(!round_is_discovery(&one("edit_file")));
-        assert!(!round_is_discovery(&[]));
+        assert!(round_is_discovery(&one("read"), root));
+        assert!(round_is_discovery(&one("explore"), root));
+        assert!(!round_is_discovery(&one("edit_file"), root));
+        assert!(!round_is_discovery(&[], root));
         // Malformed `ops`: still a SEARCH round, because the composer refuses
         // writers. Treating it as work would let bad JSON hide a long streak.
         let broken = vec![(
@@ -4101,18 +4208,64 @@
             crate::tools::BATCH_TOOL.to_string(),
             "{not json".to_string(),
         )];
-        assert!(round_is_discovery(&broken));
+        assert!(round_is_discovery(&broken, root));
         // The decisive shape: a full streak of batched search rounds must reach
         // the nudge boundary instead of collapsing to 1 every round.
         let mut streak = 0;
         for _ in 0..STREAK_NUDGE_AT {
-            assert!(round_is_discovery(&ops(&[("read", ""), ("grep", "")])));
+            assert!(round_is_discovery(&ops(&[("read", ""), ("grep", "")]), root));
             streak += 1;
         }
         assert!(
             discovery_streak_hint("agent", streak).is_some(),
             "a batched search streak must reach the explore nudge at {STREAK_NUDGE_AT}"
         );
+    }
+
+    #[test]
+    fn a_research_command_is_an_inspection_but_a_build_is_work() {
+        // Drives the discovery streak. Traced (`mwc2jvvj`, run 0): research was
+        // issued as batched read-only shell ops and every one reset the streak,
+        // so 14 real research rounds were reported as 5 and the late `explore`
+        // nudge never fired. An inspection extends the streak; a build/test is
+        // the agent doing the work and must break it.
+        let root = env!("CARGO_MANIFEST_DIR");
+        for cmd in [
+            "ls -lt src",
+            "git log --oneline -5",
+            "git status --short",
+            "lsof -nP -iTCP:5199",
+        ] {
+            assert!(
+                is_research_command(cmd, root),
+                "{cmd:?} only inspects and must keep the streak alive"
+            );
+        }
+        // `cat package.json` was the ACTUAL traced command and it is NOT counted
+        // as research: the read gate sends a workspace file to `read`, so the
+        // terminal form stays excluded on purpose (measured, not assumed).
+        assert!(!is_research_command("cat package.json | head -40", root));
+        // A build/test run reads nothing from the workspace, so it passes the
+        // read-only test — the verify-program list is what keeps it out.
+        for cmd in [
+            "cargo test --lib 2>&1 | tail -5",
+            "npm run typecheck",
+            "npx vitest run",
+            "cargo build",
+            "make test",
+        ] {
+            assert!(
+                !is_research_command(cmd, root),
+                "{cmd:?} is WORK: nudging explore on it would be wrong"
+            );
+        }
+        // Mutation is never research, however it is spelled.
+        for cmd in ["rm -rf build", "git commit -m x", "cp a b"] {
+            assert!(!is_research_command(cmd, root), "{cmd:?} mutates");
+        }
+        // One build command inside a list poisons the whole shell op, so a
+        // mixed round is never mistaken for research.
+        assert!(!is_research_command("ls -lt; cargo build", root));
     }
 
     #[test]

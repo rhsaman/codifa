@@ -2644,6 +2644,22 @@ body.coder-dragging .chat-split-child {
   text-align: start;
 }
 
+/* Reply-quote block inside user / queued bubbles (splitQuoteFromContent): a
+   sent reply renders its baked "> " quote as a dimmed block behind a bar on
+   the start edge — the same shape as the assistant's markdown blockquote, so
+   the quoted context reads as context and the typed reply as the message. */
+.user-quote-block {
+  margin: 0 0 8px;
+  padding: 1px 0;
+  padding-inline-start: 12px;
+  /* Quiet bar: mostly --border with a trace of accent — a bright accent bar
+     here glared next to the dimmed quote text (user feedback). */
+  border-inline-start: 3px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+  color: var(--text-dim);
+  font-size: calc(var(--chat-font-size) - 1px);
+  line-height: 1.6;
+}
+
 .msg-copy:hover {
   background: var(--bg-input);
   color: var(--text);

@@ -299,7 +299,10 @@ pub(super) fn is_file_search_command(cmd: &str, root: &str) -> bool {
     // so a grep on ~/.codifa’s plugin sources was refused as a workspace
     // search (mvqksnvw run59) — the same shell call the native `grep` then
     // could not answer either.
-    const SEARCH_VERBS: [&str; 7] = ["find", "fd", "locate", "tree", "glob", "grep", "rg"];
+    // `ls` joins the set: a workspace-scoped `ls -la` is file discovery the
+    // same way `find` is (traced: a batch carried ls/find over what one glob
+    // answered) — attribute checks read the file or run outside the workspace.
+    const SEARCH_VERBS: [&str; 8] = ["find", "fd", "locate", "tree", "glob", "grep", "rg", "ls"];
     // grep-family takes [flags] PATTERN [PATH…]; find/tree take PATHS first.
     const PATTERNED: [&str; 5] = ["grep", "rg", "fd", "locate", "glob"];
     let mut base = root.to_string();
@@ -795,5 +798,42 @@ pub(super) fn is_shell_read_only(cmd: &str, root: &str) -> bool {
     !is_mutating_command(cmd)
         && !is_file_search_command(cmd, root)
         && !workspace_file_read(cmd, root)
+}
+
+/// Programs whose whole job is to BUILD, TEST or verify a project.
+///
+/// They write no file and read no workspace file, so `is_shell_read_only` calls
+/// them read-only — but they are still productive WORK, never research. Counting
+/// them as research would fire the `explore` nudge on the round that ran the test
+/// suite, telling the agent to delegate a question it had already answered.
+const VERIFY_PROGRAMS: [&str; 21] = [
+    "cargo", "rustc", "npm", "npx", "yarn", "pnpm", "bun", "tsc", "vite", "vitest",
+    "jest", "pytest", "mypy", "ruff", "go", "mvn", "gradle", "gradlew", "make", "esbuild",
+    "xcodebuild",
+];
+
+/// True when a `run_terminal` command is a pure INSPECTION: read-only, and not a
+/// build/test/verify run.
+///
+/// Drives the discovery-streak counter, which asks "is this round still
+/// searching?". Traced (`mwc2jvvj`, run 0): research was issued as batched
+/// `run_terminal` ops (reading `package.json`, listing a test runner), and every
+/// such op reset the streak — the counter reported a longest streak of 5 while
+/// the run held 14 consecutive research rounds, so the late `explore` nudge
+/// never fired. A command whose arguments come from the previous result is a
+/// probe chain and does not belong here either; the caller decides that, this
+/// only judges "does it change anything".
+pub(super) fn is_research_command(cmd: &str, root: &str) -> bool {
+    if !is_shell_read_only(cmd, root) {
+        return false;
+    }
+    !split_unquoted(cmd, &[';', '|', '&', '\n']).iter().any(|seg| {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            return false;
+        };
+        let program = first.rsplit('/').next().unwrap_or(first);
+        VERIFY_PROGRAMS.contains(&program)
+    })
 }
 

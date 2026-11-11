@@ -96,13 +96,13 @@ console.log("۲) کارت explore در چت: مثل tool group با pill نام�
     html.slice(0, 300),
   );
   check(
-    "pill نام ساب‌ایجنت («Explore») اولِ هدر است",
-    /trace-pill trace-pill-sub[^>]*>Explore</.test(html),
+    "نام ساب‌ایجنت («Explore») اولِ هدر است",
+    /trace-head-name[^>]*>Explore</.test(html),
     html.slice(0, 300),
   );
   check(
-    "تعداد هر tool call در pills هدر هست",
-    html.includes("Read File") && html.includes("Search Files"),
+    "نام آخرین tool call (Search Files برای grep) در هدر هست",
+    /trace-head-tool[^>]*>Search Files</.test(html),
     html.slice(0, 400),
   );
 }

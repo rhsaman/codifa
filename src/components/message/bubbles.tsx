@@ -1,4 +1,5 @@
 import { detectDir, fixZwsp, stripBidiMarks } from '../../lib/bidi'
+import { splitQuoteFromContent } from '../../lib/chatQuote'
 import { copyToClipboard } from '../../lib/clipboard'
 import { useViewerTabs } from '../../lib/viewerTabs'
 import type { ChatMessage } from '../../types'
@@ -36,12 +37,17 @@ export function UserMessageBubble({
     el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
   }, [isEditing, draft]);
   const content = message.content || "";
+  // A sent reply bakes its quote into the content as leading markdown "> "
+  // lines (combineQuoteAndInput). Split it out so the bubble renders the
+  // styled quote block above the typed body — same look as the assistant's
+  // markdown blockquote, and retroactive for every already-sent reply.
+  const { quote, body: replyBody } = useMemo(() => splitQuoteFromContent(content), [content]);
   // Folded preview only: a long text is clamped to USER_COLLAPSE_CHARS in the
   // chat and its FULL body (not the preview) opens in the side panel — a long
   // paste reads like a diff/plan tab there, and the bubble never grows into a
   // wall of text.
   const isLong = isCollapsibleText(content);
-  const body = isLong ? content.slice(0, USER_COLLAPSE_CHARS) : content;
+  const body = isLong ? replyBody.slice(0, USER_COLLAPSE_CHARS) : replyBody;
   const clamped = isLong;
 
   const copy = async () => {
@@ -109,13 +115,24 @@ export function UserMessageBubble({
         ) : (
         <div
           className={`chat-message user-text${clamped ? " clamped" : ""}`}
-          dir={detectDir(body)}
+          dir={detectDir(replyBody)}
         >
+          {/* Reply-quote block: dimmed text behind a start-side bar, then the
+              typed body. Per-LINE direction (ChatGPT style) inside both, like
+              the rest of the bubble. */}
+          {quote && (
+            <div className="user-quote-block" dir={detectDir(quote)}>
+              {perLineDir(cachedPrepare(`${message.id}:quote`, quote))}
+            </div>
+          )}
           {/* Per-LINE direction (ChatGPT style): the bubble always parks on
               the user's side, but each line inside follows its own language —
               English lines render LTR flush-left, Persian lines RTL
-              flush-right, inside one mixed message. */}
-          {perLineDir(cachedPrepare(message.id, body) || "(empty)")}
+              flush-right, inside one mixed message. A quote-only send shows
+              just the quote block (no empty body line). */}
+          {body || !quote
+            ? perLineDir(cachedPrepare(message.id, body) || "(empty)")
+            : null}
         </div>
         )}
         {!isEditing && isLong && (
@@ -278,8 +295,10 @@ export function QueuedCollapsibleText({
   editingDisabled?: boolean;
 }) {
   // Same rule as the user bubble: a long text is clamped in the chat and its
-  // full body opens in the side panel.
+  // full body opens in the side panel. A queued reply carries the same baked
+  // "> " quote block — split it so the pending bubble matches the sent one.
   const isLong = isCollapsibleText(text);
+  const { quote, body: replyBody } = useMemo(() => splitQuoteFromContent(text), [text]);
   // Inline edit mode: same UX as UserMessageBubble — the text swaps for a
   // textarea with Save/Cancel.
   const [isEditing, setIsEditing] = useState(false);
@@ -349,9 +368,16 @@ export function QueuedCollapsibleText({
         <>
           <div
             className={`queued-bubble-text${isLong ? " clamped" : ""}`}
-            dir={detectDir(text)}
+            dir={detectDir(replyBody)}
           >
-            {cachedPrepare(id, text) || "(empty)"}
+            {quote && (
+              <div className="user-quote-block" dir={detectDir(quote)}>
+                {cachedPrepare(`${id}:quote`, quote)}
+              </div>
+            )}
+            {replyBody || quote
+              ? cachedPrepare(id, replyBody)
+              : cachedPrepare(id, replyBody) || "(empty)"}
           </div>
           {isLong && (
             <button

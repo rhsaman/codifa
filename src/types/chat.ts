@@ -197,11 +197,18 @@ export interface ChatMessage {
   thinkingStartedAt?: number
   /** Wall-clock timestamp when the "Working" indicator (streaming without
    *  active thinking) started — same remount-survival rationale as
-   *  `thinkingStartedAt`: switching chats must not reset the elapsed timer. */
+   *  `thinkingStartedAt`: switching chats must not reset the elapsed timer.
+   *  Also survives a turn close that armed a retry (ladder / give-up /
+   *  watchdog): the same bubble resumes, so the pill keeps counting the whole
+   *  turn across failed attempts instead of restarting at every re-send.
+   *  Wiped on a clean end or a user Stop so the next turn starts fresh. */
   workingStartedAt?: number
   /** Final turn duration in ms, stamped when the turn ends (success, stop or
    *  error) from `workingStartedAt`. Rendered statically in the message footer
-   *  so every finished turn keeps its working time visible in the chat. */
+   *  so every finished turn keeps its working time visible in the chat. On a
+   *  retry-armed close it is an INTERMEDIATE value (elapsed so far), used by
+   *  `resumeClockRestart` to detect a long-idle resume and re-anchored at the
+   *  next close once the resumed turn finishes. */
   turnElapsedMs?: number
   /** The failure text of a turn that ended in an error, kept so the footer's
    *  retry line can show WHY even on turns that never entered a retry ladder.

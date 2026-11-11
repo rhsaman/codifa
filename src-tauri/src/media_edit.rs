@@ -475,6 +475,13 @@ pub fn probe(ctx: &MediaCtx, bin: &FfmpegBin, path: &str) -> Result<(String, cra
 
 /// Crop a rectangular region out of an IMAGE (the manual editor's Save-crop
 /// button). ffmpeg handles images fine and keeps the pipeline single-binary.
+///
+/// `coord_src` is the pixel space x/y/w/h arrive in (the displayed image's
+/// natural size). The viewer sometimes shows a DOWNSCALED copy — an
+/// out-of-workspace file can only be displayed through the capped data-URL
+/// read — so the rectangle is rescaled to the file's true dimensions here,
+/// where the real file is at hand. `None` means the coords are already true
+/// pixels.
 pub fn crop_image(
     ctx: &MediaCtx,
     bin: &FfmpegBin,
@@ -484,11 +491,35 @@ pub fn crop_image(
     w: u32,
     h: u32,
     output: Option<&str>,
+    coord_src: Option<(u32, u32)>,
 ) -> Result<String, String> {
     if w == 0 || h == 0 {
         return Err("crop region is empty".to_string());
     }
     let src = abs_media(ctx, path)?;
+    let (x, y, w, h) = match coord_src {
+        Some((sw, sh)) if sw > 0 && sh > 0 => {
+            let true_dims = image::ImageReader::open(&src)
+                .map_err(|e| format!("cannot open image for crop: {e}"))?
+                .with_guessed_format()
+                .map_err(|e| format!("cannot sniff image format: {e}"))?
+                .into_dimensions()
+                .map_err(|e| format!("cannot read image dimensions: {e}"))?;
+            if (sw, sh) == true_dims {
+                (x, y, w, h)
+            } else {
+                let sx = f64::from(true_dims.0) / f64::from(sw);
+                let sy = f64::from(true_dims.1) / f64::from(sh);
+                (
+                    (f64::from(x) * sx).round() as u32,
+                    (f64::from(y) * sy).round() as u32,
+                    ((f64::from(w) * sx).round() as u32).max(1),
+                    ((f64::from(h) * sy).round() as u32).max(1),
+                )
+            }
+        }
+        _ => (x, y, w, h),
+    };
     let stem = Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())

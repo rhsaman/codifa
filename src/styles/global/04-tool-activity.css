@@ -1938,7 +1938,9 @@
 }
 .pm-switch.on .pm-switch-knob {
   transform: translateX(calc(var(--sw-w) - var(--sw-h)));
-  background: #2a2739;
+  /* The knob inverts against the accent fill — --on-accent is the theme's own
+     answer in both directions (dark knob on rose, cream on solarized blue). */
+  background: var(--on-accent, #2a2739);
 }
 .pm-switch:disabled {
   opacity: 0.55;

@@ -32,10 +32,14 @@ export function isMediaVideoPath(path: string): boolean {
 }
 
 /** Build the `/media/file` URL for one virtual media path. `base` is the
- *  sidecar origin (nullable — no backend yet means nothing to fetch). */
-export function mediaFileUrl(relPath: string, base: string | null): string {
+ *  sidecar origin (nullable — no backend yet means nothing to fetch). `root`
+ *  is the chat's workspace root, for the backend's workspace fallback: paths
+ *  that miss the media sandbox (an absolute screenshot path, a workspace
+ *  image) resolve there under the same containment the read tool uses. */
+export function mediaFileUrl(relPath: string, base: string | null, root?: string | null): string {
   const b = (base ?? '').replace(/\/+$/, '')
-  return `${b}/media/file?path=${encodeURIComponent(relPath)}`
+  const ws = root?.trim() ? `&root=${encodeURIComponent(root.trim())}` : ''
+  return `${b}/media/file?path=${encodeURIComponent(relPath)}${ws}`
 }
 
 /**

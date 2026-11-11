@@ -1076,7 +1076,10 @@
 
 .context-meter-ring-fill {
   fill: none;
-  stroke: var(--accent);
+  /* Accent at full strength is a glaring ring on the dark composer (the
+     default Onyx accent is near-white). Keep the theme hue but drop it to a
+     soft tint that sits next to --text-dim instead of outshining the text. */
+  stroke: color-mix(in srgb, var(--accent) 60%, transparent);
   stroke-width: 2.5;
   stroke-linecap: round;
   transition: stroke-dashoffset 0.3s ease;
@@ -1979,8 +1982,11 @@
   width: 22px;
   height: 22px;
   border-radius: 7px;
-  background: color-mix(in srgb, var(--link) 16%, var(--bg-input));
-  color: var(--link);
+  /* Selection/brand chrome reads in the ACCENT, not --link: link is a text
+     token, and on light palettes (Solarized) it is a dark teal that turned
+     every control in this popup muddy. */
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-input));
+  color: var(--accent);
   font-size: 11px;
   line-height: 1;
 }
@@ -1994,8 +2000,8 @@
   margin-left: auto;
   font-size: 10px;
   font-weight: 700;
-  color: var(--link);
-  background: color-mix(in srgb, var(--link) 14%, var(--bg-input));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-input));
   border-radius: 999px;
   padding: 2px 8px;
 }
@@ -2022,7 +2028,7 @@
 .mention-search:focus {
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--link) 20%, transparent);
+    0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .mention-item {
@@ -2046,9 +2052,10 @@
 }
 
 .mention-item.kbd:not(:hover) {
-  /* Keyboard-selected item: blue ring instead of var(--accent), which renders
-     as a white outline in the dark theme. */
-  outline: 1px solid color-mix(in srgb, var(--link) 50%, transparent);
+  /* Keyboard-selected item: ring in the accent — the app's selection language.
+     (An earlier --link ring rendered as a teal outline that fought every light
+     palette.) */
+  outline: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
   outline-offset: -1px;
 }
 
@@ -2356,18 +2363,20 @@
 }
 
 .mention-item.mcp-toggle.on .mcp-switch-track {
-  background: var(--link);
+  /* ON = accent, like every other switch in the app (pm-switch, history pins).
+     --link here was a dark teal on Solarized Light and read off-palette. */
+  background: var(--accent);
 }
 
 .mention-item.mcp-toggle.on .mcp-switch-knob {
   left: 18px;
-  background: #fff;
+  background: var(--on-accent, #fff);
 }
 
-/* Enabled cards get a subtle link-tinted surface so the on-state reads at a
+/* Enabled cards get a subtle accent-tinted surface so the on-state reads at a
    glance across the grid, without any border on the tool itself. */
 .mention-item.mcp-toggle.on {
-  background: color-mix(in srgb, var(--link) 9%, var(--bg-input));
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-input));
 }
 
 .mention-empty {
@@ -2388,35 +2397,73 @@
   background: color-mix(in srgb, var(--bg-alt) 92%, transparent);
 }
 
-/* ---- attachment chips ---- */
 /* ---- attachment chips (inside composer, above textarea) ---- */
-.composer-inner>.attachment-chips {
-  padding: 8px 14px 0;
+/* The chips are the composer card's top row: flush against the top hairline
+   (no dead band above — user ask) and inset 14px so the first pill lines up
+   with the textarea text and the edit-target badge instead of hugging the
+   card's rounded edge. The old `.composer-inner>` child selector went dead
+   when the chips moved inside .composer-input-wrap. */
+.composer-input-wrap > .attachment-chips {
+  padding: 0 14px;
+}
+
+/* A pasted/reply card above the chips keeps one row-gap below itself. */
+.composer-input-wrap > .paste-cards + .attachment-chips {
+  margin-top: 8px;
+}
+
+/* Edit/plugin badges lead the card flush to the top hairline (base margin);
+   any block ABOVE them — chips, paste cards, the sibling badge — leaves one
+   row-gap below itself. */
+.composer-input-wrap > * + .edit-target-badge {
+  margin-top: 8px;
 }
 
 /* ---- edit-target badge (composer, above the input) ---- */
-/* Pinned while an update session is open — "پلاگین · update · name". The × is
-   the ONLY way the session ends: folder and mode fall back to the chat's own. */
+/* Pinned while an update session is open — "update · name". The × is the ONLY
+   way the session ends: folder and mode fall back to the chat's own. Same slot
+   and design language as the attachment chips: flush to the card's top
+   hairline, inset 14px, pill with an inset top highlight and a soft lift.
+   The action reads as a small dim caps word; the name is the bright part. */
 .edit-target-badge {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 8px 14px 0;
-  padding: 5px 6px 5px 10px;
+  gap: 7px;
+  margin: 0 14px;
+  padding: 4px 5px 4px 4px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--link) 14%, var(--bg-input));
-  border: 1px solid color-mix(in srgb, var(--link) 35%, transparent);
-  font-size: 12px;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--link) 16%, var(--bg-input)),
+    color-mix(in srgb, var(--link) 9%, var(--bg-input))
+  );
+  border: 1px solid color-mix(in srgb, var(--link) 30%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.15),
+    0 4px 12px -6px rgba(0, 0, 0, 0.3);
+  font-family: var(--font-mono);
+  font-size: 11px;
   line-height: 1.2;
   width: fit-content;
   max-width: 100%;
   flex: 0 0 auto;
 }
 
+/* The glyph sits in a small accent tile — echoes the chips' 20px file icons
+   at badge scale. */
 .edit-target-glyph {
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 6px;
+  font-size: 9px;
   color: var(--link);
-  font-size: 11px;
+  background: color-mix(in srgb, var(--link) 24%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent);
 }
 
 .edit-target-label {
@@ -2426,6 +2473,15 @@
   min-width: 0;
 }
 
+.edit-target-action {
+  flex: none;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
 .edit-target-name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2433,26 +2489,69 @@
   color: var(--text);
 }
 
+/* The old "action · name" dot survives as the separator, only when an action
+   actually precedes the name (the plugin badge has none). */
+.edit-target-action + .edit-target-name::before {
+  content: "·";
+  margin-right: 6px;
+  opacity: 0.45;
+}
+
 .edit-target-x {
   flex: none;
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   border: 0;
   border-radius: 50%;
   background: transparent;
   color: var(--text-dim);
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
+  transition:
+    background 0.15s,
+    color 0.15s;
 }
 
 .edit-target-x:hover {
-  background: color-mix(in srgb, var(--text) 12%, transparent);
-  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+}
+
+/* Plugin session ("◈ mt5"): same pill, but the glyph tile breathes with the
+   queue-bubble ripple while the session is live. */
+.plugin-session-badge .edit-target-glyph {
+  animation: plugin-live-pulse 2.4s ease-out infinite;
+}
+
+@keyframes plugin-live-pulse {
+  0% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+      0 0 0 0 color-mix(in srgb, var(--link) 40%, transparent);
+  }
+
+  70% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+      0 0 0 6px transparent;
+  }
+
+  100% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+      0 0 0 0 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plugin-session-badge .edit-target-glyph {
+    animation: none;
+  }
 }
 
 .attachment-chips {
@@ -2460,7 +2559,6 @@
   flex-wrap: wrap;
   align-items: flex-start;
   gap: 6px;
-  margin-top: 8px;
 }
 
 /* Base pill — no outline; a soft raised surface with an inner top highlight. */

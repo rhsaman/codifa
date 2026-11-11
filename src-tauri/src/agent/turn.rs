@@ -1486,6 +1486,9 @@ it. Put update_plan in the SAME step as your other tool calls, never alone.",
     // way the per-round single-call hint did (423 of 863 rounds carried it and
     // it changed nothing).
     let mut discovery_streak: usize = 0;
+    // How many discovery rounds a turn may spend before further greps/globs
+    // are rerouted to ONE explore delegation (see the classification gate).
+    const DISCOVERY_DELEGATE_THRESHOLD: usize = 4;
     // Consecutive rounds whose ONLY call was a mutating/serial tool
     // (`run_terminal`, `edit_file`, …). The per-round batching hint fired on
     // every one of them and was measured as wallpaper (16 firings, 0 batches in
@@ -2392,7 +2395,7 @@ the Vision model's description instead.\n"
         // were counted as 1. A round that edits, writes or runs a command still
         // resets it: the agent has moved on to doing the work.
         if !tool_calls.is_empty() {
-            if round_is_discovery(&tool_calls) {
+            if round_is_discovery(&tool_calls, &root) {
                 discovery_streak += 1;
             } else {
                 discovery_streak = 0;
@@ -2738,6 +2741,34 @@ the Vision model's description instead.\n"
             // panel would never list it. The sequential arm is the only path
             // whose chain ends in agent_terminals::spawn (with the chat_id the
             // panel needs), so a background call must always land there.
+            // LONG-SEARCH delegation gate (always-on): a turn that has already
+            // spent 4 rounds on discovery must not keep grepping/globbing on
+            // the MAIN context — every such round re-sends the whole
+            // conversation (~79K tokens late in a turn vs ~16K inside an
+            // explore). Reads of files the model can NAME stay direct; only the
+            // open-ended discovery calls are rerouted.
+            if req.mode != "subagent"
+                && discovery_streak >= DISCOVERY_DELEGATE_THRESHOLD
+                && matches!(name.as_str(), "grep" | "glob")
+            {
+                emit(&AgentEvent::ToolStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                });
+                denied.push((
+                    id.clone(),
+                    name.clone(),
+                    args,
+                    format!(
+                        "this turn has already spent {discovery_streak} rounds on search lookups \
+on the main context (each one re-sends the whole conversation). Delegate the remaining \
+search to ONE `explore` call — it runs on a short context and returns the full findings — \
+and work from its report. Reads of files you can NAME stay direct."
+                    ),
+                ));
+                continue;
+            }
             let background_call = name == "run_terminal"
                 && args["background"].as_bool().unwrap_or(false);
             if is_readonly(name) || (shell_read && !background_call) {
@@ -3274,14 +3305,16 @@ Valid names: {}",
                 // real instead of trusting the prompt to be obeyed.
                 (refusal, false)
             } else if name == "run_terminal"
-                && req.mode != "subagent"
                 && is_file_search_command(args["command"].as_str().unwrap_or_default(), &root)
             {
-                // The terminal is for work only the terminal can do (listing,
-                // measuring, builds, tests, git). Locating files belongs to
-                // `grep`/`glob`/`find_symbol`, or to ONE `explore` delegation.
-                // MEASURED: 63% of traced calls arrive as `cd <path> && …`, so
-                // the gate reads the real statements, not the first word.
+                // The terminal is for work only the terminal can do (system
+                // measures, builds, tests, git, out-of-workspace paths).
+                // Locating files belongs to `grep`/`glob`/`find_symbol`, or to
+                // ONE `explore` delegation — for the SUB-AGENT too (user rule:
+                // no agent searches files through the shell; the search tools
+                // exist for both). MEASURED: 63% of traced calls arrive as
+                // `cd <path> && …`, so the gate reads the real statements, not
+                // the first word.
                 (
                     "blocked: the terminal does not locate files. Use `grep` (one token, with path= and include=), `glob` (file names), `find_symbol` (a symbol's definition AND every usage in ONE call), or ONE `explore` delegation for a broad hunt.".into(),
                     false,
@@ -4778,8 +4811,11 @@ call fetch_url again with offset={next} for the rest]",
         // the normal state of a chat whose rounds are shell commands. Falling
         // back to the escalating text keeps the lever audible exactly where the
         // counter proves it is needed.
+        // The streak nudge is resolved ONCE and reused, so "did the streak lever
+        // speak" is answered by the value rather than re-derived.
+        let streak_hint = discovery_streak_hint(&req.mode, discovery_streak);
         let hint: Option<Cow<'_, str>> = if hints_are_quiet {
-            discovery_streak_hint(&req.mode, discovery_streak)
+            streak_hint
                 .map(Cow::Borrowed)
                 .or_else(|| {
                     single_call_hint_with(
@@ -4809,11 +4845,13 @@ call fetch_url again with offset={next} for the rest]",
         // rose on rounds where the model had in fact batched (traced:
         // `hints_after=24` on a two-call round) and could no longer tell whether
         // the escalating lever had fired at all. `lone_call_hints` counts only
-        // this one.
+        // this one — and `MAX_LONE_CALL_HINTS_PER_TURN` gates only this one.
         let lone_hint_str = hint.as_deref().map(str::to_string);
-        let hint_is_lone = lone_hint_str
+        let hint_lever = lone_hint_str
             .as_deref()
-            .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"));
+            .map(|h| hint_lever(&req.mode, discovery_streak, h))
+            .unwrap_or(HintLever::Other);
+        let hint_is_lone = hint_lever == HintLever::LoneCall;
         if let Some(hint) = hint {
             // The batching hint is a LESSON, not wallpaper: traced 6 Nov, one
             // session on a model that answers with exactly one tool call per

@@ -64,34 +64,44 @@ pub(super) async fn artifact_list(
 
 #[derive(serde::Deserialize)]
 pub(super) struct MediaFileQuery {
-    /// Legacy param from the workspace-storage era; accepted and ignored so a
-    /// stale renderer URL still serves instead of 400ing.
+    /// The chat's workspace root, for the workspace fallback below. Optional —
+    /// a stale renderer URL (or an inline chat image, which carries no root)
+    /// still serves, with the data root as the fallback sandbox.
     #[serde(default)]
-    #[allow(dead_code)]
     root: String,
     path: String,
 }
 
 /// GET /media/file?path= — stream one generated media file to the renderer.
 /// This is what the chat's `codifa-media://` markdown references resolve to:
-/// the agent only ever names a VIRTUAL path (`media/<chat-slug>/<file>`)
-/// relative to the DATA root, the webview cannot read the disk, so the
-/// renderer rewrites the scheme to this route. Resolution goes through
-/// `media_gen::resolve_media_virtual` — containment inside
-/// `<data_root>/media/` — so the route can never be walked out of it.
+/// the agent names a VIRTUAL path (`media/<chat-slug>/<file>`) relative to the
+/// DATA root, the webview cannot read the disk, so the renderer rewrites the
+/// scheme to this route.
+///
+/// A chat also names PLAIN filesystem paths — an absolute screenshot under
+/// /var/folders, a workspace image the `read` tool attached. Those miss the
+/// media sandbox, so the route falls back to `media_gen::resolve_media_input`
+/// with the workspace root: the SAME containment the agent's own read tool
+/// enforces (workspace, ~/.codifa, data root), so the route can never serve
+/// anything the chat could not already read.
 pub(super) async fn media_file(State(st): State<AppState>, Query(q): Query<MediaFileQuery>) -> Response<Body> {
-    let abs = match crate::media_gen::resolve_media_virtual(&st.root().to_string_lossy(), &q.path) {
-        Ok(abs) => abs,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "detail": e })),
-            )
-                .into_response()
-        }
+    let data_root = st.root().to_string_lossy().into_owned();
+    let ws_root = q.root.trim();
+    let ws_root = if ws_root.is_empty() { data_root.as_str() } else { ws_root };
+    // Virtual sandbox first (full bytes, the generated-media contract), then
+    // the workspace file. Both legs containment-checked; whichever READS wins.
+    let read_ok = |abs: std::path::PathBuf| {
+        std::fs::read(&abs)
+            .map(|bytes| (abs, bytes))
+            .map_err(|e| e.to_string())
     };
-    let bytes = match std::fs::read(&abs) {
-        Ok(b) => b,
+    let served = crate::media_gen::resolve_media_virtual(&data_root, &q.path)
+        .and_then(read_ok)
+        .or_else(|_| {
+            crate::media_gen::resolve_media_input(ws_root, &data_root, "", &q.path).and_then(read_ok)
+        });
+    let (abs, bytes) = match served {
+        Ok(ok) => ok,
         Err(e) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -100,7 +110,7 @@ pub(super) async fn media_file(State(st): State<AppState>, Query(q): Query<Media
                 .into_response()
         }
     };
-    let mime = crate::media_gen::mime_for_path(&q.path);
+    let mime = crate::media_gen::mime_for_path(&abs.to_string_lossy());
     (
         [
             (
@@ -139,6 +149,15 @@ pub(super) struct MediaEditBody {
     w: u32,
     #[serde(default)]
     h: u32,
+    /// The pixel space x/y/w/h are measured in — the DISPLAYED image's natural
+    /// size. The viewer may show a downscaled copy (out-of-workspace files are
+    /// read through the capped data-URL command), so the backend rescales the
+    /// rectangle to the file's true dimensions before cropping. 0 = already in
+    /// true pixels.
+    #[serde(default)]
+    src_w: u32,
+    #[serde(default)]
+    src_h: u32,
     #[serde(default)]
     start: f64,
     #[serde(default)]
@@ -176,6 +195,7 @@ pub(super) async fn media_edit(Json(b): Json<MediaEditBody>) -> Response<Body> {
                     b.w,
                     b.h,
                     b.output.as_deref(),
+                    (b.src_w > 0 && b.src_h > 0).then_some((b.src_w, b.src_h)),
                 )?;
                 files.push(rel.clone());
                 format!("Cropped {rel}")

@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { detectDir } from "../lib/bidi";
 import { APP_DIR, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { deleteSchedule, listAllScheduleRuns, listScheduleRuns, listSchedules, runScheduleNow, saveSchedule, stopScheduleRun } from "../lib/api";
 import { formatTokens } from "../lib/context";
 import { liveRunningMap, taskTokenTotals } from "../lib/schedule-notify";
+import { requestReplyQuote } from "../lib/chatQuote";
+import { SelectionToolbar, useFloatingSelection } from "./SelectionToolbar";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
 /** Format next_run for display (Today/Tomorrow/date). `nowRef` is only for tests so the Today/Tomorrow boundary never depends on the wall clock. */
@@ -270,6 +272,18 @@ export function ScheduleSection() {
   // remounts on every tab switch, so a row-local useState cannot be the
   // source of truth: the backend's run rows are (the inbox reads the same).
   const [liveRunning, setLiveRunning] = useState<Record<string, boolean>>({});
+  // Selection toolbar (Reply / Read aloud) over task names and prompts.
+  // Reply pins the selection into the chat composer via the quote bridge.
+  const listRef = useRef<HTMLDivElement>(null);
+  const [selTtsBusy, setSelTtsBusy] = useState(false);
+  const selectionBar = useFloatingSelection((el) => {
+    const list = listRef.current;
+    return !!el && !!list && list.contains(el);
+  });
+  const handleScheduleReply = (text: string) => {
+    requestReplyQuote(text);
+    selectionBar.clear();
+  };
 
   const applyRuns = useCallback((all: ScheduleRun[] | { error: string }) => {
     if ("error" in all) return;
@@ -352,7 +366,7 @@ export function ScheduleSection() {
         )}
       </div>
       {!collapsed && (
-        <div className="schedule-list">
+        <div className="schedule-list" ref={listRef}>
           {loading && schedules.length === 0 ? (
             <div className="schedule-loading" aria-live="polite" aria-busy="true">
               <div className="schedule-skeleton" />
@@ -380,6 +394,13 @@ export function ScheduleSection() {
             schedules.map((t) => <ScheduleRow key={t.id} task={t} tokens={taskTokens[t.id] ?? 0} liveRunning={liveRunning[t.id] ?? false} onChanged={() => void refresh()} onError={setError} />)
           )}
         </div>
+      )}
+      {(selectionBar.sel || (selTtsBusy && selectionBar.lastSel.current)) && (
+        <SelectionToolbar
+          sel={selectionBar.sel ?? selectionBar.lastSel.current}
+          onReply={handleScheduleReply}
+          onBusyChange={setSelTtsBusy}
+        />
       )}
     </div>
   );

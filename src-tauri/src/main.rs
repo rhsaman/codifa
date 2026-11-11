@@ -272,6 +272,7 @@ fn main() {
             // updater
             commands::check_for_updates,
             commands::start_update,
+            commands::install_update,
             // window controls
             commands::window_minimize,
             commands::window_toggle_maximize,

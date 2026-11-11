@@ -329,8 +329,10 @@ pub async fn start_update(app: AppHandle, window: tauri::WebviewWindow) -> OpRes
             }
         };
         if reuse {
-            let _ = window.emit("updater:progress", serde_json::json!({"phase": "installing", "percent": 100}));
-            return install_asset(&dest);
+            let pin = expected_sha
+                .clone()
+                .or_else(|| meta.as_ref().map(|m| m.sha256.clone()).filter(|s| !s.is_empty()));
+            return mark_ready(&window, dest, pin);
         }
         // Stale or tampered cache: throw it away and download fresh.
         let _ = std::fs::remove_file(&dest);
@@ -428,8 +430,74 @@ pub async fn start_update(app: AppHandle, window: tauri::WebviewWindow) -> OpRes
     }
     // The old size-only receipt has no integrity meaning left — drop it.
     let _ = std::fs::remove_file(&legacy_size_file);
-    let _ = window.emit("updater:progress", serde_json::json!({"phase": "installing", "percent": 100}));
-    install_asset(&dest)
+    prune_stale_downloads(&dir, &asset_name);
+    mark_ready(&window, dest, Some(got_sha))
+}
+
+/// The verified installer waiting for the user's "restart now" answer: its
+/// path and the sha256 it must still match when it is finally launched.
+static READY_INSTALLER: Mutex<Option<(PathBuf, Option<String>)>> = Mutex::new(None);
+
+/// Download finished and verified: remember it and tell the renderer, which
+/// answers with the restart confirmation popup (see `install_update`).
+fn mark_ready(window: &tauri::WebviewWindow, dest: PathBuf, sha: Option<String>) -> OpResult {
+    if let Ok(mut slot) = READY_INSTALLER.lock() {
+        *slot = Some((dest, sha));
+    }
+    let _ = window.emit("updater:progress", serde_json::json!({"phase": "ready", "percent": 100}));
+    OpResult::ok()
+}
+
+/// Old installers pile up (a macOS .dmg is ~350 MB): after a fresh download
+/// keep only the files that belong to the current asset.
+fn prune_stale_downloads(dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_file() && !e.file_name().to_string_lossy().starts_with(keep) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// The user confirmed the restart popup: apply the downloaded update and
+/// relaunch. A detached helper waits for THIS process to exit, swaps the app
+/// in place (it cannot be replaced while it runs — the "item is in use"
+/// error of a manual drag-install) and starts the new version. The window is
+/// then closed through the normal CloseRequested path so the quit-flush
+/// handshake persists the renderer's state first.
+#[tauri::command]
+pub async fn install_update(app: AppHandle, window: tauri::WebviewWindow) -> OpResult {
+    let ready = READY_INSTALLER.lock().ok().and_then(|slot| slot.clone());
+    let Some((path, sha)) = ready else {
+        return OpResult::err("No downloaded update to install — download it first");
+    };
+    let prepared = tokio::task::spawn_blocking(move || {
+        if !path.is_file() {
+            return Err("The downloaded installer is missing — download the update again".to_string());
+        }
+        // Re-verified at the last moment: the file sat on disk since download.
+        if let Some(exp) = &sha {
+            if file_sha256(&path).as_deref() != Some(exp.as_str()) {
+                return Err("The downloaded installer no longer matches its checksum — download the update again".to_string());
+            }
+        }
+        spawn_installer(&path)
+    })
+    .await;
+    match prepared {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return OpResult::err(e),
+        Err(e) => return OpResult::err(e.to_string()),
+    }
+    let _ = window.close();
+    // Safety net: if the close handshake stalls, exit anyway — the helper is
+    // already waiting for this process to end.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        app.exit(0);
+    });
+    OpResult::ok()
 }
 
 /// Streaming sha256 of a file (hex). Cached installers are re-verified with
@@ -449,52 +517,217 @@ pub(super) fn file_sha256(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-/// Launch the downloaded installer for the current platform.
-///
-/// Linux, running FROM an AppImage: `APPIMAGE_EXTRACT_AND_RUN` merely ran the
-/// new build once — the installed AppImage never changed, so "update" silently
-/// never applied. When the APPIMAGE env var points at the running image (set
-/// by the AppImage runtime), the verified download is copied over it instead:
-/// renaming over a running binary is legal on Linux (the old inode lives until
-/// the process exits), so the NEXT launch is the new version. Only when the
-/// app is not AppImage-installed (dev build, .deb) does it fall back to
-/// extracted-and-run.
-pub(super) fn install_asset(dest: &Path) -> OpResult {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
-        if let Ok(appimage) = std::env::var("APPIMAGE") {
+/// Start a process that outlives this one: own session (so the parent's exit
+/// and teardown never touch it), no stdio, reaped while we are still alive.
+#[cfg(unix)]
+fn spawn_detached(mut cmd: std::process::Command) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    reap_detached(child);
+    Ok(())
+}
+
+/// Find the `.app` bundle at the top of a mounted image / unzipped archive.
+/// The image's `Applications` shortcut has no `.app` extension, so it never matches.
+#[cfg(target_os = "macos")]
+fn find_app_bundle(root: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).find(|p| {
+        p.is_dir()
+            && p.extension().map(|x| x == "app").unwrap_or(false)
+            && p.join("Contents").join("Info.plist").is_file()
+    })
+}
+
+/// macOS: mount the .dmg (or unzip the -mac.zip), validate the new bundle, then
+/// hand a detached script the swap: wait for this process to exit, replace the
+/// installed .app by rename (ditto to a sibling first, so a failed copy leaves
+/// the old app untouched), unmount, and `open` the result.
+#[cfg(target_os = "macos")]
+fn spawn_installer(asset: &Path) -> Result<(), String> {
+    use std::process::Command;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let Some(target) = exe
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .filter(|p| p.extension().map(|x| x == "app").unwrap_or(false))
+    else {
+        return Err("Codifa is not running from an .app bundle (dev build) — install the update manually".into());
+    };
+    let parent = target.parent().ok_or("The app has no parent folder")?.to_path_buf();
+    // A drag-install into /Applications needs write access to it; probe BEFORE
+    // quitting so a read-only location never ends in a half-applied update.
+    let probe = parent.join(format!(".codifa-write-test-{}", std::process::id()));
+    if std::fs::create_dir(&probe).is_err() {
+        let _ = open::that(asset);
+        return Err(format!(
+            "Codifa cannot write to {} — the installer was opened instead; drag Codifa into Applications and replace it",
+            parent.display()
+        ));
+    }
+    let _ = std::fs::remove_dir(&probe);
+
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+    let is_dmg = asset.extension().map(|e| e.eq_ignore_ascii_case("dmg")).unwrap_or(false);
+    let (stage, mount, cleanup) = if is_dmg {
+        let mnt = tmp.join(format!("codifa-update-mnt-{pid}"));
+        let _ = std::fs::create_dir_all(&mnt);
+        let out = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-noverify", "-noautoopen", "-readonly", "-mountpoint"])
+            .arg(&mnt)
+            .arg(asset)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let _ = std::fs::remove_dir(&mnt);
+            return Err(format!(
+                "Could not open the update image: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        (mnt.clone(), mnt.to_string_lossy().into_owned(), String::new())
+    } else {
+        let ex = tmp.join(format!("codifa-update-x-{pid}"));
+        let _ = std::fs::remove_dir_all(&ex);
+        let _ = std::fs::create_dir_all(&ex);
+        let ok = Command::new("/usr/bin/ditto")
+            .args(["-x", "-k"])
+            .arg(asset)
+            .arg(&ex)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_dir_all(&ex);
+            return Err("Could not unpack the update archive".into());
+        }
+        (ex.clone(), String::new(), ex.to_string_lossy().into_owned())
+    };
+    let detach = |mount: &str, stage: &Path| {
+        if !mount.is_empty() {
+            let _ = Command::new("/usr/bin/hdiutil").args(["detach", mount, "-force"]).output();
+        }
+        let _ = std::fs::remove_dir_all(stage);
+    };
+    let Some(new_app) = find_app_bundle(&stage) else {
+        detach(&mount, &stage);
+        return Err("The update does not contain a Codifa app".into());
+    };
+
+    const SWAP: &str = r#"pid="$1"; src="$2"; target="$3"; mnt="$4"; cleanup="$5"
+n=0
+while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 300 ]; do sleep 0.2; n=$((n+1)); done
+stage="$target.codifa-new"; old="$target.codifa-old"
+rm -rf "$stage" "$old"
+if /usr/bin/ditto "$src" "$stage" && mv "$target" "$old" && mv "$stage" "$target"; then
+  rm -rf "$old"
+else
+  rm -rf "$stage"
+  if [ ! -e "$target" ] && [ -e "$old" ]; then mv "$old" "$target"; fi
+fi
+/usr/bin/xattr -dr com.apple.quarantine "$target" 2>/dev/null
+if [ -n "$mnt" ]; then /usr/bin/hdiutil detach "$mnt" -force >/dev/null 2>&1; rmdir "$mnt" 2>/dev/null; fi
+if [ -n "$cleanup" ]; then rm -rf "$cleanup"; fi
+/usr/bin/open "$target"
+"#;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(SWAP)
+        .arg("sh")
+        .arg(pid.to_string())
+        .arg(&new_app)
+        .arg(&target)
+        .arg(&mount)
+        .arg(&cleanup);
+    if let Err(e) = spawn_detached(cmd) {
+        detach(&mount, &stage);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Windows: the NSIS `Setup.exe` cannot replace a running app, so a hidden
+/// PowerShell waits for this process to exit, runs the installer silently
+/// (`/S`) and starts the installed app again.
+#[cfg(target_os = "windows")]
+fn spawn_installer(asset: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    const FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
+    const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; try { Wait-Process -Id ([int]$env:CODIFA_PID) -Timeout 60 } catch {}; Start-Process -FilePath $env:CODIFA_INSTALLER -ArgumentList '/S' -Wait; Start-Process -FilePath $env:CODIFA_EXE";
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let child = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT])
+        .env("CODIFA_PID", std::process::id().to_string())
+        .env("CODIFA_INSTALLER", asset)
+        .env("CODIFA_EXE", exe)
+        .creation_flags(FLAGS)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    reap_detached(child);
+    Ok(())
+}
+
+/// Linux, running FROM an AppImage: the verified download is copied over the
+/// running image (renaming over a running binary is legal — the old inode
+/// lives until the process exits) and a detached shell starts it once this
+/// process is gone. Not AppImage-installed (dev build, .deb): the downloaded
+/// AppImage is run extracted instead.
+#[cfg(target_os = "linux")]
+fn spawn_installer(asset: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let exec_mode = std::fs::Permissions::from_mode(0o755);
+    let (launch, extract_and_run) = match std::env::var("APPIMAGE") {
+        Ok(appimage) => {
             let target = PathBuf::from(appimage);
-            if let Some(parent) = target.parent() {
-                let tmp = parent.join(format!(".codifa-update-{}.AppImage", std::process::id()));
-                if std::fs::copy(dest, &tmp).is_ok()
-                    && std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).is_ok()
-                    && std::fs::rename(&tmp, &target).is_ok()
-                {
-                    return OpResult::ok();
-                }
+            let parent = target.parent().ok_or("The AppImage has no parent folder")?;
+            let tmp = parent.join(format!(".codifa-update-{}.AppImage", std::process::id()));
+            let ok = std::fs::copy(asset, &tmp).is_ok()
+                && std::fs::set_permissions(&tmp, exec_mode).is_ok()
+                && std::fs::rename(&tmp, &target).is_ok();
+            if !ok {
                 let _ = std::fs::remove_file(&tmp);
+                return Err(format!(
+                    "Could not replace {} — check write permission on its folder",
+                    target.display()
+                ));
             }
+            (target, false)
         }
-        return match std::process::Command::new(dest)
-            .env("APPIMAGE_EXTRACT_AND_RUN", "1")
-            .spawn()
-        {
-            Ok(child) => {
-                reap_detached(child);
-                OpResult::ok()
-            }
-            Err(e) => OpResult::err(e.to_string()),
-        };
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        match open::that(dest) {
-            Ok(_) => OpResult::ok(),
-            Err(e) => OpResult::err(e.to_string()),
+        Err(_) => {
+            let _ = std::fs::set_permissions(asset, exec_mode);
+            (asset.to_path_buf(), true)
         }
+    };
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(r#"n=0; while kill -0 "$1" 2>/dev/null && [ "$n" -lt 300 ]; do sleep 0.2; n=$((n+1)); done; exec "$2""#)
+        .arg("sh")
+        .arg(std::process::id().to_string())
+        .arg(&launch)
+        // The old image's runtime variables would mislead the new one.
+        .env_remove("APPIMAGE")
+        .env_remove("APPDIR")
+        .env_remove("ARGV0")
+        .env_remove("OWD");
+    if extract_and_run {
+        cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
     }
+    spawn_detached(cmd)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn spawn_installer(_asset: &Path) -> Result<(), String> {
+    Err("Automatic update is not supported on this platform".into())
 }
 
 // --- window drag region (macOS frameless) -----------------------------------

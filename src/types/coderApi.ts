@@ -42,7 +42,9 @@ export interface UpdateInfo {
 }
 
 export interface UpdateProgress {
-  phase: 'downloading' | 'installing'
+  /** `ready`: the verified installer is on disk and waits for the user's
+   *  "restart now" answer (see `installUpdate`). */
+  phase: 'downloading' | 'ready'
   percent: number
 }
 
@@ -177,6 +179,10 @@ export interface CoderApi {
   /** Full app restart (relaunch) — applies a completed restore. */
   restartApp(): Promise<void>
   checkForUpdates(): Promise<UpdateInfo>
+  /** Downloads + verifies the update; resolves once it is READY to install. */
   startUpdate(): Promise<OpResult>
+  /** Applies the downloaded update and relaunches the app (it quits right
+   *  after answering ok). Call only after the user confirmed the restart. */
+  installUpdate(): Promise<OpResult>
   onUpdateProgress(cb: (p: UpdateProgress) => void): () => void
 }

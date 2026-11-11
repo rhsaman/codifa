@@ -296,4 +296,4 @@ pub use app::{get_data_path, has_settings_file, move_data_path, restart_app, sec
 pub use launch::{open_external, open_external_chrome, open_file_external, open_workspace_folder, open_workspace_terminal};
 
 #[allow(unused_imports)] // original commands API surface, preserved verbatim
-pub use updater::{UpdateInfo, check_for_updates, get_path_for_file, start_update, window_close, window_minimize, window_toggle_maximize};
+pub use updater::{UpdateInfo, check_for_updates, get_path_for_file, install_update, start_update, window_close, window_minimize, window_toggle_maximize};

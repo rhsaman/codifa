@@ -412,6 +412,7 @@ const bridge: CoderApi = {
       releaseUrl: '',
     }),
   startUpdate: async () => ({ ok: false, error: 'Auto-update is desktop-only.' }),
+  installUpdate: async () => ({ ok: false, error: 'Auto-update is desktop-only.' }),
   onUpdateProgress: () => () => {},
 }
 

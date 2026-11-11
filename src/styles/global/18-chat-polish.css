@@ -139,10 +139,123 @@
   display: none;
 }
 
+/* 4) Tool group + sub-agent run — Claude style: no card, no fill, no frame.
+   A run is ONE quiet line (the agent's latest words + a chevron); opened, its
+   narration and tool rows stack under it with no dividers or tints, only a
+   hairline guide on the left. Sub-agent runs render through the same
+   ToolGroupView, so they follow automatically. */
+.tool-trace {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  overflow: visible;
+}
+
+.tool-trace > .trace-row,
+.tool-trace > .tool-group,
+.tool-trace > .trace-narration {
+  border-top: 0;
+}
+
+.tool-group > .trace-head {
+  display: inline-flex;
+  align-self: flex-start;
+  width: auto;
+  max-width: 100%;
+  padding: 4px 2px;
+  gap: 6px;
+  border-radius: 6px;
+  background: none;
+  font-size: 13px;
+}
+
+.tool-trace .trace-head:hover,
+.tool-trace .trace-row-head:hover {
+  background: none;
+}
+
+.trace-head-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: start;
+  line-height: 1.5;
+  color: var(--text-dim);
+  transition: color 0.15s ease;
+}
+
+.tool-group > .trace-head:hover .trace-head-text,
+.tool-group.running > .trace-head .trace-head-text {
+  color: var(--text);
+}
+
+.tool-group.running > .trace-head .trace-head-text {
+  animation: trace-head-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes trace-head-pulse {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.tool-group > .trace-head .trace-chev {
+  opacity: 0.55;
+}
+
+.tool-group > .trace-head:hover .trace-chev {
+  opacity: 0.9;
+  color: var(--text);
+}
+
+/* Opened: the rows hang off a thin left guide instead of sitting in a card. */
+.tool-group.open {
+  gap: 2px;
+}
+
+.tool-group.open > .trace-list {
+  gap: 0;
+  margin-left: 6px;
+  padding-left: 10px;
+  border-left: 1px solid var(--hairline, rgba(255, 255, 255, 0.08));
+}
+
+.tool-trace .trace-list > .trace-row,
+.tool-trace .trace-list > .trace-narration {
+  border-top: 0;
+}
+
+.tool-trace .trace-narration {
+  padding: 4px 8px;
+}
+
+.tool-trace .trace-row-head {
+  padding: 4px 8px;
+}
+
+.tool-trace .trace-row.expanded {
+  background: none;
+}
+
+.tool-trace .trace-row-expand {
+  padding: 4px 8px 6px;
+  border-top: 0;
+  background: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .trace-head,
   .trace-row-head,
   .composer-inner {
     transition: none;
+  }
+
+  .tool-group.running > .trace-head .trace-head-text {
+    animation: none;
   }
 }

@@ -66,9 +66,91 @@
   transition: stroke-dashoffset 0.25s ease;
 }
 
-.update-btn.done,
-.update-btn.done:hover {
+.update-btn.ready,
+.update-btn.ready:hover {
   color: var(--success);
+}
+
+.update-spin {
+  animation: update-spin 0.9s linear infinite;
+}
+
+@keyframes update-spin {
+  to {
+    transform: rotate(270deg);
+  }
+}
+
+/* ----- restart-to-update confirmation popup ----- */
+.update-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.update-modal {
+  width: min(400px, calc(100vw - 32px));
+  padding: 20px 22px 18px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-panel);
+  color: var(--text);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  direction: ltr;
+  text-align: left;
+}
+
+.update-modal-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.update-modal-body {
+  margin: 0 0 18px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.update-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.update-modal-btn {
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.update-modal-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.update-modal-btn.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.update-modal-btn.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text));
+}
+
+.update-modal-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .update-btn.error,

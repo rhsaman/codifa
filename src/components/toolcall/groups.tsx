@@ -11,9 +11,9 @@ import { Fragment, KeyboardEvent, memo, useEffect, useLayoutEffect, useRef, useS
 import { createPortal } from 'react-dom'
 import { ToolArgs, argsTextFor, fmtArgValue, rowDetail } from './args'
 import { DiffPreview, useDiffPreview } from './diff'
-import { IconSparkle, fmtTime, groupSpanMs } from './editGroup'
+import { fmtTime } from './editGroup'
 import { IconChevron, StatusIcon, TerminalRowIcon } from './icons'
-import { activityLabel, batchOpTools, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel, useRunningClock } from './naming'
+import { activityLabel, batchOpTools, canonicalTool, isSubagentCard, subagentDisplayName, toolIcon, toolLabel } from './naming'
 import { FileResultLinks, InlineWebResults, MEDIA_TOOLS, MediaResultLinks, TerminalResultText, WebResultLinks, isWebRow, resultRows, webProviderLabel } from './results'
 
 export const ToolGroupView = memo(function ToolGroupView({
@@ -40,38 +40,22 @@ export const ToolGroupView = memo(function ToolGroupView({
   // one click away inside the expanded rows.
   const [open, setOpen] = useState(false);
   const subagentRows = useStore((s) => s.customSubagents);
-  // The delegation call's state owns the group clock: a sub-agent run is
-  // "running" even between its own tool calls, so the pill keeps its accent
-  // and the total keeps ticking while it works.
+  // The delegation call's state owns the group's running state: a sub-agent
+  // run is "running" even between its own tool calls.
   const subagentRunning = subagent?.status === "running";
   const running =
     activities.some((a) => a.activity.status === "running") || subagentRunning;
-  // Live clock so the group total ticks while any call is still running.
-  const now = useRunningClock(running);
-  // Start → end of the WHOLE group (see groupSpanMs), not the sum of the calls'
-  // own durations: parallel calls would count twice, the gaps between calls
-  // would vanish, and a sub-agent's delegation card (which already spans all of
-  // its inner calls) used to be added on top of them.
-  const totalMs = groupSpanMs(
-    [...(subagent ? [subagent] : []), ...activities.map((a) => a.activity)],
-    now,
-  );
-  // Dedicated sub-agent run: the agent's own name leads the header (user
-  // request) — the inner tool tallies follow as the regular label pills.
+  // Dedicated sub-agent run: its own name is the header's last-resort text
+  // (when the agent has said nothing yet and has no task description).
   const subagentName = subagent
     ? subagentDisplayName(subagent.tool, subagentRows)
     : null;
-  // Always show tool names + counts as the main status text. The narration
-  // line (if any) rides along as the caption — always in the head, plus the
-  // first row of the expanded panel (see renderSegments in ChatMessage.tsx).
-  // Build per-LABEL pills (not per-tool): grep and glob share the label
-  // "Search Files", so counting by raw tool name produced TWO identical
-  // "Search Files" pills side by side (one with ×N, one without) instead of
-  // a single merged "Search Files ×N".
-  // Sub-agent cards (explore) are NOT counted into the label pills:
-  // each one gets its own pill carrying the short description of what it is
-  // looking for, so two parallel explores are distinguishable at a glance
-  // instead of collapsing into a single "Explore ×2".
+  // Tool names + counts: only the header's FALLBACK text now (see headText) —
+  // the header itself shows the agent's latest words, never the tool list.
+  // Counted per LABEL (not per tool): grep and glob share the label
+  // "Search Files", so counting by raw tool name would list it twice.
+  // Sub-agent cards (explore) are not counted into the labels: each one is
+  // listed on its own with the short description of what it looks for.
   const subagentPills = activities
     .filter(({ activity }) => isSubagentCard(activity))
     .map(({ activity, index }) => ({
@@ -91,13 +75,6 @@ export const ToolGroupView = memo(function ToolGroupView({
     }
     return acc;
   }, {});
-  const searchEngines = [
-    ...new Set(
-      activities
-        .filter(({ activity }) => activity.tool === "web_search" && activity.engine)
-        .map(({ activity }) => activity.engine as string),
-    ),
-  ];
   // Task description of a dedicated sub-agent run (what the old dedicated
   // explore card showed as its title): rides as the name pill's tooltip, and
   // becomes the head caption when the run has no narration of its own.
@@ -116,6 +93,14 @@ export const ToolGroupView = memo(function ToolGroupView({
     }
     return subagentCaption;
   })();
+  // The header is ONE line of the agent's own words (Claude style): its latest
+  // narration. Only a run that has said nothing yet falls back to what it is
+  // doing — the tool tally, else the sub-agent's name.
+  const tally = [
+    ...Object.entries(toolCounts).map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)),
+    ...subagentPills.map((p) => (p.desc ? `${p.label}: ${p.desc}` : p.label)),
+  ].join(" · ");
+  const headText = prepareContent(headCaption || tally || subagentName || "");
 
   return (
     <div
@@ -124,54 +109,15 @@ export const ToolGroupView = memo(function ToolGroupView({
       <button
         className={`trace-head ${open ? "open" : ""}`}
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
       >
-        <IconSparkle className="trace-sparkle" />
-        <span className="trace-head-pills">
-          {subagentName && subagent && (
-            <span
-              className={`trace-pill trace-pill-sub${subagentRunning ? " running" : ""}`}
-              title={subagentDesc || subagentName || undefined}
-            >
-              {subagentName}
-            </span>
-          )}
-          {Object.entries(toolCounts).map(([label, n]) => (
-            <span key={label} className="trace-pill">
-              {label}
-              {n > 1 && <span className="trace-pill-count">×{n}</span>}
-            </span>
-          ))}
-          {subagentPills.map(({ key, label, desc, running }) => (
-            <span
-              key={`sub-${key}`}
-              className={`trace-pill trace-pill-sub${running ? " running" : ""}`}
-              title={desc || label}
-            >
-              {label}
-              {desc && <span className="trace-pill-desc">{desc}</span>}
-            </span>
-          ))}
+        {/* The button lays out LTR (text left-aligned like the rest of the
+            transcript); the text inside picks its own direction, so a Persian
+            line reads RTL with the chevron right after it. */}
+        <span className="trace-head-text" dir="auto" title={headText}>
+          {headText}
         </span>
-        {searchEngines.map((engine) => (
-          <span
-            key={engine}
-            className="trace-row-engine"
-            title="Web search provider"
-          >
-            {webProviderLabel(engine)}
-          </span>
-        ))}
-        {headCaption && (
-          <span className="trace-head-caption" dir="auto" title={prepareContent(headCaption)}>
-            {prepareContent(headCaption)}
-          </span>
-        )}
-        <span className="trace-head-right">
-          {totalMs > 0 && (
-            <span className="trace-time">{fmtTime(totalMs)}</span>
-          )}
-          <IconChevron open={open} className="trace-chev" />
-        </span>
+        <IconChevron open={open} className="trace-chev" />
       </button>
       {/* The hits of a search belong to the individual `web_search` row: they
           are rendered INSIDE that row while it is expanded, so a collapsed

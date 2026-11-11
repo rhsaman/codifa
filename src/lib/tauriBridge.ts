@@ -158,6 +158,7 @@ const bridge: CoderApi = {
   restartApp: () => invoke<void>('restart_app'),
   checkForUpdates: () => invoke<UpdateInfo>('check_for_updates'),
   startUpdate: () => invoke<OpResult>('start_update'),
+  installUpdate: () => invoke<OpResult>('install_update'),
   onUpdateProgress: (cb) =>
     eventSubscribe<UpdateProgress>('updater:progress', (p) => cb(p)),
   // Native notification plugin (desktop: permission is always granted, no
